@@ -50,8 +50,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
-    # - name: Run clippy
-    # run: cargo clippy -- -D warnings
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
 
   build-macos:
     runs-on: macos-latest
