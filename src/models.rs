@@ -5,8 +5,6 @@ fn string_or_number_to_string<'de, D>(deserializer: D) -> Result<String, D::Erro
 where
     D: Deserializer<'de>,
 {
-    use serde::de::Error;
-
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum StringOrNumber {

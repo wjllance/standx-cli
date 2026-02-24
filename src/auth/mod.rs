@@ -30,7 +30,7 @@ impl StandXSigner {
     pub fn from_base58(private_key_base58: &str) -> crate::Result<Self> {
         let private_key_bytes = bs58::decode(private_key_base58)
             .into_vec()
-            .map_err(|e| crate::Error::InvalidCredentials)?;
+            .map_err(|_e| crate::Error::InvalidCredentials)?;
 
         let signing_key = SigningKey::from_bytes(
             &private_key_bytes

@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 /// API response wrapper for list endpoints
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ApiListResponse<T> {
     code: i32,
     message: String,
@@ -45,6 +46,7 @@ impl StandXClient {
     }
 
     /// Sign request with Ed25519
+    #[allow(dead_code)]
     fn sign_request(&self, payload: &str) -> Result<(StandXSigner, crate::auth::RequestSignature)> {
         let creds = Credentials::load()?;
         let signer =

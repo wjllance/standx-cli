@@ -69,6 +69,7 @@ pub enum WsState {
 }
 
 /// WebSocket client for StandX
+#[allow(dead_code)]
 pub struct StandXWebSocket {
     url: String,
     token: String,
