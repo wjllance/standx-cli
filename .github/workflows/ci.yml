@@ -67,8 +67,25 @@ jobs:
         name: standx-macos
         path: target/release/standx
 
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-action@stable
+    
+    - name: Build for Linux
+      run: cargo build --release
+    
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: standx-linux
+        path: target/release/standx
+
   release:
-    needs: [ build, build-macos ]
+    needs: [ build, build-macos, build-linux ]
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
     steps:
@@ -78,16 +95,26 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         name: standx-macos
-        path: ./binaries/
+        path: ./binaries/macos/
+    
+    - name: Download Linux binary
+      uses: actions/download-artifact@v4
+      with:
+        name: standx-linux
+        path: ./binaries/linux/
     
     - name: Package binaries
       run: |
-        chmod +x ./binaries/standx
-        tar -czf standx-macos-amd64.tar.gz -C ./binaries standx
+        chmod +x ./binaries/macos/standx
+        chmod +x ./binaries/linux/standx
+        tar -czf standx-macos-amd64.tar.gz -C ./binaries/macos standx
+        tar -czf standx-linux-amd64.tar.gz -C ./binaries/linux standx
     
     - name: Upload to release
       uses: softprops/action-gh-release@v1
       with:
-        files: standx-macos-amd64.tar.gz
+        files: |
+          standx-macos-amd64.tar.gz
+          standx-linux-amd64.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
