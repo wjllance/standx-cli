@@ -177,42 +177,20 @@ pub enum OrderCommands {
         tif: Option<String>,
         #[arg(long)]
         reduce_only: bool,
-        #[arg(short, long)]
-        client_id: Option<String>,
+        #[arg(long)]
+        sl_price: Option<String>,
+        #[arg(long)]
+        tp_price: Option<String>,
     },
-    /// Cancel an order
+    /// Cancel an order by ID
     Cancel {
         symbol: String,
         #[arg(short, long)]
-        order_id: Option<String>,
-        #[arg(short, long)]
-        client_id: Option<String>,
+        order_id: String,
     },
     /// Cancel all orders for a symbol
     CancelAll {
         symbol: String,
-    },
-    /// List orders
-    List {
-        symbol: String,
-        #[arg(short, long)]
-        status: Option<String>,
-        #[arg(short, long)]
-        limit: Option<u32>,
-    },
-    /// Get open orders
-    Open {
-        symbol: String,
-        #[arg(short, long)]
-        limit: Option<u32>,
-    },
-    /// Get order details
-    Get {
-        symbol: String,
-        #[arg(short, long)]
-        order_id: Option<String>,
-        #[arg(short, long)]
-        client_id: Option<String>,
     },
 }
 

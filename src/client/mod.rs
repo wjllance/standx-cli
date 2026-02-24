@@ -1,6 +1,7 @@
 //! HTTP client for StandX API
 
 pub mod account;
+pub mod order;
 
 use crate::error::{Error, Result};
 use crate::models::*;

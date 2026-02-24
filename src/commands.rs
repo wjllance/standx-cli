@@ -2,58 +2,72 @@
 
 use crate::cli::*;
 use standx_cli::auth::Credentials;
+use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
+use standx_cli::models::{OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
 use anyhow::Result;
 
-/// Handle account commands
-pub async fn handle_account(command: AccountCommands, output_format: OutputFormat) -> Result<()> {
+/// Handle order commands
+pub async fn handle_order(command: OrderCommands) -> Result<()> {
     let client = StandXClient::new()?;
 
     match command {
-        AccountCommands::Balances => {
-            let balances = client.get_balance().await?;
+        OrderCommands::Create { symbol, side, order_type, qty, price, tif, reduce_only, sl_price, tp_price } => {
+            // Parse side
+            let side = match side.to_lowercase().as_str() {
+                "buy" => OrderSide::Buy,
+                "sell" => OrderSide::Sell,
+                _ => return Err(anyhow::anyhow!("Invalid side: {}", side)),
+            };
             
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(balances)),
-                OutputFormat::Json => println!("{}", output::format_json(&balances)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&balances)?),
-                OutputFormat::Quiet => {}
+            // Parse order type
+            let order_type = match order_type.to_lowercase().as_str() {
+                "limit" => OrderType::Limit,
+                "market" => OrderType::Market,
+                _ => return Err(anyhow::anyhow!("Invalid order type: {}", order_type)),
+            };
+            
+            // Parse time in force
+            let time_in_force = tif.map(|t| match t.to_uppercase().as_str() {
+                "GTC" => TimeInForce::Gtc,
+                "IOC" => TimeInForce::Ioc,
+                "FOK" => TimeInForce::Fok,
+                _ => TimeInForce::Gtc,
+            });
+            
+            let params = CreateOrderParams {
+                symbol,
+                side,
+                order_type,
+                quantity: qty,
+                price,
+                time_in_force,
+                reduce_only,
+                stop_price: None,
+                sl_price,
+                tp_price,
+            };
+            
+            let order = client.create_order(params).await?;
+            println!("✅ Order created successfully!");
+            println!("   Order ID: {}", order.id);
+            println!("   Symbol: {}", order.symbol);
+            println!("   Side: {:?}", order.side);
+            println!("   Type: {:?}", order.order_type);
+            println!("   Quantity: {}", order.quantity);
+            if !order.price.is_empty() && order.price != "0" {
+                println!("   Price: {}", order.price);
             }
         }
-        AccountCommands::Positions { symbol } => {
-            let positions = client.get_positions(symbol.as_deref()).await?;
-            
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(positions)),
-                OutputFormat::Json => println!("{}", output::format_json(&positions)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&positions)?),
-                OutputFormat::Quiet => {}
-            }
+        OrderCommands::Cancel { symbol, order_id } => {
+            client.cancel_order(&symbol, &order_id).await?;
+            println!("✅ Order {} cancelled successfully", order_id);
         }
-        AccountCommands::Orders { symbol } => {
-            let orders = client.get_open_orders(symbol.as_deref()).await?;
-            
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(orders)),
-                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
-                OutputFormat::Quiet => {}
-            }
-        }
-        AccountCommands::History { symbol, limit } => {
-            let orders = client.get_order_history(symbol.as_deref(), Some(limit)).await?;
-            
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(orders)),
-                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
-                OutputFormat::Quiet => {}
-            }
-        }
-        AccountCommands::Config { symbol } => {
-            println!("Position config for {} not yet implemented", symbol);
+        OrderCommands::CancelAll { symbol } => {
+            client.cancel_all_orders(&symbol).await?;
+            println!("✅ All orders for {} cancelled successfully", symbol);
         }
     }
     Ok(())
