@@ -118,3 +118,37 @@ jobs:
             standx-linux-amd64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    needs: release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: wjllance/homebrew-standx-cli
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Download source tarball
+        run: |
+          curl -L -o standx-cli.tar.gz "https://github.com/wjllance/standx-cli/archive/refs/tags/${{ github.event.release.tag_name }}.tar.gz"
+          SHA256=$(sha256sum standx-cli.tar.gz | cut -d' ' -f1)
+          echo "SHA256=$SHA256" >> $GITHUB_ENV
+          echo "VERSION=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+
+      - name: Update Homebrew formula
+        run: |
+          cd homebrew-tap
+          sed -i "s|url \"https://github.com/wjllance/standx-cli/archive/refs/tags/v.*.tar.gz\"|url \"https://github.com/wjllance/standx-cli/archive/refs/tags/${{ env.VERSION }}.tar.gz\"|" Formula/standx-cli.rb
+          sed -i "s|sha256 \"[^\"]*\"|sha256 \"${{ env.SHA256 }}\"|" Formula/standx-cli.rb
+
+      - name: Commit and push to tap
+        run: |
+          cd homebrew-tap
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add Formula/standx-cli.rb
+          git commit -m "Update standx-cli to ${{ env.VERSION }}"
+          git push
