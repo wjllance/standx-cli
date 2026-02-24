@@ -24,7 +24,7 @@ futures = "0.3"
 futures-util = "0.3"
 
 # HTTP
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
