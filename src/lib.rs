@@ -2,6 +2,8 @@
 //!
 //! This crate provides a Rust client for the StandX perpetual DEX API.
 
+#![allow(clippy::result_large_err)]
+
 pub mod auth;
 pub mod client;
 pub mod config;

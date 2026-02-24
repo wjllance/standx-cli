@@ -49,7 +49,7 @@ impl Credentials {
     pub fn expires_at_string(&self) -> String {
         let expires = self.created_at + self.validity_seconds;
         let datetime =
-            chrono::DateTime::from_timestamp(expires, 0).unwrap_or_else(|| chrono::Utc::now());
+            chrono::DateTime::from_timestamp(expires, 0).unwrap_or_else(chrono::Utc::now);
         datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
     }
 

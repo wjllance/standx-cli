@@ -15,7 +15,7 @@ pub fn format_item<T: Tabled>(item: T) -> String {
 
 /// Format as JSON
 pub fn format_json<T: serde::Serialize>(data: &T) -> crate::Result<String> {
-    serde_json::to_string_pretty(data).map_err(|e| crate::Error::Json(e))
+    serde_json::to_string_pretty(data).map_err(crate::Error::Json)
 }
 
 /// Format as CSV (for lists)

@@ -6,9 +6,9 @@ use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
-use standx_cli::models::{OrderBook, OrderSide, OrderType, TimeInForce};
+use standx_cli::models::{OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
-use standx_cli::websocket::{StandXWebSocket, TradeData, WsMessage};
+use standx_cli::websocket::{StandXWebSocket, WsMessage};
 
 /// Handle order commands
 pub async fn handle_order(command: OrderCommands) -> Result<()> {
@@ -374,19 +374,16 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                match msg {
-                    WsMessage::DepthBook { data, .. } => {
-                        println!("\n=== Order Book: {} ===", data.symbol);
-                        println!("Asks:");
-                        for (i, ask) in data.asks.iter().take(levels).enumerate() {
-                            println!("  {}: {}", ask[0], ask[1]);
-                        }
-                        println!("Bids:");
-                        for (i, bid) in data.bids.iter().take(levels).enumerate() {
-                            println!("  {}: {}", bid[0], bid[1]);
-                        }
+                if let WsMessage::DepthBook { data, .. } = msg {
+                    println!("\n=== Order Book: {} ===", data.symbol);
+                    println!("Asks:");
+                    for ask in data.asks.iter().take(levels) {
+                        println!("  {}: {}", ask[0], ask[1]);
                     }
-                    _ => {}
+                    println!("Bids:");
+                    for bid in data.bids.iter().take(levels) {
+                        println!("  {}: {}", bid[0], bid[1]);
+                    }
                 }
             }
         }
@@ -398,14 +395,11 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                match msg {
-                    WsMessage::Price { data } => {
-                        println!(
-                            "{} | Mark: {} | Index: {} | Last: {}",
-                            data.time, data.mark_price, data.index_price, data.last_price
-                        );
-                    }
-                    _ => {}
+                if let WsMessage::Price { data } = msg {
+                    println!(
+                        "{} | Mark: {} | Index: {} | Last: {}",
+                        data.time, data.mark_price, data.index_price, data.last_price
+                    );
                 }
             }
         }
@@ -417,15 +411,12 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                match msg {
-                    WsMessage::Trade { data } => {
-                        let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
-                        println!(
-                            "{} | {} | Price: {} | Qty: {}",
-                            data.time, side, data.price, data.qty
-                        );
-                    }
-                    _ => {}
+                if let WsMessage::Trade { data } = msg {
+                    let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
+                    println!(
+                        "{} | {} | Price: {} | Qty: {}",
+                        data.time, side, data.price, data.qty
+                    );
                 }
             }
         }
