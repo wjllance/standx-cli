@@ -5,7 +5,7 @@ use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
-use standx_cli::models::{OrderSide, OrderType, TimeInForce};
+use standx_cli::models::{OrderBook, OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
 use anyhow::Result;
 
@@ -68,6 +68,58 @@ pub async fn handle_order(command: OrderCommands) -> Result<()> {
         OrderCommands::CancelAll { symbol } => {
             client.cancel_all_orders(&symbol).await?;
             println!("✅ All orders for {} cancelled successfully", symbol);
+        }
+    }
+    Ok(())
+}
+
+/// Handle account commands
+pub async fn handle_account(command: AccountCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        AccountCommands::Balances => {
+            let balances = client.get_balance().await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(balances)),
+                OutputFormat::Json => println!("{}", output::format_json(&balances)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&balances)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Positions { symbol } => {
+            let positions = client.get_positions(symbol.as_deref()).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(positions)),
+                OutputFormat::Json => println!("{}", output::format_json(&positions)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&positions)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Orders { symbol } => {
+            let orders = client.get_open_orders(symbol.as_deref()).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::History { symbol, limit } => {
+            let orders = client.get_order_history(symbol.as_deref(), Some(limit)).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Config { symbol } => {
+            println!("Position config for {} not yet implemented", symbol);
         }
     }
     Ok(())
@@ -211,6 +263,48 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
                 OutputFormat::Table => println!("{}", output::format_table(trades)),
                 OutputFormat::Json => println!("{}", output::format_json(&trades)?),
                 OutputFormat::Csv => println!("{}", output::format_csv(&trades)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        MarketCommands::Depth { symbol, limit } => {
+            let book = client.get_depth(&symbol, limit).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_order_book(&book, limit.unwrap_or(10) as usize)),
+                OutputFormat::Json => println!("{}", output::format_json(&book)?),
+                OutputFormat::Csv => println!("CSV format not supported for order book"),
+                OutputFormat::Quiet => {
+                    if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+                        println!("{} {}", bid, ask);
+                    }
+                }
+            }
+        }
+        MarketCommands::Kline { symbol, resolution, from, to } => {
+            let klines = client.get_kline(&symbol, &resolution, from, to).await?;
+            
+            match output_format {
+                OutputFormat::Table => {
+                    println!("Kline data for {} ({}):", symbol, resolution);
+                    for kline in klines {
+                        println!("  {}: O:{} H:{} L:{} C:{} V:{}", 
+                            kline.time, kline.open, kline.high, kline.low, kline.close, kline.volume);
+                    }
+                }
+                OutputFormat::Json => println!("{}", output::format_json(&klines)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&klines)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        MarketCommands::Funding { symbol, days } => {
+            let now = chrono::Utc::now().timestamp();
+            let start_time = now - days * 24 * 60 * 60;
+            let funding_rates = client.get_funding_rate(&symbol, start_time, now).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(funding_rates)),
+                OutputFormat::Json => println!("{}", output::format_json(&funding_rates)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&funding_rates)?),
                 OutputFormat::Quiet => {}
             }
         }

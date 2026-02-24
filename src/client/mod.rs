@@ -141,6 +141,102 @@ impl StandXClient {
         Ok(data)
     }
 
+    /// Get order book depth for a symbol
+    pub async fn get_depth(&self, symbol: &str, limit: Option<u32>) -> Result<OrderBook> {
+        let url = format!("{}/api/query_depth_book", self.base_url);
+        let mut query = vec![("symbol", symbol.to_string())];
+        
+        if let Some(l) = limit {
+            query.push(("limit", l.to_string()));
+        }
+
+        let response = self.client.get(&url).query(&query).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+            });
+        }
+
+        let mut data = response.json::<OrderBook>().await?;
+        // Sort bids descending by price
+        data.bids.sort_by(|a, b| {
+            let price_a: f64 = a[0].parse().unwrap_or(0.0);
+            let price_b: f64 = b[0].parse().unwrap_or(0.0);
+            price_b.partial_cmp(&price_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // Sort asks ascending by price
+        data.asks.sort_by(|a, b| {
+            let price_a: f64 = a[0].parse().unwrap_or(0.0);
+            let price_b: f64 = b[0].parse().unwrap_or(0.0);
+            price_a.partial_cmp(&price_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(data)
+    }
+
+    /// Get kline data for a symbol
+    pub async fn get_kline(
+        &self,
+        symbol: &str,
+        resolution: &str,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<Kline>> {
+        let url = format!("{}/api/kline/history", self.base_url);
+        let query: Vec<(&str, String)> = vec![
+            ("symbol", symbol.to_string()),
+            ("resolution", resolution.to_string()),
+            ("from", from.to_string()),
+            ("to", to.to_string()),
+        ];
+
+        let response = self.client.get(&url).query(&query).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+            });
+        }
+
+        let data = response.json::<Vec<Kline>>().await?;
+        Ok(data)
+    }
+
+    /// Get funding rate history for a symbol
+    pub async fn get_funding_rate(
+        &self,
+        symbol: &str,
+        start_time: i64,
+        end_time: i64,
+    ) -> Result<Vec<FundingRate>> {
+        let url = format!("{}/api/query_funding_rates", self.base_url);
+        let query: Vec<(&str, String)> = vec![
+            ("symbol", symbol.to_string()),
+            ("start_time", start_time.to_string()),
+            ("end_time", end_time.to_string()),
+        ];
+
+        let response = self.client.get(&url).query(&query).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+            });
+        }
+
+        let data = response.json::<Vec<FundingRate>>().await?;
+        Ok(data)
+    }
+
     /// Health check - returns true if API is available
     pub async fn health_check(&self) -> Result<bool> {
         // Use query_symbol_info as health check since /api/health doesn't exist

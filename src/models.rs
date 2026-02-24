@@ -88,9 +88,11 @@ pub struct OrderBookLevel {
 /// Order book depth
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OrderBook {
+    #[serde(default)]
     pub symbol: String,
     pub bids: Vec<[String; 2]>,
     pub asks: Vec<[String; 2]>,
+    #[serde(default)]
     pub timestamp: String,
 }
 

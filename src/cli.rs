@@ -133,6 +133,28 @@ pub enum MarketCommands {
         #[arg(short, long)]
         limit: Option<u32>,
     },
+    /// Get order book depth
+    Depth {
+        symbol: String,
+        #[arg(short, long)]
+        limit: Option<u32>,
+    },
+    /// Get kline data
+    Kline {
+        symbol: String,
+        #[arg(short, long)]
+        resolution: String,
+        #[arg(short, long)]
+        from: i64,
+        #[arg(short, long)]
+        to: i64,
+    },
+    /// Get funding rate history
+    Funding {
+        symbol: String,
+        #[arg(short, long, default_value = "7")]
+        days: i64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
