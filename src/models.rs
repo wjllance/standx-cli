@@ -195,12 +195,20 @@ pub enum TimeInForce {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderStatus {
+    #[serde(rename = "new")]
     New,
+    #[serde(rename = "partially_filled")]
     PartiallyFilled,
+    #[serde(rename = "filled")]
     Filled,
+    #[serde(rename = "canceled")]
     Canceled,
+    #[serde(rename = "rejected")]
     Rejected,
+    #[serde(rename = "expired")]
     Expired,
+    #[serde(rename = "open")]
+    Open,
 }
 
 /// Position side
@@ -231,15 +239,16 @@ pub struct OrderRequest {
 /// Order response
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Order {
+    #[serde(deserialize_with = "string_or_number_to_string")]
     pub id: String,
     pub symbol: String,
     pub side: OrderSide,
-    #[serde(rename = "type")]
+    #[serde(rename = "order_type")]
     pub order_type: OrderType,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub quantity: String,
-    #[serde(deserialize_with = "string_or_number_to_string")]
-    pub filled_quantity: String,
+    pub qty: String,
+    #[serde(deserialize_with = "string_or_number_to_string", default)]
+    pub fill_qty: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub price: String,
     pub status: OrderStatus,
@@ -256,8 +265,8 @@ impl tabled::Tabled for Order {
             self.symbol.clone().into(),
             format!("{:?}", self.side).into(),
             format!("{:?}", self.order_type).into(),
-            self.quantity.clone().into(),
-            self.filled_quantity.clone().into(),
+            self.qty.clone().into(),
+            self.fill_qty.clone().into(),
             self.price.clone().into(),
             format!("{:?}", self.status).into(),
             self.created_at

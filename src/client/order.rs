@@ -109,11 +109,11 @@ impl StandXClient {
         let tif = params
             .time_in_force
             .map(|t| match t {
-                TimeInForce::Gtc => "GTC",
-                TimeInForce::Ioc => "IOC",
-                TimeInForce::Fok => "FOK",
+                TimeInForce::Gtc => "gtc",
+                TimeInForce::Ioc => "ioc",
+                TimeInForce::Fok => "fok",
             })
-            .unwrap_or("GTC");
+            .unwrap_or("gtc");
 
         let mut body = json!({
             "symbol": params.symbol,
@@ -185,8 +185,8 @@ impl StandXClient {
             symbol: params.symbol,
             side: params.side,
             order_type: params.order_type,
-            quantity: params.quantity,
-            filled_quantity: "0".to_string(),
+            qty: params.quantity,
+            fill_qty: "0".to_string(),
             price: params.price.clone().unwrap_or_else(|| "0".to_string()),
             status: crate::models::OrderStatus::New,
             created_at: now.clone(),

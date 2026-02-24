@@ -67,7 +67,7 @@ pub async fn handle_order(command: OrderCommands) -> Result<()> {
             println!("   Symbol: {}", order.symbol);
             println!("   Side: {:?}", order.side);
             println!("   Type: {:?}", order.order_type);
-            println!("   Quantity: {}", order.quantity);
+            println!("   Quantity: {}", order.qty);
             if !order.price.is_empty() && order.price != "0" {
                 println!("   Price: {}", order.price);
             }
