@@ -6,10 +6,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Duration, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_WS_URL: &str = "wss://perps.standx.com/ws-stream/v1";
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
