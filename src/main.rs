@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -24,16 +25,13 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Config { command } => {
-            tracing::info!("Config command: {:?}", command);
-            println!("Config command not yet implemented");
+            commands::handle_config(command).await?;
         }
         Commands::Auth { command } => {
-            tracing::info!("Auth command: {:?}", command);
-            println!("Auth command not yet implemented");
+            commands::handle_auth(command).await?;
         }
         Commands::Market { command } => {
-            tracing::info!("Market command: {:?}", command);
-            println!("Market command not yet implemented");
+            commands::handle_market(command, cli.output).await?;
         }
         Commands::Account { command } => {
             tracing::info!("Account command: {:?}", command);

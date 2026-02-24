@@ -45,7 +45,7 @@ impl Credentials {
     }
 
     /// Get expiration date as string
-    pub fn expires_at(&self) -> String {
+    pub fn expires_at_string(&self) -> String {
         let expires = self.created_at + self.validity_seconds;
         let datetime = chrono::DateTime::from_timestamp(expires, 0)
             .unwrap_or_else(|| chrono::Utc::now());
@@ -158,7 +158,7 @@ mod tests {
 
     #[test]
     fn test_credentials_new() {
-        let creds = Credentials::new(
+        let mut creds = Credentials::new(
             "test_token".to_string(),
             "test_key".to_string(),
         );
@@ -167,6 +167,10 @@ mod tests {
         assert_eq!(creds.private_key, "test_key");
         assert!(!creds.is_expired());
         assert!(creds.remaining_seconds() > 0);
+        
+        // Test expires_at_string returns a valid string
+        let expires = creds.expires_at_string();
+        assert!(expires.contains("UTC"));
     }
 
     #[test]
