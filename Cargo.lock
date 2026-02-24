@@ -1926,6 +1926,7 @@ dependencies = [
  "dirs",
  "ed25519-dalek",
  "futures",
+ "futures-util",
  "hex",
  "keyring",
  "mockito",

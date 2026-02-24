@@ -7,6 +7,7 @@ use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
 use standx_cli::models::{OrderBook, OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
+use standx_cli::websocket::{StandXWebSocket, WsMessage};
 use anyhow::Result;
 
 /// Handle order commands
@@ -309,5 +310,83 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
             }
         }
     }
+    Ok(())
+}
+
+/// Handle stream commands
+pub async fn handle_stream(command: StreamCommands) -> Result<()> {
+    let ws = StandXWebSocket::new()?;
+    
+    match command {
+        StreamCommands::Depth { symbol, levels } => {
+            ws.subscribe("depth_book", Some(&symbol)).await;
+            let mut rx = ws.connect().await?;
+            
+            println!("Streaming depth for {} (top {} levels)", symbol, levels);
+            println!("Press Ctrl+C to exit\n");
+            
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    WsMessage::DepthBook { data, .. } => {
+                        println!("\n=== Order Book: {} ===", data.symbol);
+                        println!("Asks:");
+                        for (i, ask) in data.asks.iter().take(levels).enumerate() {
+                            println!("  {}: {}", ask[0], ask[1]);
+                        }
+                        println!("Bids:");
+                        for (i, bid) in data.bids.iter().take(levels).enumerate() {
+                            println!("  {}: {}", bid[0], bid[1]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StreamCommands::Ticker { symbol } => {
+            ws.subscribe("price", Some(&symbol)).await;
+            let mut rx = ws.connect().await?;
+            
+            println!("Streaming ticker for {}", symbol);
+            println!("Press Ctrl+C to exit\n");
+            
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    WsMessage::Price { data } => {
+                        println!("{} | Mark: {} | Index: {} | Last: {}",
+                            data.time, data.mark_price, data.index_price, data.last_price);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StreamCommands::Trades { symbol } => {
+            println!("Trade streaming not yet implemented for {}", symbol);
+        }
+        StreamCommands::Account => {
+            ws.subscribe("position", None).await;
+            ws.subscribe("balance", None).await;
+            ws.subscribe("order", None).await;
+            let mut rx = ws.connect().await?;
+            
+            println!("Streaming account updates");
+            println!("Press Ctrl+C to exit\n");
+            
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    WsMessage::Position { data } => {
+                        println!("Position update: {}", serde_json::to_string(&data)?);
+                    }
+                    WsMessage::Balance { data } => {
+                        println!("Balance update: {}", serde_json::to_string(&data)?);
+                    }
+                    WsMessage::Order { data } => {
+                        println!("Order update: {}", serde_json::to_string(&data)?);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    
     Ok(())
 }

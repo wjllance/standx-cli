@@ -52,8 +52,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Margin command not yet implemented");
         }
         Commands::Stream { command } => {
-            tracing::info!("Stream command: {:?}", command);
-            println!("Stream command not yet implemented");
+            commands::handle_stream(command).await?;
         }
     }
 

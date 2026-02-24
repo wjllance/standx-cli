@@ -262,22 +262,22 @@ pub enum MarginCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum StreamCommands {
+    /// Stream order book depth
+    Depth {
+        symbol: String,
+        #[arg(short, long, default_value = "10")]
+        levels: usize,
+    },
+    /// Stream ticker/price updates
+    Ticker {
+        symbol: String,
+    },
     /// Stream trades
     Trades {
         symbol: String,
     },
-    /// Stream order book
-    Book {
-        symbol: String,
-        #[arg(short, long)]
-        depth: Option<u32>,
-    },
-    /// Stream ticker
-    Ticker {
-        symbol: String,
-    },
-    /// Stream orders (authenticated)
-    Orders,
+    /// Stream account updates (authenticated)
+    Account,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
