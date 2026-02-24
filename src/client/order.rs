@@ -42,34 +42,33 @@ impl Default for CreateOrderParams {
 /// Order API methods
 impl StandXClient {
     /// Build authenticated headers with optional request signing
-    async fn build_auth_headers(
-        &self,
-        payload: Option<&str>,
-    ) -> Result<HeaderMap> {
+    async fn build_auth_headers(&self, payload: Option<&str>) -> Result<HeaderMap> {
         let creds = Credentials::load()?;
-        
+
         if creds.is_expired() {
             return Err(Error::AuthRequired);
         }
 
         let mut headers = HeaderMap::new();
-        
+
         // Authorization header with JWT
         let auth_value = format!("Bearer {}", creds.token);
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&auth_value)
-                .map_err(|e| Error::Api { code: 500, message: e.to_string() })?
+            HeaderValue::from_str(&auth_value).map_err(|e| Error::Api {
+                code: 500,
+                message: e.to_string(),
+            })?,
         );
-        
+
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        
+
         // Add request signature if private key is available
         if !creds.private_key.is_empty() {
             if let Ok(signer) = StandXSigner::from_base58(&creds.private_key) {
                 let payload_str = payload.unwrap_or("");
                 let signature = signer.sign_request_now(payload_str);
-                
+
                 headers.insert(
                     "x-request-sign-version",
                     HeaderValue::from_str(&signature.version).unwrap(),
@@ -88,34 +87,34 @@ impl StandXClient {
                 );
             }
         }
-        
+
         Ok(headers)
     }
 
     /// Create a new order
-    pub async fn create_order(
-        &self,
-        params: CreateOrderParams,
-    ) -> Result<Order> {
+    pub async fn create_order(&self, params: CreateOrderParams) -> Result<Order> {
         let url = format!("{}/api/new_order", self.base_url);
-        
+
         // Build request body
         let order_type = match params.order_type {
             OrderType::Market => "market",
             OrderType::Limit => "limit",
         };
-        
+
         let side = match params.side {
             OrderSide::Buy => "buy",
             OrderSide::Sell => "sell",
         };
-        
-        let tif = params.time_in_force.map(|t| match t {
-            TimeInForce::Gtc => "GTC",
-            TimeInForce::Ioc => "IOC",
-            TimeInForce::Fok => "FOK",
-        }).unwrap_or("GTC");
-        
+
+        let tif = params
+            .time_in_force
+            .map(|t| match t {
+                TimeInForce::Gtc => "GTC",
+                TimeInForce::Ioc => "IOC",
+                TimeInForce::Fok => "FOK",
+            })
+            .unwrap_or("GTC");
+
         let mut body = json!({
             "symbol": params.symbol,
             "side": side,
@@ -124,7 +123,7 @@ impl StandXClient {
             "time_in_force": tif,
             "reduce_only": params.reduce_only,
         });
-        
+
         // Add optional fields
         if let Some(ref price) = params.price {
             body["price"] = json!(price);
@@ -138,11 +137,12 @@ impl StandXClient {
         if let Some(tp_price) = params.tp_price {
             body["tp_price"] = json!(tp_price);
         }
-        
+
         let body_str = body.to_string();
         let headers = self.build_auth_headers(Some(&body_str)).await?;
-        
-        let response = self.client
+
+        let response = self
+            .client
             .post(&url)
             .headers(headers)
             .body(body_str)
@@ -159,11 +159,12 @@ impl StandXClient {
         }
 
         let result: serde_json::Value = response.json().await?;
-        
+
         // Check for API error
         if let Some(code) = result.get("code").and_then(|c| c.as_i64()) {
             if code != 0 {
-                let message = result.get("message")
+                let message = result
+                    .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("Order rejected");
                 return Err(Error::Api {
@@ -176,7 +177,8 @@ impl StandXClient {
         // Build order from response
         let now = chrono::Utc::now().to_rfc3339();
         let order = Order {
-            id: result.get("request_id")
+            id: result
+                .get("request_id")
                 .and_then(|r| r.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -195,22 +197,19 @@ impl StandXClient {
     }
 
     /// Cancel an order by ID
-    pub async fn cancel_order(
-        &self,
-        symbol: &str,
-        order_id: &str,
-    ) -> Result<()> {
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<()> {
         let url = format!("{}/api/cancel_order", self.base_url);
-        
+
         let body = json!({
             "symbol": symbol,
             "order_id": order_id.parse::<i64>().unwrap_or(0),
         });
-        
+
         let body_str = body.to_string();
         let headers = self.build_auth_headers(Some(&body_str)).await?;
-        
-        let response = self.client
+
+        let response = self
+            .client
             .post(&url)
             .headers(headers)
             .body(body_str)
@@ -230,26 +229,24 @@ impl StandXClient {
     }
 
     /// Cancel multiple orders
-    pub async fn cancel_orders(
-        &self,
-        symbol: &str,
-        order_ids: Vec<String>,
-    ) -> Result<()> {
+    pub async fn cancel_orders(&self, symbol: &str, order_ids: Vec<String>) -> Result<()> {
         let url = format!("{}/api/cancel_orders", self.base_url);
-        
-        let order_id_list: Vec<i64> = order_ids.iter()
+
+        let order_id_list: Vec<i64> = order_ids
+            .iter()
             .filter_map(|id| id.parse::<i64>().ok())
             .collect();
-        
+
         let body = json!({
             "symbol": symbol,
             "order_id_list": order_id_list,
         });
-        
+
         let body_str = body.to_string();
         let headers = self.build_auth_headers(Some(&body_str)).await?;
-        
-        let response = self.client
+
+        let response = self
+            .client
             .post(&url)
             .headers(headers)
             .body(body_str)
@@ -269,22 +266,17 @@ impl StandXClient {
     }
 
     /// Cancel all orders for a symbol
-    pub async fn cancel_all_orders(
-        &self,
-        symbol: &str,
-    ) -> Result<()> {
+    pub async fn cancel_all_orders(&self, symbol: &str) -> Result<()> {
         // First get all open orders
         let open_orders = self.get_open_orders(Some(symbol)).await?;
-        
+
         if open_orders.is_empty() {
             return Ok(());
         }
-        
+
         // Collect order IDs
-        let order_ids: Vec<String> = open_orders.iter()
-            .map(|o| o.id.clone())
-            .collect();
-        
+        let order_ids: Vec<String> = open_orders.iter().map(|o| o.id.clone()).collect();
+
         // Cancel all orders
         self.cancel_orders(symbol, order_ids).await
     }

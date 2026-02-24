@@ -2,8 +2,8 @@
 
 pub mod credentials;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 pub use credentials::Credentials;
 
@@ -31,15 +31,16 @@ impl StandXSigner {
         let private_key_bytes = bs58::decode(private_key_base58)
             .into_vec()
             .map_err(|e| crate::Error::InvalidCredentials)?;
-        
+
         let signing_key = SigningKey::from_bytes(
-            &private_key_bytes.try_into()
-                .map_err(|_| crate::Error::InvalidCredentials)?
+            &private_key_bytes
+                .try_into()
+                .map_err(|_| crate::Error::InvalidCredentials)?,
         );
-        
+
         let verifying_key = signing_key.verifying_key();
         let request_id = hex::encode(verifying_key.as_bytes());
-        
+
         Ok(Self {
             signing_key,
             verifying_key,
@@ -58,20 +59,12 @@ impl StandXSigner {
     }
 
     /// Sign a request
-    pub fn sign_request(&self,
-        timestamp: u64,
-        payload: &str,
-    ) -> RequestSignature {
+    pub fn sign_request(&self, timestamp: u64, payload: &str) -> RequestSignature {
         let version = "v1";
-        let message = format!("{},{},{},{}", 
-            version, 
-            self.request_id, 
-            timestamp, 
-            payload
-        );
-        
+        let message = format!("{},{},{},{}", version, self.request_id, timestamp, payload);
+
         let signature = self.signing_key.sign(message.as_bytes());
-        
+
         RequestSignature {
             version: version.to_string(),
             request_id: self.request_id.clone(),
@@ -82,9 +75,7 @@ impl StandXSigner {
     }
 
     /// Sign a request with the current timestamp
-    pub fn sign_request_now(&self,
-        payload: &str,
-    ) -> RequestSignature {
+    pub fn sign_request_now(&self, payload: &str) -> RequestSignature {
         let timestamp = chrono::Utc::now().timestamp_millis() as u64;
         self.sign_request(timestamp, payload)
     }
@@ -103,9 +94,9 @@ mod tests {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let private_key_bytes = signing_key.to_bytes();
         let private_key_base58 = bs58::encode(&private_key_bytes).into_string();
-        
+
         let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
-        
+
         assert!(!signer.request_id().is_empty());
         assert!(!signer.pubkey_hex().is_empty());
     }
@@ -115,12 +106,12 @@ mod tests {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let private_key_bytes = signing_key.to_bytes();
         let private_key_base58 = bs58::encode(&private_key_bytes).into_string();
-        
+
         let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
-        
+
         let payload = r#"{"symbol":"BTC-USD","side":"buy"}"#;
         let sig = signer.sign_request(1700000000000, payload);
-        
+
         assert_eq!(sig.version, "v1");
         assert_eq!(sig.timestamp, 1700000000000);
         assert!(!sig.signature.is_empty());
@@ -139,16 +130,16 @@ mod tests {
         let signing_key = SigningKey::generate(&mut rand::thread_rng());
         let private_key_bytes = signing_key.to_bytes();
         let private_key_base58 = bs58::encode(&private_key_bytes).into_string();
-        
+
         let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
-        
+
         let payload = r#"{"symbol":"BTC-USD"}"#;
         let sig = signer.sign_request_now(payload);
-        
+
         // Verify signature is valid base64
         let decoded = STANDARD.decode(&sig.signature);
         assert!(decoded.is_ok());
-        
+
         // Ed25519 signatures are 64 bytes
         assert_eq!(decoded.unwrap().len(), 64);
     }

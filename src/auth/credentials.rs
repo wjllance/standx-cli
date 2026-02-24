@@ -9,14 +9,14 @@ use std::path::PathBuf;
 pub struct Credentials {
     /// JWT token
     pub token: String,
-    
+
     /// Ed25519 private key (Base58) - optional for read-only access
     #[serde(default)]
     pub private_key: String,
-    
+
     /// Token creation timestamp (for expiration tracking)
     pub created_at: i64,
-    
+
     /// Token validity in seconds (default: 7 days)
     pub validity_seconds: i64,
 }
@@ -48,8 +48,8 @@ impl Credentials {
     /// Get expiration date as string
     pub fn expires_at_string(&self) -> String {
         let expires = self.created_at + self.validity_seconds;
-        let datetime = chrono::DateTime::from_timestamp(expires, 0)
-            .unwrap_or_else(|| chrono::Utc::now());
+        let datetime =
+            chrono::DateTime::from_timestamp(expires, 0).unwrap_or_else(|| chrono::Utc::now());
         datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
     }
 
@@ -76,9 +76,9 @@ impl Credentials {
         // In production, use proper keyring or OS credential store
         let json = serde_json::to_string(self)
             .map_err(|e| Error::Config(format!("Failed to serialize credentials: {}", e)))?;
-        
+
         let encrypted = Self::xor_encrypt(&json);
-        
+
         std::fs::write(Self::credentials_file()?, encrypted)
             .map_err(|e| Error::Config(format!("Failed to write credentials: {}", e)))?;
 
@@ -100,7 +100,7 @@ impl Credentials {
     /// Load credentials from file
     pub fn load() -> Result<Self> {
         let file_path = Self::credentials_file()?;
-        
+
         if !file_path.exists() {
             return Err(Error::AuthRequired);
         }
@@ -109,7 +109,7 @@ impl Credentials {
             .map_err(|e| Error::Config(format!("Failed to read credentials: {}", e)))?;
 
         let json = Self::xor_decrypt(&encrypted);
-        
+
         let credentials: Credentials = serde_json::from_str(&json)
             .map_err(|e| Error::Config(format!("Failed to parse credentials: {}", e)))?;
 
@@ -119,7 +119,7 @@ impl Credentials {
     /// Delete stored credentials
     pub fn delete() -> Result<()> {
         let file_path = Self::credentials_file()?;
-        
+
         if file_path.exists() {
             std::fs::remove_file(file_path)
                 .map_err(|e| Error::Config(format!("Failed to delete credentials: {}", e)))?;
@@ -130,7 +130,9 @@ impl Credentials {
 
     /// Check if credentials exist
     pub fn exists() -> bool {
-        Self::credentials_file().map(|p| p.exists()).unwrap_or(false)
+        Self::credentials_file()
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     /// Simple XOR encryption (for basic protection)
@@ -159,16 +161,13 @@ mod tests {
 
     #[test]
     fn test_credentials_new() {
-        let mut creds = Credentials::new(
-            "test_token".to_string(),
-            Some("test_key".to_string()),
-        );
-        
+        let mut creds = Credentials::new("test_token".to_string(), Some("test_key".to_string()));
+
         assert_eq!(creds.token, "test_token");
         assert_eq!(creds.private_key, "test_key");
         assert!(!creds.is_expired());
         assert!(creds.remaining_seconds() > 0);
-        
+
         // Test expires_at_string returns a valid string
         let expires = creds.expires_at_string();
         assert!(expires.contains("UTC"));
@@ -180,7 +179,7 @@ mod tests {
             "test_token".to_string(),
             None, // No private key
         );
-        
+
         assert_eq!(creds.token, "test_token");
         assert_eq!(creds.private_key, ""); // Empty string
         assert!(!creds.is_expired());
@@ -188,14 +187,11 @@ mod tests {
 
     #[test]
     fn test_expiration() {
-        let mut creds = Credentials::new(
-            "test_token".to_string(),
-            Some("test_key".to_string()),
-        );
-        
+        let mut creds = Credentials::new("test_token".to_string(), Some("test_key".to_string()));
+
         // Set created_at to 8 days ago
         creds.created_at = chrono::Utc::now().timestamp() - 8 * 24 * 60 * 60;
-        
+
         assert!(creds.is_expired());
         assert_eq!(creds.remaining_seconds(), 0);
     }
@@ -205,7 +201,7 @@ mod tests {
         let original = "test data 123";
         let encrypted = Credentials::xor_encrypt(original);
         let decrypted = Credentials::xor_decrypt(&encrypted);
-        
+
         assert_eq!(original, decrypted);
         assert_ne!(encrypted, original.as_bytes());
     }

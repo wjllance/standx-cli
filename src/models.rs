@@ -6,14 +6,14 @@ where
     D: Deserializer<'de>,
 {
     use serde::de::Error;
-    
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum StringOrNumber {
         String(String),
         Number(serde_json::Number),
     }
-    
+
     match StringOrNumber::deserialize(deserializer)? {
         StringOrNumber::String(s) => Ok(s),
         StringOrNumber::Number(n) => Ok(n.to_string()),
@@ -54,9 +54,15 @@ pub struct MarketData {
     pub last_price: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub volume_24h: String,
-    #[serde(rename = "high_price_24h", deserialize_with = "string_or_number_to_string")]
+    #[serde(
+        rename = "high_price_24h",
+        deserialize_with = "string_or_number_to_string"
+    )]
     pub high_24h: String,
-    #[serde(rename = "low_price_24h", deserialize_with = "string_or_number_to_string")]
+    #[serde(
+        rename = "low_price_24h",
+        deserialize_with = "string_or_number_to_string"
+    )]
     pub low_24h: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub funding_rate: String,
@@ -243,7 +249,7 @@ pub struct Order {
 
 impl tabled::Tabled for Order {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.id.clone().into(),
@@ -254,10 +260,14 @@ impl tabled::Tabled for Order {
             self.filled_quantity.clone().into(),
             self.price.clone().into(),
             format!("{:?}", self.status).into(),
-            self.created_at.split('T').next().unwrap_or(&self.created_at).into(),
+            self.created_at
+                .split('T')
+                .next()
+                .unwrap_or(&self.created_at)
+                .into(),
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Order ID".into(),
@@ -296,7 +306,7 @@ pub struct Position {
 
 impl tabled::Tabled for Position {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.symbol.clone().into(),
@@ -309,7 +319,7 @@ impl tabled::Tabled for Position {
             self.unrealized_pnl.clone().into(),
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Symbol".into(),
@@ -355,7 +365,7 @@ pub struct Balance {
 
 impl tabled::Tabled for Balance {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.balance.clone().into(),
@@ -365,7 +375,7 @@ impl tabled::Tabled for Balance {
             self.upnl.clone().into(),
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Balance".into(),

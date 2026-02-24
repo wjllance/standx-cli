@@ -53,7 +53,7 @@ impl StandXClient {
     pub async fn get_symbol_info(&self) -> Result<Vec<SymbolInfo>> {
         let url = format!("{}/api/query_symbol_info", self.base_url);
         let response = self.client.get(&url).send().await?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
@@ -114,14 +114,10 @@ impl StandXClient {
     }
 
     /// Get recent trades for a symbol
-    pub async fn get_recent_trades(
-        &self,
-        symbol: &str,
-        limit: Option<u32>,
-    ) -> Result<Vec<Trade>> {
+    pub async fn get_recent_trades(&self, symbol: &str, limit: Option<u32>) -> Result<Vec<Trade>> {
         let url = format!("{}/api/query_recent_trades", self.base_url);
         let mut query = vec![("symbol", symbol.to_string())];
-        
+
         if let Some(l) = limit {
             query.push(("limit", l.to_string()));
         }
@@ -145,7 +141,7 @@ impl StandXClient {
     pub async fn get_depth(&self, symbol: &str, limit: Option<u32>) -> Result<OrderBook> {
         let url = format!("{}/api/query_depth_book", self.base_url);
         let mut query = vec![("symbol", symbol.to_string())];
-        
+
         if let Some(l) = limit {
             query.push(("limit", l.to_string()));
         }
@@ -166,13 +162,17 @@ impl StandXClient {
         data.bids.sort_by(|a, b| {
             let price_a: f64 = a[0].parse().unwrap_or(0.0);
             let price_b: f64 = b[0].parse().unwrap_or(0.0);
-            price_b.partial_cmp(&price_a).unwrap_or(std::cmp::Ordering::Equal)
+            price_b
+                .partial_cmp(&price_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         // Sort asks ascending by price
         data.asks.sort_by(|a, b| {
             let price_a: f64 = a[0].parse().unwrap_or(0.0);
             let price_b: f64 = b[0].parse().unwrap_or(0.0);
-            price_a.partial_cmp(&price_b).unwrap_or(std::cmp::Ordering::Equal)
+            price_a
+                .partial_cmp(&price_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         Ok(data)
     }
@@ -268,7 +268,7 @@ mod tests {
 
         let client = StandXClient::with_base_url(server.url()).unwrap();
         let symbols = client.get_symbol_info().await.unwrap();
-        
+
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].symbol, "BTC-USD");
     }
@@ -285,7 +285,7 @@ mod tests {
 
         let client = StandXClient::with_base_url(server.url()).unwrap();
         let market = client.get_symbol_market("BTC-USD").await.unwrap();
-        
+
         assert_eq!(market.symbol, "BTC-USD");
         assert_eq!(market.mark_price, "68000.00");
     }
@@ -293,7 +293,8 @@ mod tests {
     #[tokio::test]
     async fn test_health_check() {
         let mut server = Server::new_async().await;
-        let _m = server.mock("GET", "/api/query_symbol_info")
+        let _m = server
+            .mock("GET", "/api/query_symbol_info")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"[]"#)
@@ -301,21 +302,22 @@ mod tests {
 
         let client = StandXClient::with_base_url(server.url()).unwrap();
         let healthy = client.health_check().await.unwrap();
-        
+
         assert!(healthy);
     }
 
     #[tokio::test]
     async fn test_api_error() {
         let mut server = Server::new_async().await;
-        let _m = server.mock("GET", "/api/query_symbol_info")
+        let _m = server
+            .mock("GET", "/api/query_symbol_info")
             .with_status(400)
             .with_body("Invalid request")
             .create();
 
         let client = StandXClient::with_base_url(server.url()).unwrap();
         let result = client.get_symbol_info().await;
-        
+
         assert!(matches!(result, Err(Error::Api { code: 400, .. })));
     }
 }

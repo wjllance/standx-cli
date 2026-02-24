@@ -80,7 +80,7 @@ impl StandXWebSocket {
     /// Create a new WebSocket client
     pub fn new() -> Result<Self> {
         let creds = Credentials::load()?;
-        
+
         if creds.is_expired() {
             return Err(Error::AuthRequired);
         }
@@ -101,7 +101,7 @@ impl StandXWebSocket {
     /// Create with custom WebSocket URL
     pub fn with_url(url: String) -> Result<Self> {
         let creds = Credentials::load()?;
-        
+
         if creds.is_expired() {
             return Err(Error::AuthRequired);
         }
@@ -120,27 +120,19 @@ impl StandXWebSocket {
     }
 
     /// Connect and start the WebSocket client
-    pub async fn connect(&self,
-    ) -> Result<mpsc::Receiver<WsMessage>> {
+    pub async fn connect(&self) -> Result<mpsc::Receiver<WsMessage>> {
         let (tx, rx) = mpsc::channel(100);
-        
+
         // Clone Arc pointers for the task
         let url = self.url.clone();
         let token = self.token.clone();
         let state = Arc::clone(&self.state);
         let subscriptions = Arc::clone(&self.subscriptions);
         let reconnect_attempts = Arc::clone(&self.reconnect_attempts);
-        
+
         // Spawn connection task
         tokio::spawn(async move {
-            Self::connection_task(
-                url,
-                token,
-                state,
-                subscriptions,
-                reconnect_attempts,
-                tx,
-            ).await;
+            Self::connection_task(url, token, state, subscriptions, reconnect_attempts, tx).await;
         });
 
         Ok(rx)
@@ -176,13 +168,7 @@ impl StandXWebSocket {
                 *s = WsState::Connecting;
             }
 
-            match Self::run_connection(
-                &url,
-                &token,
-                &state,
-                &subscriptions,
-                &message_tx,
-            ).await {
+            match Self::run_connection(&url, &token, &state, &subscriptions, &message_tx).await {
                 Ok(()) => {
                     // Connection closed normally
                     tracing::info!("WebSocket connection closed");
@@ -214,7 +200,8 @@ impl StandXWebSocket {
         message_tx: &mpsc::Sender<WsMessage>,
     ) -> Result<()> {
         // Connect to WebSocket
-        let (ws_stream, _) = connect_async(url).await
+        let (ws_stream, _) = connect_async(url)
+            .await
             .map_err(|e| Error::Unknown(format!("WebSocket connect failed: {}", e)))?;
 
         let (mut write, mut read) = ws_stream.split();
@@ -231,7 +218,9 @@ impl StandXWebSocket {
                 "token": token
             }
         });
-        write.send(Message::Text(auth_msg.to_string().into())).await
+        write
+            .send(Message::Text(auth_msg.to_string().into()))
+            .await
             .map_err(|e| Error::Unknown(format!("Failed to send auth: {}", e)))?;
 
         // Start heartbeat
@@ -251,7 +240,7 @@ impl StandXWebSocket {
                                     if data.code == 200 || data.code == 0 {
                                         let mut s = state.write().await;
                                         *s = WsState::Authenticated;
-                                        
+
                                         // Resubscribe to channels
                                         let subs = subscriptions.read().await;
                                         for sub in subs.iter() {
@@ -265,7 +254,7 @@ impl StandXWebSocket {
                                         }
                                     }
                                 }
-                                
+
                                 // Forward message
                                 let _ = message_tx.send(message).await;
                             }
@@ -282,14 +271,14 @@ impl StandXWebSocket {
                         _ => {}
                     }
                 }
-                
+
                 // Send heartbeat ping
                 _ = heartbeat.tick() => {
                     // Check if we've received a pong recently
                     if last_pong.elapsed() > HEARTBEAT_INTERVAL * 2 {
                         return Err(Error::Unknown("Heartbeat timeout".to_string()));
                     }
-                    
+
                     write.send(Message::Ping(vec![].into())).await
                         .map_err(|e| Error::Unknown(format!("Failed to send ping: {}", e)))?;
                 }

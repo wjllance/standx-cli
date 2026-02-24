@@ -79,14 +79,9 @@ pub enum ConfigCommands {
     /// Initialize configuration
     Init,
     /// Set configuration value
-    Set {
-        key: String,
-        value: String,
-    },
+    Set { key: String, value: String },
     /// Get configuration value
-    Get {
-        key: String,
-    },
+    Get { key: String },
     /// Show full configuration
     Show,
 }
@@ -122,9 +117,7 @@ pub enum MarketCommands {
     /// List all trading symbols
     Symbols,
     /// Get ticker for a symbol (includes funding rate)
-    Ticker {
-        symbol: String,
-    },
+    Ticker { symbol: String },
     /// Get all tickers
     Tickers,
     /// Get recent trades
@@ -179,9 +172,7 @@ pub enum AccountCommands {
         limit: u32,
     },
     /// Get position config
-    Config {
-        symbol: String,
-    },
+    Config { symbol: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -211,9 +202,7 @@ pub enum OrderCommands {
         order_id: String,
     },
     /// Cancel all orders for a symbol
-    CancelAll {
-        symbol: String,
-    },
+    CancelAll { symbol: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -233,14 +222,9 @@ pub enum TradeCommands {
 #[derive(Subcommand, Debug)]
 pub enum LeverageCommands {
     /// Get leverage for a symbol
-    Get {
-        symbol: String,
-    },
+    Get { symbol: String },
     /// Set leverage for a symbol
-    Set {
-        symbol: String,
-        leverage: String,
-    },
+    Set { symbol: String, leverage: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -269,13 +253,9 @@ pub enum StreamCommands {
         levels: usize,
     },
     /// Stream ticker/price updates
-    Ticker {
-        symbol: String,
-    },
+    Ticker { symbol: String },
     /// Stream trades
-    Trades {
-        symbol: String,
-    },
+    Trades { symbol: String },
     /// Stream account updates (authenticated)
     Account,
 }

@@ -9,13 +9,13 @@ use std::path::PathBuf;
 pub struct Config {
     /// API base URL
     pub base_url: String,
-    
+
     /// Default output format
     pub output_format: String,
-    
+
     /// Default trading symbol
     pub default_symbol: String,
-    
+
     /// Configuration directory
     #[serde(skip)]
     pub config_dir: PathBuf,
@@ -56,10 +56,10 @@ impl Config {
 
         let content = std::fs::read_to_string(&config_file)
             .map_err(|e| Error::Config(format!("Failed to read config file: {}", e)))?;
-        
+
         let mut config: Config = toml::from_str(&content)
             .map_err(|e| Error::Config(format!("Failed to parse config file: {}", e)))?;
-        
+
         config.config_dir = config_dir;
         Ok(config)
     }
@@ -126,10 +126,10 @@ mod tests {
 
         // Save config
         config.save().unwrap();
-        
+
         // Verify file exists
         assert!(config.config_file().exists());
-        
+
         // Read and verify content
         let content = std::fs::read_to_string(config.config_file()).unwrap();
         assert!(content.contains("https://test.standx.com"));
@@ -139,13 +139,13 @@ mod tests {
     #[test]
     fn test_set_get() {
         let mut config = Config::default();
-        
+
         config.set("base_url", "https://test.com").unwrap();
         assert_eq!(config.get("base_url").unwrap(), "https://test.com");
-        
+
         config.set("output_format", "json").unwrap();
         assert_eq!(config.get("output_format").unwrap(), "json");
-        
+
         assert!(config.set("unknown_key", "value").is_err());
         assert!(config.get("unknown_key").is_err());
     }

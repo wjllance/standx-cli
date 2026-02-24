@@ -15,30 +15,29 @@ pub fn format_item<T: Tabled>(item: T) -> String {
 
 /// Format as JSON
 pub fn format_json<T: serde::Serialize>(data: &T) -> crate::Result<String> {
-    serde_json::to_string_pretty(data)
-        .map_err(|e| crate::Error::Json(e))
+    serde_json::to_string_pretty(data).map_err(|e| crate::Error::Json(e))
 }
 
 /// Format as CSV (for lists)
 pub fn format_csv<T: serde::Serialize>(data: &[T]) -> crate::Result<String> {
     let mut wtr = csv::Writer::from_writer(vec![]);
-    
+
     for item in data {
         wtr.serialize(item)
             .map_err(|e| crate::Error::Unknown(e.to_string()))?;
     }
-    
-    let result = wtr.into_inner()
+
+    let result = wtr
+        .into_inner()
         .map_err(|e| crate::Error::Unknown(e.to_string()))?;
-    
-    String::from_utf8(result)
-        .map_err(|e| crate::Error::Unknown(e.to_string()))
+
+    String::from_utf8(result).map_err(|e| crate::Error::Unknown(e.to_string()))
 }
 
 /// Format symbol info for display
 impl Tabled for SymbolInfo {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.symbol.clone().into(),
@@ -50,7 +49,7 @@ impl Tabled for SymbolInfo {
             self.taker_fee.clone().into(),
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Symbol".into(),
@@ -67,7 +66,7 @@ impl Tabled for SymbolInfo {
 /// Format market data for display
 impl Tabled for MarketData {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.symbol.clone().into(),
@@ -80,7 +79,7 @@ impl Tabled for MarketData {
             self.funding_rate.clone().into(),
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Symbol".into(),
@@ -98,16 +97,20 @@ impl Tabled for MarketData {
 /// Format trade for display
 impl Tabled for Trade {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.time.split('.').next().unwrap_or(&self.time).into(),
             self.price.clone().into(),
             self.qty.clone().into(),
-            if self.is_buyer_taker { "Buy".into() } else { "Sell".into() },
+            if self.is_buyer_taker {
+                "Buy".into()
+            } else {
+                "Sell".into()
+            },
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Time".into(),
@@ -121,15 +124,19 @@ impl Tabled for Trade {
 /// Format funding rate for display
 impl Tabled for FundingRate {
     const LENGTH: usize = 100;
-    
+
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.symbol.clone().into(),
             self.funding_rate.clone().into(),
-            self.next_funding_time.split('T').next().unwrap_or(&self.next_funding_time).into(),
+            self.next_funding_time
+                .split('T')
+                .next()
+                .unwrap_or(&self.next_funding_time)
+                .into(),
         ]
     }
-    
+
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Symbol".into(),
@@ -142,32 +149,32 @@ impl Tabled for FundingRate {
 /// Format order book for display
 pub fn format_order_book(book: &OrderBook, limit: usize) -> String {
     let mut output = String::new();
-    
+
     output.push_str(&format!("Order Book: {}\n", book.symbol));
     output.push_str("=============================\n\n");
-    
+
     // Asks (sell orders) - reversed to show highest ask first
     output.push_str("Asks (Sell):\n");
     output.push_str("Price\t\tQuantity\n");
-    
+
     let asks_to_show: Vec<_> = book.asks.iter().rev().take(limit).collect();
     for ask in asks_to_show.iter().rev() {
         output.push_str(&format!("{}\t{}\n", ask[0], ask[1]));
     }
-    
+
     // Spread
     if let Some(spread) = book.spread() {
         output.push_str(&format!("\nSpread: {}\n", spread));
     }
-    
+
     // Bids (buy orders)
     output.push_str("\nBids (Buy):\n");
     output.push_str("Price\t\tQuantity\n");
-    
+
     for bid in book.bids.iter().take(limit) {
         output.push_str(&format!("{}\t{}\n", bid[0], bid[1]));
     }
-    
+
     output
 }
 
