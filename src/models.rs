@@ -239,6 +239,38 @@ pub struct Order {
     pub updated_at: String,
 }
 
+impl tabled::Tabled for Order {
+    const LENGTH: usize = 100;
+    
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.id.clone().into(),
+            self.symbol.clone().into(),
+            format!("{:?}", self.side).into(),
+            format!("{:?}", self.order_type).into(),
+            self.quantity.clone().into(),
+            self.filled_quantity.clone().into(),
+            self.price.clone().into(),
+            format!("{:?}", self.status).into(),
+            self.created_at.split('T').next().unwrap_or(&self.created_at).into(),
+        ]
+    }
+    
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Order ID".into(),
+            "Symbol".into(),
+            "Side".into(),
+            "Type".into(),
+            "Quantity".into(),
+            "Filled".into(),
+            "Price".into(),
+            "Status".into(),
+            "Created".into(),
+        ]
+    }
+}
+
 /// Position information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Position {
@@ -260,6 +292,36 @@ pub struct Position {
     pub unrealized_pnl: String,
 }
 
+impl tabled::Tabled for Position {
+    const LENGTH: usize = 100;
+    
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.symbol.clone().into(),
+            format!("{:?}", self.side).into(),
+            self.quantity.clone().into(),
+            self.entry_price.clone().into(),
+            self.mark_price.clone().into(),
+            self.liquidation_price.clone().into(),
+            self.leverage.clone().into(),
+            self.unrealized_pnl.clone().into(),
+        ]
+    }
+    
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Symbol".into(),
+            "Side".into(),
+            "Quantity".into(),
+            "Entry Price".into(),
+            "Mark Price".into(),
+            "Liq Price".into(),
+            "Leverage".into(),
+            "Unrealized PnL".into(),
+        ]
+    }
+}
+
 /// Account balance
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Balance {
@@ -270,6 +332,28 @@ pub struct Balance {
     pub frozen: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub total: String,
+}
+
+impl tabled::Tabled for Balance {
+    const LENGTH: usize = 100;
+    
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.asset.clone().into(),
+            self.available.clone().into(),
+            self.frozen.clone().into(),
+            self.total.clone().into(),
+        ]
+    }
+    
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Asset".into(),
+            "Available".into(),
+            "Frozen".into(),
+            "Total".into(),
+        ]
+    }
 }
 
 /// API response wrapper
@@ -345,8 +429,8 @@ mod tests {
             "index_price": 8738.5,
             "last_price": 8740.0,
             "volume_24h": "1000000",
-            "high_24h": 9000.0,
-            "low_24h": 8500.0,
+            "high_price_24h": 9000.0,
+            "low_price_24h": 8500.0,
             "funding_rate": "0.0001",
             "next_funding_time": "2026-01-01T00:00:00Z"
         }"#;

@@ -34,8 +34,7 @@ async fn main() -> anyhow::Result<()> {
             commands::handle_market(command, cli.output).await?;
         }
         Commands::Account { command } => {
-            tracing::info!("Account command: {:?}", command);
-            println!("Account command not yet implemented");
+            commands::handle_account(command, cli.output).await?;
         }
         Commands::Order { command } => {
             tracing::info!("Order command: {:?}", command);

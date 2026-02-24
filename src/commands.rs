@@ -8,6 +8,58 @@ use standx_cli::models::OrderBook;
 use standx_cli::output;
 use anyhow::Result;
 
+/// Handle account commands
+pub async fn handle_account(command: AccountCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        AccountCommands::Balances => {
+            let balances = client.get_balance().await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(balances)),
+                OutputFormat::Json => println!("{}", output::format_json(&balances)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&balances)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Positions { symbol } => {
+            let positions = client.get_positions(symbol.as_deref()).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(positions)),
+                OutputFormat::Json => println!("{}", output::format_json(&positions)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&positions)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Orders { symbol } => {
+            let orders = client.get_open_orders(symbol.as_deref()).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::History { symbol, limit } => {
+            let orders = client.get_order_history(symbol.as_deref(), Some(limit)).await?;
+            
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Config { symbol } => {
+            println!("Position config for {} not yet implemented", symbol);
+        }
+    }
+    Ok(())
+}
+
 /// Handle config commands
 pub async fn handle_config(command: ConfigCommands) -> Result<()> {
     match command {

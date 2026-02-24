@@ -26,7 +26,7 @@ mod tests {
             .match_query(mockito::Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"symbol":"BTC-USD","mark_price":"68000.00","index_price":"68001.50","last_price":"68000.00","volume_24h":"1234567.89","high_24h":"69000.00","low_24h":"67000.00","funding_rate":"0.0001","next_funding_time":"2026-02-24T16:00:00Z"}"#)
+            .with_body(r#"{"symbol":"BTC-USD","mark_price":"68000.00","index_price":"68001.50","last_price":"68000.00","volume_24h":"1234567.89","high_price_24h":"69000.00","low_price_24h":"67000.00","funding_rate":"0.0001","next_funding_time":"2026-02-24T16:00:00Z"}"#)
             .create();
 
         let client = StandXClient::with_base_url(server.url()).unwrap();

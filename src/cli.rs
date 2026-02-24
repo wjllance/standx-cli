@@ -164,6 +164,18 @@ pub enum AccountCommands {
         #[arg(short, long)]
         symbol: Option<String>,
     },
+    /// Get open orders
+    Orders {
+        #[arg(short, long)]
+        symbol: Option<String>,
+    },
+    /// Get order history
+    History {
+        #[arg(short, long)]
+        symbol: Option<String>,
+        #[arg(short, long, default_value = "50")]
+        limit: u32,
+    },
     /// Get position config
     Config {
         symbol: String,
