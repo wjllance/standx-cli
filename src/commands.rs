@@ -8,7 +8,7 @@ use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
 use standx_cli::models::{OrderBook, OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
-use standx_cli::websocket::{StandXWebSocket, WsMessage};
+use standx_cli::websocket::{StandXWebSocket, TradeData, WsMessage};
 
 /// Handle order commands
 pub async fn handle_order(command: OrderCommands) -> Result<()> {
@@ -410,7 +410,22 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Trades { symbol } => {
-            println!("Trade streaming not yet implemented for {}", symbol);
+            ws.subscribe("trade", Some(&symbol)).await;
+            let mut rx = ws.connect().await?;
+
+            println!("Streaming trades for {}", symbol);
+            println!("Press Ctrl+C to exit\n");
+
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    WsMessage::Trade { data } => {
+                        let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
+                        println!("{} | {} | Price: {} | Qty: {}", 
+                            data.time, side, data.price, data.qty);
+                    }
+                    _ => {}
+                }
+            }
         }
         StreamCommands::Account => {
             ws.subscribe("position", None).await;

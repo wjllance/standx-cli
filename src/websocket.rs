@@ -22,6 +22,7 @@ pub enum WsMessage {
     Auth { data: AuthData },
     DepthBook { data: DepthBookData, seq: u64 },
     Price { data: PriceData },
+    Trade { data: TradeData },
     Order { data: serde_json::Value },
     Position { data: serde_json::Value },
     Balance { data: serde_json::Value },
@@ -47,6 +48,15 @@ pub struct PriceData {
     pub index_price: String,
     pub last_price: String,
     pub time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradeData {
+    pub symbol: String,
+    pub price: String,
+    pub qty: String,
+    pub time: String,
+    pub is_buyer_taker: bool,
 }
 
 /// WebSocket client state
