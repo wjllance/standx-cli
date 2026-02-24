@@ -2,7 +2,7 @@
 name = "standx-cli"
 version = "0.1.0"
 edition = "2021"
-authors = ["StandX CLI Contributors"]
+authors = ["Kimi Claw"]
 description = "A CLI tool for StandX perpetual DEX"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/yourusername/standx-cli"
