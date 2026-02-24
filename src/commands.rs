@@ -420,8 +420,10 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
                 match msg {
                     WsMessage::Trade { data } => {
                         let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
-                        println!("{} | {} | Price: {} | Qty: {}", 
-                            data.time, side, data.price, data.qty);
+                        println!(
+                            "{} | {} | Price: {} | Qty: {}",
+                            data.time, side, data.price, data.qty
+                        );
                     }
                     _ => {}
                 }
