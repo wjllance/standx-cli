@@ -93,15 +93,15 @@ pub enum ConfigCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
-    /// Login with JWT token and private key
+    /// Login with JWT token (private key optional for read-only access)
     Login {
-        /// JWT token
+        /// JWT token (required)
         #[arg(short, long)]
         token: Option<String>,
         /// Token file path
         #[arg(short = 'f', long)]
         token_file: Option<String>,
-        /// Private key (Base58)
+        /// Private key (Base58) - optional, required for trading
         #[arg(short, long)]
         private_key: Option<String>,
         /// Private key file path

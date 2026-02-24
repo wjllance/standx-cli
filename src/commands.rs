@@ -168,13 +168,16 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
                 token.unwrap()
             };
 
-            let private_key = if interactive || (private_key.is_none() && key_file.is_none()) {
-                println!("Enter Ed25519 Private Key (Base58):");
-                rpassword::prompt_password("Private Key: ")?.trim().to_string()
+            // Private key is optional - only needed for trading operations
+            let private_key = if interactive {
+                println!("\nEnter Ed25519 Private Key (Base58) - optional, press Enter to skip:");
+                let key = rpassword::prompt_password("Private Key: ")?.trim().to_string();
+                if key.is_empty() { None } else { Some(key) }
             } else if let Some(file) = key_file {
-                std::fs::read_to_string(file)?.trim().to_string()
+                let key = std::fs::read_to_string(file)?.trim().to_string();
+                if key.is_empty() { None } else { Some(key) }
             } else {
-                private_key.unwrap()
+                private_key
             };
 
             let credentials = Credentials::new(token, private_key);
@@ -183,6 +186,10 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
             
             println!("✅ Login successful!");
             println!("   Token expires at: {}", expires_at);
+            if private_key.is_none() {
+                println!("   ⚠️  No private key provided - trading operations will be unavailable");
+                println!("   Run 'standx auth login' again to add a private key");
+            }
         }
         AuthCommands::Logout => {
             Credentials::delete()?;

@@ -65,26 +65,28 @@ impl StandXClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         
         // Add request signature if private key is available
-        if let Ok(signer) = StandXSigner::from_base58(&creds.private_key) {
-            let payload_str = payload.unwrap_or("");
-            let signature = signer.sign_request_now(payload_str);
-            
-            headers.insert(
-                "x-request-sign-version",
-                HeaderValue::from_str(&signature.version).unwrap(),
-            );
-            headers.insert(
-                "x-request-id",
-                HeaderValue::from_str(&signature.request_id).unwrap(),
-            );
-            headers.insert(
-                "x-request-timestamp",
-                HeaderValue::from_str(&signature.timestamp.to_string()).unwrap(),
-            );
-            headers.insert(
-                "x-request-signature",
-                HeaderValue::from_str(&signature.signature).unwrap(),
-            );
+        if !creds.private_key.is_empty() {
+            if let Ok(signer) = StandXSigner::from_base58(&creds.private_key) {
+                let payload_str = payload.unwrap_or("");
+                let signature = signer.sign_request_now(payload_str);
+                
+                headers.insert(
+                    "x-request-sign-version",
+                    HeaderValue::from_str(&signature.version).unwrap(),
+                );
+                headers.insert(
+                    "x-request-id",
+                    HeaderValue::from_str(&signature.request_id).unwrap(),
+                );
+                headers.insert(
+                    "x-request-timestamp",
+                    HeaderValue::from_str(&signature.timestamp.to_string()).unwrap(),
+                );
+                headers.insert(
+                    "x-request-signature",
+                    HeaderValue::from_str(&signature.signature).unwrap(),
+                );
+            }
         }
         
         Ok(headers)

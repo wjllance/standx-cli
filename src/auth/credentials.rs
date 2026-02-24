@@ -10,7 +10,8 @@ pub struct Credentials {
     /// JWT token
     pub token: String,
     
-    /// Ed25519 private key (Base58)
+    /// Ed25519 private key (Base58) - optional for read-only access
+    #[serde(default)]
     pub private_key: String,
     
     /// Token creation timestamp (for expiration tracking)
@@ -21,11 +22,11 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    /// Create new credentials
-    pub fn new(token: String, private_key: String) -> Self {
+    /// Create new credentials (private key is optional)
+    pub fn new(token: String, private_key: Option<String>) -> Self {
         Self {
             token,
-            private_key,
+            private_key: private_key.unwrap_or_default(),
             created_at: chrono::Utc::now().timestamp(),
             validity_seconds: 7 * 24 * 60 * 60, // 7 days
         }
@@ -160,7 +161,7 @@ mod tests {
     fn test_credentials_new() {
         let mut creds = Credentials::new(
             "test_token".to_string(),
-            "test_key".to_string(),
+            Some("test_key".to_string()),
         );
         
         assert_eq!(creds.token, "test_token");
@@ -174,10 +175,22 @@ mod tests {
     }
 
     #[test]
+    fn test_credentials_without_private_key() {
+        let creds = Credentials::new(
+            "test_token".to_string(),
+            None, // No private key
+        );
+        
+        assert_eq!(creds.token, "test_token");
+        assert_eq!(creds.private_key, ""); // Empty string
+        assert!(!creds.is_expired());
+    }
+
+    #[test]
     fn test_expiration() {
         let mut creds = Credentials::new(
             "test_token".to_string(),
-            "test_key".to_string(),
+            Some("test_key".to_string()),
         );
         
         // Set created_at to 8 days ago
