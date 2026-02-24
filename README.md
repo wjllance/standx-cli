@@ -52,15 +52,25 @@ cargo build --release
 ### 1. Configure Authentication
 
 Visit [https://standx.com/user/session](https://standx.com/user/session) to generate your API credentials:
-- JWT Token
-- Ed25519 Private Key (Base58 encoded)
+- JWT Token (required)
+- Ed25519 Private Key (optional, required for trading)
 
 Then login via CLI:
 
 ```bash
+# Login with JWT only (read-only access)
 standx auth login --interactive
-# Enter your JWT token and private key when prompted
+# Enter your JWT token
+# Press Enter when prompted for private key to skip
+
+# Login with JWT and private key (full trading access)
+standx auth login --interactive
+# Enter your JWT token
+# Enter your private key
 ```
+
+**Note**: Private key is only required for trading operations (create/cancel orders). 
+For read-only operations (market data, account queries), JWT token alone is sufficient.
 
 ### 2. View Market Data
 
@@ -93,10 +103,20 @@ standx stream ticker BTC-USD
 ### Authentication Commands
 
 ```bash
-standx auth login --token <JWT> --private-key <KEY>    # Login with credentials
-standx auth login --interactive                         # Interactive login
-standx auth logout                                      # Clear credentials
-standx auth status                                      # Check auth status
+# Login with JWT only (read-only access)
+standx auth login --token <JWT>
+
+# Login with JWT and private key (full trading access)
+standx auth login --token <JWT> --private-key <KEY>
+
+# Interactive login (prompts for credentials)
+standx auth login --interactive
+
+# Logout and clear credentials
+standx auth logout
+
+# Check auth status
+standx auth status
 ```
 
 ### Market Commands (Public API)
@@ -294,7 +314,20 @@ standx auth status
 
 # Re-login if token expired
 standx auth login --interactive
+
+# Missing private key for trading
+# If you see "Private key required" error, re-login with private key:
+standx auth login --interactive
+# Enter JWT token
+# Enter private key (do not skip)
 ```
+
+### Permission Denied for Trading
+
+If you get authentication errors when creating/canceling orders:
+- Ensure you provided a private key during login
+- Re-run `standx auth login --interactive` and enter both JWT and private key
+- Check that your private key is correct (Base58 format)
 
 ### API Errors
 
