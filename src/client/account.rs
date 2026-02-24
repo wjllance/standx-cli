@@ -47,7 +47,7 @@ impl StandXClient {
 
     /// Get account balances
     pub async fn get_balance(&self,
-    ) -> Result<Vec<Balance>> {
+    ) -> Result<Balance> {
         let url = format!("{}/api/query_balance", self.base_url);
         let headers = self.auth_headers()?;
         
@@ -66,7 +66,7 @@ impl StandXClient {
             });
         }
 
-        let data = response.json::<Vec<Balance>>().await?;
+        let data = response.json::<Balance>().await?;
         Ok(data)
     }
 

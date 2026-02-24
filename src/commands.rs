@@ -80,12 +80,12 @@ pub async fn handle_account(command: AccountCommands, output_format: OutputForma
 
     match command {
         AccountCommands::Balances => {
-            let balances = client.get_balance().await?;
+            let balance = client.get_balance().await?;
             
             match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(balances)),
-                OutputFormat::Json => println!("{}", output::format_json(&balances)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&balances)?),
+                OutputFormat::Table => println!("{}", output::format_item(balance)),
+                OutputFormat::Json => println!("{}", output::format_json(&balance)?),
+                OutputFormat::Csv => println!("CSV format not supported for single item"),
                 OutputFormat::Quiet => {}
             }
         }
@@ -180,7 +180,7 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
                 private_key
             };
 
-            let credentials = Credentials::new(token, private_key);
+            let credentials = Credentials::new(token, private_key.clone());
             let expires_at = credentials.expires_at_string();
             credentials.save()?;
             

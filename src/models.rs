@@ -327,13 +327,30 @@ impl tabled::Tabled for Position {
 /// Account balance
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Balance {
-    pub asset: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub available: String,
+    pub balance: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub frozen: String,
+    pub cross_available: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub total: String,
+    pub cross_balance: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub cross_margin: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub cross_upnl: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub equity: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub isolated_balance: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub isolated_upnl: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub locked: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub pnl_24h: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub pnl_freeze: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub upnl: String,
 }
 
 impl tabled::Tabled for Balance {
@@ -341,19 +358,21 @@ impl tabled::Tabled for Balance {
     
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
-            self.asset.clone().into(),
-            self.available.clone().into(),
-            self.frozen.clone().into(),
-            self.total.clone().into(),
+            self.balance.clone().into(),
+            self.cross_available.clone().into(),
+            self.equity.clone().into(),
+            self.locked.clone().into(),
+            self.upnl.clone().into(),
         ]
     }
     
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
-            "Asset".into(),
+            "Balance".into(),
             "Available".into(),
-            "Frozen".into(),
-            "Total".into(),
+            "Equity".into(),
+            "Locked".into(),
+            "Unrealized PnL".into(),
         ]
     }
 }
