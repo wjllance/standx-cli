@@ -130,7 +130,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: wjllance/homebrew-standx-cli
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN || secrets.GITHUB_TOKEN }}
           path: homebrew-tap
 
       - name: Download source tarball
