@@ -1,6 +1,6 @@
 [package]
 name = "standx-cli"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 authors = ["Kimi Claw"]
 description = "A CLI tool for StandX perpetual DEX"
