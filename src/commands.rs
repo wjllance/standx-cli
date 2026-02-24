@@ -4,7 +4,6 @@ use crate::cli::*;
 use standx_cli::auth::Credentials;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
-use standx_cli::models::OrderBook;
 use standx_cli::output;
 use anyhow::Result;
 
@@ -199,46 +198,6 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
                 OutputFormat::Json => println!("{}", output::format_json(&trades)?),
                 OutputFormat::Csv => println!("{}", output::format_csv(&trades)?),
                 OutputFormat::Quiet => {}
-            }
-        }
-        MarketCommands::Depth { symbol, limit } => {
-            let book: OrderBook = client.get_depth(&symbol, limit).await?;
-            
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_order_book(&book, limit.unwrap_or(10) as usize)),
-                OutputFormat::Json => println!("{}", output::format_json(&book)?),
-                OutputFormat::Csv => println!("CSV format not supported for order book"),
-                OutputFormat::Quiet => {
-                    if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
-                        println!("{} {}", bid, ask);
-                    }
-                }
-            }
-        }
-        MarketCommands::Kline { symbol, resolution, from, to } => {
-            let klines = client.get_kline(&symbol, &resolution, from, to).await?;
-            
-            match output_format {
-                OutputFormat::Table => {
-                    println!("Kline data for {} ({}):", symbol, resolution);
-                    for kline in klines {
-                        println!("  {}: O:{} H:{} L:{} C:{} V:{}", 
-                            kline.time, kline.open, kline.high, kline.low, kline.close, kline.volume);
-                    }
-                }
-                OutputFormat::Json => println!("{}", output::format_json(&klines)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&klines)?),
-                OutputFormat::Quiet => {}
-            }
-        }
-        MarketCommands::Funding { symbol } => {
-            let funding = client.get_funding_rate(&symbol).await?;
-            
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_item(funding)),
-                OutputFormat::Json => println!("{}", output::format_json(&funding)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&[funding])?),
-                OutputFormat::Quiet => println!("{}", funding.funding_rate),
             }
         }
     }

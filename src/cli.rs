@@ -121,7 +121,7 @@ pub enum AuthCommands {
 pub enum MarketCommands {
     /// List all trading symbols
     Symbols,
-    /// Get ticker for a symbol
+    /// Get ticker for a symbol (includes funding rate)
     Ticker {
         symbol: String,
     },
@@ -132,26 +132,6 @@ pub enum MarketCommands {
         symbol: String,
         #[arg(short, long)]
         limit: Option<u32>,
-    },
-    /// Get order book depth
-    Depth {
-        symbol: String,
-        #[arg(short, long)]
-        limit: Option<u32>,
-    },
-    /// Get kline data
-    Kline {
-        symbol: String,
-        #[arg(short, long)]
-        resolution: String,
-        #[arg(short, long)]
-        from: i64,
-        #[arg(short, long)]
-        to: i64,
-    },
-    /// Get funding rate
-    Funding {
-        symbol: String,
     },
 }
 

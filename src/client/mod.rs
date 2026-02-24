@@ -66,7 +66,7 @@ impl StandXClient {
         Ok(data)
     }
 
-    /// Get market data for a symbol
+    /// Get market data for a symbol (includes funding rate)
     pub async fn get_symbol_market(&self, symbol: &str) -> Result<MarketData> {
         let url = format!("{}/api/query_symbol_market", self.base_url);
         let response = self
@@ -112,42 +112,6 @@ impl StandXClient {
         Ok(data)
     }
 
-    /// Get order book depth for a symbol
-    pub async fn get_depth(&self, symbol: &str, limit: Option<u32>) -> Result<OrderBook> {
-        let url = format!("{}/api/query_depth", self.base_url);
-        let mut query = vec![("symbol", symbol.to_string())];
-        
-        if let Some(l) = limit {
-            query.push(("limit", l.to_string()));
-        }
-
-        let response = self.client.get(&url).query(&query).send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                code: status.as_u16(),
-                message: text,
-            });
-        }
-
-        let mut data = response.json::<OrderBook>().await?;
-        // Sort bids descending by price
-        data.bids.sort_by(|a, b| {
-            let price_a: f64 = a[0].parse().unwrap_or(0.0);
-            let price_b: f64 = b[0].parse().unwrap_or(0.0);
-            price_b.partial_cmp(&price_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        // Sort asks ascending by price
-        data.asks.sort_by(|a, b| {
-            let price_a: f64 = a[0].parse().unwrap_or(0.0);
-            let price_b: f64 = b[0].parse().unwrap_or(0.0);
-            price_a.partial_cmp(&price_b).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(data)
-    }
-
     /// Get recent trades for a symbol
     pub async fn get_recent_trades(
         &self,
@@ -176,91 +140,12 @@ impl StandXClient {
         Ok(data)
     }
 
-    /// Get funding rate for a symbol
-    pub async fn get_funding_rate(&self, symbol: &str) -> Result<FundingRate> {
-        let url = format!("{}/api/query_funding_rates", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .query(&[("symbol", symbol)])
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                code: status.as_u16(),
-                message: text,
-            });
-        }
-
-        let data = response.json::<FundingRate>().await?;
-        Ok(data)
-    }
-
-    /// Get kline data for a symbol
-    pub async fn get_kline(
-        &self,
-        symbol: &str,
-        resolution: &str,
-        from: i64,
-        to: i64,
-    ) -> Result<Vec<Kline>> {
-        let url = format!("{}/api/query_kline", self.base_url);
-        let from_str = from.to_string();
-        let to_str = to.to_string();
-        let query = vec![
-            ("symbol", symbol),
-            ("resolution", resolution),
-            ("from", &from_str),
-            ("to", &to_str),
-        ];
-
-        let response = self.client.get(&url).query(&query).send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                code: status.as_u16(),
-                message: text,
-            });
-        }
-
-        let data = response.json::<Vec<Kline>>().await?;
-        Ok(data)
-    }
-
-    /// Get server time
-    pub async fn get_server_time(&self) -> Result<i64> {
-        let url = format!("{}/api/query_time", self.base_url);
-        let response = self.client.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                code: status.as_u16(),
-                message: text,
-            });
-        }
-
-        let data = response.json::<i64>().await?;
-        Ok(data)
-    }
-
-    /// Health check
+    /// Health check - returns true if API is available
     pub async fn health_check(&self) -> Result<bool> {
-        let url = format!("{}/api/health", self.base_url);
+        // Use query_symbol_info as health check since /api/health doesn't exist
+        let url = format!("{}/api/query_symbol_info", self.base_url);
         let response = self.client.get(&url).send().await?;
-
-        if !response.status().is_success() {
-            return Ok(false);
-        }
-
-        let data = response.json::<HealthStatus>().await?;
-        Ok(data.status == "ok")
+        Ok(response.status().is_success())
     }
 }
 
@@ -311,10 +196,10 @@ mod tests {
     #[tokio::test]
     async fn test_health_check() {
         let mut server = Server::new_async().await;
-        let _m = server.mock("GET", "/api/health")
+        let _m = server.mock("GET", "/api/query_symbol_info")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok"}"#)
+            .with_body(r#"[]"#)
             .create();
 
         let client = StandXClient::with_base_url(server.url()).unwrap();
