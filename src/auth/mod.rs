@@ -1,7 +1,11 @@
 //! Authentication module for StandX API
 
+pub mod credentials;
+
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+pub use credentials::Credentials;
 
 /// StandX request signer using Ed25519
 #[derive(Debug)]
