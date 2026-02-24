@@ -42,7 +42,7 @@ mod tests {
         let _m = server.mock("GET", "/api/health")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok"}"#)
+            .with_body(r#"{"status":"ok","version":"1.0.0"}"#)
             .create();
 
         let client = StandXClient::with_base_url(server.url()).unwrap();

@@ -131,9 +131,18 @@ impl StandXClient {
         }
 
         let mut data = response.json::<OrderBook>().await?;
-        // Sort bids and asks
-        data.sort_bids();
-        data.sort_asks();
+        // Sort bids descending by price
+        data.bids.sort_by(|a, b| {
+            let price_a: f64 = a[0].parse().unwrap_or(0.0);
+            let price_b: f64 = b[0].parse().unwrap_or(0.0);
+            price_b.partial_cmp(&price_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        // Sort asks ascending by price
+        data.asks.sort_by(|a, b| {
+            let price_a: f64 = a[0].parse().unwrap_or(0.0);
+            let price_b: f64 = b[0].parse().unwrap_or(0.0);
+            price_a.partial_cmp(&price_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
         Ok(data)
     }
 
@@ -235,8 +244,8 @@ impl StandXClient {
             });
         }
 
-        let data = response.json::<ServerTime>().await?;
-        Ok(data.server_time)
+        let data = response.json::<i64>().await?;
+        Ok(data)
     }
 
     /// Health check
