@@ -5,6 +5,8 @@ on:
     branches: [ main, develop ]
   pull_request:
     branches: [ main ]
+  release:
+    types: [ created ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,3 +49,45 @@ jobs:
     
     - name: Run clippy
       run: cargo clippy -- -D warnings
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: dtolnay/rust-action@stable
+    
+    - name: Build for macOS
+      run: cargo build --release
+    
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: standx-macos
+        path: target/release/standx
+
+  release:
+    needs: [ build, build-macos ]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Download macOS binary
+      uses: actions/download-artifact@v4
+      with:
+        name: standx-macos
+        path: ./binaries/
+    
+    - name: Package binaries
+      run: |
+        chmod +x ./binaries/standx
+        tar -czf standx-macos-amd64.tar.gz -C ./binaries standx
+    
+    - name: Upload to release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: standx-macos-amd64.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -16,6 +16,19 @@ A command-line interface tool for the StandX perpetual DEX API, written in Rust.
 
 ## Installation
 
+### macOS (Homebrew)
+
+```bash
+# Add the tap
+brew tap wjllance/standx-cli
+
+# Install
+brew install standx-cli
+
+# Upgrade
+brew upgrade standx-cli
+```
+
 ### From Source
 
 ```bash
@@ -31,7 +44,7 @@ cargo build --release
 
 ### Prerequisites
 
-- Rust 1.75 or higher
+- Rust 1.75 or higher (for building from source)
 - A StandX account with API credentials
 
 ## Quick Start
