@@ -1,0 +1,15 @@
+.DS_Store
+/target
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.idea
+.vscode
+*.iml
+.env
+.env.local
+config.local.toml
+*.log
+*.tmp
+/tmp
