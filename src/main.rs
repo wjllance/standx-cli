@@ -133,6 +133,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
 }
 
 /// Print error in appropriate format
+#[allow(clippy::borrowed_box)]
 fn print_error(error: &Box<dyn std::error::Error>, output: OutputFormat) {
     match output {
         OutputFormat::Json => {

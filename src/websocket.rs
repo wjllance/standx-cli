@@ -44,9 +44,12 @@ pub struct StandXWebSocket {
     state: Arc<RwLock<WsState>>,
     subscriptions: Arc<RwLock<Vec<String>>>,
     message_tx: mpsc::Sender<WsMessage>,
+    #[allow(dead_code)]
     message_rx: Arc<RwLock<mpsc::Receiver<WsMessage>>>,
     reconnect_attempts: Arc<RwLock<u32>>,
+    #[allow(dead_code)]
     channel: String,
+    #[allow(dead_code)]
     symbol: Option<String>,
 }
 
@@ -107,7 +110,7 @@ impl StandXWebSocket {
 
     /// Connect and start the WebSocket client
     pub async fn connect(&self) -> Result<mpsc::Receiver<WsMessage>> {
-        let (tx, rx) = mpsc::channel(100);
+        let (_tx, rx) = mpsc::channel(100);
 
         let url = self.url.clone();
         let token = self.token.clone();
