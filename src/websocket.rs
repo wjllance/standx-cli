@@ -125,10 +125,12 @@ impl StandXWebSocket {
                     Err(e) => {
                         let attempts = *reconnect_attempts.read().await;
                         if attempts >= 5 {
-                            let _ = message_tx.send(WsMessage::Error(format!(
-                                "Max reconnection attempts reached: {}",
-                                e
-                            ))).await;
+                            let _ = message_tx
+                                .send(WsMessage::Error(format!(
+                                    "Max reconnection attempts reached: {}",
+                                    e
+                                )))
+                                .await;
                             break;
                         }
 

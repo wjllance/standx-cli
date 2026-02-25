@@ -54,7 +54,10 @@ async fn main() {
 }
 
 /// Execute the command, converting anyhow errors to our Error type
-async fn execute_command(command: Commands, output: OutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+async fn execute_command(
+    command: Commands,
+    output: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Config { command } => {
             commands::handle_config(command).await?;
@@ -135,7 +138,10 @@ fn print_error(error: &Box<dyn std::error::Error>, output: OutputFormat) {
         OutputFormat::Json => {
             // Try to convert to our Error type for structured output
             if let Some(standx_err) = error.downcast_ref::<standx_cli::Error>() {
-                eprintln!("{}", serde_json::to_string_pretty(&standx_err.to_json()).unwrap());
+                eprintln!(
+                    "{}",
+                    serde_json::to_string_pretty(&standx_err.to_json()).unwrap()
+                );
             } else {
                 // Fallback for other error types
                 let error_json = serde_json::json!({
