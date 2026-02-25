@@ -37,8 +37,8 @@
 
 | Issue | Description | Status |
 |-------|-------------|--------|
-| ISSUE-1.1 | JSON output format not working | 🔴 Pending |
-| ISSUE-1.2 | Quiet mode not simplified | 🔴 Pending |
+| ISSUE-1.1 | JSON output format not working | 🟢 **FIXED** |
+| ISSUE-1.2 | Quiet mode not simplified | 🟢 **FIXED** |
 
 ---
 
@@ -210,8 +210,8 @@ standx stream fills
 
 | ID | Description | Priority |
 |----|-------------|----------|
-| ISSUE-1.1 | JSON output format not working | Medium |
-| ISSUE-1.2 | Quiet mode not simplified | Low |
+| ISSUE-1.1 | JSON output format not working | Medium | 🟢 **FIXED** |
+| ISSUE-1.2 | Quiet mode not simplified | Low | 🟢 **FIXED** |
 | ISSUE-2.1 | K-line parameter format unfriendly | Medium |
 | ISSUE-2.2 | Funding rate returns empty data | Low |
 | ISSUE-4.1 | Trade history not implemented | Medium |
@@ -224,6 +224,8 @@ standx stream fills
 
 | ID | Description | Fix |
 |----|-------------|-----|
+| FIX-1.1 | JSON output for config commands | handle_config now accepts output_format |
+| FIX-1.2 | Quiet mode for config commands | Added OutputFormat::Quiet handling |
 | FIX-3.1 | Positions API parsing error | Changed to direct array parsing |
 | FIX-3.2 | History API 404 | Changed to `/api/query_orders?status=filled` |
 | FIX-3.3 | Orders API parsing error | Use `ApiListResponse` wrapper |
