@@ -43,6 +43,7 @@ pub struct StandXWebSocket {
     token: Option<String>,
     state: Arc<RwLock<WsState>>,
     subscriptions: Arc<RwLock<Vec<String>>>,
+    #[allow(dead_code)]
     message_tx: mpsc::Sender<WsMessage>,
     #[allow(dead_code)]
     message_rx: Arc<RwLock<mpsc::Receiver<WsMessage>>>,
@@ -412,16 +413,8 @@ async fn connect_and_run(
                 let _ = message_tx.send(WsMessage::Disconnected).await;
                 break;
             }
-            Err(e) => {
-                if verbose {
-                    eprintln!("[WebSocket Debug] WebSocket error: {}", e);
-                }
-                return Err(Error::Unknown(format!("WebSocket error: {}", e)));
-            }
             Ok(Message::Frame(_)) => {
-                if verbose {
-                    eprintln!("[WebSocket Debug] Received frame");
-                }
+                // Frame messages are handled internally by tungstenite
             }
             Ok(Message::Binary(data)) => {
                 if verbose {
@@ -431,7 +424,12 @@ async fn connect_and_run(
                     );
                 }
             }
-            _ => {}
+            Err(e) => {
+                if verbose {
+                    eprintln!("[WebSocket Debug] WebSocket error: {}", e);
+                }
+                return Err(Error::Unknown(format!("WebSocket error: {}", e)));
+            }
         }
     }
 

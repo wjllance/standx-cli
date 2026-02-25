@@ -207,8 +207,8 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
                 match client.get_position_config(&symbol).await {
                     Ok(config) => {
                         println!(
-                            "Margin mode for {}: {} (leverage: {}x)",
-                            symbol, "cross", config.leverage
+                            "Margin mode for {}: cross (leverage: {}x)",
+                            symbol, config.leverage
                         );
                     }
                     Err(_) => {
@@ -220,8 +220,8 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
                             .find(|s| s.symbol == symbol)
                             .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
                         println!(
-                            "Margin mode for {}: {} (default leverage: {}x)",
-                            symbol, "cross", symbol_info.def_leverage
+                            "Margin mode for {}: cross (default leverage: {}x)",
+                            symbol, symbol_info.def_leverage
                         );
                     }
                 }
