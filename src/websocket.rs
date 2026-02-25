@@ -283,19 +283,26 @@ async fn connect_and_run(
                                         let _ = message_tx.send(WsMessage::Price(price)).await;
                                     }
                                 }
-                                "depth" => {
+                                "depth_book" => {
                                     if let Ok(depth) =
                                         serde_json::from_value::<OrderBook>(data_obj.clone())
                                     {
                                         let _ = message_tx.send(WsMessage::Depth(depth)).await;
                                     }
                                 }
-                                "trades" => {
+                                "public_trade" => {
                                     if let Ok(trade) =
                                         serde_json::from_value::<Trade>(data_obj.clone())
                                     {
                                         let _ = message_tx.send(WsMessage::Trade(trade)).await;
                                     }
+                                }
+                                "order" | "position" | "balance" | "trade" => {
+                                    eprintln!(
+                                        "[WebSocket Debug] User channel received: {}",
+                                        channel
+                                    );
+                                    // TODO: Parse user-specific messages
                                 }
                                 _ => {
                                     eprintln!("[WebSocket Debug] Unknown channel: {}", channel);

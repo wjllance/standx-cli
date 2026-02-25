@@ -50,9 +50,7 @@ impl StandXClient {
     }
 
     /// Build authenticated headers with optional request signing
-    pub async fn build_auth_headers(&self,
-        payload: Option<&str>,
-    ) -> Result<HeaderMap> {
+    pub async fn build_auth_headers(&self, payload: Option<&str>) -> Result<HeaderMap> {
         let creds = Credentials::load()?;
 
         if creds.is_expired() {

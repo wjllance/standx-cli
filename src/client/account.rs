@@ -234,7 +234,9 @@ impl StandXClient {
             });
         }
 
-        let wrapper = response.json::<ApiListResponse<crate::models::Trade>>().await?;
+        let wrapper = response
+            .json::<ApiListResponse<crate::models::Trade>>()
+            .await?;
         Ok(wrapper.result)
     }
 

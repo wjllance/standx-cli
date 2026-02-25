@@ -116,28 +116,28 @@ pub async fn handle_leverage(command: LeverageCommands, output_format: OutputFor
         LeverageCommands::Get { symbol } => {
             // Try to get position config first, fallback to symbol info
             match client.get_position_config(&symbol).await {
-                Ok(config) => {
-                    match output_format {
-                        OutputFormat::Table => println!("{}", output::format_item(config)),
-                        OutputFormat::Json => println!("{}", output::format_json(&config)?),
-                        OutputFormat::Csv => println!("{}", output::format_csv(&[config])?),
-                        OutputFormat::Quiet => println!("{}", config.leverage),
-                    }
-                }
+                Ok(config) => match output_format {
+                    OutputFormat::Table => println!("{}", output::format_item(config)),
+                    OutputFormat::Json => println!("{}", output::format_json(&config)?),
+                    OutputFormat::Csv => println!("{}", output::format_csv(&[config])?),
+                    OutputFormat::Quiet => println!("{}", config.leverage),
+                },
                 Err(_) => {
                     // Fallback: get leverage from symbol info
-                    let symbol_info = client.get_symbol_info().await?
+                    let symbol_info = client
+                        .get_symbol_info()
+                        .await?
                         .into_iter()
                         .find(|s| s.symbol == symbol)
                         .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
-                    
+
                     let config = standx_cli::models::PositionConfig {
                         symbol: symbol.clone(),
                         leverage: symbol_info.def_leverage.clone(),
                         max_leverage: symbol_info.max_leverage.clone(),
                         def_leverage: symbol_info.def_leverage,
                     };
-                    
+
                     match output_format {
                         OutputFormat::Table => println!("{}", output::format_item(config)),
                         OutputFormat::Json => println!("{}", output::format_json(&config)?),
@@ -148,9 +148,10 @@ pub async fn handle_leverage(command: LeverageCommands, output_format: OutputFor
             }
         }
         LeverageCommands::Set { symbol, leverage } => {
-            let leverage_val: u32 = leverage.parse()
+            let leverage_val: u32 = leverage
+                .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid leverage value: {}", leverage))?;
-            
+
             match client.change_leverage(&symbol, leverage_val).await {
                 Ok(_) => println!("✅ Leverage for {} set to {}x", symbol, leverage),
                 Err(e) => {
@@ -509,7 +510,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
 
     match command {
         StreamCommands::Depth { symbol, levels } => {
-            let _ = ws.subscribe("depth", Some(&symbol)).await;
+            let _ = ws.subscribe("depth_book", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming depth for {} (top {} levels)", symbol, levels);
@@ -546,7 +547,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Trades { symbol } => {
-            let _ = ws.subscribe("trades", Some(&symbol)).await;
+            let _ = ws.subscribe("public_trade", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming trades for {}", symbol);
@@ -554,10 +555,21 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
 
             while let Some(msg) = rx.recv().await {
                 if let WsMessage::Trade(data) = msg {
-                    let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
+                    let side = data.side.as_deref().unwrap_or({
+                        if data.is_buyer_taker {
+                            "buy"
+                        } else {
+                            "sell"
+                        }
+                    });
+                    let side_emoji = match side.to_lowercase().as_str() {
+                        "buy" => "🟢 BUY",
+                        "sell" => "🔴 SELL",
+                        _ => side,
+                    };
                     println!(
                         "{} | {} | Price: {} | Qty: {}",
-                        data.time, side, data.price, data.qty
+                        data.time, side_emoji, data.price, data.qty
                     );
                 }
             }

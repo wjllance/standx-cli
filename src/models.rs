@@ -131,11 +131,15 @@ impl OrderBook {
 pub struct Trade {
     #[serde(default)]
     pub id: u64,
+    #[serde(deserialize_with = "string_or_number_to_string")]
     pub time: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub price: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub qty: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(default)]
     pub is_buyer_taker: bool,
 }
 
