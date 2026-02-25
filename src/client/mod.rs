@@ -60,6 +60,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_symbol_info".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -83,6 +85,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_symbol_market".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -106,6 +110,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_symbol_price".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -130,6 +136,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_recent_trades".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -154,6 +162,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_depth_book".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -201,6 +211,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/kline/history".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -230,6 +242,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_funding_rates".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 

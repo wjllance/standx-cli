@@ -25,7 +25,10 @@ impl StandXClient {
         let creds = Credentials::load()?;
 
         if creds.is_expired() {
-            return Err(Error::AuthRequired);
+            return Err(Error::AuthRequired {
+                message: "Token expired".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable".to_string(),
+            });
         }
 
         let mut headers = HeaderMap::new();
@@ -37,6 +40,8 @@ impl StandXClient {
             HeaderValue::from_str(&auth_value).map_err(|e| Error::Api {
                 code: 500,
                 message: e.to_string(),
+                endpoint: None,
+                retryable: false,
             })?,
         );
 
@@ -50,7 +55,9 @@ impl StandXClient {
     fn sign_request(&self, payload: &str) -> Result<(StandXSigner, crate::auth::RequestSignature)> {
         let creds = Credentials::load()?;
         let signer =
-            StandXSigner::from_base58(&creds.private_key).map_err(|_| Error::InvalidCredentials)?;
+            StandXSigner::from_base58(&creds.private_key).map_err(|_| Error::InvalidCredentials {
+                message: "Invalid private key format".to_string(),
+            })?;
 
         let signature = signer.sign_request_now(payload);
         Ok((signer, signature))
@@ -69,6 +76,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_balance".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -100,6 +109,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_positions".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -131,6 +142,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_open_orders".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -169,6 +182,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/query_order_history".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 

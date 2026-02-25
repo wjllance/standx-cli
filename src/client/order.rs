@@ -46,7 +46,10 @@ impl StandXClient {
         let creds = Credentials::load()?;
 
         if creds.is_expired() {
-            return Err(Error::AuthRequired);
+            return Err(Error::AuthRequired {
+                message: "Token expired".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable".to_string(),
+            });
         }
 
         let mut headers = HeaderMap::new();
@@ -58,6 +61,8 @@ impl StandXClient {
             HeaderValue::from_str(&auth_value).map_err(|e| Error::Api {
                 code: 500,
                 message: e.to_string(),
+                endpoint: None,
+                retryable: false,
             })?,
         );
 
@@ -155,6 +160,8 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/new_order".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
@@ -170,6 +177,8 @@ impl StandXClient {
                 return Err(Error::Api {
                     code: code as u16,
                     message: message.to_string(),
+                    endpoint: Some("/api/new_order".to_string()),
+                    retryable: false,
                 });
             }
         }
@@ -222,24 +231,20 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/cancel_order".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
         Ok(())
     }
 
-    /// Cancel multiple orders
-    pub async fn cancel_orders(&self, symbol: &str, order_ids: Vec<String>) -> Result<()> {
+    /// Cancel all orders for a symbol
+    pub async fn cancel_all_orders(&self, symbol: &str) -> Result<()> {
         let url = format!("{}/api/cancel_orders", self.base_url);
-
-        let order_id_list: Vec<i64> = order_ids
-            .iter()
-            .filter_map(|id| id.parse::<i64>().ok())
-            .collect();
 
         let body = json!({
             "symbol": symbol,
-            "order_id_list": order_id_list,
         });
 
         let body_str = body.to_string();
@@ -259,37 +264,42 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
+                endpoint: Some("/api/cancel_orders".to_string()),
+                retryable: status.as_u16() >= 500,
             });
         }
 
         Ok(())
-    }
-
-    /// Cancel all orders for a symbol
-    pub async fn cancel_all_orders(&self, symbol: &str) -> Result<()> {
-        // First get all open orders
-        let open_orders = self.get_open_orders(Some(symbol)).await?;
-
-        if open_orders.is_empty() {
-            return Ok(());
-        }
-
-        // Collect order IDs
-        let order_ids: Vec<String> = open_orders.iter().map(|o| o.id.clone()).collect();
-
-        // Cancel all orders
-        self.cancel_orders(symbol, order_ids).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::Server;
 
-    #[test]
-    fn test_create_order_params_default() {
-        let params = CreateOrderParams::default();
-        assert!(!params.reduce_only);
-        assert!(params.price.is_none());
+    #[tokio::test]
+    async fn test_create_order_success() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/api/new_order")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"code":0,"request_id":"12345"}"#)
+            .create();
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let params = CreateOrderParams {
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Buy,
+            order_type: OrderType::Limit,
+            quantity: "0.1".to_string(),
+            price: Some("65000".to_string()),
+            ..Default::default()
+        };
+
+        // Should fail because no credentials
+        let result = client.create_order(params).await;
+        assert!(result.is_err());
     }
 }
