@@ -1,12 +1,14 @@
-# StandX for OpenClaw
+# StandX Agent Toolkit
 
-> **The native trading companion for OpenClaw agents**
+> **OpenClaw First. AI Agent Native. Trading Ecosystem Ready.**
 
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![OpenClaw](https://img.shields.io/badge/OpenClaw-Ready-blue.svg)](https://openclaw.ai)
+[![OpenClaw](https://img.shields.io/badge/OpenClaw-First-blue.svg)](https://openclaw.ai)
 
-**StandX for OpenClaw** is a purpose-built CLI that transforms your OpenClaw agent into a professional crypto trader. No complex integration, no boilerplate code—just natural language to execution.
+**StandX Agent Toolkit** is a CLI designed for the AI Trading era—**OpenClaw First**, yet universally adaptable to any AI Agent that can execute commands.
+
+We believe the future of trading is conversational. Your agent should trade as naturally as it chats. No complex APIs, no boilerplate—just intent to execution.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -26,26 +28,27 @@
 
 ---
 
-## 🎯 Why OpenClaw + StandX?
+## 🎯 Why StandX Agent Toolkit?
 
 ### The Problem
 
-You have OpenClaw. You want your agent to trade. But:
-- ❌ Generic trading bots are built for humans, not agents
-- ❌ APIs require complex authentication and parsing
-- ❌ No seamless bridge between natural language and execution
+You have an AI Agent (OpenClaw, Claude, AutoGPT, etc.). You want it to trade. But:
+- ❌ Traditional trading tools are built for humans clicking buttons
+- ❌ APIs require complex integration and parsing
+- ❌ No bridge between natural language and execution
 
 ### The Solution
 
-StandX CLI is **designed for OpenClaw's execution model**:
+**Agent-First Design**—structured output, non-interactive, composable:
 
-| Feature | Generic Tools | StandX for OpenClaw |
-|---------|---------------|---------------------|
-| **Integration** | Custom code needed | Works out of the box |
-| **Output** | Tables for humans | JSON for agents |
-| **Errors** | Text to parse | Structured, actionable |
-| **Workflow** | Interactive prompts | 100% scriptable |
-| **Context** | None | Maintains session state |
+| Feature | Traditional Tools | StandX Agent Toolkit |
+|---------|-------------------|----------------------|
+| **Built For** | Human traders | **AI Agents** |
+| **OpenClaw Integration** | Custom code | **Works out of the box** |
+| **Output** | Pretty tables | **Structured JSON** |
+| **Errors** | Text to parse | **Machine-readable** |
+| **Workflow** | Interactive prompts | **100% scriptable** |
+| **Other Agents** | Not supported | **CLI = Universal** |
 
 ---
 
@@ -62,16 +65,16 @@ brew install standx-cli
 cargo install standx-cli
 ```
 
-### 2. Configure (One-time)
+### 2. Configure
 
 ```bash
 # Get credentials from https://standx.com/user/session
 standx auth login --token "$STANDX_JWT" --private-key "$STANDX_KEY"
 ```
 
-### 3. Use in OpenClaw
+### 3. Use With Your Agent
 
-Your agent can now execute trades:
+#### OpenClaw (Native)
 
 ```
 You: What's the BTC price?
@@ -82,74 +85,77 @@ You: Buy 0.1 BTC at market price
 OpenClaw: [executes: standx order create BTC-USD buy market --qty 0.1]
           ✅ Market order executed
           Bought 0.1 BTC at $65,001
-          Order ID: ord_xxx
+```
 
-You: Set a stop loss at $62,000
-OpenClaw: [executes: standx order create BTC-USD sell limit --qty 0.1 --price 62000]
-          ✅ Stop loss order placed
-          Will sell 0.1 BTC if price drops to $62,000
+#### Claude / Cursor / Any CLI-capable Agent
+
+```python
+# Same commands work everywhere
+import subprocess
+
+result = subprocess.run(
+    ["standx", "market", "ticker", "BTC-USD", "--output", "json"],
+    capture_output=True
+)
+data = json.loads(result.stdout)
 ```
 
 ---
 
-## 🛠️ OpenClaw Integration
+## 🛠️ Integration Patterns
 
-### Direct Command Execution
+### Pattern 1: OpenClaw Native (Recommended)
 
-OpenClaw can call StandX CLI directly via the `exec` tool:
+OpenClaw calls StandX CLI directly via `exec`:
 
 ```python
-# In your OpenClaw session
+# In OpenClaw
 result = await exec("standx market ticker BTC-USD --output json")
 price_data = json.loads(result.stdout)
+# Agent parses and responds naturally
 ```
 
-### Recommended Workflow
+**Best for**: OpenClaw users who want seamless conversation-to-trading
 
-```
-User Request
-     ↓
-OpenClaw parses intent
-     ↓
-Selects StandX command
-     ↓
-Executes via exec()
-     ↓
-Parses JSON output
-     ↓
-Natural language response
-```
+### Pattern 2: Universal CLI
 
-### Example: Grid Strategy Agent
+Any AI Agent that can execute shell commands:
 
 ```python
-# Your OpenClaw agent running a grid strategy
+# LangChain
+from langchain.tools import ShellTool
 
-async def grid_trade():
-    # Check current price
-    ticker = await exec("standx market ticker BTC-USD --output json")
-    price = json.loads(ticker.stdout)["mark_price"]
-    
-    # Get open orders
-    orders = await exec("standx account orders --symbol BTC-USD --output json")
-    open_orders = json.loads(orders.stdout)
-    
-    # Logic: If no orders in grid range, place new ones
-    if should_place_buy_order(price, open_orders):
-        await exec(f"standx order create BTC-USD buy limit --qty 0.01 --price {buy_price}")
-    
-    if should_place_sell_order(price, open_orders):
-        await exec(f"standx order create BTC-USD sell limit --qty 0.01 --price {sell_price}")
+tool = ShellTool()
+result = tool.run("standx account balances --output json")
 ```
+
+```python
+# AutoGPT
+# Add to skills
+os.system("standx order create BTC-USD buy market --qty 0.1")
+```
+
+**Best for**: Multi-platform agents, custom workflows
+
+### Pattern 3: Future MCP (Optional)
+
+When you need richer tool definitions:
+
+```bash
+# Coming soon
+standx mcp serve
+```
+
+**Best for**: Complex multi-step workflows across multiple services
 
 ---
 
-## 📋 Command Reference for OpenClaw
+## 📋 Command Reference
 
-### Market Data (No auth required)
+### Market Data
 
 ```bash
-# Get price
+# Price
 standx market ticker BTC-USD --output json
 
 # Order book
@@ -162,7 +168,7 @@ standx market trades BTC-USD --limit 20 --output json
 standx market funding BTC-USD --days 7 --output json
 ```
 
-### Account (Auth required)
+### Account
 
 ```bash
 # Balance
@@ -175,7 +181,7 @@ standx account positions --symbol BTC-USD --output json
 standx account orders --symbol BTC-USD --output json
 ```
 
-### Trading (Auth required)
+### Trading
 
 ```bash
 # Market order
@@ -188,23 +194,17 @@ standx order create BTC-USD buy limit --qty 0.1 --price 64000
 standx order create BTC-USD buy limit --qty 0.1 --price 64000 \
   --sl-price 62000 --tp-price 68000
 
-# Cancel order
+# Cancel
 standx order cancel BTC-USD --order-id ord_xxx
-
-# Cancel all
 standx order cancel-all BTC-USD
 ```
 
-### Streaming (Real-time)
+### Streaming
 
 ```bash
-# Price stream
+# Real-time data
 standx stream ticker BTC-USD
-
-# Order book updates
 standx stream depth BTC-USD --levels 5
-
-# Account updates
 standx stream account
 ```
 
@@ -212,137 +212,103 @@ standx stream account
 
 ## 💡 Use Cases
 
-### 1. Natural Language Trading
+### 1. Natural Language Trading (OpenClaw)
 
 ```
 You: "I want to long ETH with 0.5 size, entry at 3500"
 OpenClaw: "I'll place a limit buy order for 0.5 ETH at $3,500. 
-           Current price is $3,480, so this will execute when 
-           the price rises to your entry. Confirm?"
+           Current price is $3,480. Confirm?"
 You: "Yes"
-OpenClaw: [places order] "✅ Order placed. Order ID: ord_eth_xxx"
+OpenClaw: "✅ Order placed. Order ID: ord_eth_xxx"
 ```
 
-### 2. Automated Monitoring
+### 2. Automated Strategy (Any Agent)
 
-```
-OpenClaw: "I'll monitor your BTC position. If it drops below 
-           $60,000, I'll alert you and suggest hedging options."
-[Every 5 minutes]
-OpenClaw: [checks price] "BTC at $62,500. Position healthy."
-```
-
-### 3. Risk Management
-
-```
-You: "Set up a trailing stop for my BTC position"
-OpenClaw: "Current BTC price: $65,000. Your position: +5% profit.
-           I'll set a trailing stop at -3% from peak. 
-           If BTC hits $63,050, I'll sell."
-[Price rises to $68,000]
-OpenClaw: "Trailing stop updated to $65,960 (3% below new peak)"
+```python
+# Grid trading bot
+async def grid_trade():
+    ticker = await exec("standx market ticker BTC-USD --output json")
+    price = json.loads(ticker.stdout)["mark_price"]
+    
+    if price < lower_bound:
+        await exec(f"standx order create BTC-USD buy limit --qty 0.01 --price {buy_price}")
 ```
 
-### 4. Multi-Step Strategies
+### 3. Multi-Agent Coordination
 
-```
-You: "Execute a grid strategy on BTC from 60k to 70k"
-OpenClaw: "Setting up grid:
-           - 10 levels from $60,000 to $70,000
-           - Each level: 0.01 BTC
-           - Total exposure: 0.1 BTC
-           Placing orders..."
-[Places 10 buy orders and 10 sell orders]
-OpenClaw: "✅ Grid active. I'll monitor and rebalance as orders fill."
-```
-
----
-
-## 🔧 Configuration for OpenClaw
-
-### Environment Variables
-
-```bash
-# Add to your OpenClaw environment
-export STANDX_JWT="your-jwt-token"
-export STANDX_PRIVATE_KEY="your-private-key"
-```
-
-### Config File
-
-```toml
-# ~/.config/standx/config.toml
-[openclaw]
-auto_confirm = true        # Skip confirmations in agent mode
-default_output = "json"    # Always JSON for parsing
-show_raw_output = false    # Only show parsed results
-```
-
----
-
-## 📊 Comparison
-
-| Tool | Built For | OpenClaw Integration | Learning Curve |
-|------|-----------|---------------------|----------------|
-| **StandX CLI** | OpenClaw agents | Native | 🟢 Low |
-| Hummingbot | Human traders | Complex | 🔴 High |
-| CCXT | Developers | Requires wrapper | 🟡 Medium |
-| Hyperliquid SDK | Developers | Requires integration | 🟡 Medium |
-
----
-
-## 🛡️ Safety Features
-
-### For Agent Use
-
-- **Structured errors** - Agent can parse and handle errors programmatically
-- **Dry-run mode** - Test commands without execution
-- **Confirmation prompts** - Critical actions require explicit confirmation
-- **Rate limiting** - Built-in protection against accidental spam
-
-### Example: Safe Execution
-
-```bash
-# Dry run first
-standx order create BTC-USD buy market --qty 0.1 --dry-run
-# Output: "Would buy 0.1 BTC at ~$65,000. Cost: ~$6,500"
-
-# Then execute
-standx order create BTC-USD buy market --qty 0.1
+```python
+# Risk monitoring agent
+while True:
+    positions = await exec("standx account positions --output json")
+    # Alert if exposure too high
+    
+# Execution agent
+await exec("standx order create ...")
 ```
 
 ---
 
 ## 🗺️ Roadmap
 
-### Now (Phase 1)
-- [x] Core CLI with JSON output
-- [x] Structured error handling
-- [ ] **OpenClaw-optimized defaults**
-- [ ] **Session state management**
-- [ ] **Batch command execution**
+### Phase 1: OpenClaw Excellence (Now)
 
-### Next (Phase 2)
-- [ ] **OpenClaw skill** - Native integration
-- [ ] **Strategy templates** - Grid, DCA, TWAP
-- [ ] **Webhook callbacks** - Event-driven agents
-- [ ] **Python SDK** - `pip install standx-openclaw`
+**Goal**: Best-in-class OpenClaw integration
 
-### Future (Phase 3)
-- [ ] **Multi-exchange** - Unified interface
-- [ ] **AI strategy builder** - Natural language to strategy
-- [ ] **Agent marketplace** - Share strategies
+- [x] Structured JSON output
+- [x] Non-interactive mode
+- [ ] `--openclaw` optimized defaults
+- [ ] Session persistence
+- [ ] Batch execution
+
+### Phase 2: Universal Agent Toolkit (1-2 months)
+
+**Goal**: Seamless experience across all AI Agents
+
+- [ ] Python SDK - `pip install standx-agent`
+- [ ] Strategy templates (Grid, DCA, TWAP)
+- [ ] Webhook callbacks
+- [ ] MCP support (optional enhancement)
+
+### Phase 3: AI Trading Ecosystem (3-6 months)
+
+**Goal**: Define the standard for AI-native trading
+
+- [ ] Multi-exchange abstraction
+- [ ] Natural language strategy builder
+- [ ] Agent marketplace
+- [ ] Cross-agent coordination protocol
 
 ---
 
-## 🤝 Contributing
+## 🤝 Comparison
 
-We welcome contributions that improve the OpenClaw experience:
+| Tool | OpenClaw | Other Agents | Learning Curve |
+|------|----------|--------------|----------------|
+| **StandX Agent Toolkit** | 🟢 Native | 🟢 CLI = Universal | 🟢 Low |
+| Hummingbot | 🔴 Complex | 🔴 Complex | 🔴 High |
+| CCXT | 🟡 Wrapper needed | 🟡 Wrapper needed | 🟡 Medium |
+| Hyperliquid SDK | 🟡 Integration needed | 🟡 Integration needed | 🟡 Medium |
 
-- OpenClaw workflow examples
-- Strategy templates
-- Documentation improvements
-- Bug reports
+---
+
+## 🛡️ Safety Features
+
+- **Structured errors** - Agents can handle errors programmatically
+- **Dry-run mode** - Test without execution
+- **Confirmation controls** - `--confirm` / `--no-confirm`
+- **Rate limiting** - Built-in protection
+
+---
+
+## 📝 Philosophy
+
+**OpenClaw First** — We optimize for the best OpenClaw experience first.
+
+**Agent Native** — Every design decision prioritizes machine consumption over human readability.
+
+**Ecosystem Ready** — CLI is the universal interface. Works with any agent, today.
+
+**Future Proof** — MCP, SDKs, and advanced features come later. The foundation is solid.
 
 ---
 
@@ -352,6 +318,6 @@ MIT OR Apache-2.0
 
 ---
 
-**Built for OpenClaw. Powered by StandX.**
+**Built for the AI Trading era.**
 
-*Your agent's trading journey starts here.*
+*OpenClaw First. Agent Native. Ecosystem Ready.*
