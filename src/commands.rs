@@ -448,7 +448,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
 
     match command {
         StreamCommands::Depth { symbol, levels } => {
-            let _ = ws.subscribe("depth_book", Some(&symbol)).await;
+            let _ = ws.subscribe("depth", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming depth for {} (top {} levels)", symbol, levels);
@@ -485,7 +485,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Trades { symbol } => {
-            let _ = ws.subscribe("trade", Some(&symbol)).await;
+            let _ = ws.subscribe("trades", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming trades for {}", symbol);

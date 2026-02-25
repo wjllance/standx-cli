@@ -110,27 +110,26 @@ impl StandXWebSocket {
 
     /// Connect and start the WebSocket client
     pub async fn connect(&self) -> Result<mpsc::Receiver<WsMessage>> {
-        let (_tx, rx) = mpsc::channel(100);
+        let (tx, rx) = mpsc::channel(100);
 
         let url = self.url.clone();
         let token = self.token.clone();
         let state = self.state.clone();
         let subscriptions = self.subscriptions.clone();
-        let message_tx = self.message_tx.clone();
         let reconnect_attempts = self.reconnect_attempts.clone();
 
         tokio::spawn(async move {
             loop {
                 *state.write().await = WsState::Connecting;
 
-                match connect_and_run(&url, &token, &subscriptions, &message_tx).await {
+                match connect_and_run(&url, &token, &subscriptions, &tx).await {
                     Ok(_) => {
                         *reconnect_attempts.write().await = 0;
                     }
                     Err(e) => {
                         let attempts = *reconnect_attempts.read().await;
                         if attempts >= 5 {
-                            let _ = message_tx
+                            let _ = tx
                                 .send(WsMessage::Error(format!(
                                     "Max reconnection attempts reached: {}",
                                     e
@@ -172,14 +171,16 @@ impl StandXWebSocket {
 async fn connect_and_run(
     url: &str,
     token: &str,
-    _subscriptions: &Arc<RwLock<Vec<String>>>,
+    subscriptions: &Arc<RwLock<Vec<String>>>,
     message_tx: &mpsc::Sender<WsMessage>,
 ) -> Result<()> {
-    let ws_url = format!("{}?token={}", url, token);
+    let ws_url = url.to_string(); // Don't add token to URL
+    eprintln!("[WebSocket Debug] Connecting to: {}", ws_url);
 
     let (ws_stream, _) = connect_async(&ws_url)
         .await
         .map_err(|e| Error::Unknown(format!("WebSocket connect failed: {}", e)))?;
+    eprintln!("[WebSocket Debug] Connected successfully");
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -188,12 +189,48 @@ async fn connect_and_run(
         "op": "auth",
         "token": token
     });
+    eprintln!("[WebSocket Debug] Sending auth: {}", auth_msg);
     write
         .send(Message::Text(auth_msg.to_string().into()))
         .await
         .map_err(|e| Error::Unknown(format!("Failed to send auth: {}", e)))?;
+    eprintln!("[WebSocket Debug] Auth sent");
+
+    // Send subscription messages for all registered subscriptions
+    let subs = subscriptions.read().await;
+    eprintln!("[WebSocket Debug] Subscribing to {} topics", subs.len());
+
+    // Wait a bit for server to be ready
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    for topic in subs.iter() {
+        // Parse topic to get channel and symbol (format: "price:BTC-USD")
+        let parts: Vec<&str> = topic.split(':').collect();
+        let (channel, symbol) = if parts.len() == 2 {
+            (parts[0], parts[1])
+        } else {
+            (topic.as_str(), "")
+        };
+
+        let sub_msg = serde_json::json!({
+            "subscribe": {
+                "channel": channel,
+                "symbol": symbol
+            }
+        });
+        eprintln!("[WebSocket Debug] Sending subscribe: {}", sub_msg);
+        if let Err(e) = write.send(Message::Text(sub_msg.to_string().into())).await {
+            let _ = message_tx
+                .send(WsMessage::Error(format!(
+                    "Failed to subscribe to {}: {}",
+                    topic, e
+                )))
+                .await;
+        }
+    }
 
     let _ = message_tx.send(WsMessage::Connected).await;
+    eprintln!("[WebSocket Debug] Entering message loop");
 
     // Spawn heartbeat task
     let heartbeat_tx = message_tx.clone();
@@ -218,28 +255,58 @@ async fn connect_and_run(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
+                // Debug: print received message
+                eprintln!("[WebSocket Debug] Received: {}", text);
+
                 if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                    // Parse message based on type
-                    if let Some(msg_type) = data.get("type").and_then(|t| t.as_str()) {
-                        match msg_type {
-                            "price" => {
-                                if let Ok(price) = serde_json::from_value::<PriceData>(data) {
-                                    let _ = message_tx.send(WsMessage::Price(price)).await;
-                                }
-                            }
-                            "depth" => {
-                                if let Ok(depth) = serde_json::from_value::<OrderBook>(data) {
-                                    let _ = message_tx.send(WsMessage::Depth(depth)).await;
-                                }
-                            }
-                            "trade" => {
-                                if let Ok(trade) = serde_json::from_value::<Trade>(data) {
-                                    let _ = message_tx.send(WsMessage::Trade(trade)).await;
-                                }
-                            }
-                            _ => {}
+                    // Check for error response
+                    if let Some(code) = data.get("code").and_then(|c| c.as_i64()) {
+                        if code != 0 {
+                            let message = data
+                                .get("message")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("Unknown error");
+                            eprintln!("[WebSocket Debug] Server error: {}", message);
+                            continue;
                         }
                     }
+
+                    // Parse message based on channel field
+                    if let Some(channel) = data.get("channel").and_then(|c| c.as_str()) {
+                        eprintln!("[WebSocket Debug] Message channel: {}", channel);
+                        if let Some(data_obj) = data.get("data") {
+                            match channel {
+                                "price" => {
+                                    if let Ok(price) =
+                                        serde_json::from_value::<PriceData>(data_obj.clone())
+                                    {
+                                        let _ = message_tx.send(WsMessage::Price(price)).await;
+                                    }
+                                }
+                                "depth" => {
+                                    if let Ok(depth) =
+                                        serde_json::from_value::<OrderBook>(data_obj.clone())
+                                    {
+                                        let _ = message_tx.send(WsMessage::Depth(depth)).await;
+                                    }
+                                }
+                                "trades" => {
+                                    if let Ok(trade) =
+                                        serde_json::from_value::<Trade>(data_obj.clone())
+                                    {
+                                        let _ = message_tx.send(WsMessage::Trade(trade)).await;
+                                    }
+                                }
+                                _ => {
+                                    eprintln!("[WebSocket Debug] Unknown channel: {}", channel);
+                                }
+                            }
+                        }
+                    } else {
+                        eprintln!("[WebSocket Debug] No channel field in message");
+                    }
+                } else {
+                    eprintln!("[WebSocket Debug] Failed to parse JSON: {}", text);
                 }
             }
             Ok(Message::Ping(data)) => {
@@ -251,12 +318,23 @@ async fn connect_and_run(
             Ok(Message::Pong(_)) => {
                 let _ = message_tx.send(WsMessage::Heartbeat).await;
             }
-            Ok(Message::Close(_)) => {
+            Ok(Message::Close(frame)) => {
+                eprintln!("[WebSocket Debug] Connection closed: {:?}", frame);
                 let _ = message_tx.send(WsMessage::Disconnected).await;
                 break;
             }
             Err(e) => {
+                eprintln!("[WebSocket Debug] WebSocket error: {}", e);
                 return Err(Error::Unknown(format!("WebSocket error: {}", e)));
+            }
+            Ok(Message::Frame(_)) => {
+                eprintln!("[WebSocket Debug] Received frame");
+            }
+            Ok(Message::Binary(data)) => {
+                eprintln!(
+                    "[WebSocket Debug] Received binary data: {} bytes",
+                    data.len()
+                );
             }
             _ => {}
         }
