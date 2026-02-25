@@ -7,21 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Vision
-- **Repositioning**: From generic AI Agent Toolkit to OpenClaw-native trading companion
-- **Goal**: The seamless bridge between OpenClaw agents and StandX trading
-- **Focus**: CLI optimization for OpenClaw integration over MCP
+## [0.3.0] - 2026-02-26
 
 ### Added
-- New project positioning: "The native trading companion for OpenClaw agents"
-- OpenClaw-centric documentation and examples
-- Natural language to execution workflow examples
+- **New stream command structure** with 7 subcommands:
+  - `stream price <symbol>` - Public price ticker
+  - `stream depth <symbol>` - Public order book depth
+  - `stream trade <symbol>` - Public trades
+  - `stream order` - User order updates (authenticated)
+  - `stream position` - User position updates (authenticated)
+  - `stream balance` - User balance updates (authenticated)
+  - `stream fills` - User fill/trade updates (authenticated)
+- **Public channels without authentication** - price, depth, trade work without JWT
+- **Verbose mode for WebSocket** - use `-v` flag to show debug messages
+- **New WebSocket auth format** - `{ "auth": { "token": "Bearer ...", "streams": [...] } }`
+
+### Fixed
+- Fixed WebSocket channel names: `depth` → `depth_book`, `trades` → `public_trade`
+- Fixed Trade struct to support WebSocket `side` field
+- Fixed PriceData timestamp field mapping for WebSocket format
+- Fixed WebSocket message parsing for all public channels
 
 ### Changed
-- Updated README with OpenClaw-focused narrative
-- Updated Cargo.toml description and keywords
-- Simplified roadmap to focus on OpenClaw integration
-- Removed MCP-centric claims (may revisit later)
+- Split `stream account` into individual commands (order, position, balance, fills)
+- WebSocket debug messages only shown in verbose mode
+- Updated test report with 79% pass rate
 
 ## [0.2.0] - 2026-02-24
 
