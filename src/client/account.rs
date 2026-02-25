@@ -159,10 +159,12 @@ impl StandXClient {
         symbol: Option<&str>,
         limit: Option<u32>,
     ) -> Result<Vec<Order>> {
-        let url = format!("{}/api/query_order_history", self.base_url);
+        let url = format!("{}/api/query_orders", self.base_url);
         let headers = self.auth_headers()?;
 
         let mut query: Vec<(&str, String)> = vec![];
+        // status=filled means filled orders (history)
+        query.push(("status", "filled".to_string()));
         if let Some(s) = symbol {
             query.push(("symbol", s.to_string()));
         }
@@ -184,7 +186,7 @@ impl StandXClient {
             return Err(Error::Api {
                 code: status.as_u16(),
                 message: text,
-                endpoint: Some("/api/query_order_history".to_string()),
+                endpoint: Some("/api/query_orders".to_string()),
                 retryable: status.as_u16() >= 500,
             });
         }
