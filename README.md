@@ -16,7 +16,7 @@
 │   ✓ Native MCP (Model Context Protocol) support                 │
 │   ✓ Structured output by default                                │
 │   ✓ Non-interactive design for automation                       │
-│   ✓ Sub-100ms latency for real-time decisions                   │
+│   ✓ Efficient local execution for automation                   │
 │                                                                 │
 │   Give your AI Agent professional trading capabilities in       │
 │   5 minutes. No complex integration. Just works.                │
@@ -36,7 +36,6 @@
 | **Interaction Mode** | Interactive prompts | 100% scriptable |
 | **Error Handling** | Text messages | Structured JSON with error codes |
 | **Integration** | Shell scripts | MCP, SDK, WebSocket |
-| **Latency** | 200-500ms | <100ms |
 | **AI Context** | None | Native MCP tools |
 
 ### Built for AI Agent Workflows
@@ -273,10 +272,10 @@ skills = [StandXSkill()]
 
 | Metric | Value |
 |--------|-------|
-| **API Latency** | < 50ms (market data) |
-| **Order Execution** | < 100ms |
-| **WebSocket Latency** | < 10ms |
-| **MCP Tool Call** | < 20ms overhead |
+| **API Response** | ~50-100ms (market data) |
+| **Order Execution** | ~100-300ms |
+| **WebSocket Delivery** | ~10-50ms |
+| **MCP Tool Call** | ~20-50ms overhead |
 
 ---
 
