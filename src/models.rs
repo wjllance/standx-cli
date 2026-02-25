@@ -352,12 +352,10 @@ pub struct PositionConfig {
     pub symbol: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub leverage: String,
-    #[serde(deserialize_with = "string_or_number_to_string", default)]
+    #[serde(deserialize_with = "string_or_number_to_string")]
     pub max_leverage: String,
-    #[serde(deserialize_with = "string_or_number_to_string", default)]
+    #[serde(deserialize_with = "string_or_number_to_string")]
     pub def_leverage: String,
-    #[serde(default)]
-    pub margin_mode: String,
 }
 
 impl tabled::Tabled for PositionConfig {
