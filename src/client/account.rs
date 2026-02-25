@@ -116,8 +116,8 @@ impl StandXClient {
             });
         }
 
-        let wrapper = response.json::<ApiListResponse<Position>>().await?;
-        Ok(wrapper.result)
+        let data = response.json::<Vec<Position>>().await?;
+        Ok(data)
     }
 
     /// Get open orders
@@ -149,8 +149,8 @@ impl StandXClient {
             });
         }
 
-        let wrapper = response.json::<ApiListResponse<Order>>().await?;
-        Ok(wrapper.result)
+        let data = response.json::<Vec<Order>>().await?;
+        Ok(data)
     }
 
     /// Get order history
