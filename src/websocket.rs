@@ -37,20 +37,29 @@ pub enum WsMessage {
     Heartbeat,
 }
 
+/// Subscription target for a channel (and optional symbol)
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub channel: String,
+    pub symbol: Option<String>,
+}
+
+impl Subscription {
+    pub fn new(channel: &str, symbol: Option<&str>) -> Self {
+        Self {
+            channel: channel.to_string(),
+            symbol: symbol.map(String::from),
+        }
+    }
+}
+
 /// StandX WebSocket client
 pub struct StandXWebSocket {
     url: String,
     token: String,
     state: Arc<RwLock<WsState>>,
-    subscriptions: Arc<RwLock<Vec<String>>>,
-    message_tx: mpsc::Sender<WsMessage>,
-    #[allow(dead_code)]
-    message_rx: Arc<RwLock<mpsc::Receiver<WsMessage>>>,
+    subscriptions: Arc<RwLock<Vec<Subscription>>>,
     reconnect_attempts: Arc<RwLock<u32>>,
-    #[allow(dead_code)]
-    channel: String,
-    #[allow(dead_code)]
-    symbol: Option<String>,
 }
 
 impl StandXWebSocket {
@@ -66,18 +75,12 @@ impl StandXWebSocket {
             });
         }
 
-        let (message_tx, message_rx) = mpsc::channel(100);
-
         Ok(Self {
             url: DEFAULT_WS_URL.to_string(),
             token: creds.token,
             state: Arc::new(RwLock::new(WsState::Disconnected)),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
-            message_tx,
-            message_rx: Arc::new(RwLock::new(message_rx)),
             reconnect_attempts: Arc::new(RwLock::new(0)),
-            channel: String::new(),
-            symbol: None,
         })
     }
 
@@ -93,37 +96,30 @@ impl StandXWebSocket {
             });
         }
 
-        let (message_tx, message_rx) = mpsc::channel(100);
-
         Ok(Self {
             url,
             token: creds.token,
             state: Arc::new(RwLock::new(WsState::Disconnected)),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
-            message_tx,
-            message_rx: Arc::new(RwLock::new(message_rx)),
             reconnect_attempts: Arc::new(RwLock::new(0)),
-            channel: String::new(),
-            symbol: None,
         })
     }
 
-    /// Connect and start the WebSocket client
+    /// Connect and start the WebSocket client. Returns the receiver for stream messages.
     pub async fn connect(&self) -> Result<mpsc::Receiver<WsMessage>> {
-        let (_tx, rx) = mpsc::channel(100);
+        let (message_tx, message_rx) = mpsc::channel(100);
 
         let url = self.url.clone();
         let token = self.token.clone();
         let state = self.state.clone();
-        let subscriptions = self.subscriptions.clone();
-        let message_tx = self.message_tx.clone();
+        let subs: Vec<Subscription> = self.subscriptions.read().await.clone();
         let reconnect_attempts = self.reconnect_attempts.clone();
 
         tokio::spawn(async move {
             loop {
                 *state.write().await = WsState::Connecting;
 
-                match connect_and_run(&url, &token, &subscriptions, &message_tx).await {
+                match connect_and_run(&url, &token, &subs, &message_tx).await {
                     Ok(_) => {
                         *reconnect_attempts.write().await = 0;
                     }
@@ -148,18 +144,13 @@ impl StandXWebSocket {
             }
         });
 
-        Ok(rx)
+        Ok(message_rx)
     }
 
-    /// Subscribe to a channel
+    /// Subscribe to a channel (and optional symbol for market channels)
     pub async fn subscribe(&self, channel: &str, symbol: Option<&str>) -> Result<()> {
         let mut subs = self.subscriptions.write().await;
-        let topic = if let Some(sym) = symbol {
-            format!("{}:{}", channel, sym)
-        } else {
-            channel.to_string()
-        };
-        subs.push(topic);
+        subs.push(Subscription::new(channel, symbol));
         Ok(())
     }
 
@@ -172,21 +163,20 @@ impl StandXWebSocket {
 async fn connect_and_run(
     url: &str,
     token: &str,
-    _subscriptions: &Arc<RwLock<Vec<String>>>,
+    subscriptions: &[Subscription],
     message_tx: &mpsc::Sender<WsMessage>,
 ) -> Result<()> {
-    let ws_url = format!("{}?token={}", url, token);
-
-    let (ws_stream, _) = connect_async(&ws_url)
+    let (ws_stream, _) = connect_async(url)
         .await
         .map_err(|e| Error::Unknown(format!("WebSocket connect failed: {}", e)))?;
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send authentication
+    // Auth: API expects { "auth": { "token": "...", "streams": [...] } }
     let auth_msg = serde_json::json!({
-        "op": "auth",
-        "token": token
+        "auth": {
+            "token": token
+        }
     });
     write
         .send(Message::Text(auth_msg.to_string().into()))
@@ -195,7 +185,20 @@ async fn connect_and_run(
 
     let _ = message_tx.send(WsMessage::Connected).await;
 
-    // Spawn heartbeat task
+    // Subscribe to each channel
+    for sub in subscriptions {
+        let body: serde_json::Value = if let Some(ref sym) = sub.symbol {
+            serde_json::json!({ "subscribe": { "channel": sub.channel, "symbol": sym } })
+        } else {
+            serde_json::json!({ "subscribe": { "channel": sub.channel } })
+        };
+        write
+            .send(Message::Text(body.to_string().into()))
+            .await
+            .map_err(|e| Error::Unknown(format!("Failed to send subscribe: {}", e)))?;
+    }
+
+    // Spawn heartbeat task (respond to server ping with pong)
     let heartbeat_tx = message_tx.clone();
     let heartbeat_write = Arc::new(RwLock::new(write));
     let heartbeat_write_clone = heartbeat_write.clone();
@@ -214,27 +217,53 @@ async fn connect_and_run(
         }
     });
 
-    // Main message loop
+    // Main message loop: API responses are { "seq", "channel", "symbol"?, "data": { ... } }
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
-                    // Parse message based on type
-                    if let Some(msg_type) = data.get("type").and_then(|t| t.as_str()) {
-                        match msg_type {
+                if let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let channel = root.get("channel").and_then(|c| c.as_str());
+                    let data = root.get("data").cloned();
+
+                    if let (Some(ch), Some(d)) = (channel, data) {
+                        match ch {
                             "price" => {
-                                if let Ok(price) = serde_json::from_value::<PriceData>(data) {
+                                if let Ok(price) = serde_json::from_value::<PriceData>(d) {
                                     let _ = message_tx.send(WsMessage::Price(price)).await;
                                 }
                             }
-                            "depth" => {
-                                if let Ok(depth) = serde_json::from_value::<OrderBook>(data) {
+                            "depth_book" => {
+                                if let Ok(depth) = serde_json::from_value::<OrderBook>(d) {
                                     let _ = message_tx.send(WsMessage::Depth(depth)).await;
                                 }
                             }
-                            "trade" => {
-                                if let Ok(trade) = serde_json::from_value::<Trade>(data) {
+                            "public_trade" => {
+                                if let Ok(trade) = serde_json::from_value::<Trade>(d) {
                                     let _ = message_tx.send(WsMessage::Trade(trade)).await;
+                                }
+                            }
+                            "order" => {
+                                if let Ok(order) = serde_json::from_value::<Order>(d) {
+                                    let _ = message_tx.send(WsMessage::Order(order)).await;
+                                }
+                            }
+                            "position" => {
+                                if let Ok(pos) = serde_json::from_value::<Position>(d) {
+                                    let _ = message_tx.send(WsMessage::Position(pos)).await;
+                                }
+                            }
+                            "balance" => {
+                                if let Ok(bal) = serde_json::from_value::<Balance>(d) {
+                                    let _ = message_tx.send(WsMessage::Balance(bal)).await;
+                                }
+                            }
+                            "auth" => {
+                                // Auth response e.g. { "code": 200, "msg": "success" }
+                                if let Some(code) = d.get("code").and_then(|c| c.as_i64()) {
+                                    if code != 200 {
+                                        let msg = d.get("msg").and_then(|m| m.as_str()).unwrap_or("auth failed");
+                                        let _ = message_tx.send(WsMessage::Error(msg.to_string())).await;
+                                    }
                                 }
                             }
                             _ => {}
@@ -272,5 +301,14 @@ mod tests {
     #[test]
     fn test_ws_state() {
         assert_ne!(WsState::Connected, WsState::Disconnected);
+    }
+
+    #[test]
+    fn test_subscription_new() {
+        let s = Subscription::new("price", Some("BTC-USD"));
+        assert_eq!(s.channel, "price");
+        assert_eq!(s.symbol.as_deref(), Some("BTC-USD"));
+        let s2 = Subscription::new("order", None);
+        assert_eq!(s2.symbol, None);
     }
 }

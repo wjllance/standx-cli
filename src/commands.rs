@@ -467,7 +467,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Trades { symbol } => {
-            let _ = ws.subscribe("trade", Some(&symbol)).await;
+            let _ = ws.subscribe("public_trade", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming trades for {}", symbol);
