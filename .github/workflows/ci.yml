@@ -95,6 +95,9 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
+        env:
+          RUSTFLAGS: "-C linker=aarch64-linux-gnu-gcc"
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Upload binary
