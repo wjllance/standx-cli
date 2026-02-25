@@ -243,7 +243,7 @@ impl StandXClient {
     /// Get position config (includes leverage)
     pub async fn get_position_config(&self, symbol: &str) -> Result<crate::models::PositionConfig> {
         let url = format!("{}/api/query_position_config", self.base_url);
-        let headers = self.auth_headers()?;
+        let headers = self.build_auth_headers(None).await?;
 
         let response = self
             .client

@@ -136,6 +136,7 @@ pub async fn handle_leverage(command: LeverageCommands, output_format: OutputFor
                         leverage: symbol_info.def_leverage.clone(),
                         max_leverage: symbol_info.max_leverage.clone(),
                         def_leverage: symbol_info.def_leverage,
+                        margin_mode: "cross".to_string(),
                     };
 
                     match output_format {
@@ -203,28 +204,15 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
                     }
                 }
             } else {
-                // Get margin mode (fallback to position info)
-                match client.get_position_config(&symbol).await {
-                    Ok(config) => {
-                        println!(
-                            "Margin mode for {}: cross (leverage: {}x)",
-                            symbol, config.leverage
-                        );
-                    }
-                    Err(_) => {
-                        // Fallback: get from symbol info
-                        let symbol_info = client
-                            .get_symbol_info()
-                            .await?
-                            .into_iter()
-                            .find(|s| s.symbol == symbol)
-                            .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
-                        println!(
-                            "Margin mode for {}: cross (default leverage: {}x)",
-                            symbol, symbol_info.def_leverage
-                        );
-                    }
-                }
+                // Get margin mode from position config
+                let config = client.get_position_config(&symbol).await?;
+                let mode = if config.margin_mode.is_empty() {
+                    "cross"
+                } else {
+                    &config.margin_mode
+                };
+                println!("Margin mode for {}: {} (leverage: {}x)", 
+                    symbol, mode, config.leverage);
             }
         }
     }
