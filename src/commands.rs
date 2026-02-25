@@ -367,7 +367,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
 
     match command {
         StreamCommands::Depth { symbol, levels } => {
-            ws.subscribe("depth_book", Some(&symbol)).await;
+            let _ = ws.subscribe("depth_book", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming depth for {} (top {} levels)", symbol, levels);
@@ -388,7 +388,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Ticker { symbol } => {
-            ws.subscribe("price", Some(&symbol)).await;
+            let _ = ws.subscribe("price", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming ticker for {}", symbol);
@@ -404,7 +404,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Trades { symbol } => {
-            ws.subscribe("trade", Some(&symbol)).await;
+            let _ = ws.subscribe("trade", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming trades for {}", symbol);
@@ -421,9 +421,9 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Account => {
-            ws.subscribe("position", None).await;
-            ws.subscribe("balance", None).await;
-            ws.subscribe("order", None).await;
+            let _ = ws.subscribe("position", None).await;
+            let _ = ws.subscribe("balance", None).await;
+            let _ = ws.subscribe("order", None).await;
             let mut rx = ws.connect().await?;
 
             println!("Streaming account updates");
