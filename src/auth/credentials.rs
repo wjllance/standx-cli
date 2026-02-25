@@ -4,6 +4,10 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Environment variable names
+pub const ENV_JWT_TOKEN: &str = "STANDX_JWT";
+pub const ENV_PRIVATE_KEY: &str = "STANDX_PRIVATE_KEY";
+
 /// Stored credentials
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
@@ -30,6 +34,60 @@ impl Credentials {
             created_at: chrono::Utc::now().timestamp(),
             validity_seconds: 7 * 24 * 60 * 60, // 7 days
         }
+    }
+
+    /// Load credentials from environment variables or file
+    /// Priority: Environment variables > File storage
+    pub fn load() -> Result<Self> {
+        // First, try to load from environment variables
+        if let Ok(creds) = Self::from_env() {
+            return Ok(creds);
+        }
+
+        // Fall back to file storage
+        Self::from_file()
+    }
+
+    /// Load credentials from environment variables
+    pub fn from_env() -> Result<Self> {
+        let token = std::env::var(ENV_JWT_TOKEN)
+            .map_err(|_| Error::AuthRequired {
+                message: "Environment variable STANDX_JWT not set".to_string(),
+                resolution: "Set STANDX_JWT environment variable or run 'standx auth login'".to_string(),
+            })?;
+
+        let private_key = std::env::var(ENV_PRIVATE_KEY).unwrap_or_default();
+
+        // Environment credentials don't have expiration tracking
+        // Assume they're managed externally
+        Ok(Self {
+            token,
+            private_key,
+            created_at: chrono::Utc::now().timestamp(),
+            validity_seconds: 365 * 24 * 60 * 60, // 1 year (effectively no expiration for env vars)
+        })
+    }
+
+    /// Load credentials from file storage
+    fn from_file() -> Result<Self> {
+        let file_path = Self::credentials_file()?;
+
+        if !file_path.exists() {
+            return Err(Error::AuthRequired {
+                message: "No credentials found".to_string(),
+                resolution: "Set STANDX_JWT environment variable or run 'standx auth login'".to_string(),
+            });
+        }
+
+        let encrypted = std::fs::read(&file_path)
+            .map_err(|e| Error::Config(format!("Failed to read credentials: {}", e)))?;
+
+        let json = Self::xor_decrypt(&encrypted);
+
+        let credentials: Credentials = serde_json::from_str(&json)
+            .map_err(|e| Error::Config(format!("Failed to parse credentials: {}", e)))?;
+
+        Ok(credentials)
     }
 
     /// Check if token is expired
@@ -97,25 +155,6 @@ impl Credentials {
         Ok(())
     }
 
-    /// Load credentials from file
-    pub fn load() -> Result<Self> {
-        let file_path = Self::credentials_file()?;
-
-        if !file_path.exists() {
-            return Err(Error::AuthRequired);
-        }
-
-        let encrypted = std::fs::read(&file_path)
-            .map_err(|e| Error::Config(format!("Failed to read credentials: {}", e)))?;
-
-        let json = Self::xor_decrypt(&encrypted);
-
-        let credentials: Credentials = serde_json::from_str(&json)
-            .map_err(|e| Error::Config(format!("Failed to parse credentials: {}", e)))?;
-
-        Ok(credentials)
-    }
-
     /// Delete stored credentials
     pub fn delete() -> Result<()> {
         let file_path = Self::credentials_file()?;
@@ -128,11 +167,24 @@ impl Credentials {
         Ok(())
     }
 
-    /// Check if credentials exist
+    /// Check if credentials exist (in file or environment)
     pub fn exists() -> bool {
+        // Check environment first
+        if std::env::var(ENV_JWT_TOKEN).is_ok() {
+            return true;
+        }
+        // Then check file
         Self::credentials_file()
             .map(|p| p.exists())
             .unwrap_or(false)
+    }
+
+    /// Check if credentials are from environment variables
+    pub fn is_from_env(&self) -> bool {
+        // If created_at is very recent (within last second), likely from env
+        // This is a heuristic - env credentials are created on each load
+        let now = chrono::Utc::now().timestamp();
+        now - self.created_at < 2
     }
 
     /// Simple XOR encryption (for basic protection)
@@ -204,5 +256,29 @@ mod tests {
 
         assert_eq!(original, decrypted);
         assert_ne!(encrypted, original.as_bytes());
+    }
+
+    #[test]
+    fn test_from_env() {
+        // Set environment variables
+        std::env::set_var(ENV_JWT_TOKEN, "env_test_token");
+        std::env::set_var(ENV_PRIVATE_KEY, "env_test_key");
+
+        let creds = Credentials::from_env().unwrap();
+        assert_eq!(creds.token, "env_test_token");
+        assert_eq!(creds.private_key, "env_test_key");
+
+        // Clean up
+        std::env::remove_var(ENV_JWT_TOKEN);
+        std::env::remove_var(ENV_PRIVATE_KEY);
+    }
+
+    #[test]
+    fn test_from_env_missing() {
+        // Ensure env vars are not set
+        std::env::remove_var(ENV_JWT_TOKEN);
+
+        let result = Credentials::from_env();
+        assert!(result.is_err());
     }
 }

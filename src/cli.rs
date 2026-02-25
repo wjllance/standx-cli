@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(name = "standx")]
-#[command(about = "A CLI tool for StandX perpetual DEX")]
+#[command(about = "OpenClaw-first AI Agent trading toolkit")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
     #[command(subcommand)]
@@ -23,6 +23,18 @@ pub struct Cli {
     /// Quiet mode
     #[arg(short, long, global = true)]
     pub quiet: bool,
+
+    /// OpenClaw mode - optimized for AI Agent execution
+    #[arg(long, global = true, env = "STANDX_OPENCLAW_MODE")]
+    pub openclaw: bool,
+
+    /// Dry run - show what would be executed without executing
+    #[arg(long, global = true)]
+    pub dry_run: bool,
+
+    /// Auto-confirm dangerous operations (skip prompts)
+    #[arg(long, global = true, env = "STANDX_AUTO_CONFIRM")]
+    pub yes: bool,
 }
 
 #[derive(Subcommand, Debug)]
