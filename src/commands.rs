@@ -211,8 +211,10 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
                 } else {
                     &config.margin_mode
                 };
-                println!("Margin mode for {}: {} (leverage: {}x)", 
-                    symbol, mode, config.leverage);
+                println!(
+                    "Margin mode for {}: {} (leverage: {}x)",
+                    symbol, mode, config.leverage
+                );
             }
         }
     }
