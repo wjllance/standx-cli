@@ -129,7 +129,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
 }
 
 /// Print error in appropriate format
-fn print_error(error: &dyn std::error::Error, output: OutputFormat) {
+fn print_error(error: &Box<dyn std::error::Error>, output: OutputFormat) {
     match output {
         OutputFormat::Json => {
             // Try to convert to our Error type for structured output

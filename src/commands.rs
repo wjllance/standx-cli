@@ -374,7 +374,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::DepthBook { data, .. } = msg {
+                if let WsMessage::Depth(data) = msg {
                     println!("\n=== Order Book: {} ===", data.symbol);
                     println!("Asks:");
                     for ask in data.asks.iter().take(levels) {
@@ -395,7 +395,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::Price { data } = msg {
+                if let WsMessage::Price(data) = msg {
                     println!(
                         "{} | Mark: {} | Index: {} | Last: {}",
                         data.time, data.mark_price, data.index_price, data.last_price
@@ -411,7 +411,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::Trade { data } = msg {
+                if let WsMessage::Trade(data) = msg {
                     let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
                     println!(
                         "{} | {} | Price: {} | Qty: {}",
@@ -431,13 +431,13 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
 
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    WsMessage::Position { data } => {
+                    WsMessage::Position(data) => {
                         println!("Position update: {}", serde_json::to_string(&data)?);
                     }
-                    WsMessage::Balance { data } => {
+                    WsMessage::Balance(data) => {
                         println!("Balance update: {}", serde_json::to_string(&data)?);
                     }
-                    WsMessage::Order { data } => {
+                    WsMessage::Order(data) => {
                         println!("Order update: {}", serde_json::to_string(&data)?);
                     }
                     _ => {}
