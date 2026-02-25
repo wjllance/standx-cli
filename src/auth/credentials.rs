@@ -277,6 +277,10 @@ mod tests {
     fn test_from_env_missing() {
         // Ensure env vars are not set
         std::env::remove_var(ENV_JWT_TOKEN);
+        std::env::remove_var(ENV_PRIVATE_KEY);
+        
+        // Ensure no credentials file exists
+        let _ = Credentials::delete();
 
         let result = Credentials::from_env();
         assert!(result.is_err());
