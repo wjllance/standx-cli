@@ -29,7 +29,7 @@ async fn main() {
         match handle_dry_run(&cli.command, output).await {
             Ok(_) => std::process::exit(0),
             Err(e) => {
-                print_error(e, output);
+                print_error(&e, output);
                 std::process::exit(1);
             }
         }
@@ -42,47 +42,51 @@ async fn main() {
         cli.output
     };
 
-    // Execute command
-    let result = match cli.command {
+    // Execute command and handle errors
+    match execute_command(cli.command, output).await {
+        Ok(_) => {}
+        Err(e) => {
+            print_error(&e, output);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Execute the command, converting anyhow errors to our Error type
+async fn execute_command(command: Commands, output: OutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         Commands::Config { command } => {
-            commands::handle_config(command).await
+            commands::handle_config(command).await?;
         }
         Commands::Auth { command } => {
-            commands::handle_auth(command).await
+            commands::handle_auth(command).await?;
         }
         Commands::Market { command } => {
-            commands::handle_market(command, output).await
+            commands::handle_market(command, output).await?;
         }
         Commands::Account { command } => {
-            commands::handle_account(command, output).await
+            commands::handle_account(command, output).await?;
         }
         Commands::Order { command } => {
-            commands::handle_order(command).await
+            commands::handle_order(command).await?;
         }
         Commands::Trade { command } => {
             tracing::info!("Trade command: {:?}", command);
             println!("Trade command not yet implemented");
-            Ok(())
         }
         Commands::Leverage { command } => {
             tracing::info!("Leverage command: {:?}", command);
             println!("Leverage command not yet implemented");
-            Ok(())
         }
         Commands::Margin { command } => {
             tracing::info!("Margin command: {:?}", command);
             println!("Margin command not yet implemented");
-            Ok(())
         }
         Commands::Stream { command } => {
-            commands::handle_stream(command).await
+            commands::handle_stream(command).await?;
         }
-    };
-
-    if let Err(e) = result {
-        print_error(e, output);
-        std::process::exit(1);
     }
+    Ok(())
 }
 
 /// Handle dry run mode - show what would be executed
@@ -125,16 +129,26 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
 }
 
 /// Print error in appropriate format
-fn print_error(error: standx_cli::Error, output: OutputFormat) {
+fn print_error(error: &dyn std::error::Error, output: OutputFormat) {
     match output {
         OutputFormat::Json => {
-            eprintln!("{}", serde_json::to_string_pretty(&error.to_json()).unwrap());
+            // Try to convert to our Error type for structured output
+            if let Some(standx_err) = error.downcast_ref::<standx_cli::Error>() {
+                eprintln!("{}", serde_json::to_string_pretty(&standx_err.to_json()).unwrap());
+            } else {
+                // Fallback for other error types
+                let error_json = serde_json::json!({
+                    "error": {
+                        "error_type": "UNKNOWN_ERROR",
+                        "message": error.to_string()
+                    },
+                    "timestamp": chrono::Utc::now().to_rfc3339()
+                });
+                eprintln!("{}", serde_json::to_string_pretty(&error_json).unwrap());
+            }
         }
         _ => {
             eprintln!("❌ Error: {}", error);
-            if let Some(action) = error.suggested_action() {
-                eprintln!("💡 Suggested action: {}", action);
-            }
         }
     }
 }
