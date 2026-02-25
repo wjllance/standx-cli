@@ -15,7 +15,8 @@
 | Part 3 | Auth & Account | 6 | 6 | 0 | 100% |
 | Part 4 | Orders & Trading | 8 | 5 | 3 | 63% |
 | Part 5 | Streaming Data | 7 | 6 | 1 | 86% |
-| **Total** | | **38** | **30** | **8** | **79%** |
+| Part 6 | Special Features | 6 | 5 | 1 | 83% |
+| **Total** | | **44** | **35** | **9** | **80%** |
 
 ---
 
@@ -157,6 +158,52 @@ standx stream fills
 
 ---
 
+## Part 6: Special Features
+
+### ✅ Passed Tests
+
+| Test | Command | Result |
+|------|---------|--------|
+| OpenClaw mode | `--openclaw market ticker BTC-USD` | JSON output, AI-optimized |
+| OpenClaw + dry-run | `--openclaw --dry-run order create` | Combined flags work |
+| Dry run (table) | `--dry-run order create` | Shows warning for order commands |
+| Dry run (JSON) | `-o json --dry-run order create` | Structured JSON output |
+| Dry run market | `--dry-run market ticker` | Shows safe to execute |
+
+### ⚠️ Partial Tests
+
+| Test | Command | Result | Note |
+|------|---------|--------|------|
+| Auto-confirm flag | `--yes` | ✅ Flag exists | Not integrated with interactive prompts |
+| Environment variable | `STANDX_AUTO_CONFIRM=true` | ✅ Recognized | No interactive prompts to skip currently |
+
+### Feature Details
+
+#### `--openclaw` Mode
+- Forces JSON output regardless of `-o` setting
+- Optimized for AI Agent consumption
+- Example: `standx --openclaw market ticker BTC-USD`
+
+#### `--dry-run` Mode
+- Shows what would be executed without making changes
+- Warns about financial impact for order/leverage/margin commands
+- Safe commands (market, account, trade) marked as "read-only"
+- Works with all output formats (table, json)
+
+#### `--yes` / `STANDX_AUTO_CONFIRM`
+- Flag exists and is parsed
+- Environment variable supported
+- Currently no interactive prompts in CLI (all commands are non-interactive)
+- Reserved for future use when confirmation prompts are added
+
+### ⚠️ Issues
+
+| Issue | Description | Status |
+|-------|-------------|--------|
+| ISSUE-6.1 | `--yes` flag not integrated (no prompts to skip) | 🟡 Low Priority |
+
+---
+
 ## Issue Summary
 
 ### Pending Issues
@@ -171,6 +218,7 @@ standx stream fills
 | ISSUE-4.2 | Leverage functions not implemented | Medium |
 | ISSUE-4.3 | Margin functions not implemented | Low |
 | ISSUE-5.1 | User auth channel token issue | Medium |
+| ISSUE-6.1 | `--yes` flag not integrated (no prompts to skip) | Low |
 
 ### Fixed Issues
 
@@ -198,6 +246,9 @@ standx stream fills
 | Trade history | ⚠️ Not implemented | trade history |
 | Leverage management | ⚠️ Not implemented | leverage get/set |
 | Margin management | ⚠️ Not implemented | margin transfer/mode |
+| OpenClaw mode | ✅ Complete | JSON output, AI-optimized |
+| Dry run mode | ✅ Complete | Preview before execute |
+| Auto-confirm | ⚠️ Partial | `--yes` flag exists, not fully integrated |
 
 ---
 
