@@ -137,32 +137,4 @@ impl StandXClient {
 
         Ok(())
     }
-
-    /// Query current position config (leverage + margin mode) for a symbol
-    pub async fn get_position_config(&self, symbol: &str) -> Result<PositionConfig> {
-        let url = format!("{}/api/query_position_config", self.base_url);
-        let headers = self.margin_auth_headers()?;
-
-        let response = self
-            .client
-            .get(&url)
-            .headers(headers)
-            .query(&[("symbol", symbol)])
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(Error::Api {
-                code: status.as_u16(),
-                message: text,
-                endpoint: Some("/api/query_position_config".to_string()),
-                retryable: status.as_u16() >= 500,
-            });
-        }
-
-        let data = response.json::<PositionConfig>().await?;
-        Ok(data)
-    }
 }

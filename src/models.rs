@@ -428,31 +428,6 @@ impl tabled::Tabled for Balance {
     }
 }
 
-/// Position configuration (leverage + margin mode)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PositionConfig {
-    pub symbol: String,
-    #[serde(deserialize_with = "string_or_number_to_string")]
-    pub leverage: String,
-    pub margin_mode: String,
-}
-
-impl tabled::Tabled for PositionConfig {
-    const LENGTH: usize = 3;
-
-    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
-        vec![
-            self.symbol.clone().into(),
-            self.leverage.clone().into(),
-            self.margin_mode.clone().into(),
-        ]
-    }
-
-    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
-        vec!["Symbol".into(), "Leverage".into(), "Margin Mode".into()]
-    }
-}
-
 /// API response wrapper
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiResponse<T> {
