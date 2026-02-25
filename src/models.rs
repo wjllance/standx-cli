@@ -341,6 +341,40 @@ impl tabled::Tabled for Position {
     }
 }
 
+/// Position configuration (leverage settings)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PositionConfig {
+    pub symbol: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub leverage: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub max_leverage: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub def_leverage: String,
+}
+
+impl tabled::Tabled for PositionConfig {
+    const LENGTH: usize = 4;
+
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.symbol.clone().into(),
+            self.leverage.clone().into(),
+            self.max_leverage.clone().into(),
+            self.def_leverage.clone().into(),
+        ]
+    }
+
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Symbol".into(),
+            "Current Leverage".into(),
+            "Max Leverage".into(),
+            "Default Leverage".into(),
+        ]
+    }
+}
+
 /// Account balance
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Balance {

@@ -1,10 +1,8 @@
 //! Order API client methods
 
-use crate::auth::{Credentials, StandXSigner};
 use crate::client::StandXClient;
 use crate::error::{Error, Result};
 use crate::models::{Order, OrderSide, OrderType, TimeInForce};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::json;
 
 /// Order request parameters
@@ -41,62 +39,6 @@ impl Default for CreateOrderParams {
 
 /// Order API methods
 impl StandXClient {
-    /// Build authenticated headers with optional request signing
-    async fn build_auth_headers(&self, payload: Option<&str>) -> Result<HeaderMap> {
-        let creds = Credentials::load()?;
-
-        if creds.is_expired() {
-            return Err(Error::AuthRequired {
-                message: "Token expired".to_string(),
-                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable"
-                    .to_string(),
-            });
-        }
-
-        let mut headers = HeaderMap::new();
-
-        // Authorization header with JWT
-        let auth_value = format!("Bearer {}", creds.token);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).map_err(|e| Error::Api {
-                code: 500,
-                message: e.to_string(),
-                endpoint: None,
-                retryable: false,
-            })?,
-        );
-
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        // Add request signature if private key is available
-        if !creds.private_key.is_empty() {
-            if let Ok(signer) = StandXSigner::from_base58(&creds.private_key) {
-                let payload_str = payload.unwrap_or("");
-                let signature = signer.sign_request_now(payload_str);
-
-                headers.insert(
-                    "x-request-sign-version",
-                    HeaderValue::from_str(&signature.version).unwrap(),
-                );
-                headers.insert(
-                    "x-request-id",
-                    HeaderValue::from_str(&signature.request_id).unwrap(),
-                );
-                headers.insert(
-                    "x-request-timestamp",
-                    HeaderValue::from_str(&signature.timestamp.to_string()).unwrap(),
-                );
-                headers.insert(
-                    "x-request-signature",
-                    HeaderValue::from_str(&signature.signature).unwrap(),
-                );
-            }
-        }
-
-        Ok(headers)
-    }
-
     /// Create a new order
     pub async fn create_order(&self, params: CreateOrderParams) -> Result<Order> {
         let url = format!("{}/api/new_order", self.base_url);

@@ -237,6 +237,68 @@ impl StandXClient {
         let wrapper = response.json::<ApiListResponse<crate::models::Trade>>().await?;
         Ok(wrapper.result)
     }
+
+    /// Get position config (includes leverage)
+    pub async fn get_position_config(&self, symbol: &str) -> Result<crate::models::PositionConfig> {
+        let url = format!("{}/api/query_position_config", self.base_url);
+        let headers = self.auth_headers()?;
+
+        let response = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&[("symbol", symbol)])
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/api/query_position_config".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        let data = response.json::<crate::models::PositionConfig>().await?;
+        Ok(data)
+    }
+
+    /// Change leverage for a symbol
+    pub async fn change_leverage(&self, symbol: &str, leverage: u32) -> Result<()> {
+        let url = format!("{}/api/change_leverage", self.base_url);
+
+        let body = serde_json::json!({
+            "symbol": symbol,
+            "leverage": leverage,
+        });
+        let body_str = body.to_string();
+
+        let headers = self.build_auth_headers(Some(&body_str)).await?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(body_str)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/api/change_leverage".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

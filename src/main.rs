@@ -78,8 +78,7 @@ async fn execute_command(
             commands::handle_trade(command, output).await?;
         }
         Commands::Leverage { command } => {
-            tracing::info!("Leverage command: {:?}", command);
-            println!("Leverage command not yet implemented");
+            commands::handle_leverage(command, output).await?;
         }
         Commands::Margin { command } => {
             tracing::info!("Margin command: {:?}", command);

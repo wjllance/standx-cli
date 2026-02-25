@@ -3,8 +3,10 @@
 pub mod account;
 pub mod order;
 
+use crate::auth::{Credentials, StandXSigner};
 use crate::error::{Error, Result};
 use crate::models::*;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, ClientBuilder};
 use std::time::Duration;
 
@@ -45,6 +47,64 @@ impl StandXClient {
     /// Get the base URL
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Build authenticated headers with optional request signing
+    pub async fn build_auth_headers(&self,
+        payload: Option<&str>,
+    ) -> Result<HeaderMap> {
+        let creds = Credentials::load()?;
+
+        if creds.is_expired() {
+            return Err(Error::AuthRequired {
+                message: "Token expired".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable"
+                    .to_string(),
+            });
+        }
+
+        let mut headers = HeaderMap::new();
+
+        // Authorization header with JWT
+        let auth_value = format!("Bearer {}", creds.token);
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&auth_value).map_err(|e| Error::Api {
+                code: 500,
+                message: e.to_string(),
+                endpoint: None,
+                retryable: false,
+            })?,
+        );
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        // Add request signature if private key is available
+        if !creds.private_key.is_empty() {
+            if let Ok(signer) = StandXSigner::from_base58(&creds.private_key) {
+                let payload_str = payload.unwrap_or("");
+                let signature = signer.sign_request_now(payload_str);
+
+                headers.insert(
+                    "x-request-sign-version",
+                    HeaderValue::from_str(&signature.version).unwrap(),
+                );
+                headers.insert(
+                    "x-request-id",
+                    HeaderValue::from_str(&signature.request_id).unwrap(),
+                );
+                headers.insert(
+                    "x-request-timestamp",
+                    HeaderValue::from_str(&signature.timestamp.to_string()).unwrap(),
+                );
+                headers.insert(
+                    "x-request-signature",
+                    HeaderValue::from_str(&signature.signature).unwrap(),
+                );
+            }
+        }
+
+        Ok(headers)
     }
 
     // ==================== Public API ====================
