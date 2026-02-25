@@ -299,6 +299,79 @@ impl StandXClient {
 
         Ok(())
     }
+
+    /// Change margin mode for a symbol
+    pub async fn change_margin_mode(&self, symbol: &str, mode: &str) -> Result<()> {
+        let url = format!("{}/api/change_margin_mode", self.base_url);
+
+        let body = serde_json::json!({
+            "symbol": symbol,
+            "margin_mode": mode,
+        });
+        let body_str = body.to_string();
+
+        let headers = self.build_auth_headers(Some(&body_str)).await?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(body_str)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/api/change_margin_mode".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Transfer margin for a symbol
+    pub async fn transfer_margin(
+        &self,
+        symbol: &str,
+        amount: &str,
+        _direction: &str,
+    ) -> Result<()> {
+        let url = format!("{}/api/transfer_margin", self.base_url);
+
+        let body = serde_json::json!({
+            "symbol": symbol,
+            "amount_in": amount,
+        });
+        let body_str = body.to_string();
+
+        let headers = self.build_auth_headers(Some(&body_str)).await?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(body_str)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/api/transfer_margin".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

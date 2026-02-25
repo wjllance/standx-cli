@@ -165,6 +165,67 @@ pub async fn handle_leverage(command: LeverageCommands, output_format: OutputFor
     Ok(())
 }
 
+/// Handle margin commands
+pub async fn handle_margin(command: MarginCommands) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        MarginCommands::Transfer {
+            symbol,
+            amount,
+            direction,
+        } => {
+            match client.transfer_margin(&symbol, &amount, &direction).await {
+                Ok(_) => {
+                    println!(
+                        "✅ Margin transferred for {}: {} (direction: {})",
+                        symbol, amount, direction
+                    );
+                }
+                Err(e) => {
+                    println!("⚠️  Margin transfer failed");
+                    println!("   Symbol: {}", symbol);
+                    println!("   Amount: {}", amount);
+                    println!("   Direction: {}", direction);
+                    println!("   Error: {}", e);
+                }
+            }
+        }
+        MarginCommands::Mode { symbol, set } => {
+            if let Some(mode) = set {
+                // Set margin mode
+                match client.change_margin_mode(&symbol, &mode).await {
+                    Ok(_) => println!("✅ Margin mode for {} set to {}", symbol, mode),
+                    Err(e) => {
+                        println!("⚠️  Margin mode change failed");
+                        println!("   Symbol: {}", symbol);
+                        println!("   Mode: {}", mode);
+                        println!("   Error: {}", e);
+                    }
+                }
+            } else {
+                // Get margin mode (fallback to position info)
+                match client.get_position_config(&symbol).await {
+                    Ok(config) => {
+                        println!("Margin mode for {}: {} (leverage: {}x)", 
+                            symbol, "cross", config.leverage);
+                    }
+                    Err(_) => {
+                        // Fallback: get from symbol info
+                        let symbol_info = client.get_symbol_info().await?
+                            .into_iter()
+                            .find(|s| s.symbol == symbol)
+                            .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
+                        println!("Margin mode for {}: {} (default leverage: {}x)",
+                            symbol, "cross", symbol_info.def_leverage);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handle account commands
 pub async fn handle_account(command: AccountCommands, output_format: OutputFormat) -> Result<()> {
     let client = StandXClient::new()?;
