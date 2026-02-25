@@ -75,8 +75,7 @@ async fn execute_command(
             commands::handle_order(command).await?;
         }
         Commands::Trade { command } => {
-            tracing::info!("Trade command: {:?}", command);
-            println!("Trade command not yet implemented");
+            commands::handle_trade(command, output).await?;
         }
         Commands::Leverage { command } => {
             tracing::info!("Leverage command: {:?}", command);

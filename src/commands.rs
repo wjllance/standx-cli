@@ -84,6 +84,30 @@ pub async fn handle_order(command: OrderCommands) -> Result<()> {
     Ok(())
 }
 
+/// Handle trade commands
+pub async fn handle_trade(command: TradeCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        TradeCommands::History {
+            symbol,
+            from,
+            to,
+            limit,
+        } => {
+            let trades = client.get_user_trades(&symbol, from, to, limit).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(trades)),
+                OutputFormat::Json => println!("{}", output::format_json(&trades)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&trades)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handle account commands
 pub async fn handle_account(command: AccountCommands, output_format: OutputFormat) -> Result<()> {
     let client = StandXClient::new()?;

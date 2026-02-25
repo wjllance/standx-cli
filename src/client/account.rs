@@ -194,6 +194,49 @@ impl StandXClient {
         let wrapper = response.json::<ApiListResponse<Order>>().await?;
         Ok(wrapper.result)
     }
+
+    /// Get user trade history
+    pub async fn get_user_trades(
+        &self,
+        symbol: &str,
+        from: i64,
+        to: i64,
+        limit: Option<u32>,
+    ) -> Result<Vec<crate::models::Trade>> {
+        let url = format!("{}/api/query_trades", self.base_url);
+        let headers = self.auth_headers()?;
+
+        let mut query: Vec<(&str, String)> = vec![
+            ("symbol", symbol.to_string()),
+            ("from", from.to_string()),
+            ("to", to.to_string()),
+        ];
+        if let Some(l) = limit {
+            query.push(("limit", l.to_string()));
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&query)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/api/query_trades".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        let wrapper = response.json::<ApiListResponse<crate::models::Trade>>().await?;
+        Ok(wrapper.result)
+    }
 }
 
 #[cfg(test)]
