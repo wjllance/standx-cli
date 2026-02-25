@@ -50,11 +50,11 @@ impl Credentials {
 
     /// Load credentials from environment variables
     pub fn from_env() -> Result<Self> {
-        let token = std::env::var(ENV_JWT_TOKEN)
-            .map_err(|_| Error::AuthRequired {
-                message: "Environment variable STANDX_JWT not set".to_string(),
-                resolution: "Set STANDX_JWT environment variable or run 'standx auth login'".to_string(),
-            })?;
+        let token = std::env::var(ENV_JWT_TOKEN).map_err(|_| Error::AuthRequired {
+            message: "Environment variable STANDX_JWT not set".to_string(),
+            resolution: "Set STANDX_JWT environment variable or run 'standx auth login'"
+                .to_string(),
+        })?;
 
         let private_key = std::env::var(ENV_PRIVATE_KEY).unwrap_or_default();
 
@@ -75,17 +75,20 @@ impl Credentials {
         if !file_path.exists() {
             return Err(Error::AuthRequired {
                 message: "No credentials found".to_string(),
-                resolution: "Set STANDX_JWT environment variable or run 'standx auth login'".to_string(),
+                resolution: "Set STANDX_JWT environment variable or run 'standx auth login'"
+                    .to_string(),
             });
         }
 
-        let encrypted = std::fs::read(&file_path)
-            .map_err(|e| Error::Config { message: format!("Failed to read credentials: {}", e) })?;
+        let encrypted = std::fs::read(&file_path).map_err(|e| Error::Config {
+            message: format!("Failed to read credentials: {}", e),
+        })?;
 
         let json = Self::xor_decrypt(&encrypted);
 
-        let credentials: Credentials = serde_json::from_str(&json)
-            .map_err(|e| Error::Config { message: format!("Failed to parse credentials: {}", e) })?;
+        let credentials: Credentials = serde_json::from_str(&json).map_err(|e| Error::Config {
+            message: format!("Failed to parse credentials: {}", e),
+        })?;
 
         Ok(credentials)
     }
@@ -116,7 +119,9 @@ impl Credentials {
         dirs::data_dir()
             .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share")))
             .map(|d| d.join("standx"))
-            .ok_or_else(|| Error::Config { message: "Could not determine data directory".to_string() })
+            .ok_or_else(|| Error::Config {
+                message: "Could not determine data directory".to_string(),
+            })
     }
 
     /// Get credentials file path
@@ -127,29 +132,37 @@ impl Credentials {
     /// Save credentials to file (simple encryption - in production use proper keyring)
     pub fn save(&self) -> Result<()> {
         let data_dir = Self::data_dir()?;
-        std::fs::create_dir_all(&data_dir)
-            .map_err(|e| Error::Config { message: format!("Failed to create data directory: {}", e) })?;
+        std::fs::create_dir_all(&data_dir).map_err(|e| Error::Config {
+            message: format!("Failed to create data directory: {}", e),
+        })?;
 
         // Simple XOR encryption with a fixed key (for basic protection)
         // In production, use proper keyring or OS credential store
-        let json = serde_json::to_string(self)
-            .map_err(|e| Error::Config { message: format!("Failed to serialize credentials: {}", e) })?;
+        let json = serde_json::to_string(self).map_err(|e| Error::Config {
+            message: format!("Failed to serialize credentials: {}", e),
+        })?;
 
         let encrypted = Self::xor_encrypt(&json);
 
-        std::fs::write(Self::credentials_file()?, encrypted)
-            .map_err(|e| Error::Config { message: format!("Failed to write credentials: {}", e) })?;
+        std::fs::write(Self::credentials_file()?, encrypted).map_err(|e| Error::Config {
+            message: format!("Failed to write credentials: {}", e),
+        })?;
 
         // Set restrictive permissions (Unix only)
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(Self::credentials_file()?)
-                .map_err(|e| Error::Config { message: format!("Failed to get metadata: {}", e) })?;
+            let metadata =
+                std::fs::metadata(Self::credentials_file()?).map_err(|e| Error::Config {
+                    message: format!("Failed to get metadata: {}", e),
+                })?;
             let mut permissions = metadata.permissions();
             permissions.set_mode(0o600); // Owner read/write only
-            std::fs::set_permissions(Self::credentials_file()?, permissions)
-                .map_err(|e| Error::Config { message: format!("Failed to set permissions: {}", e) })?;
+            std::fs::set_permissions(Self::credentials_file()?, permissions).map_err(|e| {
+                Error::Config {
+                    message: format!("Failed to set permissions: {}", e),
+                }
+            })?;
         }
 
         Ok(())
@@ -160,8 +173,9 @@ impl Credentials {
         let file_path = Self::credentials_file()?;
 
         if file_path.exists() {
-            std::fs::remove_file(file_path)
-                .map_err(|e| Error::Config { message: format!("Failed to delete credentials: {}", e) })?;
+            std::fs::remove_file(file_path).map_err(|e| Error::Config {
+                message: format!("Failed to delete credentials: {}", e),
+            })?;
         }
 
         Ok(())
@@ -278,7 +292,7 @@ mod tests {
         // Ensure env vars are not set
         std::env::remove_var(ENV_JWT_TOKEN);
         std::env::remove_var(ENV_PRIVATE_KEY);
-        
+
         // Ensure no credentials file exists
         let _ = Credentials::delete();
 

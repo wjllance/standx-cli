@@ -48,7 +48,8 @@ impl StandXClient {
         if creds.is_expired() {
             return Err(Error::AuthRequired {
                 message: "Token expired".to_string(),
-                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable"
+                    .to_string(),
             });
         }
 

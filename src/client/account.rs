@@ -27,7 +27,8 @@ impl StandXClient {
         if creds.is_expired() {
             return Err(Error::AuthRequired {
                 message: "Token expired".to_string(),
-                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable"
+                    .to_string(),
             });
         }
 
@@ -54,10 +55,11 @@ impl StandXClient {
     #[allow(dead_code)]
     fn sign_request(&self, payload: &str) -> Result<(StandXSigner, crate::auth::RequestSignature)> {
         let creds = Credentials::load()?;
-        let signer =
-            StandXSigner::from_base58(&creds.private_key).map_err(|_| Error::InvalidCredentials {
+        let signer = StandXSigner::from_base58(&creds.private_key).map_err(|_| {
+            Error::InvalidCredentials {
                 message: "Invalid private key format".to_string(),
-            })?;
+            }
+        })?;
 
         let signature = signer.sign_request_now(payload);
         Ok((signer, signature))

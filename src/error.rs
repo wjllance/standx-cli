@@ -16,15 +16,11 @@ pub enum Error {
 
     #[error("WebSocket error")]
     #[serde(rename = "WEBSOCKET_ERROR")]
-    WebSocket {
-        message: String,
-    },
+    WebSocket { message: String },
 
     #[error("JSON parse error")]
     #[serde(rename = "JSON_ERROR")]
-    Json {
-        message: String,
-    },
+    Json { message: String },
 
     #[error("API error")]
     #[serde(rename = "API_ERROR")]
@@ -38,23 +34,15 @@ pub enum Error {
 
     #[error("Authentication required")]
     #[serde(rename = "AUTH_REQUIRED")]
-    AuthRequired {
-        message: String,
-        resolution: String,
-    },
+    AuthRequired { message: String, resolution: String },
 
     #[error("Invalid credentials")]
     #[serde(rename = "INVALID_CREDENTIALS")]
-    InvalidCredentials {
-        message: String,
-    },
+    InvalidCredentials { message: String },
 
     #[error("Token expired")]
     #[serde(rename = "TOKEN_EXPIRED")]
-    TokenExpired {
-        message: String,
-        resolution: String,
-    },
+    TokenExpired { message: String, resolution: String },
 
     #[error("Invalid symbol: {symbol}")]
     #[serde(rename = "INVALID_SYMBOL")]
@@ -73,22 +61,15 @@ pub enum Error {
 
     #[error("Configuration error")]
     #[serde(rename = "CONFIG_ERROR")]
-    Config {
-        message: String,
-    },
+    Config { message: String },
 
     #[error("IO error")]
     #[serde(rename = "IO_ERROR")]
-    Io {
-        message: String,
-    },
+    Io { message: String },
 
     #[error("Validation error")]
     #[serde(rename = "VALIDATION_ERROR")]
-    Validation {
-        field: String,
-        message: String,
-    },
+    Validation { field: String, message: String },
 
     #[error("Dry run")]
     #[serde(rename = "DRY_RUN")]
@@ -120,8 +101,10 @@ impl Error {
             Error::Http {
                 retryable: Some(true),
                 ..
-            } | Error::Api { retryable: true, .. }
-                | Error::RateLimitExceeded { .. }
+            } | Error::Api {
+                retryable: true,
+                ..
+            } | Error::RateLimitExceeded { .. }
                 | Error::WebSocket { .. }
         )
     }
@@ -135,9 +118,9 @@ impl Error {
             Error::TokenExpired { .. } => {
                 Some("Re-authenticate with 'standx auth login'".to_string())
             }
-            Error::RateLimitExceeded { retry_after, .. } => retry_after.map(|secs| {
-                format!("Wait {} seconds before retrying", secs)
-            }),
+            Error::RateLimitExceeded { retry_after, .. } => {
+                retry_after.map(|secs| format!("Wait {} seconds before retrying", secs))
+            }
             Error::InvalidSymbol { .. } => {
                 Some("Run 'standx market symbols' to see available symbols".to_string())
             }
