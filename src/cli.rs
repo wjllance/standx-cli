@@ -258,18 +258,24 @@ pub enum MarginCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum StreamCommands {
-    /// Stream order book depth
+    /// Stream price ticker (public channel)
+    Price { symbol: String },
+    /// Stream order book depth (public channel)
     Depth {
         symbol: String,
         #[arg(short, long, default_value = "10")]
         levels: usize,
     },
-    /// Stream ticker/price updates
-    Ticker { symbol: String },
-    /// Stream trades
-    Trades { symbol: String },
-    /// Stream account updates (authenticated)
-    Account,
+    /// Stream public trades (public channel)
+    Trade { symbol: String },
+    /// Stream order updates (authenticated)
+    Order,
+    /// Stream position updates (authenticated)
+    Position,
+    /// Stream balance updates (authenticated)
+    Balance,
+    /// Stream fill/trade updates (authenticated)
+    Fills,
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]

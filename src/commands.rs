@@ -175,23 +175,21 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
             symbol,
             amount,
             direction,
-        } => {
-            match client.transfer_margin(&symbol, &amount, &direction).await {
-                Ok(_) => {
-                    println!(
-                        "✅ Margin transferred for {}: {} (direction: {})",
-                        symbol, amount, direction
-                    );
-                }
-                Err(e) => {
-                    println!("⚠️  Margin transfer failed");
-                    println!("   Symbol: {}", symbol);
-                    println!("   Amount: {}", amount);
-                    println!("   Direction: {}", direction);
-                    println!("   Error: {}", e);
-                }
+        } => match client.transfer_margin(&symbol, &amount, &direction).await {
+            Ok(_) => {
+                println!(
+                    "✅ Margin transferred for {}: {} (direction: {})",
+                    symbol, amount, direction
+                );
             }
-        }
+            Err(e) => {
+                println!("⚠️  Margin transfer failed");
+                println!("   Symbol: {}", symbol);
+                println!("   Amount: {}", amount);
+                println!("   Direction: {}", direction);
+                println!("   Error: {}", e);
+            }
+        },
         MarginCommands::Mode { symbol, set } => {
             if let Some(mode) = set {
                 // Set margin mode
@@ -208,17 +206,23 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
                 // Get margin mode (fallback to position info)
                 match client.get_position_config(&symbol).await {
                     Ok(config) => {
-                        println!("Margin mode for {}: {} (leverage: {}x)", 
-                            symbol, "cross", config.leverage);
+                        println!(
+                            "Margin mode for {}: {} (leverage: {}x)",
+                            symbol, "cross", config.leverage
+                        );
                     }
                     Err(_) => {
                         // Fallback: get from symbol info
-                        let symbol_info = client.get_symbol_info().await?
+                        let symbol_info = client
+                            .get_symbol_info()
+                            .await?
                             .into_iter()
                             .find(|s| s.symbol == symbol)
                             .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
-                        println!("Margin mode for {}: {} (default leverage: {}x)",
-                            symbol, "cross", symbol_info.def_leverage);
+                        println!(
+                            "Margin mode for {}: {} (default leverage: {}x)",
+                            symbol, "cross", symbol_info.def_leverage
+                        );
                     }
                 }
             }
@@ -509,6 +513,23 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
     let ws = StandXWebSocket::new()?;
 
     match command {
+        // Public channels
+        StreamCommands::Price { symbol } => {
+            let _ = ws.subscribe("price", Some(&symbol)).await;
+            let mut rx = ws.connect().await?;
+
+            println!("Streaming price for {}", symbol);
+            println!("Press Ctrl+C to exit\n");
+
+            while let Some(msg) = rx.recv().await {
+                if let WsMessage::Price(data) = msg {
+                    println!(
+                        "{} | Mark: {} | Index: {} | Last: {}",
+                        data.timestamp, data.mark_price, data.index_price, data.last_price
+                    );
+                }
+            }
+        }
         StreamCommands::Depth { symbol, levels } => {
             let _ = ws.subscribe("depth_book", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
@@ -530,23 +551,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
                 }
             }
         }
-        StreamCommands::Ticker { symbol } => {
-            let _ = ws.subscribe("price", Some(&symbol)).await;
-            let mut rx = ws.connect().await?;
-
-            println!("Streaming ticker for {}", symbol);
-            println!("Press Ctrl+C to exit\n");
-
-            while let Some(msg) = rx.recv().await {
-                if let WsMessage::Price(data) = msg {
-                    println!(
-                        "{} | Mark: {} | Index: {} | Last: {}",
-                        data.timestamp, data.mark_price, data.index_price, data.last_price
-                    );
-                }
-            }
-        }
-        StreamCommands::Trades { symbol } => {
+        StreamCommands::Trade { symbol } => {
             let _ = ws.subscribe("public_trade", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
@@ -574,27 +579,68 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
                 }
             }
         }
-        StreamCommands::Account => {
-            let _ = ws.subscribe("position", None).await;
-            let _ = ws.subscribe("balance", None).await;
+        // User-level authenticated channels
+        StreamCommands::Order => {
             let _ = ws.subscribe("order", None).await;
             let mut rx = ws.connect().await?;
 
-            println!("Streaming account updates");
+            println!("Streaming order updates");
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                match msg {
-                    WsMessage::Position(data) => {
-                        println!("Position update: {}", serde_json::to_string(&data)?);
-                    }
-                    WsMessage::Balance(data) => {
-                        println!("Balance update: {}", serde_json::to_string(&data)?);
-                    }
-                    WsMessage::Order(data) => {
-                        println!("Order update: {}", serde_json::to_string(&data)?);
-                    }
-                    _ => {}
+                if let WsMessage::Order(data) = msg {
+                    println!("Order update: {}", serde_json::to_string(&data)?);
+                }
+            }
+        }
+        StreamCommands::Position => {
+            let _ = ws.subscribe("position", None).await;
+            let mut rx = ws.connect().await?;
+
+            println!("Streaming position updates");
+            println!("Press Ctrl+C to exit\n");
+
+            while let Some(msg) = rx.recv().await {
+                if let WsMessage::Position(data) = msg {
+                    println!("Position update: {}", serde_json::to_string(&data)?);
+                }
+            }
+        }
+        StreamCommands::Balance => {
+            let _ = ws.subscribe("balance", None).await;
+            let mut rx = ws.connect().await?;
+
+            println!("Streaming balance updates");
+            println!("Press Ctrl+C to exit\n");
+
+            while let Some(msg) = rx.recv().await {
+                if let WsMessage::Balance(data) = msg {
+                    println!("Balance update: {}", serde_json::to_string(&data)?);
+                }
+            }
+        }
+        StreamCommands::Fills => {
+            let _ = ws.subscribe("trade", None).await;
+            let mut rx = ws.connect().await?;
+
+            println!("Streaming fill/trade updates");
+            println!("Press Ctrl+C to exit\n");
+
+            while let Some(msg) = rx.recv().await {
+                if let WsMessage::Trade(data) = msg {
+                    let side = data.side.as_deref().unwrap_or({
+                        if data.is_buyer_taker {
+                            "buy"
+                        } else {
+                            "sell"
+                        }
+                    });
+                    println!(
+                        "Fill | {} | Price: {} | Qty: {}",
+                        side.to_uppercase(),
+                        data.price,
+                        data.qty
+                    );
                 }
             }
         }

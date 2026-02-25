@@ -77,6 +77,7 @@ pub struct PriceData {
     pub index_price: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub last_price: String,
+    #[serde(alias = "time")]
     pub timestamp: String,
 }
 
