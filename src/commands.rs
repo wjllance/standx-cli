@@ -385,6 +385,45 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
     Ok(())
 }
 
+/// Handle margin commands
+pub async fn handle_margin(command: MarginCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        MarginCommands::Transfer { symbol, amount } => {
+            client.transfer_margin(&symbol, &amount).await?;
+            let direction = if amount.starts_with('-') {
+                "withdrawn from"
+            } else {
+                "deposited into"
+            };
+            println!("✅ {} DUSD {} position margin ({})", amount.trim_start_matches('-'), direction, symbol);
+        }
+        MarginCommands::Mode { symbol, set } => {
+            if let Some(mode) = set {
+                let mode_lower = mode.to_lowercase();
+                if mode_lower != "cross" && mode_lower != "isolated" {
+                    return Err(anyhow::anyhow!(
+                        "Invalid margin mode '{}'. Use 'cross' or 'isolated'",
+                        mode
+                    ));
+                }
+                client.change_margin_mode(&symbol, &mode_lower).await?;
+                println!("✅ Margin mode for {} set to {}", symbol, mode_lower);
+            } else {
+                let config = client.get_position_config(&symbol).await?;
+                match output_format {
+                    OutputFormat::Table => println!("{}", output::format_item(config)),
+                    OutputFormat::Json => println!("{}", output::format_json(&config)?),
+                    OutputFormat::Csv => println!("{}", output::format_csv(&[config])?),
+                    OutputFormat::Quiet => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Handle stream commands
 pub async fn handle_stream(command: StreamCommands) -> Result<()> {
     let ws = StandXWebSocket::new()?;

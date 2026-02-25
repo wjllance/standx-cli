@@ -241,16 +241,16 @@ pub enum LeverageCommands {
 
 #[derive(Subcommand, Debug)]
 pub enum MarginCommands {
-    /// Transfer margin
+    /// Transfer margin to/from an isolated position (positive = deposit, negative = withdraw)
     Transfer {
         symbol: String,
+        /// Amount to transfer, e.g. "500" to deposit or "-500" to withdraw
         amount: String,
-        #[arg(short, long)]
-        direction: String,
     },
-    /// Get/Set margin mode
+    /// Get or set margin mode for a symbol
     Mode {
         symbol: String,
+        /// Set margin mode: 'cross' or 'isolated' (omit to query current mode)
         #[arg(short, long)]
         set: Option<String>,
     },

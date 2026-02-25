@@ -82,8 +82,7 @@ async fn execute_command(
             println!("Leverage command not yet implemented");
         }
         Commands::Margin { command } => {
-            tracing::info!("Margin command: {:?}", command);
-            println!("Margin command not yet implemented");
+            commands::handle_margin(command, output).await?;
         }
         Commands::Stream { command } => {
             commands::handle_stream(command).await?;

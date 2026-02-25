@@ -42,7 +42,7 @@ impl Default for CreateOrderParams {
 /// Order API methods
 impl StandXClient {
     /// Build authenticated headers with optional request signing
-    async fn build_auth_headers(&self, payload: Option<&str>) -> Result<HeaderMap> {
+    pub(super) async fn build_auth_headers(&self, payload: Option<&str>) -> Result<HeaderMap> {
         let creds = Credentials::load()?;
 
         if creds.is_expired() {
