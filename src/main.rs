@@ -61,7 +61,7 @@ async fn execute_command(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Config { command } => {
-            commands::handle_config(command).await?;
+            commands::handle_config(command, output).await?;
         }
         Commands::Auth { command } => {
             commands::handle_auth(command).await?;
