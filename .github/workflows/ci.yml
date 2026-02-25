@@ -54,10 +54,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             cross: false
-          # macOS Intel (x86_64)
-          - os: macos-12
-            target: x86_64-apple-darwin
-            cross: false
           # Linux x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -124,7 +120,7 @@ jobs:
           VERSION="${{ github.event.release.tag_name }}"
           mkdir -p ./packages
 
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             if [ -f "./binaries/standx-${target}/standx" ]; then
               chmod +x "./binaries/standx-${target}/standx"
               tar -czf "./packages/standx-${VERSION}-${target}.tar.gz" -C "./binaries/standx-${target}" standx

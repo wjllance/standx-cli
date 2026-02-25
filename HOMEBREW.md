@@ -124,8 +124,8 @@ sudo chown -R $(whoami) $(brew --prefix)/*
 For users who don't want to build from source, provide pre-built binaries:
 
 ```bash
-# Download pre-built binary for macOS
-curl -L -o standx https://github.com/wjllance/standx-cli/releases/download/v0.1.0/standx-darwin-amd64
+# Download pre-built binary for macOS (Apple Silicon)
+curl -L -o standx https://github.com/wjllance/standx-cli/releases/download/v0.1.0/standx-darwin-arm64
 chmod +x standx
 sudo mv standx /usr/local/bin/
 ```

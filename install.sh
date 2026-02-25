@@ -25,9 +25,6 @@ get_target() {
                 arm64|aarch64)
                     echo "aarch64-apple-darwin"
                     ;;
-                x86_64|amd64)
-                    echo "x86_64-apple-darwin"
-                    ;;
                 *)
                     echo "${RED}Error: Unsupported macOS architecture: $arch${NC}" >&2
                     exit 1

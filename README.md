@@ -59,7 +59,7 @@ You have an AI Agent (OpenClaw, Claude, AutoGPT, etc.). You want it to trade. Bu
 #### Option 1: One-line Installer (Recommended)
 
 ```bash
-# macOS / Linux (x86_64 & ARM64)
+# macOS (Apple Silicon) / Linux (x86_64 & ARM64)
 curl -sSL https://raw.githubusercontent.com/wjllance/standx-cli/main/install.sh | sh
 ```
 
