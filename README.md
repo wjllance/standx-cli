@@ -321,3 +321,15 @@ MIT OR Apache-2.0
 **Built for the AI Trading era.**
 
 *OpenClaw First. Agent Native. Ecosystem Ready.*
+
+---
+
+## 💰 Buy Me Some Tokens
+
+If this tool helps your AI agent trade better, consider sponsoring some API tokens:
+
+**EVM Address**: `0xAb3D58779dFC50BC84caA796003ABE31b5296210`
+
+Your support helps keep the project maintained and improves AI-native trading infrastructure.
+
+Thank you! 🤖💸
