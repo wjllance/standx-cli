@@ -149,8 +149,8 @@ impl StandXClient {
             });
         }
 
-        let data = response.json::<Vec<Order>>().await?;
-        Ok(data)
+        let wrapper = response.json::<ApiListResponse<Order>>().await?;
+        Ok(wrapper.result)
     }
 
     /// Get order history
