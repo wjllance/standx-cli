@@ -243,7 +243,7 @@ async fn connect_and_run(
 
         let auth_msg = serde_json::json!({
             "auth": {
-                "token": t,
+                "token": format!("Bearer {}", t),
                 "streams": streams
             }
         });
