@@ -398,7 +398,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
                 if let WsMessage::Price(data) = msg {
                     println!(
                         "{} | Mark: {} | Index: {} | Last: {}",
-                        data.time, data.mark_price, data.index_price, data.last_price
+                        data.timestamp, data.mark_price, data.index_price, data.last_price
                     );
                 }
             }
@@ -415,7 +415,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
                     let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
                     println!(
                         "{} | {} | Price: {} | Qty: {}",
-                        data.time, side, data.price, data.qty
+                        data.timestamp, side, data.price, data.qty
                     );
                 }
             }
