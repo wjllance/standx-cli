@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Vision
+- **Repositioning**: Transforming from a CLI tool to the industry-standard AI Agent Toolkit for trading
+- **Goal**: Become the reference implementation for exchange Agent toolkits
+
+### Added
+- New project positioning: "The first AI Agent-native trading infrastructure"
+- MCP (Model Context Protocol) support planned
+- Structured error output for machine parsing
+- Agent-first design principles documentation
+
+### Changed
+- Updated README with Agent-centric narrative
+- Updated Cargo.toml description and keywords
+- Reframed all documentation for AI Agent use cases
+
 ## [0.2.0] - 2026-02-24
 
 ### Added

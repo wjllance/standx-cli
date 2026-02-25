@@ -1,95 +1,141 @@
-# StandX CLI 未来迭代计划
+# StandX Agent Toolkit Roadmap
 
-## 高优先级
-
-### 1. 监控与告警服务
-- [ ] 后台监控服务 (systemd)
-- [ ] 价格阈值告警
-- [ ] 仓位风险告警
-- [ ] 资金费率监控
-- [ ] 异常交易检测
-
-### 2. 高级订单类型
-- [ ] 止损/止盈订单 (Stop Loss / Take Profit)
-- [ ] 追踪止损 (Trailing Stop)
-- [ ] 冰山订单 (Iceberg)
-- [ ] TWAP/VWAP 算法订单
-- [ ] 条件订单 (OCO)
-
-### 3. 多账户管理
-- [ ] 子账户切换
-- [ ] 账户组管理
-- [ ] API Key 轮换
-- [ ] 权限分级
-
-## 中优先级
-
-### 4. 数据分析
-- [ ] 交易历史导出 (Excel/CSV)
-- [ ] PnL 分析报表
-- [ ] 收益率曲线
-- [ ] 风险指标计算 (Sharpe, Max Drawdown)
-- [ ] 交易统计 (胜率, 盈亏比)
-
-### 5. 策略交易
-- [ ] 网格交易策略
-- [ ] 定投策略 (DCA)
-- [ ] 套利监控 (跨所/期现)
-- [ ] 策略回测框架
-- [ ] 自定义策略脚本
-
-### 6. 用户体验
-- [ ] 交互式 TUI (ratatui)
-- [ ] 配置文件热重载
-- [ ] 命令自动补全
-- [ ] 历史命令记录
-- [ ] 彩色日志输出
-
-## 低优先级
-
-### 7. 集成与生态
-- [ ] TradingView 信号集成
-- [ ] Telegram/Discord 机器人
-- [ ] Webhook 通知
-- [ ] Prometheus 指标导出
-- [ ] Grafana 仪表盘
-
-### 8. 安全增强
-- [ ] 硬件钱包支持 (Ledger/Trezor)
-- [ ] 2FA 双因素认证
-- [ ] 交易密码确认
-- [ ] 白名单地址
-- [ ] 审计日志
-
-### 9. 性能优化
-- [ ] 连接池复用
-- [ ] 本地缓存 (Redis)
-- [ ] 批量 API 请求
-- [ ] WebSocket 重连优化
-- [ ] 增量数据更新
-
-### 10. 多平台支持
-- [ ] Windows 原生支持
-- [ ] ARM64 架构支持
-- [ ] Docker 镜像
-- [ ] 云函数部署
-
-## 技术债务
-
-- [ ] 完善单元测试覆盖率 (>80%)
-- [ ] 集成测试 (mock server)
-- [ ] API 文档自动生成
-- [ ] 性能基准测试
-- [ ] 错误处理细化
-
-## 社区功能
-
-- [ ] 插件系统
-- [ ] 自定义指标
-- [ ] 社区策略分享
-- [ ] 多语言支持 (i18n)
+> **Vision**: Become the industry-standard AI Agent trading infrastructure
+> 
+> "When exchanges build Agent toolkits, they reference StandX Agent Toolkit"
 
 ---
 
-*创建时间: 2026-02-24*
-*版本: v0.1.2*
+## Phase 1: Agent Foundation ✅ (Current)
+
+**Goal**: AI Agents can trade via MCP
+
+### Core Features
+- [x] **Structured JSON Output** - All commands support `--output json`
+- [x] **Non-Interactive Mode** - Environment variable authentication
+- [ ] **MCP Server** - Native Model Context Protocol support
+- [ ] **Structured Errors** - Machine-readable error responses
+- [ ] **OpenClaw Integration** - Official support and examples
+
+### Timeline
+- **Week 1**: MCP Server implementation, structured errors
+- **Week 2**: Documentation, examples, community announcement
+
+---
+
+## Phase 2: Automation Toolkit (Next 1-2 months)
+
+**Goal**: Production-ready automation for AI Agents
+
+### MCP Enhancements
+- [ ] **Streaming Tools** - Real-time data via MCP resources
+- [ ] **Batch Operations** - Multi-order execution
+- [ ] **Webhook Callbacks** - Event-driven Agent reactions
+- [ ] **Tool Composability** - Complex workflow support
+
+### Developer Experience
+- [ ] **Python SDK** - `pip install standx-agent`
+- [ ] **TypeScript SDK** - `npm install @standx/agent`
+- [ ] **Strategy Templates** - Grid, DCA, TWAP built-in
+- [ ] **Local Testing** - Mock server for Agent development
+
+### Agent Capabilities
+- [ ] **Risk Management Tools** - Position limits, stop-loss automation
+- [ ] **Portfolio Analytics** - PnL tracking, performance metrics
+- [ ] **Multi-Account Support** - Agent-managed sub-accounts
+- [ ] **Paper Trading** - Test strategies without real funds
+
+---
+
+## Phase 3: Ecosystem Standard (3-6 months)
+
+**Goal**: Define the industry standard for Agent trading
+
+### Protocol Extensions
+- [ ] **Multi-Exchange Abstraction** - Unified interface for CEX/DEX
+- [ ] **Cross-Chain Coordination** - Multi-chain Agent workflows
+- [ ] **Agent-to-Agent Protocol** - Collaborative trading
+- [ ] **On-Chain Settlement** - Direct blockchain integration
+
+### AI-Native Features
+- [ ] **Natural Language Strategy Builder** - "Create a grid strategy for BTC"
+- [ ] **AI Strategy Recommendations** - Market-aware suggestions
+- [ ] **Autonomous Fund Management** - Self-managing portfolios
+- [ ] **Social Trading Graph** - Copy successful Agents
+
+### Standardization
+- [ ] **MCP Extension Proposal** - Standard trading tool schema
+- [ ] **OpenAPI Specification** - Industry reference
+- [ ] **Security Best Practices** - Agent authentication standards
+- [ ] **Compliance Framework** - Regulatory-aware trading
+
+---
+
+## Phase 4: Platform Economy (6+ months)
+
+**Goal**: Build the Agent trading ecosystem
+
+### Marketplace
+- [ ] **Strategy Marketplace** - Buy/sell Agent strategies
+- [ ] **Agent Reputation System** - Track record verification
+- [ ] **Performance Analytics** - Public leaderboards
+- [ ] **Strategy Backtesting** - Historical validation
+
+### Infrastructure
+- [ ] **Hosted Agent Service** - Cloud-based Agent execution
+- [ ] **Agent Coordination Network** - Distributed trading
+- [ ] **Real-Time Data Feed** - Sub-second market data
+- [ ] **Institutional API** - Enterprise-grade infrastructure
+
+### Community
+- [ ] **Agent Hackathons** - Build the future of trading
+- [ ] **Research Grants** - Academic partnerships
+- [ ] **Developer DAO** - Community governance
+- [ ] **Education Platform** - Learn Agent trading
+
+---
+
+## Design Principles
+
+Throughout all phases, we adhere to:
+
+1. **Agent-First** - Machine before human
+2. **Structured-Everything** - Zero text parsing
+3. **Composable** - Tools build workflows
+4. **Zero-Config** - Works out of the box
+5. **Observable** - Full visibility into Agent actions
+
+---
+
+## Success Metrics
+
+| Phase | Metric | Target |
+|-------|--------|--------|
+| Phase 1 | GitHub Stars | 500+ |
+| Phase 1 | MCP Connections | 100+ |
+| Phase 2 | Active Agents | 500+ |
+| Phase 2 | SDK Downloads | 10k+ |
+| Phase 3 | Exchange Partners | 3+ |
+| Phase 3 | Industry References | 10+ |
+| Phase 4 | Marketplace Strategies | 100+ |
+| Phase 4 | Daily Agent Transactions | 10k+ |
+
+---
+
+## Contributing
+
+We welcome contributions aligned with our vision:
+
+- **MCP Tools** - Expand Agent capabilities
+- **SDKs** - Support more languages
+- **Strategies** - Share proven templates
+- **Documentation** - Help others build Agents
+- **Standards** - Shape the industry
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+**Building the future of AI-native trading.**
+
+*Last updated: 2026-02-25*

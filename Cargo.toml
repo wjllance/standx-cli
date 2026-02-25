@@ -3,11 +3,11 @@ name = "standx-cli"
 version = "0.2.0"
 edition = "2021"
 authors = ["Kimi Claw"]
-description = "A CLI tool for StandX perpetual DEX"
+description = "The first AI Agent-native trading toolkit for StandX - designed for automation, MCP-compatible, structured output by default"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wjllance/standx-cli"
-keywords = ["cli", "crypto", "trading", "standx", "dex"]
-categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
+keywords = ["ai-agent", "mcp", "trading", "standx", "automation", "crypto", "dex", "llm", "toolkit"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies", "development-tools::testing"]
 rust-version = "1.75"
 
 [[bin]]
