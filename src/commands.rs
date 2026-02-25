@@ -136,6 +136,7 @@ pub async fn handle_leverage(command: LeverageCommands, output_format: OutputFor
                         leverage: symbol_info.def_leverage.clone(),
                         max_leverage: symbol_info.max_leverage.clone(),
                         def_leverage: symbol_info.def_leverage,
+                        margin_mode: "cross".to_string(),
                     };
 
                     match output_format {
@@ -203,28 +204,365 @@ pub async fn handle_margin(command: MarginCommands) -> Result<()> {
                     }
                 }
             } else {
-                // Get margin mode (fallback to position info)
-                match client.get_position_config(&symbol).await {
-                    Ok(config) => {
-                        println!(
-                            "Margin mode for {}: cross (leverage: {}x)",
-                            symbol, config.leverage
-                        );
+                // Get margin mode from position config
+                let config = client.get_position_config(&symbol).await?;
+                let mode = if config.margin_mode.is_empty() {
+                    "cross"
+                } else {
+                    &config.margin_mode
+                };
+                println!("Margin mode for {}: {} (leverage: {}x)", 
+                    symbol, mode, config.leverage);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle account commands
+pub async fn handle_account(command: AccountCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        AccountCommands::Balances => {
+            let balance = client.get_balance().await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_item(balance)),
+                OutputFormat::Json => println!("{}", output::format_json(&balance)?),
+                OutputFormat::Csv => println!("CSV format not supported for single item"),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Positions { symbol } => {
+            let positions = client.get_positions(symbol.as_deref()).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(positions)),
+                OutputFormat::Json => println!("{}", output::format_json(&positions)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&positions)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Orders { symbol } => {
+            let orders = client.get_open_orders(symbol.as_deref()).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::History { symbol, limit } => {
+            let orders = client
+                .get_order_history(symbol.as_deref(), Some(limit))
+                .await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        AccountCommands::Leverage { symbol, set } => {
+            if let Some(leverage_str) = set {
+                let leverage: u32 = leverage_str.parse()?;
+                client.change_leverage(&symbol, leverage).await?;
+                println!("✅ Leverage for {} set to {}x", symbol, leverage);
+            } else {
+                // Get current leverage
+                let symbol_info = client
+                    .get_symbol_info()
+                    .await?
+                    .into_iter()
+                    .find(|s| s.symbol == symbol)
+                    .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
+
+                let config = standx_cli::models::PositionConfig {
+                    symbol: symbol.clone(),
+                    leverage: symbol_info.def_leverage.clone(),
+                    max_leverage: symbol_info.max_leverage.clone(),
+                    def_leverage: symbol_info.def_leverage,
+                    margin_mode: "cross".to_string(),
+                };
+
+                match output_format {
+                    OutputFormat::Table => println!("{}", output::format_item(config)),
+                    OutputFormat::Json => println!("{}", output::format_json(&config)?),
+                    OutputFormat::Csv => println!("{}", output::format_csv(&[config])?),
+                    OutputFormat::Quiet => println!("{}", config.leverage),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle market commands
+pub async fn handle_market(command: MarketCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        MarketCommands::Symbols => {
+            let symbols = client.get_symbol_info().await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(symbols)),
+                OutputFormat::Json => println!("{}", output::format_json(&symbols)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&symbols)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        MarketCommands::Ticker { symbol } => {
+            let tickers = client.get_ticker(&symbol).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(tickers)),
+                OutputFormat::Json => println!("{}", output::format_json(&tickers)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&tickers)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+        MarketCommands::OrderBook { symbol, depth } => {
+            let orderbook = client.get_order_book(&symbol, depth).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_item(orderbook)),
+                OutputFormat::Json => println!("{}", output::format_json(&orderbook)?),
+                OutputFormat::Csv => println!("CSV format not supported for order book"),
+                OutputFormat::Quiet => {}
+            }
+        }
+        MarketCommands::Trades { symbol, limit } => {
+            let trades = client.get_recent_trades(&symbol, limit).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(trades)),
+                OutputFormat::Json => println!("{}", output::format_json(&trades)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&trades)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle order commands
+pub async fn handle_order(command: OrderCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        OrderCommands::Create {
+            symbol,
+            side,
+            order_type,
+            quantity,
+            price,
+            time_in_force,
+            reduce_only,
+        } => {
+            let side_enum = match side.as_str() {
+                "buy" => OrderSide::Buy,
+                "sell" => OrderSide::Sell,
+                _ => return Err(anyhow::anyhow!("Invalid side: {}", side)),
+            };
+
+            let order_type_enum = match order_type.as_str() {
+                "market" => OrderType::Market,
+                "limit" => OrderType::Limit,
+                _ => return Err(anyhow::anyhow!("Invalid order type: {}", order_type)),
+            };
+
+            let tif = time_in_force.map(|tif| match tif.as_str() {
+                "gtc" => TimeInForce::Gtc,
+                "ioc" => TimeInForce::Ioc,
+                "fok" => TimeInForce::Fok,
+                _ => TimeInForce::Gtc,
+            });
+
+            let params = CreateOrderParams {
+                symbol,
+                side: side_enum,
+                order_type: order_type_enum,
+                quantity,
+                price,
+                time_in_force: tif,
+                reduce_only,
+                stop_price: None,
+                sl_price: None,
+                tp_price: None,
+            };
+
+            let order = client.create_order(params).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_item(order)),
+                OutputFormat::Json => println!("{}", output::format_json(&order)?),
+                OutputFormat::Csv => println!("CSV format not supported for single item"),
+                OutputFormat::Quiet => {}
+            }
+        }
+        OrderCommands::Cancel { order_id } => {
+            client.cancel_order(&order_id).await?;
+            println!("✅ Order {} cancelled", order_id);
+        }
+        OrderCommands::CancelAll { symbol } => {
+            client.cancel_all_orders(symbol.as_deref()).await?;
+            if let Some(s) = symbol {
+                println!("✅ All orders cancelled for {}", s);
+            } else {
+                println!("✅ All orders cancelled");
+            }
+        }
+        OrderCommands::Get { order_id } => {
+            let order = client.get_order(&order_id).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_item(order)),
+                OutputFormat::Json => println!("{}", output::format_json(&order)?),
+                OutputFormat::Csv => println!("CSV format not supported for single item"),
+                OutputFormat::Quiet => {}
+            }
+        }
+        OrderCommands::List { symbol } => {
+            let orders = client.get_open_orders(symbol.as_deref()).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(orders)),
+                OutputFormat::Json => println!("{}", output::format_json(&orders)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&orders)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle trade commands
+pub async fn handle_trade(command: TradeCommands, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        TradeCommands::History { symbol, start_time, end_time, limit } => {
+            let trades = client.get_trade_history(symbol.as_deref(), start_time, end_time, Some(limit)).await?;
+
+            match output_format {
+                OutputFormat::Table => println!("{}", output::format_table(trades)),
+                OutputFormat::Json => println!("{}", output::format_json(&trades)?),
+                OutputFormat::Csv => println!("{}", output::format_csv(&trades)?),
+                OutputFormat::Quiet => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handle stream commands
+pub async fn handle_stream(command: StreamCommands) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        StreamCommands::Depth { symbol, levels } => {
+            let mut ws = StandXWebSocket::new().await?;
+            ws.subscribe_depth(&symbol, levels).await?;
+
+            println!("Streaming order book depth for {} ({} levels)...", symbol, levels);
+            println!("Press Ctrl+C to stop\n");
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    WsMessage::Depth(depth) => {
+                        println!("{}", output::format_item(depth));
                     }
-                    Err(_) => {
-                        // Fallback: get from symbol info
-                        let symbol_info = client
-                            .get_symbol_info()
-                            .await?
-                            .into_iter()
-                            .find(|s| s.symbol == symbol)
-                            .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
-                        println!(
+                    WsMessage::Error(e) => {
+                        eprintln!("❌ WebSocket error: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StreamCommands::Ticker { symbol } => {
+            let mut ws = StandXWebSocket::new().await?;
+            ws.subscribe_ticker(&symbol).await?;
+
+            println!("Streaming ticker updates for {}...", symbol);
+            println!("Press Ctrl+C to stop\n");
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    WsMessage::Ticker(ticker) => {
+                        println!("{}", output::format_item(ticker));
+                    }
+                    WsMessage::Error(e) => {
+                        eprintln!("❌ WebSocket error: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StreamCommands::Trades { symbol } => {
+            let mut ws = StandXWebSocket::new().await?;
+            ws.subscribe_trades(&symbol).await?;
+
+            println!("Streaming trades for {}...", symbol);
+            println!("Press Ctrl+C to stop\n");
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    WsMessage::Trade(trade) => {
+                        println!("{}", output::format_item(trade));
+                    }
+                    WsMessage::Error(e) => {
+                        eprintln!("❌ WebSocket error: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        StreamCommands::Account => {
+            let mut ws = StandXWebSocket::new().await?;
+            ws.subscribe_account().await?;
+
+            println!("Streaming account updates...");
+            println!("Press Ctrl+C to stop\n");
+
+            while let Some(msg) = ws.next().await {
+                match msg {
+                    WsMessage::Account(account) => {
+                        println!("{}", output::format_item(account));
+                    }
+                    WsMessage::Error(e) => {
+                        eprintln!("❌ WebSocket error: {}", e);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
                             "Margin mode for {}: cross (default leverage: {}x)",
                             symbol, symbol_info.def_leverage
                         );
                     }
                 }
+=======
+                // Get margin mode from position config
+                let config = client.get_position_config(&symbol).await?;
+                let mode = if config.margin_mode.is_empty() {
+                    "cross"
+                } else {
+                    &config.margin_mode
+                };
+                println!("Margin mode for {}: {} (leverage: {}x)", 
+                    symbol, mode, config.leverage);
+>>>>>>> c564697 (fix: Fix margin mode get to use request signing and return actual value)
             }
         }
     }

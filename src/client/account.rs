@@ -243,7 +243,7 @@ impl StandXClient {
     /// Get position config (includes leverage)
     pub async fn get_position_config(&self, symbol: &str) -> Result<crate::models::PositionConfig> {
         let url = format!("{}/api/query_position_config", self.base_url);
-        let headers = self.auth_headers()?;
+        let headers = self.build_auth_headers(None).await?;
 
         let response = self
             .client
@@ -253,18 +253,19 @@ impl StandXClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+        let status = response.status();
+        let response_text = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
             return Err(Error::Api {
                 code: status.as_u16(),
-                message: text,
+                message: response_text,
                 endpoint: Some("/api/query_position_config".to_string()),
                 retryable: status.as_u16() >= 500,
             });
         }
 
-        let data = response.json::<crate::models::PositionConfig>().await?;
+        let data = serde_json::from_str::<crate::models::PositionConfig>(&response_text)?;
         Ok(data)
     }
 
@@ -322,12 +323,13 @@ impl StandXClient {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
+        let status = response.status();
+        let response_text = response.text().await.unwrap_or_default();
+
+        if !status.is_success() {
             return Err(Error::Api {
                 code: status.as_u16(),
-                message: text,
+                message: response_text,
                 endpoint: Some("/api/change_margin_mode".to_string()),
                 retryable: status.as_u16() >= 500,
             });
