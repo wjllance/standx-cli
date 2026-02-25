@@ -415,7 +415,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
                     let side = if data.is_buyer_taker { "Buy" } else { "Sell" };
                     println!(
                         "{} | {} | Price: {} | Qty: {}",
-                        data.timestamp, side, data.price, data.qty
+                        data.time, side, data.price, data.qty
                     );
                 }
             }

@@ -29,7 +29,8 @@ async fn main() {
         match handle_dry_run(&cli.command, output).await {
             Ok(_) => std::process::exit(0),
             Err(e) => {
-                print_error(&e, output);
+                let boxed_error: Box<dyn std::error::Error> = Box::new(e);
+                print_error(&boxed_error, output);
                 std::process::exit(1);
             }
         }
