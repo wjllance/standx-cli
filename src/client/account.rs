@@ -337,23 +337,17 @@ impl StandXClient {
     }
 
     /// Transfer margin for a symbol
-    pub async fn transfer_margin(
-        &self,
-        symbol: &str,
-        amount: &str,
-        direction: &str,
-    ) -> Result<()> {
+    pub async fn transfer_margin(&self, symbol: &str, amount: &str, direction: &str) -> Result<()> {
         let url = format!("{}/api/transfer_margin", self.base_url);
 
         // Convert amount to negative for withdraw
-        let amount_val: f64 = amount.parse()
-            .map_err(|_| Error::Api {
-                code: 400,
-                message: format!("Invalid amount: {}", amount),
-                endpoint: None,
-                retryable: false,
-            })?;
-        
+        let amount_val: f64 = amount.parse().map_err(|_| Error::Api {
+            code: 400,
+            message: format!("Invalid amount: {}", amount),
+            endpoint: None,
+            retryable: false,
+        })?;
+
         let final_amount = if direction == "withdraw" {
             -amount_val.abs()
         } else {

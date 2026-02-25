@@ -40,7 +40,7 @@ pub enum WsMessage {
 /// StandX WebSocket client
 pub struct StandXWebSocket {
     url: String,
-    token: String,
+    token: Option<String>,
     state: Arc<RwLock<WsState>>,
     subscriptions: Arc<RwLock<Vec<String>>>,
     message_tx: mpsc::Sender<WsMessage>,
@@ -54,7 +54,7 @@ pub struct StandXWebSocket {
 }
 
 impl StandXWebSocket {
-    /// Create a new WebSocket client
+    /// Create a new WebSocket client (requires auth for user channels)
     pub fn new() -> Result<Self> {
         let creds = Credentials::load()?;
 
@@ -70,7 +70,24 @@ impl StandXWebSocket {
 
         Ok(Self {
             url: DEFAULT_WS_URL.to_string(),
-            token: creds.token,
+            token: Some(creds.token),
+            state: Arc::new(RwLock::new(WsState::Disconnected)),
+            subscriptions: Arc::new(RwLock::new(Vec::new())),
+            message_tx,
+            message_rx: Arc::new(RwLock::new(message_rx)),
+            reconnect_attempts: Arc::new(RwLock::new(0)),
+            channel: String::new(),
+            symbol: None,
+        })
+    }
+
+    /// Create without authentication (for public channels only)
+    pub fn without_auth() -> Result<Self> {
+        let (message_tx, message_rx) = mpsc::channel(100);
+
+        Ok(Self {
+            url: DEFAULT_WS_URL.to_string(),
+            token: None,
             state: Arc::new(RwLock::new(WsState::Disconnected)),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             message_tx,
@@ -97,7 +114,7 @@ impl StandXWebSocket {
 
         Ok(Self {
             url,
-            token: creds.token,
+            token: Some(creds.token),
             state: Arc::new(RwLock::new(WsState::Disconnected)),
             subscriptions: Arc::new(RwLock::new(Vec::new())),
             message_tx,
@@ -122,7 +139,7 @@ impl StandXWebSocket {
             loop {
                 *state.write().await = WsState::Connecting;
 
-                match connect_and_run(&url, &token, &subscriptions, &tx).await {
+                match connect_and_run(&url, token.as_deref(), &subscriptions, &tx).await {
                     Ok(_) => {
                         *reconnect_attempts.write().await = 0;
                     }
@@ -170,11 +187,11 @@ impl StandXWebSocket {
 
 async fn connect_and_run(
     url: &str,
-    token: &str,
+    token: Option<&str>,
     subscriptions: &Arc<RwLock<Vec<String>>>,
     message_tx: &mpsc::Sender<WsMessage>,
 ) -> Result<()> {
-    let ws_url = url.to_string(); // Don't add token to URL
+    let ws_url = url.to_string();
     eprintln!("[WebSocket Debug] Connecting to: {}", ws_url);
 
     let (ws_stream, _) = connect_async(&ws_url)
@@ -184,17 +201,21 @@ async fn connect_and_run(
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send authentication
-    let auth_msg = serde_json::json!({
-        "op": "auth",
-        "token": token
-    });
-    eprintln!("[WebSocket Debug] Sending auth: {}", auth_msg);
-    write
-        .send(Message::Text(auth_msg.to_string().into()))
-        .await
-        .map_err(|e| Error::Unknown(format!("Failed to send auth: {}", e)))?;
-    eprintln!("[WebSocket Debug] Auth sent");
+    // Send authentication only if token is provided
+    if let Some(t) = token {
+        let auth_msg = serde_json::json!({
+            "op": "auth",
+            "token": t
+        });
+        eprintln!("[WebSocket Debug] Sending auth: {}", auth_msg);
+        write
+            .send(Message::Text(auth_msg.to_string().into()))
+            .await
+            .map_err(|e| Error::Unknown(format!("Failed to send auth: {}", e)))?;
+        eprintln!("[WebSocket Debug] Auth sent");
+    } else {
+        eprintln!("[WebSocket Debug] Skipping auth (public channel)");
+    }
 
     // Send subscription messages for all registered subscriptions
     let subs = subscriptions.read().await;

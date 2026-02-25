@@ -510,11 +510,10 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
 
 /// Handle stream commands
 pub async fn handle_stream(command: StreamCommands) -> Result<()> {
-    let ws = StandXWebSocket::new()?;
-
     match command {
-        // Public channels
+        // Public channels - no auth required
         StreamCommands::Price { symbol } => {
+            let ws = StandXWebSocket::without_auth()?;
             let _ = ws.subscribe("price", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
@@ -531,6 +530,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Depth { symbol, levels } => {
+            let ws = StandXWebSocket::without_auth()?;
             let _ = ws.subscribe("depth_book", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
@@ -552,6 +552,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Trade { symbol } => {
+            let ws = StandXWebSocket::without_auth()?;
             let _ = ws.subscribe("public_trade", Some(&symbol)).await;
             let mut rx = ws.connect().await?;
 
@@ -581,6 +582,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
         }
         // User-level authenticated channels
         StreamCommands::Order => {
+            let ws = StandXWebSocket::new()?;
             let _ = ws.subscribe("order", None).await;
             let mut rx = ws.connect().await?;
 
@@ -594,6 +596,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Position => {
+            let ws = StandXWebSocket::new()?;
             let _ = ws.subscribe("position", None).await;
             let mut rx = ws.connect().await?;
 
@@ -607,6 +610,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Balance => {
+            let ws = StandXWebSocket::new()?;
             let _ = ws.subscribe("balance", None).await;
             let mut rx = ws.connect().await?;
 
@@ -620,6 +624,7 @@ pub async fn handle_stream(command: StreamCommands) -> Result<()> {
             }
         }
         StreamCommands::Fills => {
+            let ws = StandXWebSocket::new()?;
             let _ = ws.subscribe("trade", None).await;
             let mut rx = ws.connect().await?;
 
