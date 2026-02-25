@@ -1,147 +1,147 @@
-# StandX CLI 测试报告
+# StandX CLI Test Report
 
-**测试时间**: 2026-02-26  
-**CLI 版本**: 0.3.0  
-**测试环境**: Linux x86_64, Rust 1.93.1
-
----
-
-## 测试概览
-
-| 部分 | 名称 | 测试数 | 通过 | 失败 | 通过率 |
-|------|------|--------|------|------|--------|
-| 第一部分 | 基础与配置 | 8 | 6 | 2 | 75% |
-| 第二部分 | 公共市场数据 | 9 | 7 | 2 | 78% |
-| 第三部分 | 认证与账户 | 6 | 6 | 0 | 100% |
-| 第四部分 | 订单与交易 | 8 | 5 | 3 | 63% |
-| 第五部分 | 流式数据 | 7 | 6 | 1 | 86% |
-| **总计** | | **38** | **30** | **8** | **79%** |
+**Test Date**: 2026-02-26  
+**CLI Version**: 0.3.0  
+**Test Environment**: Linux x86_64, Rust 1.93.1
 
 ---
 
-## 第一部分：基础与配置
+## Test Overview
 
-### ✅ 通过的测试
-
-| 测试 | 命令 | 结果 |
-|------|------|------|
-| 版本信息 | `standx --version` | `standx 0.3.0` |
-| 主帮助 | `standx --help` | 显示所有子命令 |
-| config 帮助 | `standx config --help` | 显示 4 个子命令 |
-| 显示配置 | `standx config show` | 3 项配置正常 |
-| 获取配置项 | `standx config get base_url` | `https://perps.standx.com` |
-| verbose 模式 | `standx -v config show` | 正常执行 |
-
-### ⚠️ 问题
-
-| 问题 | 描述 | 状态 |
-|------|------|------|
-| ISSUE-1.1 | JSON 输出格式不生效 | 🔴 待修复 |
-| ISSUE-1.2 | quiet 模式未简化 | 🔴 待完善 |
+| Part | Name | Tests | Passed | Failed | Pass Rate |
+|------|------|-------|--------|--------|-----------|
+| Part 1 | Basic & Config | 8 | 6 | 2 | 75% |
+| Part 2 | Public Market Data | 9 | 7 | 2 | 78% |
+| Part 3 | Auth & Account | 6 | 6 | 0 | 100% |
+| Part 4 | Orders & Trading | 8 | 5 | 3 | 63% |
+| Part 5 | Streaming Data | 7 | 6 | 1 | 86% |
+| **Total** | | **38** | **30** | **8** | **79%** |
 
 ---
 
-## 第二部分：公共市场数据
+## Part 1: Basic & Config
 
-### ✅ 通过的测试
+### ✅ Passed Tests
 
-| 测试 | 命令 | 结果 |
-|------|------|------|
-| 交易对列表 | `market symbols` | 4 个交易对 |
-| BTC 行情 | `market ticker BTC-USD` | 价格正常 |
-| ETH 行情 | `market ticker ETH-USD` | 价格正常 |
-| 所有行情 | `market tickers` | 4 个交易对 |
-| 订单簿深度 | `market depth BTC-USD` | 10 档买卖盘 |
-| 最近成交 | `market trades BTC-USD` | 成交记录正常 |
-| OpenClaw 模式 | `--openclaw market ticker` | JSON 输出正常 |
+| Test | Command | Result |
+|------|---------|--------|
+| Version info | `standx --version` | `standx 0.3.0` |
+| Main help | `standx --help` | Shows all subcommands |
+| Config help | `standx config --help` | Shows 4 subcommands |
+| Show config | `standx config show` | 3 config items displayed |
+| Get config item | `standx config get base_url` | `https://perps.standx.com` |
+| Verbose mode | `standx -v config show` | Executes normally |
 
-### ⚠️ 问题
+### ⚠️ Issues
 
-| 问题 | 描述 | 状态 |
-|------|------|------|
-| ISSUE-2.1 | K 线参数格式不友好 | 🔴 待优化 |
-| ISSUE-2.2 | 资金费率返回空数据 | 🔴 待排查 |
-
----
-
-## 第三部分：认证与账户
-
-### ✅ 通过的测试
-
-| 测试 | 命令 | 结果 |
-|------|------|------|
-| auth 帮助 | `auth --help` | 3 个子命令 |
-| 认证状态 | `auth status` | Authenticated |
-| account 帮助 | `account --help` | 5 个子命令 |
-| 账户余额 | `account balances` | Balance 正常显示 |
-| 持仓查询 | `account positions` | 正常显示 |
-| 当前订单 | `account orders` | 正常显示订单列表 |
-| 订单历史 | `account history` | 正常显示 |
+| Issue | Description | Status |
+|-------|-------------|--------|
+| ISSUE-1.1 | JSON output format not working | 🔴 Pending |
+| ISSUE-1.2 | Quiet mode not simplified | 🔴 Pending |
 
 ---
 
-## 第四部分：订单与交易
+## Part 2: Public Market Data
 
-### ✅ 通过的测试
+### ✅ Passed Tests
 
-| 测试 | 命令 | 结果 |
-|------|------|------|
-| order 帮助 | `order --help` | 3 个子命令 |
-| order create 帮助 | `order create --help` | 参数完整 |
-| trade 帮助 | `trade --help` | 1 个子命令 |
-| leverage 帮助 | `leverage --help` | 2 个子命令 |
-| **下单** | `order create BTC-USD buy limit` | **✅ 成功** |
-| **查单** | `account orders` | **✅ 显示正常** |
-| **撤单** | `order cancel` | **✅ 取消成功** |
+| Test | Command | Result |
+|------|---------|--------|
+| Symbol list | `market symbols` | 4 trading pairs |
+| BTC ticker | `market ticker BTC-USD` | Price displayed |
+| ETH ticker | `market ticker ETH-USD` | Price displayed |
+| All tickers | `market tickers` | 4 trading pairs |
+| Order book depth | `market depth BTC-USD` | 10 levels of bids/asks |
+| Recent trades | `market trades BTC-USD` | Trade records displayed |
+| OpenClaw mode | `--openclaw market ticker` | JSON output works |
 
-### ⚠️ 未实现的功能
+### ⚠️ Issues
 
-| 功能 | 状态 | 说明 |
-|------|------|------|
-| `trade history` | ⚠️ | 未实现 |
-| `leverage get/set` | ⚠️ | 未实现 |
-| `margin transfer/mode` | ⚠️ | 未实现 |
+| Issue | Description | Status |
+|-------|-------------|--------|
+| ISSUE-2.1 | K-line parameter format unfriendly | 🔴 Pending |
+| ISSUE-2.2 | Funding rate returns empty data | 🔴 Pending |
 
 ---
 
-## 第五部分：流式数据 (WebSocket)
+## Part 3: Auth & Account
 
-### ✅ 通过的测试
+### ✅ Passed Tests
 
-| 测试 | 命令 | 结果 |
-|------|------|------|
-| stream 帮助 | `stream --help` | 7 个子命令 |
-| **stream price** | `stream price BTC-USD` | **✅ 正常输出** |
-| **stream depth** | `stream depth BTC-USD` | **✅ 正常输出** |
-| **stream trade** | `stream trade BTC-USD` | **✅ 正常输出** |
-| stream order | `stream order` | 需认证 |
-| stream position | `stream position` | 需认证 |
-| stream balance | `stream balance` | 需认证 |
-| stream fills | `stream fills` | 需认证 |
+| Test | Command | Result |
+|------|---------|--------|
+| Auth help | `auth --help` | 3 subcommands |
+| Auth status | `auth status` | Authenticated |
+| Account help | `account --help` | 5 subcommands |
+| Account balance | `account balances` | Balance displayed |
+| Position query | `account positions` | Displayed normally |
+| Current orders | `account orders` | Order list displayed |
+| Order history | `account history` | Displayed normally |
 
-### 🔧 已修复的问题
+---
 
-| 问题 | 修复内容 |
-|------|----------|
-| FIX-5.1 | 修复频道名称: `depth` → `depth_book`, `trades` → `public_trade` |
-| FIX-5.2 | 修复 Trade 结构体支持 WebSocket 格式 |
-| FIX-5.3 | 修复 PriceData timestamp 字段映射 |
-| FIX-5.4 | 公共频道无需 token 即可使用 |
-| FIX-5.5 | 添加 verbose 模式控制 debug 输出 |
-| FIX-5.6 | 更新认证消息格式为 `{ "auth": { "token": "Bearer ...", "streams": [...] } }` |
+## Part 4: Orders & Trading
 
-### 使用示例
+### ✅ Passed Tests
+
+| Test | Command | Result |
+|------|---------|--------|
+| Order help | `order --help` | 3 subcommands |
+| Order create help | `order create --help` | Complete parameters |
+| Trade help | `trade --help` | 1 subcommand |
+| Leverage help | `leverage --help` | 2 subcommands |
+| **Place order** | `order create BTC-USD buy limit` | **✅ Success** |
+| **Query order** | `account orders` | **✅ Displayed** |
+| **Cancel order** | `order cancel` | **✅ Cancelled** |
+
+### ⚠️ Unimplemented Features
+
+| Feature | Status | Note |
+|---------|--------|------|
+| `trade history` | ⚠️ | Not implemented |
+| `leverage get/set` | ⚠️ | Not implemented |
+| `margin transfer/mode` | ⚠️ | Not implemented |
+
+---
+
+## Part 5: Streaming Data (WebSocket)
+
+### ✅ Passed Tests
+
+| Test | Command | Result |
+|------|---------|--------|
+| Stream help | `stream --help` | 7 subcommands |
+| **Stream price** | `stream price BTC-USD` | **✅ Normal output** |
+| **Stream depth** | `stream depth BTC-USD` | **✅ Normal output** |
+| **Stream trade** | `stream trade BTC-USD` | **✅ Normal output** |
+| Stream order | `stream order` | Requires auth |
+| Stream position | `stream position` | Requires auth |
+| Stream balance | `stream balance` | Requires auth |
+| Stream fills | `stream fills` | Requires auth |
+
+### 🔧 Fixed Issues
+
+| Issue | Fix |
+|-------|-----|
+| FIX-5.1 | Fixed channel names: `depth` → `depth_book`, `trades` → `public_trade` |
+| FIX-5.2 | Fixed Trade struct to support WebSocket format |
+| FIX-5.3 | Fixed PriceData timestamp field mapping |
+| FIX-5.4 | Public channels work without token |
+| FIX-5.5 | Added verbose mode for debug output |
+| FIX-5.6 | Updated auth message format to `{ "auth": { "token": "Bearer ...", "streams": [...] } }` |
+
+### Usage Examples
 
 ```bash
-# 公共频道 - 无需认证
+# Public channels - no auth required
 standx stream price BTC-USD
 standx stream depth BTC-USD
 standx stream trade BTC-USD
 
-# 公共频道 - 带 debug 输出
+# Public channels with debug output
 standx -v stream price BTC-USD
 
-# 用户频道 - 需要 JWT token
+# User channels - requires JWT token
 export STANDX_JWT="your_jwt_token"
 standx stream order
 standx stream position
@@ -149,70 +149,70 @@ standx stream balance
 standx stream fills
 ```
 
-### ⚠️ 问题
+### ⚠️ Issues
 
-| 问题 | 描述 | 状态 |
-|------|------|------|
-| ISSUE-5.1 | 用户认证频道返回 `invalid token` | 🔴 待排查 |
-
----
-
-## 问题汇总
-
-### 待修复问题
-
-| 编号 | 描述 | 优先级 |
-|------|------|--------|
-| ISSUE-1.1 | JSON 输出格式不生效 | 中 |
-| ISSUE-1.2 | quiet 模式未简化 | 低 |
-| ISSUE-2.1 | K 线参数格式不友好 | 中 |
-| ISSUE-2.2 | 资金费率返回空数据 | 低 |
-| ISSUE-4.1 | trade history 未实现 | 中 |
-| ISSUE-4.2 | leverage 功能未实现 | 中 |
-| ISSUE-4.3 | margin 功能未实现 | 低 |
-| ISSUE-5.1 | 用户认证频道 token 问题 | 中 |
-
-### 已修复问题
-
-| 编号 | 描述 | 修复内容 |
-|------|------|----------|
-| FIX-3.1 | positions API 解析错误 | 改为直接解析数组 |
-| FIX-3.2 | history API 404 | 改为 `/api/query_orders?status=filled` |
-| FIX-3.3 | orders API 解析错误 | 使用 `ApiListResponse` 包装对象 |
-| FIX-4.1 | Private Key 不正确 | 使用正确的 Ed25519 key |
-| FIX-5.1-5.6 | WebSocket 流修复 | 见第五部分 |
+| Issue | Description | Status |
+|-------|-------------|--------|
+| ISSUE-5.1 | User auth channels return `invalid token` | 🔴 Pending |
 
 ---
 
-## 核心功能状态
+## Issue Summary
 
-| 功能模块 | 状态 | 说明 |
-|----------|------|------|
-| 基础命令 | ✅ 完整 | version, help, config |
-| 公共市场数据 | ✅ 完整 | symbols, ticker, depth, trades |
-| 认证 | ✅ 正常 | JWT + Private Key |
-| 账户查询 | ✅ 正常 | balances, positions, orders, history |
-| 订单管理 | ✅ 正常 | create, cancel, query |
-| 流式数据 (公共) | ✅ 正常 | price, depth, trade |
-| 流式数据 (用户) | ⚠️ 需认证 | order, position, balance, fills |
-| 交易历史 | ⚠️ 未实现 | trade history |
-| 杠杆管理 | ⚠️ 未实现 | leverage get/set |
-| 保证金管理 | ⚠️ 未实现 | margin transfer/mode |
+### Pending Issues
+
+| ID | Description | Priority |
+|----|-------------|----------|
+| ISSUE-1.1 | JSON output format not working | Medium |
+| ISSUE-1.2 | Quiet mode not simplified | Low |
+| ISSUE-2.1 | K-line parameter format unfriendly | Medium |
+| ISSUE-2.2 | Funding rate returns empty data | Low |
+| ISSUE-4.1 | Trade history not implemented | Medium |
+| ISSUE-4.2 | Leverage functions not implemented | Medium |
+| ISSUE-4.3 | Margin functions not implemented | Low |
+| ISSUE-5.1 | User auth channel token issue | Medium |
+
+### Fixed Issues
+
+| ID | Description | Fix |
+|----|-------------|-----|
+| FIX-3.1 | Positions API parsing error | Changed to direct array parsing |
+| FIX-3.2 | History API 404 | Changed to `/api/query_orders?status=filled` |
+| FIX-3.3 | Orders API parsing error | Use `ApiListResponse` wrapper |
+| FIX-4.1 | Private Key incorrect | Use correct Ed25519 key |
+| FIX-5.1-5.6 | WebSocket streaming fixes | See Part 5 |
 
 ---
 
-## 测试环境
+## Core Features Status
+
+| Feature Module | Status | Note |
+|----------------|--------|------|
+| Basic commands | ✅ Complete | version, help, config |
+| Public market data | ✅ Complete | symbols, ticker, depth, trades |
+| Authentication | ✅ Normal | JWT + Private Key |
+| Account queries | ✅ Normal | balances, positions, orders, history |
+| Order management | ✅ Normal | create, cancel, query |
+| Streaming (public) | ✅ Normal | price, depth, trade |
+| Streaming (user) | ⚠️ Requires auth | order, position, balance, fills |
+| Trade history | ⚠️ Not implemented | trade history |
+| Leverage management | ⚠️ Not implemented | leverage get/set |
+| Margin management | ⚠️ Not implemented | margin transfer/mode |
+
+---
+
+## Test Environment
 
 ```bash
-# 认证信息
+# Auth credentials
 export STANDX_JWT="eyJhbGciOiJFUzI1NiIsImtpZCI6IlhnaEJQSVNuN0RQVHlMcWJtLUVHVkVhOU1lMFpwdU9iMk1Qc2gtbUFlencifQ..."
 export STANDX_PRIVATE_KEY="8RYHtn9RvCwgLyyeW5XurT4kVyZrDkN5B92P3FoLmsnb"
 
-# API 端点
+# API endpoints
 base_url: https://perps.standx.com
 websocket: wss://perps.standx.com/ws-stream/v1
 ```
 
 ---
 
-*报告生成时间: 2026-02-26*
+*Report generated: 2026-02-26*

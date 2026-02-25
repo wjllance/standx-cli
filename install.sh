@@ -1,6 +1,6 @@
 #!/bin/sh
-# StandX CLI 一键安装脚本
-# 支持 macOS (Intel/Apple Silicon) 和 Linux (x86_64/ARM64)
+# StandX CLI One-line Installer
+# Supports macOS (Intel/Apple Silicon) and Linux (x86_64/ARM64)
 
 set -e
 
@@ -8,13 +8,13 @@ REPO="wjllance/standx-cli"
 BINARY_NAME="standx"
 INSTALL_DIR="/usr/local/bin"
 
-# 颜色输出
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-# 检测目标平台
+# Detect target platform
 get_target() {
     local os=$(uname -s)
     local arch=$(uname -m)
@@ -29,7 +29,7 @@ get_target() {
                     echo "x86_64-apple-darwin"
                     ;;
                 *)
-                    echo "${RED}错误: 不支持的 macOS 架构: $arch${NC}" >&2
+                    echo "${RED}Error: Unsupported macOS architecture: $arch${NC}" >&2
                     exit 1
                     ;;
             esac
@@ -43,129 +43,129 @@ get_target() {
                     echo "x86_64-unknown-linux-gnu"
                     ;;
                 *)
-                    echo "${RED}错误: 不支持的 Linux 架构: $arch${NC}" >&2
+                    echo "${RED}Error: Unsupported Linux architecture: $arch${NC}" >&2
                     exit 1
                     ;;
             esac
             ;;
         *)
-            echo "${RED}错误: 不支持的操作系统: $os${NC}" >&2
+            echo "${RED}Error: Unsupported operating system: $os${NC}" >&2
             exit 1
             ;;
     esac
 }
 
-# 获取最新版本标签
+# Get latest version tag
 get_latest_tag() {
     local api_url="https://api.github.com/repos/${REPO}/releases/latest"
     local tag=$(curl -sSL "$api_url" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 
     if [ -z "$tag" ]; then
-        echo "${RED}错误: 无法获取最新版本信息${NC}" >&2
+        echo "${RED}Error: Unable to get latest version information${NC}" >&2
         exit 1
     fi
 
     echo "$tag"
 }
 
-# 主安装逻辑
+# Main installation logic
 main() {
-    echo "${GREEN}=== StandX CLI 安装脚本 ===${NC}"
+    echo "${GREEN}=== StandX CLI Installer ===${NC}"
     echo ""
 
-    # 检测平台
+    # Detect platform
     local target=$(get_target)
-    echo "检测到平台: ${YELLOW}$target${NC}"
+    echo "Detected platform: ${YELLOW}$target${NC}"
 
-    # 获取最新版本
-    echo "正在获取最新版本信息..."
+    # Get latest version
+    echo "Fetching latest version information..."
     local tag=$(get_latest_tag)
-    echo "最新版本: ${YELLOW}$tag${NC}"
+    echo "Latest version: ${YELLOW}$tag${NC}"
 
-    # 构造下载 URL
+    # Construct download URL
     local tarball_name="${BINARY_NAME}-${tag}-${target}.tar.gz"
     local download_url="https://github.com/${REPO}/releases/download/${tag}/${tarball_name}"
     local checksums_url="https://github.com/${REPO}/releases/download/${tag}/checksums.txt"
 
-    # 创建临时目录
+    # Create temp directory
     local tmp_dir=$(mktemp -d)
     trap "rm -rf $tmp_dir" EXIT
 
-    # 下载 tarball
+    # Download tarball
     echo ""
-    echo "正在下载 ${tarball_name}..."
+    echo "Downloading ${tarball_name}..."
     if ! curl -sSL -o "${tmp_dir}/${tarball_name}" "$download_url"; then
-        echo "${RED}错误: 下载失败${NC}" >&2
+        echo "${RED}Error: Download failed${NC}" >&2
         exit 1
     fi
 
-    # 下载 checksums.txt
-    echo "正在下载 checksums.txt..."
+    # Download checksums.txt
+    echo "Downloading checksums.txt..."
     if ! curl -sSL -o "${tmp_dir}/checksums.txt" "$checksums_url"; then
-        echo "${YELLOW}警告: 无法下载 checksums.txt，跳过校验${NC}"
+        echo "${YELLOW}Warning: Unable to download checksums.txt, skipping verification${NC}"
     else
-        # 校验 SHA256
-        echo "正在校验文件完整性..."
+        # Verify SHA256
+        echo "Verifying file integrity..."
         cd "$tmp_dir"
         if ! sha256sum -c checksums.txt --ignore-missing 2>/dev/null | grep -q "${tarball_name}: OK"; then
-            echo "${RED}错误: SHA256 校验失败，文件可能损坏或被篡改${NC}" >&2
+            echo "${RED}Error: SHA256 verification failed, file may be corrupted or tampered${NC}" >&2
             exit 1
         fi
-        echo "${GREEN}✓ 校验通过${NC}"
+        echo "${GREEN}✓ Verification passed${NC}"
         cd - >/dev/null
     fi
 
-    # 解压
+    # Extract
     echo ""
-    echo "正在解压..."
+    echo "Extracting..."
     tar -xzf "${tmp_dir}/${tarball_name}" -C "$tmp_dir"
 
-    # 检查解压后的二进制文件
+    # Check extracted binary
     local binary_path="${tmp_dir}/${BINARY_NAME}"
     if [ ! -f "$binary_path" ]; then
-        echo "${RED}错误: 解压后未找到 ${BINARY_NAME} 二进制文件${NC}" >&2
+        echo "${RED}Error: Binary file ${BINARY_NAME} not found after extraction${NC}" >&2
         exit 1
     fi
 
-    # 检查安装目录权限
+    # Check install directory permissions
     if [ ! -d "$INSTALL_DIR" ]; then
-        echo "${YELLOW}安装目录 $INSTALL_DIR 不存在，尝试创建...${NC}"
+        echo "${YELLOW}Install directory $INSTALL_DIR does not not exist, attempting to create...${NC}"
         if ! sudo mkdir -p "$INSTALL_DIR"; then
-            echo "${RED}错误: 无法创建安装目录${NC}" >&2
+            echo "${RED}Error: Unable to create install directory${NC}" >&2
             exit 1
         fi
     fi
 
-    # 安装
+    # Install
     echo ""
-    echo "正在安装到 ${INSTALL_DIR}/${BINARY_NAME}..."
+    echo "Installing to ${INSTALL_DIR}/${BINARY_NAME}..."
     if [ -w "$INSTALL_DIR" ]; then
         mv "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
         chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     else
-        echo "${YELLOW}需要管理员权限来安装到 $INSTALL_DIR${NC}"
+        echo "${YELLOW}Administrator privileges required to install to $INSTALL_DIR${NC}"
         sudo mv "$binary_path" "${INSTALL_DIR}/${BINARY_NAME}"
         sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
     fi
 
-    # 验证安装
+    # Verify installation
     echo ""
-    echo "验证安装..."
+    echo "Verifying installation..."
     if command -v "$BINARY_NAME" >/dev/null 2>&1; then
         local version=$($BINARY_NAME --version 2>/dev/null || echo "unknown")
-        echo "${GREEN}✓ 安装成功!${NC}"
+        echo "${GREEN}✓ Installation successful!${NC}"
         echo ""
-        echo "版本: ${YELLOW}$version${NC}"
+        echo "Version: ${YELLOW}$version${NC}"
         echo ""
-        echo "使用以下命令开始使用:"
-        echo "  ${YELLOW}standx --help${NC}          查看帮助"
-        echo "  ${YELLOW}standx --version${NC}       查看版本"
-        echo "  ${YELLOW}standx auth login${NC}      登录认证"
+        echo "Get started with:"
+        echo "  ${YELLOW}standx --help${NC}          Show help"
+        echo "  ${YELLOW}standx --version${NC}       Show version"
+        echo "  ${YELLOW}standx auth login${NC}      Authenticate"
     else
-        echo "${YELLOW}警告: 安装完成，但 $BINARY_NAME 不在 PATH 中${NC}"
-        echo "请确保 $INSTALL_DIR 在你的 PATH 环境变量中"
+        echo "${YELLOW}Warning: Installation complete, but $BINARY_NAME is not in PATH${NC}"
+        echo "Please ensure $INSTALL_DIR is in your PATH environment variable"
     fi
 }
 
-# 运行主函数
+# Run main function
 main "$@"
