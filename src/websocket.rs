@@ -170,11 +170,9 @@ async fn connect_and_run(
 ) -> Result<()> {
     let ws_url = format!("{}?token={}", url, token);
 
-    let (ws_stream, _) = connect_async(&ws_url)
-        .await
-        .map_err(|e| Error::Unknown { 
-            0: format!("WebSocket connect failed: {}", e) 
-        })?;
+    let (ws_stream, _) = connect_async(&ws_url).await.map_err(|e| Error::Unknown {
+        0: format!("WebSocket connect failed: {}", e),
+    })?;
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -186,8 +184,8 @@ async fn connect_and_run(
     write
         .send(Message::Text(auth_msg.to_string().into()))
         .await
-        .map_err(|e| Error::Unknown { 
-            0: format!("Failed to send auth: {}", e) 
+        .map_err(|e| Error::Unknown {
+            0: format!("Failed to send auth: {}", e),
         })?;
 
     let _ = message_tx.send(WsMessage::Connected).await;
@@ -203,7 +201,9 @@ async fn connect_and_run(
             interval.tick().await;
             let mut writer = heartbeat_write_clone.write().await;
             if let Err(e) = writer.send(Message::Ping(vec![].into())).await {
-                let _ = heartbeat_tx.send(WsMessage::Error(format!("Heartbeat failed: {}", e))).await;
+                let _ = heartbeat_tx
+                    .send(WsMessage::Error(format!("Heartbeat failed: {}", e)))
+                    .await;
                 break;
             }
         }
@@ -240,8 +240,8 @@ async fn connect_and_run(
             Ok(Message::Ping(data)) => {
                 let mut writer = heartbeat_write.write().await;
                 if let Err(e) = writer.send(Message::Pong(data)).await {
-                    return Err(Error::Unknown { 
-                        0: format!("Failed to send pong: {}", e) 
+                    return Err(Error::Unknown {
+                        0: format!("Failed to send pong: {}", e),
                     });
                 }
             }
@@ -253,8 +253,8 @@ async fn connect_and_run(
                 break;
             }
             Err(e) => {
-                return Err(Error::Unknown { 
-                    0: format!("WebSocket error: {}", e) 
+                return Err(Error::Unknown {
+                    0: format!("WebSocket error: {}", e),
                 });
             }
             _ => {}
