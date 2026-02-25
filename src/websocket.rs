@@ -155,7 +155,7 @@ impl StandXWebSocket {
 
     /// Get current state
     pub async fn state(&self) -> WsState {
-        *self.state.read().await
+        self.state.read().await.clone()
     }
 }
 
@@ -181,7 +181,7 @@ async fn connect_and_run(
         "token": token
     });
     write
-        .send(Message::Text(auth_msg.to_string()))
+        .send(Message::Text(auth_msg.to_string().into()))
         .await
         .map_err(|e| Error::Unknown { 
             0: format!("Failed to send auth: {}", e) 
@@ -199,7 +199,7 @@ async fn connect_and_run(
         loop {
             interval.tick().await;
             let mut writer = heartbeat_write_clone.write().await;
-            if let Err(e) = writer.send(Message::Ping(vec![])).await {
+            if let Err(e) = writer.send(Message::Ping(vec![].into())).await {
                 let _ = heartbeat_tx.send(WsMessage::Error(format!("Heartbeat failed: {}", e))).await;
                 break;
             }
