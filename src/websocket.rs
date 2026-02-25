@@ -221,11 +221,31 @@ async fn connect_and_run(
 
     let (mut write, mut read) = ws_stream.split();
 
+    // Get subscriptions early for auth message
+    let subs = subscriptions.read().await;
+
     // Send authentication only if token is provided
     if let Some(t) = token {
+        // Build streams array from subscriptions
+        let streams: Vec<serde_json::Value> = subs
+            .iter()
+            .map(|topic| {
+                let parts: Vec<&str> = topic.split(':').collect();
+                let channel = parts[0];
+                let symbol = if parts.len() > 1 { parts[1] } else { "" };
+                if symbol.is_empty() {
+                    serde_json::json!({ "channel": channel })
+                } else {
+                    serde_json::json!({ "channel": channel, "symbol": symbol })
+                }
+            })
+            .collect();
+
         let auth_msg = serde_json::json!({
-            "op": "auth",
-            "token": t
+            "auth": {
+                "token": t,
+                "streams": streams
+            }
         });
         if verbose {
             eprintln!("[WebSocket Debug] Sending auth: {}", auth_msg);
@@ -242,7 +262,6 @@ async fn connect_and_run(
     }
 
     // Send subscription messages for all registered subscriptions
-    let subs = subscriptions.read().await;
     if verbose {
         eprintln!("[WebSocket Debug] Subscribing to {} topics", subs.len());
     }

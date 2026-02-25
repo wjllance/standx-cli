@@ -44,7 +44,7 @@ async fn main() {
     };
 
     // Execute command and handle errors
-    match execute_command(cli.command, output).await {
+    match execute_command(cli.command, output, cli.verbose).await {
         Ok(_) => {}
         Err(e) => {
             print_error(&e, output);
@@ -57,6 +57,7 @@ async fn main() {
 async fn execute_command(
     command: Commands,
     output: OutputFormat,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Config { command } => {
@@ -84,7 +85,7 @@ async fn execute_command(
             commands::handle_margin(command).await?;
         }
         Commands::Stream { command } => {
-            commands::handle_stream(command).await?;
+            commands::handle_stream(command, verbose).await?;
         }
     }
     Ok(())
