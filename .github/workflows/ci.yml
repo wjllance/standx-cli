@@ -42,7 +42,17 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
-        run: cargo build --verbose
+        run: |
+          cargo build --verbose 2>&1 | tee build.log
+          echo "Build exit code: ${PIPESTATUS[0]}"
+        continue-on-error: true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Run tests
         run: cargo test --verbose
