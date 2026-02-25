@@ -3,10 +3,10 @@ name = "standx-cli"
 version = "0.2.0"
 edition = "2021"
 authors = ["Kimi Claw"]
-description = "The first AI Agent-native trading toolkit for StandX - designed for automation, MCP-compatible, structured output by default"
+description = "The native trading companion for OpenClaw agents - seamless crypto trading through natural language"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/wjllance/standx-cli"
-keywords = ["ai-agent", "mcp", "trading", "standx", "automation", "crypto", "dex", "llm", "toolkit"]
+keywords = ["openclaw", "trading", "crypto", "standx", "agent", "cli", "automation"]
 categories = ["command-line-utilities", "cryptography::cryptocurrencies", "development-tools::testing"]
 rust-version = "1.75"
 

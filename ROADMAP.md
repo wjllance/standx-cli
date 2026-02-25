@@ -1,109 +1,93 @@
-# StandX Agent Toolkit Roadmap
+# StandX for OpenClaw - Roadmap
 
-> **Vision**: Become the industry-standard AI Agent trading infrastructure
-> 
-> "When exchanges build Agent toolkits, they reference StandX Agent Toolkit"
+> **Vision**: The seamless bridge between natural language and crypto trading for OpenClaw agents
 
 ---
 
-## Phase 1: Agent Foundation ✅ (Current)
+## Phase 1: OpenClaw Native (Current - 2 weeks)
 
-**Goal**: AI Agents can trade via MCP
+**Goal**: Perfect integration with OpenClaw's execution model
 
 ### Core Features
-- [x] **Structured JSON Output** - All commands support `--output json`
-- [x] **Non-Interactive Mode** - Environment variable authentication
-- [ ] **MCP Server** - Native Model Context Protocol support
-- [ ] **Structured Errors** - Machine-readable error responses
-- [ ] **OpenClaw Integration** - Official support and examples
+- [x] **Structured JSON output** - All commands parseable by agents
+- [x] **Non-interactive mode** - No prompts, scriptable execution
+- [ ] **Session persistence** - Maintain state across commands
+- [ ] **Batch execution** - Multiple commands in one call
+- [ ] **OpenClaw defaults** - Optimized configuration out of the box
 
-### Timeline
-- **Week 1**: MCP Server implementation, structured errors
-- **Week 2**: Documentation, examples, community announcement
+### CLI Optimizations
+- [ ] `--openclaw` flag - Enable agent-optimized mode
+- [ ] `--confirm` / `--no-confirm` - Control confirmation prompts
+- [ ] `--dry-run` - Test commands without execution
+- [ ] Better error messages for agent parsing
 
----
+### Documentation
+- [ ] OpenClaw integration guide
+- [ ] Example workflows
+- [ ] Best practices for agent trading
 
-## Phase 2: Automation Toolkit (Next 1-2 months)
-
-**Goal**: Production-ready automation for AI Agents
-
-### MCP Enhancements
-- [ ] **Streaming Tools** - Real-time data via MCP resources
-- [ ] **Batch Operations** - Multi-order execution
-- [ ] **Webhook Callbacks** - Event-driven Agent reactions
-- [ ] **Tool Composability** - Complex workflow support
-
-### Developer Experience
-- [ ] **Python SDK** - `pip install standx-agent`
-- [ ] **TypeScript SDK** - `npm install @standx/agent`
-- [ ] **Strategy Templates** - Grid, DCA, TWAP built-in
-- [ ] **Local Testing** - Mock server for Agent development
-
-### Agent Capabilities
-- [ ] **Risk Management Tools** - Position limits, stop-loss automation
-- [ ] **Portfolio Analytics** - PnL tracking, performance metrics
-- [ ] **Multi-Account Support** - Agent-managed sub-accounts
-- [ ] **Paper Trading** - Test strategies without real funds
+**Success Metric**: OpenClaw user can trade within 5 minutes of install
 
 ---
 
-## Phase 3: Ecosystem Standard (3-6 months)
+## Phase 2: Enhanced Agent Experience (1-2 months)
 
-**Goal**: Define the industry standard for Agent trading
+**Goal**: Richer interactions, smarter defaults
 
-### Protocol Extensions
-- [ ] **Multi-Exchange Abstraction** - Unified interface for CEX/DEX
-- [ ] **Cross-Chain Coordination** - Multi-chain Agent workflows
-- [ ] **Agent-to-Agent Protocol** - Collaborative trading
-- [ ] **On-Chain Settlement** - Direct blockchain integration
+### New Features
+- [ ] **Strategy templates** - Grid, DCA, TWAP as one-liners
+  ```bash
+  standx strategy grid BTC-USD --range 60000-70000 --grids 10
+  ```
+- [ ] **Position tracking** - Automatic PnL calculation
+- [ ] **Risk management** - Built-in stop-loss monitoring
+- [ ] **Webhook support** - Event-driven agent reactions
 
-### AI-Native Features
-- [ ] **Natural Language Strategy Builder** - "Create a grid strategy for BTC"
-- [ ] **AI Strategy Recommendations** - Market-aware suggestions
-- [ ] **Autonomous Fund Management** - Self-managing portfolios
-- [ ] **Social Trading Graph** - Copy successful Agents
+### OpenClaw Skill (Optional)
+- [ ] Native OpenClaw skill wrapper
+- [ ] Pre-built intents ("buy", "sell", "check position")
+- [ ] Conversation memory for trading context
 
-### Standardization
-- [ ] **MCP Extension Proposal** - Standard trading tool schema
-- [ ] **OpenAPI Specification** - Industry reference
-- [ ] **Security Best Practices** - Agent authentication standards
-- [ ] **Compliance Framework** - Regulatory-aware trading
+### Developer Tools
+- [ ] Python SDK - `pip install standx-openclaw`
+- [ ] Testing framework - Mock StandX API for development
+- [ ] Strategy backtesting
+
+**Success Metric**: 100+ active OpenClaw users
 
 ---
 
-## Phase 4: Platform Economy (6+ months)
+## Phase 3: Advanced Automation (3-6 months)
 
-**Goal**: Build the Agent trading ecosystem
+**Goal**: Production-grade automated trading
 
-### Marketplace
-- [ ] **Strategy Marketplace** - Buy/sell Agent strategies
-- [ ] **Agent Reputation System** - Track record verification
-- [ ] **Performance Analytics** - Public leaderboards
-- [ ] **Strategy Backtesting** - Historical validation
+### Automation Features
+- [ ] **Multi-account management** - Trade across accounts
+- [ ] **Portfolio rebalancing** - Automated allocation
+- [ ] **Cross-exchange arbitrage** - Multi-venue execution
+- [ ] **Advanced order types** - Iceberg, TWAP, VWAP
 
-### Infrastructure
-- [ ] **Hosted Agent Service** - Cloud-based Agent execution
-- [ ] **Agent Coordination Network** - Distributed trading
-- [ ] **Real-Time Data Feed** - Sub-second market data
-- [ ] **Institutional API** - Enterprise-grade infrastructure
+### Intelligence
+- [ ] **Market analysis** - Trend detection, sentiment
+- [ ] **Smart alerts** - Context-aware notifications
+- [ ] **Strategy optimization** - ML-based parameter tuning
 
-### Community
-- [ ] **Agent Hackathons** - Build the future of trading
-- [ ] **Research Grants** - Academic partnerships
-- [ ] **Developer DAO** - Community governance
-- [ ] **Education Platform** - Learn Agent trading
+### Ecosystem
+- [ ] **Strategy marketplace** - Share and discover strategies
+- [ ] **Community templates** - Curated best practices
+- [ ] **Educational content** - Learn agent trading
+
+**Success Metric**: Featured in OpenClaw documentation
 
 ---
 
 ## Design Principles
 
-Throughout all phases, we adhere to:
-
-1. **Agent-First** - Machine before human
-2. **Structured-Everything** - Zero text parsing
-3. **Composable** - Tools build workflows
-4. **Zero-Config** - Works out of the box
-5. **Observable** - Full visibility into Agent actions
+1. **OpenClaw-First** - Every feature designed for agent workflows
+2. **Progressive Disclosure** - Simple for beginners, powerful for experts
+3. **Safety by Default** - Protect users from costly mistakes
+4. **Transparent** - Always show what the agent is doing
+5. **Composable** - Small tools that combine into complex strategies
 
 ---
 
@@ -111,31 +95,24 @@ Throughout all phases, we adhere to:
 
 | Phase | Metric | Target |
 |-------|--------|--------|
-| Phase 1 | GitHub Stars | 500+ |
-| Phase 1 | MCP Connections | 100+ |
-| Phase 2 | Active Agents | 500+ |
-| Phase 2 | SDK Downloads | 10k+ |
-| Phase 3 | Exchange Partners | 3+ |
-| Phase 3 | Industry References | 10+ |
-| Phase 4 | Marketplace Strategies | 100+ |
-| Phase 4 | Daily Agent Transactions | 10k+ |
+| Phase 1 | GitHub Stars | 200+ |
+| Phase 1 | OpenClaw mentions | 10+ |
+| Phase 2 | Active users | 100+ |
+| Phase 2 | Strategy templates | 10+ |
+| Phase 3 | Daily trades via agents | 1000+ |
+| Phase 3 | Community strategies | 50+ |
 
 ---
 
 ## Contributing
 
-We welcome contributions aligned with our vision:
+We prioritize contributions that improve the OpenClaw experience:
 
-- **MCP Tools** - Expand Agent capabilities
-- **SDKs** - Support more languages
-- **Strategies** - Share proven templates
-- **Documentation** - Help others build Agents
-- **Standards** - Shape the industry
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+- OpenClaw workflow examples
+- Natural language command mappings
+- Safety features
+- Documentation
 
 ---
-
-**Building the future of AI-native trading.**
 
 *Last updated: 2026-02-25*

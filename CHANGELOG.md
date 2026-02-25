@@ -8,19 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Vision
-- **Repositioning**: Transforming from a CLI tool to the industry-standard AI Agent Toolkit for trading
-- **Goal**: Become the reference implementation for exchange Agent toolkits
+- **Repositioning**: From generic AI Agent Toolkit to OpenClaw-native trading companion
+- **Goal**: The seamless bridge between OpenClaw agents and StandX trading
+- **Focus**: CLI optimization for OpenClaw integration over MCP
 
 ### Added
-- New project positioning: "The first AI Agent-native trading infrastructure"
-- MCP (Model Context Protocol) support planned
-- Structured error output for machine parsing
-- Agent-first design principles documentation
+- New project positioning: "The native trading companion for OpenClaw agents"
+- OpenClaw-centric documentation and examples
+- Natural language to execution workflow examples
 
 ### Changed
-- Updated README with Agent-centric narrative
+- Updated README with OpenClaw-focused narrative
 - Updated Cargo.toml description and keywords
-- Reframed all documentation for AI Agent use cases
+- Simplified roadmap to focus on OpenClaw integration
+- Removed MCP-centric claims (may revisit later)
 
 ## [0.2.0] - 2026-02-24
 
