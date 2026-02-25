@@ -1,87 +1,48 @@
-//! WebSocket client for StandX real-time data
+//! WebSocket client for real-time data
 
 use crate::auth::Credentials;
 use crate::error::{Error, Result};
-use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use crate::models::*;
+use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tokio::time::{interval, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_WS_URL: &str = "wss://perps.standx.com/ws-stream/v1";
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-const RECONNECT_DELAY_BASE: Duration = Duration::from_secs(2);
-const RECONNECT_DELAY_MAX: Duration = Duration::from_secs(30);
-
-/// WebSocket message types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "channel", rename_all = "snake_case")]
-pub enum WsMessage {
-    Auth { data: AuthData },
-    DepthBook { data: DepthBookData, seq: u64 },
-    Price { data: PriceData },
-    Trade { data: TradeData },
-    Order { data: serde_json::Value },
-    Position { data: serde_json::Value },
-    Balance { data: serde_json::Value },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuthData {
-    pub code: i32,
-    pub msg: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DepthBookData {
-    pub symbol: String,
-    pub bids: Vec<[serde_json::Value; 2]>,
-    pub asks: Vec<[serde_json::Value; 2]>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PriceData {
-    pub symbol: String,
-    pub mark_price: String,
-    pub index_price: String,
-    pub last_price: String,
-    pub time: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TradeData {
-    pub symbol: String,
-    pub price: String,
-    pub qty: String,
-    pub time: String,
-    pub is_buyer_taker: bool,
-}
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// WebSocket client state
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WsState {
     Disconnected,
     Connecting,
     Connected,
-    Authenticated,
+    Reconnecting,
 }
 
-/// WebSocket client for StandX
-#[allow(dead_code)]
+/// WebSocket message wrapper
+#[derive(Debug, Clone)]
+pub enum WsMessage {
+    Connected,
+    Disconnected,
+    Price(PriceData),
+    Depth(OrderBook),
+    Trade(Trade),
+    AccountUpdate(String),
+    Error(String),
+    Heartbeat,
+}
+
+/// StandX WebSocket client
 pub struct StandXWebSocket {
     url: String,
     token: String,
     state: Arc<RwLock<WsState>>,
-    subscriptions: Arc<RwLock<Vec<Subscription>>>,
+    subscriptions: Arc<RwLock<Vec<String>>>,
     message_tx: mpsc::Sender<WsMessage>,
     message_rx: Arc<RwLock<mpsc::Receiver<WsMessage>>>,
     reconnect_attempts: Arc<RwLock<u32>>,
-}
-
-#[derive(Debug, Clone)]
-struct Subscription {
     channel: String,
     symbol: Option<String>,
 }
@@ -92,7 +53,10 @@ impl StandXWebSocket {
         let creds = Credentials::load()?;
 
         if creds.is_expired() {
-            return Err(Error::AuthRequired);
+            return Err(Error::AuthRequired {
+                message: "Token expired".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable".to_string(),
+            });
         }
 
         let (message_tx, message_rx) = mpsc::channel(100);
@@ -105,6 +69,8 @@ impl StandXWebSocket {
             message_tx,
             message_rx: Arc::new(RwLock::new(message_rx)),
             reconnect_attempts: Arc::new(RwLock::new(0)),
+            channel: String::new(),
+            symbol: None,
         })
     }
 
@@ -113,7 +79,10 @@ impl StandXWebSocket {
         let creds = Credentials::load()?;
 
         if creds.is_expired() {
-            return Err(Error::AuthRequired);
+            return Err(Error::AuthRequired {
+                message: "Token expired".to_string(),
+                resolution: "Run 'standx auth login' or set STANDX_JWT environment variable".to_string(),
+            });
         }
 
         let (message_tx, message_rx) = mpsc::channel(100);
@@ -126,6 +95,8 @@ impl StandXWebSocket {
             message_tx,
             message_rx: Arc::new(RwLock::new(message_rx)),
             reconnect_attempts: Arc::new(RwLock::new(0)),
+            channel: String::new(),
+            symbol: None,
         })
     }
 
@@ -133,183 +104,161 @@ impl StandXWebSocket {
     pub async fn connect(&self) -> Result<mpsc::Receiver<WsMessage>> {
         let (tx, rx) = mpsc::channel(100);
 
-        // Clone Arc pointers for the task
         let url = self.url.clone();
         let token = self.token.clone();
-        let state = Arc::clone(&self.state);
-        let subscriptions = Arc::clone(&self.subscriptions);
-        let reconnect_attempts = Arc::clone(&self.reconnect_attempts);
+        let state = self.state.clone();
+        let subscriptions = self.subscriptions.clone();
+        let message_tx = self.message_tx.clone();
+        let reconnect_attempts = self.reconnect_attempts.clone();
 
-        // Spawn connection task
         tokio::spawn(async move {
-            Self::connection_task(url, token, state, subscriptions, reconnect_attempts, tx).await;
+            loop {
+                *state.write().await = WsState::Connecting;
+
+                match connect_and_run(&url, &token, &subscriptions, &message_tx).await {
+                    Ok(_) => {
+                        *reconnect_attempts.write().await = 0;
+                    }
+                    Err(e) => {
+                        let attempts = *reconnect_attempts.read().await;
+                        if attempts >= 5 {
+                            let _ = message_tx.send(WsMessage::Error(format!(
+                                "Max reconnection attempts reached: {}",
+                                e
+                            ))).await;
+                            break;
+                        }
+
+                        *reconnect_attempts.write().await = attempts + 1;
+                        *state.write().await = WsState::Reconnecting;
+
+                        tokio::time::sleep(RECONNECT_DELAY).await;
+                    }
+                }
+            }
         });
 
         Ok(rx)
     }
 
     /// Subscribe to a channel
-    pub async fn subscribe(&self, channel: &str, symbol: Option<&str>) {
+    pub async fn subscribe(&self, channel: &str, symbol: Option<&str>) -> Result<()> {
         let mut subs = self.subscriptions.write().await;
-        subs.push(Subscription {
-            channel: channel.to_string(),
-            symbol: symbol.map(|s| s.to_string()),
-        });
-    }
-
-    /// Get current connection state
-    pub async fn state(&self) -> WsState {
-        *self.state.read().await
-    }
-
-    /// Connection management task
-    async fn connection_task(
-        url: String,
-        token: String,
-        state: Arc<RwLock<WsState>>,
-        subscriptions: Arc<RwLock<Vec<Subscription>>>,
-        reconnect_attempts: Arc<RwLock<u32>>,
-        message_tx: mpsc::Sender<WsMessage>,
-    ) {
-        loop {
-            // Update state to connecting
-            {
-                let mut s = state.write().await;
-                *s = WsState::Connecting;
-            }
-
-            match Self::run_connection(&url, &token, &state, &subscriptions, &message_tx).await {
-                Ok(()) => {
-                    // Connection closed normally
-                    tracing::info!("WebSocket connection closed");
-                }
-                Err(e) => {
-                    tracing::error!("WebSocket error: {}", e);
-                }
-            }
-
-            // Increment reconnect attempts
-            {
-                let mut attempts = reconnect_attempts.write().await;
-                *attempts += 1;
-            }
-
-            // Calculate backoff delay
-            let delay = Self::calculate_backoff(&reconnect_attempts).await;
-            tracing::info!("Reconnecting in {:?}...", delay);
-            tokio::time::sleep(delay).await;
-        }
-    }
-
-    /// Run a single WebSocket connection
-    async fn run_connection(
-        url: &str,
-        token: &str,
-        state: &Arc<RwLock<WsState>>,
-        subscriptions: &Arc<RwLock<Vec<Subscription>>>,
-        message_tx: &mpsc::Sender<WsMessage>,
-    ) -> Result<()> {
-        // Connect to WebSocket
-        let (ws_stream, _) = connect_async(url)
-            .await
-            .map_err(|e| Error::Unknown(format!("WebSocket connect failed: {}", e)))?;
-
-        let (mut write, mut read) = ws_stream.split();
-
-        // Update state to connected
-        {
-            let mut s = state.write().await;
-            *s = WsState::Connected;
-        }
-
-        // Send authentication
-        let auth_msg = json!({
-            "auth": {
-                "token": token
-            }
-        });
-        write
-            .send(Message::Text(auth_msg.to_string().into()))
-            .await
-            .map_err(|e| Error::Unknown(format!("Failed to send auth: {}", e)))?;
-
-        // Start heartbeat
-        let mut heartbeat = interval(HEARTBEAT_INTERVAL);
-        let mut last_pong = Instant::now();
-
-        loop {
-            tokio::select! {
-                // Handle incoming messages
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            // Parse and handle message
-                            if let Ok(message) = serde_json::from_str::<WsMessage>(&text) {
-                                // Update state on auth success
-                                if let WsMessage::Auth { data } = &message {
-                                    if data.code == 200 || data.code == 0 {
-                                        let mut s = state.write().await;
-                                        *s = WsState::Authenticated;
-
-                                        // Resubscribe to channels
-                                        let subs = subscriptions.read().await;
-                                        for sub in subs.iter() {
-                                            let sub_msg = json!({
-                                                "subscribe": {
-                                                    "channel": sub.channel,
-                                                    "symbol": sub.symbol
-                                                }
-                                            });
-                                            let _ = write.send(Message::Text(sub_msg.to_string().into())).await;
-                                        }
-                                    }
-                                }
-
-                                // Forward message
-                                let _ = message_tx.send(message).await;
-                            }
-                        }
-                        Some(Ok(Message::Pong(_))) => {
-                            last_pong = Instant::now();
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            return Err(Error::Unknown(format!("WebSocket error: {}", e)));
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Send heartbeat ping
-                _ = heartbeat.tick() => {
-                    // Check if we've received a pong recently
-                    if last_pong.elapsed() > HEARTBEAT_INTERVAL * 2 {
-                        return Err(Error::Unknown("Heartbeat timeout".to_string()));
-                    }
-
-                    write.send(Message::Ping(vec![].into())).await
-                        .map_err(|e| Error::Unknown(format!("Failed to send ping: {}", e)))?;
-                }
-            }
-        }
-
-        // Update state to disconnected
-        {
-            let mut s = state.write().await;
-            *s = WsState::Disconnected;
-        }
-
+        let topic = if let Some(sym) = symbol {
+            format!("{}:{}", channel, sym)
+        } else {
+            channel.to_string()
+        };
+        subs.push(topic);
         Ok(())
     }
 
-    /// Calculate reconnect backoff delay
-    async fn calculate_backoff(reconnect_attempts: &Arc<RwLock<u32>>) -> Duration {
-        let attempts = *reconnect_attempts.read().await;
-        let delay = RECONNECT_DELAY_BASE * 2_u32.pow(attempts.min(4));
-        delay.min(RECONNECT_DELAY_MAX)
+    /// Get current state
+    pub async fn state(&self) -> WsState {
+        *self.state.read().await
     }
+}
+
+async fn connect_and_run(
+    url: &str,
+    token: &str,
+    _subscriptions: &Arc<RwLock<Vec<String>>>,
+    message_tx: &mpsc::Sender<WsMessage>,
+) -> Result<()> {
+    let ws_url = format!("{}?token={}", url, token);
+
+    let (ws_stream, _) = connect_async(&ws_url)
+        .await
+        .map_err(|e| Error::Unknown { 
+            0: format!("WebSocket connect failed: {}", e) 
+        })?;
+
+    let (mut write, mut read) = ws_stream.split();
+
+    // Send authentication
+    let auth_msg = serde_json::json!({
+        "op": "auth",
+        "token": token
+    });
+    write
+        .send(Message::Text(auth_msg.to_string()))
+        .await
+        .map_err(|e| Error::Unknown { 
+            0: format!("Failed to send auth: {}", e) 
+        })?;
+
+    let _ = message_tx.send(WsMessage::Connected).await;
+
+    // Spawn heartbeat task
+    let heartbeat_tx = message_tx.clone();
+    let heartbeat_write = Arc::new(RwLock::new(write));
+    let heartbeat_write_clone = heartbeat_write.clone();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut writer = heartbeat_write_clone.write().await;
+            if let Err(e) = writer.send(Message::Ping(vec![])).await {
+                let _ = heartbeat_tx.send(WsMessage::Error(format!("Heartbeat failed: {}", e))).await;
+                break;
+            }
+        }
+    });
+
+    // Main message loop
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Parse message based on type
+                    if let Some(msg_type) = data.get("type").and_then(|t| t.as_str()) {
+                        match msg_type {
+                            "price" => {
+                                if let Ok(price) = serde_json::from_value::<PriceData>(data) {
+                                    let _ = message_tx.send(WsMessage::Price(price)).await;
+                                }
+                            }
+                            "depth" => {
+                                if let Ok(depth) = serde_json::from_value::<OrderBook>(data) {
+                                    let _ = message_tx.send(WsMessage::Depth(depth)).await;
+                                }
+                            }
+                            "trade" => {
+                                if let Ok(trade) = serde_json::from_value::<Trade>(data) {
+                                    let _ = message_tx.send(WsMessage::Trade(trade)).await;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                let mut writer = heartbeat_write.write().await;
+                if let Err(e) = writer.send(Message::Pong(data)).await {
+                    return Err(Error::Unknown { 
+                        0: format!("Failed to send pong: {}", e) 
+                    });
+                }
+            }
+            Ok(Message::Pong(_)) => {
+                let _ = message_tx.send(WsMessage::Heartbeat).await;
+            }
+            Ok(Message::Close(_)) => {
+                let _ = message_tx.send(WsMessage::Disconnected).await;
+                break;
+            }
+            Err(e) => {
+                return Err(Error::Unknown { 
+                    0: format!("WebSocket error: {}", e) 
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,7 +267,6 @@ mod tests {
 
     #[test]
     fn test_ws_state() {
-        assert_ne!(WsState::Disconnected, WsState::Connected);
-        assert_ne!(WsState::Connecting, WsState::Authenticated);
+        assert_ne!(WsState::Connected, WsState::Disconnected);
     }
 }

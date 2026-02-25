@@ -55,10 +55,10 @@ impl Config {
         }
 
         let content = std::fs::read_to_string(&config_file)
-            .map_err(|e| Error::Config(format!("Failed to read config file: {}", e)))?;
+            .map_err(|e| Error::Config { message: format!("Failed to read config file: {}", e) })?;
 
         let mut config: Config = toml::from_str(&content)
-            .map_err(|e| Error::Config(format!("Failed to parse config file: {}", e)))?;
+            .map_err(|e| Error::Config { message: format!("Failed to parse config file: {}", e) })?;
 
         config.config_dir = config_dir;
         Ok(config)
@@ -67,13 +67,13 @@ impl Config {
     /// Save configuration to file
     pub fn save(&self) -> Result<()> {
         std::fs::create_dir_all(&self.config_dir)
-            .map_err(|e| Error::Config(format!("Failed to create config directory: {}", e)))?;
+            .map_err(|e| Error::Config { message: format!("Failed to create config directory: {}", e) })?;
 
         let content = toml::to_string_pretty(self)
-            .map_err(|e| Error::Config(format!("Failed to serialize config: {}", e)))?;
+            .map_err(|e| Error::Config { message: format!("Failed to serialize config: {}", e) })?;
 
         std::fs::write(self.config_file(), content)
-            .map_err(|e| Error::Config(format!("Failed to write config file: {}", e)))?;
+            .map_err(|e| Error::Config { message: format!("Failed to write config file: {}", e) })?;
 
         Ok(())
     }
@@ -84,7 +84,7 @@ impl Config {
             "base_url" => self.base_url = value.to_string(),
             "output_format" => self.output_format = value.to_string(),
             "default_symbol" => self.default_symbol = value.to_string(),
-            _ => return Err(Error::Config(format!("Unknown config key: {}", key))),
+            _ => return Err(Error::Config { message: format!("Unknown config key: {}", key) }),
         }
         self.save()
     }
@@ -95,7 +95,7 @@ impl Config {
             "base_url" => Ok(self.base_url.clone()),
             "output_format" => Ok(self.output_format.clone()),
             "default_symbol" => Ok(self.default_symbol.clone()),
-            _ => Err(Error::Config(format!("Unknown config key: {}", key))),
+            _ => Err(Error::Config { message: format!("Unknown config key: {}", key) }),
         }
     }
 }
