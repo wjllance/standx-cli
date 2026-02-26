@@ -1,11 +1,18 @@
 mod cli;
 mod commands;
+mod telemetry;
 
 use clap::Parser;
 use cli::{Cli, Commands, OutputFormat};
+use telemetry::Telemetry;
 
 /// Print cool splash screen
 fn print_splash_screen() {
+    // Only print if stdout is a terminal
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        return;
+    }
+
     println!();
     println!("    ╔══════════════════════════════════════════════════════════════════╗");
     println!("    ║                                                                  ║");
@@ -18,7 +25,7 @@ fn print_splash_screen() {
     println!("    ║                                                                  ║");
     println!("    ║              ⚡ StandX Agent Toolkit ⚡                           ║");
     println!("    ║                                                                  ║");
-    println!("    ║                    Version 0.3.0                                 ║");
+    println!("    ║                    Version {}                                 ║", env!("CARGO_PKG_VERSION"));
     println!("    ║                                                                  ║");
     println!("    ╚══════════════════════════════════════════════════════════════════╝");
     println!();
@@ -26,15 +33,18 @@ fn print_splash_screen() {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    // Check if we should show splash screen BEFORE parsing args
+    // Show splash only when: no args, or --help/-h
+    let args: Vec<String> = std::env::args().collect();
+    let should_show_splash =
+        args.len() == 1 || (args.len() == 2 && (args[1] == "--help" || args[1] == "-h"));
 
-    // Print splash screen only when:
-    // 1. Not in quiet mode
-    // 2. Not in OpenClaw mode
-    // 3. stdout is a terminal (not piped)
-    if !cli.quiet && !cli.openclaw && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+    if should_show_splash {
         print_splash_screen();
     }
+
+    let cli = Cli::parse();
+    let mut telemetry = Telemetry::new();
 
     // Initialize logging
     if cli.verbose {
@@ -51,14 +61,27 @@ async fn main() {
             .init();
     }
 
+    // Track command start
+    let command_name = format!("{:?}", cli.command);
+    let args: Vec<String> = std::env::args().collect();
+    telemetry.track_command_start(&command_name, &args);
+
     // Handle dry run mode
     if cli.dry_run {
         let output = cli.output;
         match handle_dry_run(&cli.command, output).await {
-            Ok(_) => std::process::exit(0),
+            Ok(_) => {
+                telemetry.track_command_complete(&command_name, true, None);
+                std::process::exit(0);
+            }
             Err(e) => {
                 let boxed_error: Box<dyn std::error::Error> = Box::new(e);
                 print_error(&boxed_error, output);
+                telemetry.track_command_complete(
+                    &command_name,
+                    false,
+                    Some(&boxed_error.to_string()),
+                );
                 std::process::exit(1);
             }
         }
@@ -73,9 +96,12 @@ async fn main() {
 
     // Execute command and handle errors
     match execute_command(cli.command, output, cli.verbose).await {
-        Ok(_) => {}
+        Ok(_) => {
+            telemetry.track_command_complete(&command_name, true, None);
+        }
         Err(e) => {
             print_error(&e, output);
+            telemetry.track_command_complete(&command_name, false, Some(&e.to_string()));
             std::process::exit(1);
         }
     }
