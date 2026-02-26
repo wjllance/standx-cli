@@ -147,7 +147,11 @@ pub enum MarketCommands {
     /// Get kline data
     Kline {
         symbol: String,
-        #[arg(short, long, help = "Resolution: 1, 5, 15, 30, 60, 240, 720, 1D, 1W, 1M")]
+        #[arg(
+            short,
+            long,
+            help = "Resolution: 1, 5, 15, 30, 60, 240, 720, 1D, 1W, 1M"
+        )]
         resolution: String,
         /// Start time (timestamp, ISO date YYYY-MM-DD, or relative like 1h, 1d, 7d)
         #[arg(short, long)]
