@@ -25,7 +25,10 @@ fn print_splash_screen() {
     println!("    ║                                                                  ║");
     println!("    ║              ⚡ StandX Agent Toolkit ⚡                           ║");
     println!("    ║                                                                  ║");
-    println!("    ║                    Version 0.3.5                                 ║");
+    println!(
+        "    ║                    Version {}                                 ║",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("    ║                                                                  ║");
     println!("    ╚══════════════════════════════════════════════════════════════════╝");
     println!();
