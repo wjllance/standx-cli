@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-02-26
+
+### Documentation
+- **Improved README authentication section**
+  - Detailed explanation of JWT Token vs Ed25519 Private Key
+  - Added 4 login methods (interactive, CLI, file, env vars)
+  - Added authentication status check instructions
+  - Added permission requirements table
+  - Clear warning about trading operations requiring private key
+
 ## [0.3.5] - 2026-02-26
 
 ### Changed
@@ -130,7 +140,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Homebrew support
 - Comprehensive documentation (README, API docs, Homebrew guide)
 
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/wjllance/standx-cli/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/wjllance/standx-cli/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/wjllance/standx-cli/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/wjllance/standx-cli/compare/v0.3.2...v0.3.3
