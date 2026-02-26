@@ -16,9 +16,9 @@ fn print_splash_screen() {
     println!("    ║     ███████║   ██║   ██║  ██║██║ ╚████║██████╔╝██╔╝ ██╗        ║");
     println!("    ║     ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝        ║");
     println!("    ║                                                                  ║");
-    println!("    ║              ⚡ High-Performance Crypto Trading CLI ⚡            ║");
+    println!("    ║              ⚡ StandX Agent Toolkit ⚡                           ║");
     println!("    ║                                                                  ║");
-    println!("    ║                    Version 0.3.0 | StandX Labs                   ║");
+    println!("    ║                    Version 0.3.0                                 ║");
     println!("    ║                                                                  ║");
     println!("    ╚══════════════════════════════════════════════════════════════════╝");
     println!();
