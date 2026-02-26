@@ -27,7 +27,7 @@ fn print_splash_screen() {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    
+
     // Print splash screen (unless in quiet mode or OpenClaw mode)
     if !cli.quiet && !cli.openclaw {
         print_splash_screen();

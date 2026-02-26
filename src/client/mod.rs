@@ -288,8 +288,8 @@ impl StandXClient {
         let url = format!("{}/api/query_funding_rates", self.base_url);
         let query: Vec<(&str, String)> = vec![
             ("symbol", symbol.to_string()),
-            ("start_time", start_time.to_string()),
-            ("end_time", end_time.to_string()),
+            ("start_time", (start_time * 1000).to_string()),
+            ("end_time", (end_time * 1000).to_string()),
         ];
 
         let response = self.client.get(&url).query(&query).send().await?;
