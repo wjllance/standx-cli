@@ -798,3 +798,67 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_relative_time_hours() {
+        let now = chrono::Utc::now().timestamp();
+        let result = parse_time_string("1h", false).unwrap();
+        assert!(result < now);
+        assert!(result >= now - 3600);
+    }
+
+    #[test]
+    fn test_parse_relative_time_days() {
+        let now = chrono::Utc::now().timestamp();
+        let result = parse_time_string("1d", false).unwrap();
+        assert!(result < now);
+        assert!(result >= now - 86400);
+    }
+
+    #[test]
+    fn test_parse_iso_date() {
+        let result = parse_time_string("2024-01-01", true).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_unix_timestamp() {
+        let result = parse_time_string("1704067200", true).unwrap();
+        assert_eq!(result, 1704067200);
+    }
+
+    #[test]
+    fn test_parse_invalid_time() {
+        assert!(parse_time_string("invalid", true).is_err());
+        assert!(parse_time_string("", true).is_err());
+    }
+
+    #[test]
+    fn test_parse_time_edge_cases() {
+        let now = chrono::Utc::now().timestamp();
+
+        // 测试 0 秒（边界值）
+        let result = parse_time_string("0s", false).unwrap();
+        assert!(result <= now && result >= now - 10); // 允许 10 秒误差
+
+        // 测试大数字天数
+        let result = parse_time_string("999d", false).unwrap();
+        assert!(result < now);
+        assert!(result < now - 86300000); // 999 天大约是这么多秒
+
+        // 测试分钟
+        let result = parse_time_string("30m", false).unwrap();
+        assert!(result < now);
+        assert!(result >= now - 1800);
+    }
+}
