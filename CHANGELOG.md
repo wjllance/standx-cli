@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-02-26
+
+### Added
+- **Telemetry module** (PR #19)
+  - Local usage statistics collection
+  - Privacy-first: all data stays on user machine
+  - Opt-out via `STANDX_TELEMETRY=0`
+  - Tracks command execution, duration, success/failure
+  
+### Changed
+- **Improved authentication flow** (PR #19)
+  - Always prompts for private key interactively
+  - Simpler flow for adding private key to existing token
+  
+- **Splash screen improvements** (PR #19)
+  - Only shows when running `standx` without arguments
+  - Only shows with `--help` or `-h`
+  - Hidden for all actual commands
+
 ## [0.3.6] - 2026-02-26
 
 ### Documentation
@@ -140,7 +159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Homebrew support
 - Comprehensive documentation (README, API docs, Homebrew guide)
 
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/wjllance/standx-cli/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/wjllance/standx-cli/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/wjllance/standx-cli/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/wjllance/standx-cli/compare/v0.3.3...v0.3.4
