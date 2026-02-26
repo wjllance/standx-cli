@@ -299,4 +299,74 @@ mod tests {
         let result = Credentials::from_env();
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_credentials_encryption_roundtrip() {
+        // Test that encryption and decryption are inverse operations
+        let test_cases = vec![
+            "simple_token",
+            "token_with_special_chars!@#$%",
+            "", // Empty string
+        ];
+
+        for original in test_cases {
+            let encrypted = Credentials::xor_encrypt(original);
+            let decrypted = Credentials::xor_decrypt(&encrypted);
+            assert_eq!(original, decrypted, "Failed for input: {}", original);
+            // Encrypted should be different from original (unless empty)
+            if !original.is_empty() {
+                assert_ne!(encrypted, original.as_bytes());
+            }
+        }
+
+        // Test long string separately
+        let long_token = "very_long_token_".repeat(100);
+        let encrypted = Credentials::xor_encrypt(&long_token);
+        let decrypted = Credentials::xor_decrypt(&encrypted);
+        assert_eq!(long_token, decrypted);
+    }
+
+    #[test]
+    fn test_credentials_save_load_roundtrip() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let creds = Credentials {
+            token: "test_token_123".to_string(),
+            private_key: "test_key_456".to_string(),
+            created_at: chrono::Utc::now().timestamp(),
+            validity_seconds: 7 * 24 * 60 * 60,
+        };
+
+        // Save to temp location
+        let file_path = temp_dir.path().join("credentials.enc");
+        let encrypted = Credentials::xor_encrypt(&serde_json::to_string(&creds).unwrap());
+        std::fs::write(&file_path, encrypted).unwrap();
+
+        // Load and verify
+        let loaded_encrypted = std::fs::read(&file_path).unwrap();
+        let loaded_json = Credentials::xor_decrypt(&loaded_encrypted);
+        let loaded: Credentials = serde_json::from_str(&loaded_json).unwrap();
+
+        assert_eq!(loaded.token, creds.token);
+        assert_eq!(loaded.private_key, creds.private_key);
+        assert_eq!(loaded.created_at, creds.created_at);
+    }
+
+    #[test]
+    fn test_credentials_corrupted_file() {
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("credentials.enc");
+
+        // Write corrupted data (not valid encrypted JSON)
+        std::fs::write(&file_path, b"corrupted_data_not_valid").unwrap();
+
+        // Attempt to decrypt should produce garbage, JSON parse should fail
+        let loaded_encrypted = std::fs::read(&file_path).unwrap();
+        let loaded_json = Credentials::xor_decrypt(&loaded_encrypted);
+        let result: std::result::Result<Credentials, _> = serde_json::from_str(&loaded_json);
+        assert!(result.is_err());
+    }
 }
