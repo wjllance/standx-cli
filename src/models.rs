@@ -198,10 +198,19 @@ impl KlineResponse {
 /// Funding rate information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FundingRate {
+    pub id: i64,
     pub symbol: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub funding_rate: String,
-    pub next_funding_time: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub mark_price: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub index_price: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub premium: String,
+    pub time: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// Order side
