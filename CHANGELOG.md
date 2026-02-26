@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-02-26
+
+### Fixed
+- **Position model updated** (PR #24)
+  - Updated Position struct fields to match actual API response
+  - Added new fields: id, qty, entry_value, holding_margin, initial_margin, margin_asset, margin_mode, position_value, realized_pnl, required_margin, status, upnl, time, created_at, updated_at
+  - Added optional fields: liq_price, mmr, user
+  - Removed non-existent fields: side, quantity, liquidation_price, margin, unrealized_pnl
+
+- **Splash screen version** (PR #23)
+  - Now uses CARGO_PKG_VERSION to always display correct version
+
 ## [0.4.0] - 2026-02-26
 
 ### Added
@@ -159,7 +171,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Homebrew support
 - Comprehensive documentation (README, API docs, Homebrew guide)
 
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/wjllance/standx-cli/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/wjllance/standx-cli/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/wjllance/standx-cli/compare/v0.3.6...v0.4.0
 [0.3.6]: https://github.com/wjllance/standx-cli/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/wjllance/standx-cli/compare/v0.3.4...v0.3.5
