@@ -430,6 +430,7 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
             key_file,
             interactive,
         } => {
+            // Get token
             let token = if interactive || (token.is_none() && token_file.is_none()) {
                 println!("Enter JWT Token:");
                 rpassword::prompt_password("Token: ")?.trim().to_string()
@@ -439,8 +440,20 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
                 token.unwrap()
             };
 
-            // Private key is optional - only needed for trading operations
-            let private_key = if interactive {
+            // Get private key - always interactive if not provided via file or arg
+            let private_key = if let Some(key) = private_key {
+                // Provided via --private-key flag
+                Some(key)
+            } else if let Some(file) = key_file {
+                // Provided via --key-file flag
+                let key = std::fs::read_to_string(file)?.trim().to_string();
+                if key.is_empty() {
+                    None
+                } else {
+                    Some(key)
+                }
+            } else {
+                // Interactive prompt - always ask, but allow empty (optional)
                 println!("\nEnter Ed25519 Private Key (Base58) - optional, press Enter to skip:");
                 let key = rpassword::prompt_password("Private Key: ")?
                     .trim()
@@ -450,15 +463,6 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
                 } else {
                     Some(key)
                 }
-            } else if let Some(file) = key_file {
-                let key = std::fs::read_to_string(file)?.trim().to_string();
-                if key.is_empty() {
-                    None
-                } else {
-                    Some(key)
-                }
-            } else {
-                private_key
             };
 
             let credentials = Credentials::new(token, private_key.clone());
