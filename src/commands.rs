@@ -584,8 +584,8 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
                 None => now - 86400, // Default: 1 day ago
             };
             let to_ts = match to {
-                Some(t) => parse_time_string(&t, true)?,
-                None => now, // Default: now
+                Some(t) => parse_time_string(&t, false)?, // Fix: use false to get past time
+                None => now,                              // Default: now
             };
 
             let klines = client

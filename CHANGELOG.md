@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-02-26
+
+### Fixed
+- **K-line time calculation bug**
+  - Fixed relative time strings (e.g., "1d", "7d") calculating future time for `to` parameter
+  - Now correctly calculates past time range for K-line data queries
+  - Example: `standx market kline BTC-USD -r 60 --from 1d` now works correctly
+
 ## [0.3.3] - 2026-02-26
 
 ### Added
@@ -114,7 +122,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Homebrew support
 - Comprehensive documentation (README, API docs, Homebrew guide)
 
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/wjllance/standx-cli/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/wjllance/standx-cli/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/wjllance/standx-cli/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/wjllance/standx-cli/compare/v0.3.0...v0.3.1
