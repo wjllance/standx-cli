@@ -160,6 +160,41 @@ pub struct Kline {
     pub volume: String,
 }
 
+/// Kline API response wrapper
+#[derive(Debug, Clone, Deserialize)]
+pub struct KlineResponse {
+    pub s: String,
+    #[serde(default)]
+    pub t: Vec<i64>,
+    #[serde(default)]
+    pub o: Vec<f64>,
+    #[serde(default)]
+    pub h: Vec<f64>,
+    #[serde(default)]
+    pub l: Vec<f64>,
+    #[serde(default)]
+    pub c: Vec<f64>,
+    #[serde(default)]
+    pub v: Vec<f64>,
+}
+
+impl KlineResponse {
+    pub fn to_klines(self) -> Vec<Kline> {
+        let mut klines = Vec::new();
+        for i in 0..self.t.len() {
+            klines.push(Kline {
+                time: self.t[i].to_string(),
+                open: self.o[i].to_string(),
+                high: self.h[i].to_string(),
+                low: self.l[i].to_string(),
+                close: self.c[i].to_string(),
+                volume: self.v[i].to_string(),
+            });
+        }
+        klines
+    }
+}
+
 /// Funding rate information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FundingRate {

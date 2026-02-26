@@ -274,7 +274,18 @@ impl StandXClient {
             });
         }
 
-        let data = response.json::<Vec<Kline>>().await?;
+        let response_wrapper = response.json::<crate::models::KlineResponse>().await?;
+
+        if response_wrapper.s != "ok" {
+            return Err(Error::Api {
+                code: 500,
+                message: format!("Kline API returned status: {}", response_wrapper.s),
+                endpoint: Some("/api/kline/history".to_string()),
+                retryable: false,
+            });
+        }
+
+        let data = response_wrapper.to_klines();
         Ok(data)
     }
 
