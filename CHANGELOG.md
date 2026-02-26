@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-02-26
+
+### Fixed
+- **K-line API response parsing**
+  - Fixed K-line command failing with "HTTP request failed" error
+  - Added `KlineResponse` struct to handle API response format
+  - Now correctly parses `{"s": "ok", "t": [...], "o": [...], ...}` format
+  - All resolution parameters working: 1, 5, 15, 30, 60, 240, 720, 1D, 1W, 1M
+
+### Added
+- **Comprehensive documentation**
+  - Added `docs/` directory with 11 detailed guides
+  - Quick start, authentication, market data, orders, trading, leverage, streaming
+  - Output formats guide (table, JSON, CSV, quiet)
+  - Special features (OpenClaw, Dry Run)
+  - Troubleshooting guide
+- **Git workflow guidelines** in `WORKFLOW.md`
+
 ## [0.3.1] - 2026-02-26
 
 ### Added
@@ -88,7 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Homebrew support
 - Comprehensive documentation (README, API docs, Homebrew guide)
 
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/wjllance/standx-cli/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/wjllance/standx-cli/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wjllance/standx-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wjllance/standx-cli/compare/v0.1.0...v0.2.0
