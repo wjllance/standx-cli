@@ -10,6 +10,55 @@ use standx_cli::models::{OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
 
+/// Parse time string to timestamp
+/// Supports:
+/// - Unix timestamp (e.g., "1704067200")
+/// - ISO date (e.g., "2024-01-01")
+/// - Relative time (e.g., "1h", "1d", "7d", "30m")
+pub fn parse_time_string(time_str: &str, default_now: bool) -> anyhow::Result<i64> {
+    // Try parsing as unix timestamp first
+    if let Ok(timestamp) = time_str.parse::<i64>() {
+        return Ok(timestamp);
+    }
+
+    // Try parsing as ISO date (YYYY-MM-DD)
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(time_str, "%Y-%m-%d") {
+        let datetime = date.and_hms_opt(0, 0, 0).unwrap();
+        return Ok(datetime.and_utc().timestamp());
+    }
+
+    // Try parsing as relative time
+    let time_str = time_str.to_lowercase();
+    let now = chrono::Utc::now().timestamp();
+
+    if let Some(captures) = regex::Regex::new(r"^(\d+)([smhdw])$")?.captures(&time_str) {
+        let value: i64 = captures[1].parse()?;
+        let unit = &captures[2];
+
+        let seconds = match unit {
+            "s" => value,
+            "m" => value * 60,
+            "h" => value * 3600,
+            "d" => value * 86400,
+            "w" => value * 604800,
+            _ => return Err(anyhow::anyhow!("Invalid time unit: {}", unit)),
+        };
+
+        if default_now {
+            // For "to" time, we use now + offset (future) or just now
+            return Ok(now + seconds);
+        } else {
+            // For "from" time, we use now - offset (past)
+            return Ok(now - seconds);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Invalid time format: {}. Use unix timestamp, YYYY-MM-DD, or relative like 1h, 1d, 7d",
+        time_str
+    ))
+}
+
 /// Handle order commands
 pub async fn handle_order(command: OrderCommands) -> Result<()> {
     let client = StandXClient::new()?;
@@ -95,10 +144,32 @@ pub async fn handle_trade(command: TradeCommands, output_format: OutputFormat) -
             to,
             limit,
         } => {
-            let trades = client.get_user_trades(&symbol, from, to, limit).await?;
+            // Parse time parameters with defaults
+            let now = chrono::Utc::now().timestamp();
+            let from_ts = match from {
+                Some(f) => parse_time_string(&f, false)?,
+                None => now - 86400, // Default: 1 day ago
+            };
+            let to_ts = match to {
+                Some(t) => parse_time_string(&t, true)?,
+                None => now, // Default: now
+            };
+
+            let trades = client
+                .get_user_trades(&symbol, from_ts, to_ts, limit)
+                .await?;
 
             match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(trades)),
+                OutputFormat::Table => {
+                    if trades.is_empty() {
+                        println!(
+                            "ℹ️  No trades found for {} in the specified time range",
+                            symbol
+                        );
+                    } else {
+                        println!("{}", output::format_table(trades));
+                    }
+                }
                 OutputFormat::Json => println!("{}", output::format_json(&trades)?),
                 OutputFormat::Csv => println!("{}", output::format_csv(&trades)?),
                 OutputFormat::Quiet => {}
@@ -504,8 +575,29 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
             resolution,
             from,
             to,
+            limit,
         } => {
-            let klines = client.get_kline(&symbol, &resolution, from, to).await?;
+            // Parse time parameters
+            let now = chrono::Utc::now().timestamp();
+            let from_ts = match from {
+                Some(f) => parse_time_string(&f, false)?,
+                None => now - 86400, // Default: 1 day ago
+            };
+            let to_ts = match to {
+                Some(t) => parse_time_string(&t, true)?,
+                None => now, // Default: now
+            };
+
+            let klines = client
+                .get_kline(&symbol, &resolution, from_ts, to_ts)
+                .await?;
+
+            // Apply limit if specified
+            let klines: Vec<_> = if let Some(lim) = limit {
+                klines.into_iter().take(lim as usize).collect()
+            } else {
+                klines
+            };
 
             match output_format {
                 OutputFormat::Table => {
@@ -532,11 +624,25 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
             let start_time = now - days * 24 * 60 * 60;
             let funding_rates = client.get_funding_rate(&symbol, start_time, now).await?;
 
-            match output_format {
-                OutputFormat::Table => println!("{}", output::format_table(funding_rates)),
-                OutputFormat::Json => println!("{}", output::format_json(&funding_rates)?),
-                OutputFormat::Csv => println!("{}", output::format_csv(&funding_rates)?),
-                OutputFormat::Quiet => {}
+            if funding_rates.is_empty() {
+                println!(
+                    "ℹ️  No funding rate data available for {} in the last {} days",
+                    symbol, days
+                );
+                println!("   This may be because:");
+                println!("   - The symbol is not actively trading");
+                println!("   - Funding rates are only recorded at specific intervals");
+                println!(
+                    "   - Try checking the current funding rate with: standx market ticker {}",
+                    symbol
+                );
+            } else {
+                match output_format {
+                    OutputFormat::Table => println!("{}", output::format_table(funding_rates)),
+                    OutputFormat::Json => println!("{}", output::format_json(&funding_rates)?),
+                    OutputFormat::Csv => println!("{}", output::format_csv(&funding_rates)?),
+                    OutputFormat::Quiet => {}
+                }
             }
         }
     }

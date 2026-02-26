@@ -147,12 +147,21 @@ pub enum MarketCommands {
     /// Get kline data
     Kline {
         symbol: String,
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            help = "Resolution: 1, 5, 15, 30, 60, 240, 720, 1D, 1W, 1M"
+        )]
         resolution: String,
+        /// Start time (timestamp, ISO date YYYY-MM-DD, or relative like 1h, 1d, 7d)
         #[arg(short, long)]
-        from: i64,
+        from: Option<String>,
+        /// End time (timestamp, ISO date YYYY-MM-DD, or relative like 1h, 1d, 7d, defaults to now)
         #[arg(short, long)]
-        to: i64,
+        to: Option<String>,
+        /// Number of candles to fetch (alternative to from/to)
+        #[arg(short, long, help = "Number of candles (alternative to from/to)")]
+        limit: Option<u32>,
     },
     /// Get funding rate history
     Funding {
@@ -222,10 +231,13 @@ pub enum TradeCommands {
     /// Get trade history
     History {
         symbol: String,
+        /// Start time (timestamp, ISO date YYYY-MM-DD, or relative like 1h, 1d, 7d)
         #[arg(short, long)]
-        from: i64,
+        from: Option<String>,
+        /// End time (timestamp, ISO date YYYY-MM-DD, or relative like 1h, 1d, 7d, defaults to now)
         #[arg(short, long)]
-        to: i64,
+        to: Option<String>,
+        /// Number of trades to fetch
         #[arg(short, long)]
         limit: Option<u32>,
     },
