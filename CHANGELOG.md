@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-02-26
+
+### Added
+- **Smart splash screen** with TTY detection
+  - ASCII art StandX logo displayed on startup
+  - Auto-hides when output is piped or redirected
+  - Respects `--quiet` and `--openclaw` flags
+  - Uses `std::io::IsTerminal` for cross-platform detection
+
 ## [0.3.1] - 2026-02-26
 
 ### Added
@@ -71,6 +80,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed all clippy warnings for `-D warnings`
 - Fixed code formatting with `cargo fmt`
 
+### Changed
+- Updated `Cargo.toml` version to 0.2.0
+- Updated repository URL in `Cargo.toml`
+
+## [0.1.0] - 2026-02-22
+
+### Added
+- Initial release of StandX CLI
+- Market data queries (symbols, ticker, trades, depth, kline, funding)
+- Account management (balances, positions, orders, history)
+- Order management (create, cancel, cancel-all)
+- WebSocket streaming (ticker, depth, account)
+- JWT + Ed25519 authentication
+- Multiple output formats (table, json, csv)
+- Homebrew support
+- Comprehensive documentation (README, API docs, Homebrew guide)
+
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/wjllance/standx-cli/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/wjllance/standx-cli/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/wjllance/standx-cli/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/wjllance/standx-cli/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/wjllance/standx-cli/releases/tag/v0.1.0
 ### Changed
 - Updated `Cargo.toml` version to 0.2.0
 - Updated repository URL in `Cargo.toml`
