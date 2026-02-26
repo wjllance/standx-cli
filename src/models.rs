@@ -623,4 +623,125 @@ mod tests {
         // Note: This test documents expected behavior
         // In actual implementation, sorting would happen in the client
     }
+
+    #[test]
+    fn test_position_full_deserialization() {
+        let json = r#"[{
+            "id": 80374,
+            "symbol": "BTC-USD",
+            "qty": "0.5",
+            "entry_price": "62000",
+            "entry_value": "31000",
+            "holding_margin": "1550",
+            "initial_margin": "1550",
+            "leverage": "20",
+            "mark_price": "67972.53",
+            "margin_asset": "DUSD",
+            "margin_mode": "isolated",
+            "position_value": "33986.27",
+            "realized_pnl": "0.062040",
+            "required_margin": "1699.31",
+            "status": "open",
+            "upnl": "2986.27",
+            "time": "2026-02-26T07:45:48.770053Z",
+            "created_at": "2026-02-25T14:07:08.498140Z",
+            "updated_at": "2026-02-25T17:31:29.932389Z",
+            "liq_price": "60000",
+            "mmr": "0.05",
+            "user": "bsc_0x7ccEA090C8BCE0038c9407c9341baF3f6c714Fe2"
+        }]"#;
+
+        let positions: Vec<Position> = serde_json::from_str(json).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].symbol, "BTC-USD");
+        assert_eq!(positions[0].qty, "0.5");
+    }
+
+    #[test]
+    fn test_position_optional_null_fields() {
+        let json = r#"[{
+            "id": 1,
+            "symbol": "ETH-USD",
+            "qty": "0",
+            "entry_price": "0",
+            "entry_value": "0",
+            "holding_margin": "0",
+            "initial_margin": "0",
+            "leverage": "20",
+            "mark_price": "3456.78",
+            "margin_asset": "DUSD",
+            "margin_mode": "isolated",
+            "position_value": "0",
+            "realized_pnl": "0",
+            "required_margin": "0",
+            "status": "open",
+            "upnl": "0",
+            "time": "2026-02-26T07:45:48Z",
+            "created_at": "2026-02-25T14:07:08Z",
+            "updated_at": "2026-02-25T17:31:29Z",
+            "liq_price": null,
+            "mmr": null,
+            "user": "test_user"
+        }]"#;
+
+        let positions: Vec<Position> = serde_json::from_str(json).unwrap();
+        assert!(positions[0].liq_price.is_none());
+        assert!(positions[0].mmr.is_none());
+    }
+
+    #[test]
+    fn test_position_zero_qty() {
+        // 测试持仓为 0 的情况（无实际持仓）
+        let json = r#"[{
+            "id": 100,
+            "symbol": "BTC-USD",
+            "qty": "0",
+            "entry_price": "0",
+            "entry_value": "0",
+            "holding_margin": "0",
+            "initial_margin": "0",
+            "leverage": "20",
+            "mark_price": "65000",
+            "margin_asset": "DUSD",
+            "margin_mode": "isolated",
+            "position_value": "0",
+            "realized_pnl": "0",
+            "required_margin": "0",
+            "status": "open",
+            "upnl": "0",
+            "time": "2026-02-26T07:45:48Z",
+            "created_at": "2026-02-25T14:07:08Z",
+            "updated_at": "2026-02-25T17:31:29Z",
+            "user": "test_user"
+        }]"#;
+
+        let positions: Vec<Position> = serde_json::from_str(json).unwrap();
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].qty, "0");
+        assert_eq!(positions[0].entry_price, "0");
+        assert_eq!(positions[0].position_value, "0");
+        assert_eq!(positions[0].upnl, "0");
+        // 零持仓时应该没有强平价格
+        assert!(positions[0].liq_price.is_none());
+    }
+
+    #[test]
+    fn test_funding_rate_full_deserialization() {
+        let json = r#"{
+            "id": 12345,
+            "symbol": "BTC-USD",
+            "funding_rate": "0.00001250",
+            "mark_price": "63127.37",
+            "index_price": "63126.67",
+            "premium": "0.00000100",
+            "time": "2024-01-01T08:00:00Z",
+            "created_at": "2024-01-01T07:59:59Z",
+            "updated_at": "2024-01-01T08:00:00Z"
+        }"#;
+
+        let rate: FundingRate = serde_json::from_str(json).unwrap();
+        assert_eq!(rate.id, 12345);
+        assert_eq!(rate.symbol, "BTC-USD");
+        assert_eq!(rate.funding_rate, "0.00001250");
+    }
 }
