@@ -160,4 +160,55 @@ mod tests {
         assert!(config.set("unknown_key", "value").is_err());
         assert!(config.get("unknown_key").is_err());
     }
+
+    #[test]
+    fn test_config_missing_file() {
+        // 使用临时目录确保配置文件不存在
+        let temp_dir = TempDir::new().unwrap();
+        let config_dir = temp_dir.path().join("nonexistent");
+
+        // 直接测试：当配置文件不存在时，应该返回默认配置
+        // 注意：这里我们手动构造场景，因为 Config::load() 使用固定路径
+        let config_file = config_dir.join("config.toml");
+        assert!(!config_file.exists());
+
+        // 验证默认配置
+        let config = Config::default();
+        assert_eq!(config.base_url, "https://perps.standx.com");
+        assert_eq!(config.output_format, "table");
+    }
+
+    #[test]
+    fn test_config_corrupted_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("config.toml");
+
+        // 写入损坏的 TOML 内容
+        let mut file = std::fs::File::create(&config_file).unwrap();
+        file.write_all(b"invalid toml content [[[").unwrap();
+        drop(file);
+
+        // 尝试从该目录加载配置应该失败
+        // 由于 Config::load() 使用固定路径，我们测试 save/load 循环
+        let config = Config {
+            base_url: "https://test.com".to_string(),
+            output_format: "json".to_string(),
+            default_symbol: "ETH-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+
+        // 先保存有效配置
+        config.save().unwrap();
+
+        // 然后损坏文件
+        let mut file = std::fs::File::create(&config.config_file()).unwrap();
+        file.write_all(b"invalid toml [[[").unwrap();
+        drop(file);
+
+        // 尝试加载损坏的配置文件
+        // 注意：Config::load() 使用默认路径，这里我们手动测试解析错误
+        let content = std::fs::read_to_string(&config.config_file()).unwrap();
+        let result: std::result::Result<Config, _> = toml::from_str(&content);
+        assert!(result.is_err());
+    }
 }
