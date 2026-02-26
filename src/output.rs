@@ -125,25 +125,34 @@ impl Tabled for Trade {
 
 /// Format funding rate for display
 impl Tabled for FundingRate {
-    const LENGTH: usize = 100;
+    const LENGTH: usize = 6;
 
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
-            self.symbol.clone().into(),
-            self.funding_rate.clone().into(),
-            self.next_funding_time
+            self.time.split('T').next().unwrap_or(&self.time).into(),
+            self.time
                 .split('T')
+                .nth(1)
+                .unwrap_or("")
+                .split('.')
                 .next()
-                .unwrap_or(&self.next_funding_time)
+                .unwrap_or("")
                 .into(),
+            self.funding_rate.clone().into(),
+            self.mark_price.clone().into(),
+            self.index_price.clone().into(),
+            self.premium.clone().into(),
         ]
     }
 
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
-            "Symbol".into(),
+            "Date".into(),
+            "Time".into(),
             "Funding Rate".into(),
-            "Next Funding".into(),
+            "Mark Price".into(),
+            "Index Price".into(),
+            "Premium".into(),
         ]
     }
 }
