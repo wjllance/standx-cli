@@ -242,9 +242,16 @@ async fn connect_and_run(
             })
             .collect();
 
+        // Format token with Bearer prefix if not already present
+        let token_with_bearer = if t.starts_with("Bearer ") {
+            t.to_string()
+        } else {
+            format!("Bearer {}", t)
+        };
+
         let auth_msg = serde_json::json!({
             "auth": {
-                "token": t,
+                "token": token_with_bearer,
                 "streams": streams
             }
         });
