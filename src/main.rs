@@ -28,8 +28,11 @@ fn print_splash_screen() {
 async fn main() {
     let cli = Cli::parse();
 
-    // Print splash screen (unless in quiet mode or OpenClaw mode)
-    if !cli.quiet && !cli.openclaw {
+    // Print splash screen only when:
+    // 1. Not in quiet mode
+    // 2. Not in OpenClaw mode
+    // 3. stdout is a terminal (not piped)
+    if !cli.quiet && !cli.openclaw && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         print_splash_screen();
     }
 
