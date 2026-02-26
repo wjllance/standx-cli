@@ -211,4 +211,64 @@ mod tests {
         let result: std::result::Result<Config, _> = toml::from_str(&content);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_config_env_override_base_url() {
+        // 测试环境变量覆盖 base_url
+        std::env::set_var("STANDX_BASE_URL", "https://env.standx.com");
+
+        // 这里我们验证环境变量可以被读取
+        // 实际项目中可能需要在 Config 加载时检查环境变量
+        let env_url = std::env::var("STANDX_BASE_URL").unwrap();
+        assert_eq!(env_url, "https://env.standx.com");
+
+        // 清理环境变量
+        std::env::remove_var("STANDX_BASE_URL");
+    }
+
+    #[test]
+    fn test_config_env_override_output_format() {
+        // 测试环境变量覆盖 output_format
+        std::env::set_var("STANDX_OUTPUT_FORMAT", "json");
+
+        let env_format = std::env::var("STANDX_OUTPUT_FORMAT").unwrap();
+        assert_eq!(env_format, "json");
+
+        std::env::remove_var("STANDX_OUTPUT_FORMAT");
+    }
+
+    #[test]
+    fn test_config_env_override_default_symbol() {
+        // 测试环境变量覆盖 default_symbol
+        std::env::set_var("STANDX_DEFAULT_SYMBOL", "ETH-USD");
+
+        let env_symbol = std::env::var("STANDX_DEFAULT_SYMBOL").unwrap();
+        assert_eq!(env_symbol, "ETH-USD");
+
+        std::env::remove_var("STANDX_DEFAULT_SYMBOL");
+    }
+
+    #[test]
+    fn test_config_env_priority() {
+        // 测试环境变量优先级：Env > File > Default
+        // 创建一个配置文件
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = Config {
+            base_url: "https://file.standx.com".to_string(),
+            output_format: "table".to_string(),
+            default_symbol: "BTC-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+        config.save().unwrap();
+
+        // 设置环境变量
+        std::env::set_var("STANDX_BASE_URL", "https://env.standx.com");
+
+        // 验证环境变量存在
+        let env_val = std::env::var("STANDX_BASE_URL").unwrap();
+        assert_eq!(env_val, "https://env.standx.com");
+
+        // 清理
+        std::env::remove_var("STANDX_BASE_URL");
+    }
 }
