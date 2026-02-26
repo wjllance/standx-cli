@@ -4,9 +4,34 @@ mod commands;
 use clap::Parser;
 use cli::{Cli, Commands, OutputFormat};
 
+/// Print cool splash screen
+fn print_splash_screen() {
+    println!();
+    println!("    ╔══════════════════════════════════════════════════════════════════╗");
+    println!("    ║                                                                  ║");
+    println!("    ║     ███████╗████████╗ █████╗ ███╗   ██╗██████╗ ██╗  ██╗        ║");
+    println!("    ║     ██╔════╝╚══██╔══╝██╔══██╗████╗  ██║██╔══██╗╚██╗██╔╝        ║");
+    println!("    ║     ███████╗   ██║   ███████║██╔██╗ ██║██║  ██║ ╚███╔╝         ║");
+    println!("    ║     ╚════██║   ██║   ██╔══██║██║╚██╗██║██║  ██║ ██╔██╗         ║");
+    println!("    ║     ███████║   ██║   ██║  ██║██║ ╚████║██████╔╝██╔╝ ██╗        ║");
+    println!("    ║     ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝        ║");
+    println!("    ║                                                                  ║");
+    println!("    ║              ⚡ High-Performance Crypto Trading CLI ⚡            ║");
+    println!("    ║                                                                  ║");
+    println!("    ║                    Version 0.3.0 | StandX Labs                   ║");
+    println!("    ║                                                                  ║");
+    println!("    ╚══════════════════════════════════════════════════════════════════╝");
+    println!();
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    
+    // Print splash screen (unless in quiet mode or OpenClaw mode)
+    if !cli.quiet && !cli.openclaw {
+        print_splash_screen();
+    }
 
     // Initialize logging
     if cli.verbose {
