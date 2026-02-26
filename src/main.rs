@@ -13,6 +13,18 @@ fn print_splash_screen() {
         return;
     }
 
+    let version = env!("CARGO_PKG_VERSION");
+    let version_text = format!("Version {}", version);
+    // Center the version text in 66 chars width
+    let padding = (66 - version_text.len()) / 2;
+    let version_line = format!(
+        "    ║{:>width$}{}{:<width$}║",
+        "",
+        version_text,
+        "",
+        width = padding
+    );
+
     println!();
     println!("    ╔══════════════════════════════════════════════════════════════════╗");
     println!("    ║                                                                  ║");
@@ -25,10 +37,7 @@ fn print_splash_screen() {
     println!("    ║                                                                  ║");
     println!("    ║              ⚡ StandX Agent Toolkit ⚡                           ║");
     println!("    ║                                                                  ║");
-    println!(
-        "    ║                    Version {}                                 ║",
-        env!("CARGO_PKG_VERSION")
-    );
+    println!("{}", version_line);
     println!("    ║                                                                  ║");
     println!("    ╚══════════════════════════════════════════════════════════════════╝");
     println!();
