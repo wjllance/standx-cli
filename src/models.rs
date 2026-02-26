@@ -342,22 +342,42 @@ impl tabled::Tabled for Order {
 /// Position information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Position {
+    pub id: i64,
     pub symbol: String,
-    pub side: PositionSide,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub quantity: String,
+    pub qty: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub entry_price: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub mark_price: String,
+    pub entry_value: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub liquidation_price: String,
+    pub holding_margin: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub margin: String,
+    pub initial_margin: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub leverage: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
-    pub unrealized_pnl: String,
+    pub mark_price: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub margin_asset: String,
+    pub margin_mode: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub position_value: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub realized_pnl: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub required_margin: String,
+    pub status: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub upnl: String,
+    pub time: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liq_price: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mmr: Option<String>,
+    pub user: String,
 }
 
 impl tabled::Tabled for Position {
@@ -366,25 +386,25 @@ impl tabled::Tabled for Position {
     fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
         vec![
             self.symbol.clone().into(),
-            format!("{:?}", self.side).into(),
-            self.quantity.clone().into(),
+            self.qty.clone().into(),
             self.entry_price.clone().into(),
             self.mark_price.clone().into(),
-            self.liquidation_price.clone().into(),
+            self.liq_price.clone().unwrap_or_default().into(),
             self.leverage.clone().into(),
-            self.unrealized_pnl.clone().into(),
+            self.margin_mode.clone().into(),
+            self.upnl.clone().into(),
         ]
     }
 
     fn headers() -> Vec<std::borrow::Cow<'static, str>> {
         vec![
             "Symbol".into(),
-            "Side".into(),
-            "Quantity".into(),
+            "Qty".into(),
             "Entry Price".into(),
             "Mark Price".into(),
             "Liq Price".into(),
             "Leverage".into(),
+            "Margin Mode".into(),
             "Unrealized PnL".into(),
         ]
     }
