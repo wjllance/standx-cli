@@ -5,7 +5,7 @@ use thiserror::Error;
 #[derive(Error, Debug, Serialize)]
 #[serde(tag = "error_type")]
 pub enum Error {
-    #[error("HTTP request failed")]
+    #[error("HTTP request failed: {code} - {message}")]
     #[serde(rename = "HTTP_ERROR")]
     Http {
         code: u16,
@@ -22,7 +22,7 @@ pub enum Error {
     #[serde(rename = "JSON_ERROR")]
     Json { message: String },
 
-    #[error("API error")]
+    #[error("API error: {code} - {message}")]
     #[serde(rename = "API_ERROR")]
     Api {
         code: u16,
