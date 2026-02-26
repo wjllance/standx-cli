@@ -1992,6 +1992,7 @@ dependencies = [
  "mockito",
  "once_cell",
  "rand 0.8.5",
+ "regex",
  "reqwest",
  "rpassword",
  "serde",
