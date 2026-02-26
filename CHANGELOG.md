@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.2] - 2026-02-26
+## [0.3.3] - 2026-02-26
 
 ### Added
 - **Smart splash screen** with TTY detection
@@ -15,6 +15,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Auto-hides when output is piped or redirected
   - Respects `--quiet` and `--openclaw` flags
   - Uses `std::io::IsTerminal` for cross-platform detection
+
+## [0.3.2] - 2026-02-26
+
+### Added
+- **K-line command improvements** (ISSUE-2.1)
+  - Support friendly time formats: Unix timestamp, ISO date (YYYY-MM-DD), relative time (1h, 1d, 7d)
+  - Added `--limit` option as alternative to from/to
+  - Added `parse_time_string()` helper function
+- **Trade history command improvements** (ISSUE-4.1)
+  - Same time format support as K-line
+  - Default time range: last 24 hours
+  - Empty result handling with informative message
+- **Funding rate empty data handling** (ISSUE-2.2)
+  - Added helpful message when no funding data available
+  - Suggests alternative commands
+
+### Fixed
+- Confirmed Leverage and Margin APIs are working (ISSUE-4.2, ISSUE-4.3)
+- Code formatting with `cargo fmt`
 
 ## [0.3.1] - 2026-02-26
 
@@ -97,30 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Homebrew support
 - Comprehensive documentation (README, API docs, Homebrew guide)
 
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/wjllance/standx-cli/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/wjllance/standx-cli/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/wjllance/standx-cli/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/wjllance/standx-cli/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/wjllance/standx-cli/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/wjllance/standx-cli/releases/tag/v0.1.0
-### Changed
-- Updated `Cargo.toml` version to 0.2.0
-- Updated repository URL in `Cargo.toml`
-
-## [0.1.0] - 2026-02-22
-
-### Added
-- Initial release of StandX CLI
-- Market data queries (symbols, ticker, trades, depth, kline, funding)
-- Account management (balances, positions, orders, history)
-- Order management (create, cancel, cancel-all)
-- WebSocket streaming (ticker, depth, account)
-- JWT + Ed25519 authentication
-- Multiple output formats (table, json, csv)
-- Homebrew support
-- Comprehensive documentation (README, API docs, Homebrew guide)
-
-[Unreleased]: https://github.com/wjllance/standx-cli/compare/v0.3.1...HEAD
 [0.3.1]: https://github.com/wjllance/standx-cli/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/wjllance/standx-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wjllance/standx-cli/compare/v0.1.0...v0.2.0

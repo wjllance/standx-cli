@@ -18,7 +18,7 @@ fn print_splash_screen() {
     println!("    ║                                                                  ║");
     println!("    ║              ⚡ StandX Agent Toolkit ⚡                           ║");
     println!("    ║                                                                  ║");
-    println!("    ║                    Version 0.3.2                                 ║");
+    println!("    ║                    Version 0.3.3                                 ║");
     println!("    ║                                                                  ║");
     println!("    ╚══════════════════════════════════════════════════════════════════╝");
     println!();
