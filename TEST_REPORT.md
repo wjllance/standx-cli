@@ -154,7 +154,7 @@ standx stream fills
 
 | Issue | Description | Status |
 |-------|-------------|--------|
-| ISSUE-5.1 | User auth channels return `invalid token` | 🟢 **FIXED** |
+| ISSUE-5.1 | User auth channels return `invalid token` | 🔴 Pending |
 
 ---
 
@@ -217,7 +217,7 @@ standx stream fills
 | ISSUE-4.1 | Trade history not implemented | Medium | 🟢 **FIXED** |
 | ISSUE-4.2 | Leverage functions not implemented | Medium | 🟢 **FIXED** |
 | ISSUE-4.3 | Margin functions not implemented | Low | 🟢 **FIXED** |
-| ISSUE-5.1 | User auth channel token issue | Medium | 🟢 **FIXED** |
+| ISSUE-5.1 | User auth channel token issue | Medium | 🔴 Pending |
 | ISSUE-6.1 | `--yes` flag not integrated (no prompts to skip) | Low |
 
 ### Fixed Issues
@@ -235,7 +235,6 @@ standx stream fills
 | FIX-4.1 | Trade history time format | Same improvements as Kline |
 | FIX-4.2 | Leverage API | Already implemented, marked as fixed |
 | FIX-4.3 | Margin API | Already implemented, marked as fixed |
-| FIX-5.7 | WebSocket auth token | Added Bearer prefix to token |
 
 ---
 
@@ -253,7 +252,6 @@ standx stream fills
 | Trade history | ✅ Complete | trade history with friendly time format |
 | Leverage management | ✅ Complete | leverage get/set working |
 | Margin management | ✅ Complete | margin transfer/mode working |
-| Margin management | ⚠️ Not implemented | margin transfer/mode |
 | OpenClaw mode | ✅ Complete | JSON output, AI-optimized |
 | Dry run mode | ✅ Complete | Preview before execute |
 | Auto-confirm | ⚠️ Partial | `--yes` flag exists, not fully integrated |
