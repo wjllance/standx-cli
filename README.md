@@ -78,10 +78,77 @@ cargo install standx-cli
 
 ### 2. Configure
 
+StandX CLI requires authentication for most operations. You need:
+
+1. **JWT Token** (required) - For reading account data
+2. **Ed25519 Private Key** (optional, but recommended) - For trading operations
+
+#### Get Credentials
+
+Visit https://standx.com/user/session to generate:
+- JWT Token (valid for 7 days)
+- Ed25519 Private Key (Base58 encoded)
+
+#### Login Methods
+
+**Interactive (Recommended for first-time setup):**
 ```bash
-# Get credentials from https://standx.com/user/session
-standx auth login --token "$STANDX_JWT" --private-key "$STANDX_KEY"
+standx auth login --interactive
 ```
+
+**Command line (for scripts/agents):**
+```bash
+standx auth login \
+  --token "$STANDX_JWT" \
+  --private-key "$STANDX_PRIVATE_KEY"
+```
+
+**From files:**
+```bash
+standx auth login \
+  --token-file ~/.standx_token \
+  --key-file ~/.standx_key
+```
+
+**Environment variables (auto-detected):**
+```bash
+export STANDX_JWT="your_jwt_token"
+export STANDX_PRIVATE_KEY="your_private_key"
+```
+
+#### Check Authentication Status
+
+```bash
+standx auth status
+```
+
+**Example output:**
+```
+✅ Authenticated
+   Token expires at: 2024-02-02T09:56:07Z
+   Remaining: 167 hours
+```
+
+#### Logout
+
+```bash
+standx auth logout
+```
+
+#### Permission Requirements
+
+| Operation | JWT Token | Private Key |
+|-----------|-----------|-------------|
+| Market data (ticker, depth) | ❌ No | ❌ No |
+| Account info (balances, positions) | ✅ Yes | ❌ No |
+| View orders & trades | ✅ Yes | ❌ No |
+| **Create/cancel orders** | ✅ Yes | ✅ **Yes** |
+| **Change leverage** | ✅ Yes | ✅ **Yes** |
+| **Margin operations** | ✅ Yes | ✅ **Yes** |
+
+> **Note:** Trading operations require the Ed25519 private key for request signing. If you only provide the JWT token, you'll see: `⚠️ No private key provided - trading operations will be unavailable`
+
+For detailed authentication documentation, see [docs/02-authentication.md](docs/02-authentication.md).
 
 ### 3. Use With Your Agent
 
