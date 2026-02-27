@@ -10,7 +10,11 @@ fn test_market_symbols_json_output() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("\"symbol\"").or(predicate::str::contains("\"data\"")))
-        .stdout(predicate::str::contains("BTC").or(predicate::str::contains("ETH")).or(predicate::str::contains("[]")));
+        .stdout(
+            predicate::str::contains("BTC")
+                .or(predicate::str::contains("ETH"))
+                .or(predicate::str::contains("[]")),
+        );
 }
 
 #[test]

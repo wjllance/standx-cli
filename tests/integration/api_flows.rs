@@ -7,14 +7,14 @@ use standx_cli::client::StandXClient;
 #[tokio::test]
 async fn test_market_data_flow() {
     let mut server = Server::new_async().await;
-    
+
     // Mock symbols endpoint
     let _m1 = server.mock("GET", "/api/query_symbol_info")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"[{"symbol":"BTC-USD","base_asset":"BTC","quote_asset":"DUSD","base_decimals":9,"price_tick_decimals":2,"qty_tick_decimals":4,"min_order_qty":"0.0001","def_leverage":"10","max_leverage":"40","maker_fee":"0.0001","taker_fee":"0.0004","status":"trading"}]"#)
         .create();
-    
+
     // Mock market data endpoint
     let _m2 = server.mock("GET", "/api/query_symbol_market")
         .match_query(mockito::Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
@@ -24,12 +24,12 @@ async fn test_market_data_flow() {
         .create();
 
     let client = StandXClient::with_base_url(server.url()).unwrap();
-    
+
     // Step 1: Get symbols
     let symbols = client.get_symbol_info().await.unwrap();
     assert!(!symbols.is_empty());
     assert_eq!(symbols[0].symbol, "BTC-USD");
-    
+
     // Step 2: Get market data for first symbol
     let market = client.get_symbol_market("BTC-USD").await.unwrap();
     assert_eq!(market.symbol, "BTC-USD");
@@ -38,16 +38,17 @@ async fn test_market_data_flow() {
 #[tokio::test]
 async fn test_api_error_handling_flow() {
     let mut server = Server::new_async().await;
-    
+
     // Mock 401 unauthorized
-    let _m = server.mock("GET", "/api/query_positions")
+    let _m = server
+        .mock("GET", "/api/query_positions")
         .with_status(401)
         .with_header("content-type", "application/json")
         .with_body(r#"{"error":"Unauthorized","message":"Invalid or missing authentication"}"#)
         .create();
 
     let client = StandXClient::with_base_url(server.url()).unwrap();
-    
+
     // Should handle 401 gracefully
     let result = client.get_positions(None).await;
     assert!(result.is_err());
