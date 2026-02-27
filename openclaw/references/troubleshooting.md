@@ -39,6 +39,34 @@
 2. Verify API endpoint: `standx config get base_url`
 3. Check StandX status page
 
+## Security Best Practices
+
+### Verify Download Integrity
+
+All releases include SHA256 checksums. Always verify before installing:
+
+```bash
+# Download binary and checksums
+curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-x86_64-unknown-linux-gnu.tar.gz
+curl -L -o /tmp/checksums.txt https://github.com/wjllance/standx-cli/releases/download/v0.4.4/checksums.txt
+
+# Verify checksum
+cd /tmp && sha256sum -c checksums.txt --ignore-missing
+```
+
+### Avoid Pipe-to-Shell
+
+⚠️ **Warning**: Never run `curl ... | sh` without inspecting the script first. Always:
+1. Download the script: `curl -L -o install.sh ...`
+2. Inspect the content: `cat install.sh`
+3. Then execute: `sh install.sh`
+
+### Recommended Installation Methods (Most Secure)
+
+1. **ClawHub**: `clawhub install standx-cli` ✅ Recommended
+2. **Homebrew**: `brew install standx-cli` ✅ Recommended
+3. **Direct Download with checksum verification** ⚠️ Requires manual verification
+
 ## Debug Mode
 
 Enable verbose output:

@@ -77,15 +77,29 @@ brew install standx-cli
 
 ### Option 3: Direct Download
 
+> **Security Note:** Downloads are verified against SHA256 checksums. Each release includes a `checksums.txt` file for verification.
+
 ```bash
 # Linux x86_64
 curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-x86_64-unknown-linux-gnu.tar.gz
+
+# Download and verify checksum
+curl -L -o /tmp/checksums.txt https://github.com/wjllance/standx-cli/releases/download/v0.4.4/checksums.txt
+cd /tmp && sha256sum -c checksums.txt --ignore-missing
+
+# Extract and install
 tar -xzf /tmp/standx.tar.gz -C /tmp
 sudo mv /tmp/standx /usr/local/bin/
 sudo chmod +x /usr/local/bin/standx
 
 # macOS Apple Silicon
 curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-aarch64-apple-darwin.tar.gz
+
+# Download and verify checksum
+curl -L -o /tmp/checksums.txt https://github.com/wjllance/standx-cli/releases/download/v0.4.4/checksums.txt
+cd /tmp && shasum -a 256 -c checksums.txt --ignore-missing
+
+# Extract and install
 tar -xzf /tmp/standx.tar.gz -C /tmp
 sudo mv /tmp/standx /usr/local/bin/
 sudo chmod +x /usr/local/bin/standx
