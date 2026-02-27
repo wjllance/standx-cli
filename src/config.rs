@@ -49,6 +49,17 @@ impl Config {
     pub fn load() -> Result<Self> {
         let config_dir = Self::default_config_dir();
         let config_file = config_dir.join("config.toml");
+        Self::load_from_path(Some(config_file))
+    }
+
+    /// Load configuration from a specific path
+    /// If path is None, uses the default config file location
+    pub fn load_from_path(path: Option<PathBuf>) -> Result<Self> {
+        let config_file = path.unwrap_or_else(|| Self::default_config_dir().join("config.toml"));
+        let config_dir = config_file
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(Self::default_config_dir);
 
         if !config_file.exists() {
             return Ok(Self::default());
@@ -312,5 +323,52 @@ mod tests {
 
         // Cleanup
         std::env::remove_var("TEST_ISOLATION_VAR");
+    }
+
+    #[test]
+    fn test_load_from_path() {
+        use tempfile::TempDir;
+
+        // Test loading from custom path
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("custom_config.toml");
+
+        // Create a config file
+        let config = Config {
+            base_url: "https://custom.standx.com".to_string(),
+            output_format: "json".to_string(),
+            default_symbol: "ETH-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+        let content = toml::to_string(&config).unwrap();
+        std::fs::write(&config_file, content).unwrap();
+
+        // Load from custom path
+        let loaded = Config::load_from_path(Some(config_file.clone())).unwrap();
+        assert_eq!(loaded.base_url, "https://custom.standx.com");
+        assert_eq!(loaded.output_format, "json");
+        assert_eq!(loaded.default_symbol, "ETH-USD");
+    }
+
+    #[test]
+    fn test_load_from_path_missing_file() {
+        use tempfile::TempDir;
+
+        // Test loading from non-existent path returns default
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("nonexistent_config.toml");
+
+        let config = Config::load_from_path(Some(config_file)).unwrap();
+        assert_eq!(config.base_url, "https://perps.standx.com");
+        assert_eq!(config.output_format, "table");
+    }
+
+    #[test]
+    fn test_load_from_path_none() {
+        // Test load_from_path(None) uses default location
+        // This should behave like load() - return default if no config or use existing
+        let result = Config::load_from_path(None);
+        // Should succeed (either return default or load existing config)
+        assert!(result.is_ok());
     }
 }
