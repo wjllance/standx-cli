@@ -1,6 +1,6 @@
 ---
 name: standx-cli
-description: "Crypto trading CLI for StandX exchange v0.3.5. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings. Supports BTC, ETH, SOL, XRP and other trading pairs."
+description: "Crypto trading CLI for StandX exchange v0.4.3. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings. Supports BTC, ETH, SOL, XRP and other trading pairs."
 metadata:
   {
     "openclaw":
@@ -33,16 +33,23 @@ metadata:
             {
               "id": "github-linux",
               "kind": "script",
-              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.3.5/standx-v0.3.5-x86_64-unknown-linux-gnu.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
+              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-x86_64-unknown-linux-gnu.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
               "bins": ["standx"],
               "label": "Install StandX CLI on Linux",
             },
             {
               "id": "github-macos",
               "kind": "script",
-              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.3.5/standx-v0.3.5-aarch64-apple-darwin.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
+              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-aarch64-apple-darwin.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
               "bins": ["standx"],
               "label": "Install StandX CLI on macOS",
+            },
+            {
+              "id": "manual",
+              "kind": "script",
+              "script": "git clone https://github.com/wjllance/standx-cli.git ~/.openclaw/skills/standx-cli && echo 'Skill installed. Please install standx binary separately via Homebrew or direct download.'",
+              "bins": ["standx"],
+              "label": "Manual install (skill only, binary separate)",
             },
           ],
       },
@@ -72,16 +79,27 @@ brew install standx-cli
 
 ```bash
 # Linux x86_64
-curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.3.5/standx-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
+curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-x86_64-unknown-linux-gnu.tar.gz
 tar -xzf /tmp/standx.tar.gz -C /tmp
 sudo mv /tmp/standx /usr/local/bin/
 sudo chmod +x /usr/local/bin/standx
 
 # macOS Apple Silicon
-curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.3.5/standx-v0.3.5-aarch64-apple-darwin.tar.gz
+curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-aarch64-apple-darwin.tar.gz
 tar -xzf /tmp/standx.tar.gz -C /tmp
 sudo mv /tmp/standx /usr/local/bin/
 sudo chmod +x /usr/local/bin/standx
+```
+
+### Option 4: Manual Install (Skill Only)
+
+If you prefer to install the skill manually and manage the binary separately:
+
+```bash
+# Install skill
+git clone https://github.com/wjllance/standx-cli.git ~/.openclaw/skills/standx-cli
+
+# Then install binary separately via Homebrew or direct download (see Option 2 or 3)
 ```
 
 ## Quick Start
@@ -315,9 +333,10 @@ standx --dry-run order create BTC-USD buy limit --qty 0.01 --price 60000
 
 ## References
 
-- [API Documentation](https://github.com/wjllance/standx-cli/blob/main/docs/01-quickstart.md)
-- [Authentication Details](https://github.com/wjllance/standx-cli/blob/main/docs/02-authentication.md)
-- [Command Examples](https://github.com/wjllance/standx-cli/blob/main/docs/)
+- [API Documentation](references/api-docs.md)
+- [Authentication Details](references/authentication.md)
+- [Command Examples](references/examples.md)
+- [Troubleshooting](references/troubleshooting.md)
 
 ## Links
 
