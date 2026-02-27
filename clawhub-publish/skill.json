@@ -16,13 +16,21 @@
         "sensitive": true
       }
     ],
+    "homepage": "https://github.com/wjllance/standx-cli",
+    "source": {
+      "type": "github",
+      "owner": "wjllance",
+      "repo": "standx-cli",
+      "verified": true
+    },
     "install": [
       {
         "id": "brew",
         "kind": "brew",
         "formula": "wjllance/standx-cli/standx-cli",
         "bins": ["standx"],
-        "label": "Install StandX CLI via Homebrew"
+        "label": "Install StandX CLI via Homebrew",
+        "verification": "https://github.com/wjllance/standx-cli/blob/main/homebrew/standx-cli.rb"
       }
     ]
   }

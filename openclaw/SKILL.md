@@ -49,6 +49,16 @@ clawhub install standx-cli
 
 ### Option 2: Homebrew
 
+> **Security Note:** This uses a third-party tap. You can inspect the formula before installing:
+> ```bash
+> # View the formula source
+> curl -sL https://raw.githubusercontent.com/wjllance/homebrew-standx-cli/main/standx-cli.rb
+> 
+> # Then install
+> brew tap wjllance/standx-cli
+> brew install standx-cli
+> ```
+
 ```bash
 brew tap wjllance/standx-cli
 brew install standx-cli

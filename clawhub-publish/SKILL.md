@@ -1,6 +1,6 @@
 ---
 name: standx-cli
-description: "Crypto trading CLI for StandX exchange v0.4.2. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings. Supports BTC, ETH, SOL, XRP and other trading pairs."
+description: "Crypto trading CLI for StandX exchange v0.4.5. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings. Supports BTC, ETH, SOL, XRP and other trading pairs."
 metadata:
   {
     "openclaw":
@@ -48,6 +48,16 @@ clawhub install standx-cli
 ```
 
 ### Option 2: Homebrew
+
+> **Security Note:** This uses a third-party tap. You can inspect the formula before installing:
+> ```bash
+> # View the formula source
+> curl -sL https://raw.githubusercontent.com/wjllance/homebrew-standx-cli/main/standx-cli.rb
+> 
+> # Then install
+> brew tap wjllance/standx-cli
+> brew install standx-cli
+> ```
 
 ```bash
 brew tap wjllance/standx-cli
