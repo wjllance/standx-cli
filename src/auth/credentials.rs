@@ -225,6 +225,33 @@ impl Credentials {
 mod tests {
     use super::*;
 
+    /// Helper struct to temporarily set environment variables
+    /// Restores original value (or removes if not set) when dropped
+    struct EnvGuard {
+        key: String,
+        original_value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let original_value = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                original_value,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original_value {
+                Some(val) => std::env::set_var(&self.key, val),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_credentials_new() {
         let mut creds = Credentials::new("test_token".to_string(), Some("test_key".to_string()));
@@ -274,17 +301,14 @@ mod tests {
 
     #[test]
     fn test_from_env() {
-        // Set environment variables
-        std::env::set_var(ENV_JWT_TOKEN, "env_test_token");
-        std::env::set_var(ENV_PRIVATE_KEY, "env_test_key");
+        // Set environment variables using EnvGuard for automatic cleanup
+        let _token_guard = EnvGuard::set(ENV_JWT_TOKEN, "env_test_token");
+        let _key_guard = EnvGuard::set(ENV_PRIVATE_KEY, "env_test_key");
 
         let creds = Credentials::from_env().unwrap();
         assert_eq!(creds.token, "env_test_token");
         assert_eq!(creds.private_key, "env_test_key");
-
-        // Clean up
-        std::env::remove_var(ENV_JWT_TOKEN);
-        std::env::remove_var(ENV_PRIVATE_KEY);
+        // EnvGuard automatically cleans up when dropped
     }
 
     #[test]
@@ -319,7 +343,8 @@ mod tests {
             }
         }
 
-        // Test long string separately
+        // Test with large data to verify encryption handles arbitrary length
+        // 100 repetitions creates a ~1600 character string to test buffer handling
         let long_token = "very_long_token_".repeat(100);
         let encrypted = Credentials::xor_encrypt(&long_token);
         let decrypted = Credentials::xor_decrypt(&encrypted);
