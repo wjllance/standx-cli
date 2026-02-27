@@ -15,7 +15,7 @@ fn test_market_symbols_command() {
 #[test]
 fn test_market_ticker_command() {
     let mut cmd = Command::cargo_bin("standx").unwrap();
-    cmd.args(["market", "ticker", "--symbol", "BTC-USD"]);
+    cmd.args(["market", "ticker", "BTC-USD"]);
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("BTC-USD").or(predicate::str::contains("mark_price")).or(predicate::str::contains("Error")));
@@ -24,17 +24,17 @@ fn test_market_ticker_command() {
 #[test]
 fn test_market_depth_command() {
     let mut cmd = Command::cargo_bin("standx").unwrap();
-    cmd.args(["market", "depth", "--symbol", "BTC-USD"]);
+    cmd.args(["market", "depth", "BTC-USD"]);
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("bids").or(predicate::str::contains("asks")).or(predicate::str::contains("Error")));
+        .stdout(predicate::str::contains("Asks").or(predicate::str::contains("Bids")).or(predicate::str::contains("Error")));
 }
 
 #[test]
 fn test_market_funding_command() {
     let mut cmd = Command::cargo_bin("standx").unwrap();
-    cmd.args(["market", "funding", "--symbol", "BTC-USD"]);
+    cmd.args(["market", "funding", "BTC-USD"]);
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("funding_rate").or(predicate::str::contains("Error")));
+        .stdout(predicate::str::contains("Funding Rate").or(predicate::str::contains("Error")));
 }
