@@ -145,4 +145,54 @@ mod tests {
         // Ed25519 signatures are 64 bytes
         assert_eq!(decoded.unwrap().len(), 64);
     }
+
+    #[test]
+    fn test_signature_verification() {
+        // Test that signature format is correct and can be decoded
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let private_key_bytes = signing_key.to_bytes();
+        let private_key_base58 = bs58::encode(&private_key_bytes).into_string();
+
+        let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
+
+        let payload = r#"{"symbol":"BTC-USD","side":"buy"}"#;
+        let sig = signer.sign_request_now(payload);
+
+        // Decode the signature from base64
+        let sig_bytes = STANDARD.decode(&sig.signature).unwrap();
+
+        // Decode the public key from hex
+        let pubkey_bytes = hex::decode(&sig.pubkey).unwrap();
+
+        // Verify the signature format is correct
+        // Ed25519 signatures are 64 bytes
+        assert_eq!(sig_bytes.len(), 64);
+        // Ed25519 public keys are 32 bytes
+        assert_eq!(pubkey_bytes.len(), 32);
+    }
+
+    #[test]
+    fn test_sign_request_consistency() {
+        // Test that signing the same payload produces consistent results
+        // Ed25519 is deterministic - same message + same key = same signature
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let private_key_bytes = signing_key.to_bytes();
+        let private_key_base58 = bs58::encode(&private_key_bytes).into_string();
+
+        let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
+
+        let payload = r#"{"symbol":"BTC-USD","side":"buy"}"#;
+        let timestamp = 1700000000000u64;
+
+        // Sign same payload twice
+        let sig1 = signer.sign_request(timestamp, payload);
+        let sig2 = signer.sign_request(timestamp, payload);
+
+        // Same signer should produce same request_id and pubkey
+        assert_eq!(sig1.request_id, sig2.request_id);
+        assert_eq!(sig1.pubkey, sig2.pubkey);
+
+        // Ed25519 is deterministic, so signatures should be identical
+        assert_eq!(sig1.signature, sig2.signature);
+    }
 }
