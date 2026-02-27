@@ -394,4 +394,63 @@ mod tests {
         let result: std::result::Result<Credentials, _> = serde_json::from_str(&loaded_json);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_jwt_expiration_calculation() {
+        // Test that expiration is calculated correctly
+        let now = chrono::Utc::now().timestamp();
+        let creds = Credentials {
+            token: "test_token".to_string(),
+            private_key: "test_key".to_string(),
+            created_at: now,
+            validity_seconds: 3600, // 1 hour
+        };
+
+        // Should not be expired immediately
+        assert!(!creds.is_expired());
+
+        // Remaining seconds should be close to 3600
+        let remaining = creds.remaining_seconds();
+        assert!(remaining > 3590 && remaining <= 3600);
+
+        // Expires at string should contain UTC
+        let expires_str = creds.expires_at_string();
+        assert!(expires_str.contains("UTC"));
+    }
+
+    #[test]
+    fn test_jwt_expired_token() {
+        // Test expired token detection
+        let now = chrono::Utc::now().timestamp();
+        let mut creds = Credentials {
+            token: "test_token".to_string(),
+            private_key: "test_key".to_string(),
+            created_at: now - 7200, // 2 hours ago
+            validity_seconds: 3600, // 1 hour validity
+        };
+
+        // Should be expired (2 hours > 1 hour validity)
+        assert!(creds.is_expired());
+        assert_eq!(creds.remaining_seconds(), 0);
+
+        // Test with token expired by 1 second
+        creds.created_at = now - 3601;
+        assert!(creds.is_expired());
+    }
+
+    #[test]
+    fn test_jwt_token_format() {
+        // Test that token is stored as-is
+        let test_tokens = vec![
+            "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.test",
+            "simple_token_123",
+            "token-with-dashes_and_underscores",
+            "Bearer token_with_special_chars!@#$%",
+        ];
+
+        for token in test_tokens {
+            let creds = Credentials::new(token.to_string(), None);
+            assert_eq!(creds.token, token);
+        }
+    }
 }
