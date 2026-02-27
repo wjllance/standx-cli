@@ -403,4 +403,36 @@ mod tests {
 
         assert!(matches!(result, Err(Error::Api { code: 400, .. })));
     }
+
+    #[tokio::test]
+    async fn test_api_error_401_unauthorized() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/query_symbol_info")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"Unauthorized"}"#)
+            .create();
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let result = client.get_symbol_info().await;
+
+        assert!(matches!(result, Err(Error::Api { code: 401, .. })));
+    }
+
+    #[tokio::test]
+    async fn test_api_error_500_server_error() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/query_symbol_info")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"Internal Server Error"}"#)
+            .create();
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let result = client.get_symbol_info().await;
+
+        assert!(matches!(result, Err(Error::Api { code: 500, .. })));
+    }
 }
