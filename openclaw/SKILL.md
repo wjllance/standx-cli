@@ -1,6 +1,6 @@
 ---
 name: standx-cli
-description: "Crypto trading CLI for StandX exchange v0.4.3. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings. Supports BTC, ETH, SOL, XRP and other trading pairs."
+description: "Crypto trading CLI for StandX exchange v0.4.4. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings. Supports BTC, ETH, SOL, XRP and other trading pairs."
 metadata:
   {
     "openclaw":
@@ -33,14 +33,14 @@ metadata:
             {
               "id": "github-linux",
               "kind": "script",
-              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-x86_64-unknown-linux-gnu.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
+              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-x86_64-unknown-linux-gnu.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
               "bins": ["standx"],
               "label": "Install StandX CLI on Linux",
             },
             {
               "id": "github-macos",
               "kind": "script",
-              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-aarch64-apple-darwin.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
+              "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-aarch64-apple-darwin.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
               "bins": ["standx"],
               "label": "Install StandX CLI on macOS",
             },
@@ -79,13 +79,13 @@ brew install standx-cli
 
 ```bash
 # Linux x86_64
-curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-x86_64-unknown-linux-gnu.tar.gz
+curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-x86_64-unknown-linux-gnu.tar.gz
 tar -xzf /tmp/standx.tar.gz -C /tmp
 sudo mv /tmp/standx /usr/local/bin/
 sudo chmod +x /usr/local/bin/standx
 
 # macOS Apple Silicon
-curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.3/standx-v0.4.3-aarch64-apple-darwin.tar.gz
+curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.4.4/standx-v0.4.4-aarch64-apple-darwin.tar.gz
 tar -xzf /tmp/standx.tar.gz -C /tmp
 sudo mv /tmp/standx /usr/local/bin/
 sudo chmod +x /usr/local/bin/standx
