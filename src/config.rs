@@ -117,6 +117,33 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    /// Helper struct to temporarily set environment variables
+    /// Restores original value (or removes if not set) when dropped
+    struct EnvGuard {
+        key: String,
+        original_value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let original_value = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                original_value,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original_value {
+                Some(val) => std::env::set_var(&self.key, val),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
@@ -214,44 +241,35 @@ mod tests {
 
     #[test]
     fn test_config_env_override_base_url() {
-        // 测试环境变量覆盖 base_url
-        std::env::set_var("STANDX_BASE_URL", "https://env.standx.com");
+        // Test that environment variable can be set and read for base_url
+        let _guard = EnvGuard::set("STANDX_BASE_URL", "https://env.standx.com");
 
-        // 这里我们验证环境变量可以被读取
-        // 实际项目中可能需要在 Config 加载时检查环境变量
         let env_url = std::env::var("STANDX_BASE_URL").unwrap();
         assert_eq!(env_url, "https://env.standx.com");
-
-        // 清理环境变量
-        std::env::remove_var("STANDX_BASE_URL");
     }
 
     #[test]
     fn test_config_env_override_output_format() {
-        // 测试环境变量覆盖 output_format
-        std::env::set_var("STANDX_OUTPUT_FORMAT", "json");
+        // Test that environment variable can be set and read for output_format
+        let _guard = EnvGuard::set("STANDX_OUTPUT_FORMAT", "json");
 
         let env_format = std::env::var("STANDX_OUTPUT_FORMAT").unwrap();
         assert_eq!(env_format, "json");
-
-        std::env::remove_var("STANDX_OUTPUT_FORMAT");
     }
 
     #[test]
     fn test_config_env_override_default_symbol() {
-        // 测试环境变量覆盖 default_symbol
-        std::env::set_var("STANDX_DEFAULT_SYMBOL", "ETH-USD");
+        // Test that environment variable can be set and read for default_symbol
+        let _guard = EnvGuard::set("STANDX_DEFAULT_SYMBOL", "ETH-USD");
 
         let env_symbol = std::env::var("STANDX_DEFAULT_SYMBOL").unwrap();
         assert_eq!(env_symbol, "ETH-USD");
-
-        std::env::remove_var("STANDX_DEFAULT_SYMBOL");
     }
 
     #[test]
     fn test_config_env_priority() {
-        // 测试环境变量优先级：Env > File > Default
-        // 创建一个配置文件
+        // Test environment variable priority: Env > File > Default
+        // Create a config file with specific values
         let temp_dir = TempDir::new().unwrap();
         let mut config = Config {
             base_url: "https://file.standx.com".to_string(),
@@ -261,14 +279,38 @@ mod tests {
         };
         config.save().unwrap();
 
-        // 设置环境变量
-        std::env::set_var("STANDX_BASE_URL", "https://env.standx.com");
+        // Set environment variable (should take priority)
+        let _guard = EnvGuard::set("STANDX_BASE_URL", "https://env.standx.com");
 
-        // 验证环境变量存在
+        // Verify environment variable exists
         let env_val = std::env::var("STANDX_BASE_URL").unwrap();
         assert_eq!(env_val, "https://env.standx.com");
+    }
 
-        // 清理
-        std::env::remove_var("STANDX_BASE_URL");
+    #[test]
+    fn test_config_env_empty_string() {
+        // Test empty string environment variable
+        let _guard = EnvGuard::set("STANDX_BASE_URL", "");
+
+        let env_val = std::env::var("STANDX_BASE_URL").unwrap();
+        assert_eq!(env_val, "");
+    }
+
+    #[test]
+    fn test_config_env_isolation() {
+        // Test that EnvGuard properly restores original values
+        // Set an initial value
+        std::env::set_var("TEST_ISOLATION_VAR", "original");
+
+        {
+            let _guard = EnvGuard::set("TEST_ISOLATION_VAR", "modified");
+            assert_eq!(std::env::var("TEST_ISOLATION_VAR").unwrap(), "modified");
+        }
+
+        // After guard is dropped, should be restored
+        assert_eq!(std::env::var("TEST_ISOLATION_VAR").unwrap(), "original");
+
+        // Cleanup
+        std::env::remove_var("TEST_ISOLATION_VAR");
     }
 }
