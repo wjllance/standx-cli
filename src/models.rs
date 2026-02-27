@@ -18,6 +18,38 @@ where
     }
 }
 
+/// Helper to deserialize OrderSide from string
+fn deserialize_order_side<'de, D>(deserializer: D) -> Result<OrderSide, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.to_lowercase().as_str() {
+        "buy" => Ok(OrderSide::Buy),
+        "sell" => Ok(OrderSide::Sell),
+        _ => Err(serde::de::Error::custom(format!(
+            "unknown order side: {}",
+            s
+        ))),
+    }
+}
+
+/// Helper to deserialize OrderType from string
+fn deserialize_order_type<'de, D>(deserializer: D) -> Result<OrderType, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.to_lowercase().as_str() {
+        "limit" => Ok(OrderType::Limit),
+        "market" => Ok(OrderType::Market),
+        _ => Err(serde::de::Error::custom(format!(
+            "unknown order type: {}",
+            s
+        ))),
+    }
+}
+
 /// Trading symbol information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SymbolInfo {
@@ -256,6 +288,8 @@ pub enum OrderStatus {
     Expired,
     #[serde(rename = "open")]
     Open,
+    #[serde(rename = "untriggered")]
+    Untriggered,
 }
 
 /// Position side
@@ -289,8 +323,9 @@ pub struct Order {
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub id: String,
     pub symbol: String,
+    #[serde(deserialize_with = "deserialize_order_side")]
     pub side: OrderSide,
-    #[serde(rename = "order_type")]
+    #[serde(rename = "order_type", deserialize_with = "deserialize_order_type")]
     pub order_type: OrderType,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub qty: String,
@@ -723,6 +758,183 @@ mod tests {
         assert_eq!(positions[0].upnl, "0");
         // 零持仓时应该没有强平价格
         assert!(positions[0].liq_price.is_none());
+    }
+
+    #[test]
+    fn test_order_side_deserialization() {
+        // Test deserialize_order_side with valid values
+        let json = r#"{
+            "id": "1",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.side, OrderSide::Buy);
+
+        let json = r#"{
+            "id": "2",
+            "symbol": "BTC-USD",
+            "side": "sell",
+            "order_type": "limit",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.side, OrderSide::Sell);
+
+        // Test case insensitivity
+        let json = r#"{
+            "id": "3",
+            "symbol": "BTC-USD",
+            "side": "BUY",
+            "order_type": "limit",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.side, OrderSide::Buy);
+
+        let json = r#"{
+            "id": "4",
+            "symbol": "BTC-USD",
+            "side": "Sell",
+            "order_type": "limit",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn test_order_side_deserialization_invalid() {
+        // Test invalid order side
+        let json = r#"{"side": "invalid"}"#;
+        let result: Result<Order, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+
+        // Test empty string
+        let json = r#"{"side": ""}"#;
+        let result: Result<Order, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_order_type_deserialization() {
+        // Test deserialize_order_type with valid values
+        let json = r#"{
+            "id": "1",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.order_type, OrderType::Limit);
+
+        let json = r#"{
+            "id": "2",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "market",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.order_type, OrderType::Market);
+
+        // Test case insensitivity
+        let json = r#"{
+            "id": "3",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "LIMIT",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.order_type, OrderType::Limit);
+
+        let json = r#"{
+            "id": "4",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "Market",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "open",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(json).unwrap();
+        assert_eq!(order.order_type, OrderType::Market);
+    }
+
+    #[test]
+    fn test_order_type_deserialization_invalid() {
+        // Test invalid order type
+        let json = r#"{"order_type": "stop_loss"}"#;
+        let result: Result<Order, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+
+        // Test empty string
+        let json = r#"{"order_type": ""}"#;
+        let result: Result<Order, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_order_status_untriggered() {
+        // Test new Untriggered status
+        let json = r#"{"status": "untriggered"}"#;
+        // We need to test this via Order since OrderStatus is not directly deserializable
+        let order_json = r#"{
+            "id": "123",
+            "symbol": "BTC-USD",
+            "side": "buy",
+            "order_type": "limit",
+            "qty": "0.1",
+            "fill_qty": "0",
+            "price": "60000",
+            "status": "untriggered",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let order: Order = serde_json::from_str(order_json).unwrap();
+        assert_eq!(order.status, OrderStatus::Untriggered);
     }
 
     #[test]
