@@ -11,7 +11,7 @@ fn test_cli_version() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("standx"))
-        .stdout(predicate::str::contains("0.4"));
+        .stdout(predicate::str::contains("0.5"));
 }
 
 #[test]
@@ -20,8 +20,8 @@ fn test_cli_help() {
     cmd.arg("--help");
     cmd.assert()
         .success()
-        .stdout(predicate::str::contains("StandX CLI"))
-        .stdout(predicate::str::contains("USAGE"));
+        .stdout(predicate::str::contains("OpenClaw"))
+        .stdout(predicate::str::contains("Usage:"));
 }
 
 #[test]
