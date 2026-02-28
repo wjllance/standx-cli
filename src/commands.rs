@@ -849,49 +849,31 @@ pub async fn handle_dashboard(
                     println!("Timestamp: {}", snapshot.timestamp);
                     println!();
 
+                    // Format account/balance as table (single row)
                     if let Some(ref balance) = snapshot.account {
                         println!("--- Account ---");
-                        println!("  Balance: {}", balance.balance);
-                        println!("  Equity: {}", balance.equity);
-                        println!("  Available: {}", balance.cross_available);
-                        println!("  Unrealized PnL: {}", balance.upnl);
+                        println!("{}", output::format_item(balance));
                         println!();
                     }
 
+                    // Format positions as table
                     if !snapshot.positions.is_empty() {
                         println!("--- Positions ({}) ---", snapshot.positions.len());
-                        for pos in &snapshot.positions {
-                            println!(
-                                "  {}: {} @ {} (PnL: {})",
-                                pos.symbol, pos.qty, pos.mark_price, pos.upnl
-                            );
-                        }
+                        println!("{}", output::format_table(snapshot.positions));
                         println!();
                     }
 
+                    // Format orders as table
                     if !snapshot.orders.is_empty() {
                         println!("--- Open Orders ({}) ---", snapshot.orders.len());
-                        for order in &snapshot.orders {
-                            println!(
-                                "  {} {} {:?} {:?} @ {}",
-                                order.id, order.symbol, order.side, order.order_type, order.price
-                            );
-                        }
+                        println!("{}", output::format_table(snapshot.orders));
                         println!();
                     }
 
+                    // Format market data as table
                     if !snapshot.market.is_empty() {
                         println!("--- Market Data ({}) ---", snapshot.market.len());
-                        for data in &snapshot.market {
-                            println!(
-                                "  {}: Last: {} 24h: {}/{} Vol: {}",
-                                data.symbol,
-                                data.last_price,
-                                data.high_24h,
-                                data.low_24h,
-                                data.volume_24h
-                            );
-                        }
+                        println!("{}", output::format_table(snapshot.market));
                     }
 
                     if verbose {
