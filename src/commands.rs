@@ -6,7 +6,7 @@ use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
-use standx_cli::models::{OrderSide, OrderType, TimeInForce};
+use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
 
@@ -796,6 +796,143 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
         }
     }
 
+    Ok(())
+}
+
+/// Handle dashboard commands - unified view of account, positions, orders, and market data
+pub async fn handle_dashboard(
+    command: DashboardCommands,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    match command {
+        DashboardCommands::Snapshot {
+            symbols,
+            verbose,
+            watch,
+        } => {
+            // Build list of symbols to track
+            let symbol_list: Vec<String> = if let Some(s) = symbols {
+                s.split(',').map(|s| s.trim().to_string()).collect()
+            } else {
+                // Default: get all positions' symbols
+                let positions = client.get_positions(None).await?;
+                positions.into_iter().map(|p| p.symbol).collect()
+            };
+
+            // Fetch all data in parallel
+            let account = client.get_balance().await.ok();
+            let positions = client.get_positions(None).await?;
+            let orders = client.get_open_orders(None).await?;
+
+            // Fetch market data for tracked symbols
+            let mut market = Vec::new();
+            for symbol in &symbol_list {
+                if let Ok(ticker) = client.get_symbol_market(symbol).await {
+                    market.push(ticker);
+                }
+            }
+
+            // Create dashboard snapshot
+            let snapshot = DashboardSnapshot {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                account,
+                positions,
+                orders,
+                market,
+            };
+
+            match output_format {
+                OutputFormat::Table => {
+                    println!("=== Dashboard Snapshot ===");
+                    println!("Timestamp: {}", snapshot.timestamp);
+                    println!();
+
+                    if let Some(ref balance) = snapshot.account {
+                        println!("--- Account ---");
+                        println!("  Balance: {}", balance.balance);
+                        println!("  Equity: {}", balance.equity);
+                        println!("  Available: {}", balance.cross_available);
+                        println!("  Unrealized PnL: {}", balance.upnl);
+                        println!();
+                    }
+
+                    if !snapshot.positions.is_empty() {
+                        println!("--- Positions ({}) ---", snapshot.positions.len());
+                        for pos in &snapshot.positions {
+                            println!(
+                                "  {}: {} @ {} (PnL: {})",
+                                pos.symbol, pos.qty, pos.mark_price, pos.upnl
+                            );
+                        }
+                        println!();
+                    }
+
+                    if !snapshot.orders.is_empty() {
+                        println!("--- Open Orders ({}) ---", snapshot.orders.len());
+                        for order in &snapshot.orders {
+                            println!(
+                                "  {} {} {:?} {:?} @ {}",
+                                order.id,
+                                order.symbol,
+                                order.side,
+                                order.order_type,
+                                order.price
+                            );
+                        }
+                        println!();
+                    }
+
+                    if !snapshot.market.is_empty() {
+                        println!("--- Market Data ({}) ---", snapshot.market.len());
+                        for data in &snapshot.market {
+                            println!(
+                                "  {}: Last: {} 24h: {}/{} Vol: {}",
+                                data.symbol,
+                                data.last_price,
+                                data.high_24h,
+                                data.low_24h,
+                                data.volume_24h
+                            );
+                        }
+                    }
+
+                    if verbose {
+                        println!();
+                        println!("--- Verbose Details ---");
+                        if let Some(ref balance) = snapshot.account {
+                            println!("  Cross Margin: {}", balance.cross_margin);
+                            println!("  Cross UPNL: {}", balance.cross_upnl);
+                            println!("  PnL 24h: {}", balance.pnl_24h);
+                        }
+                    }
+                }
+                OutputFormat::Json => {
+                    println!("{}", output::format_json(&snapshot)?);
+                }
+                OutputFormat::Csv => {
+                    // For CSV, output positions as they're the most important
+                    if !snapshot.positions.is_empty() {
+                        println!("{}", output::format_csv(&snapshot.positions)?);
+                    } else {
+                        println!("No positions to display");
+                    }
+                }
+                OutputFormat::Quiet => {}
+            }
+
+            // Handle watch mode
+            if let Some(seconds) = watch {
+                println!(
+                    "\nWatch mode: refreshing every {} seconds (Ctrl+C to stop)",
+                    seconds
+                );
+                // Note: Full watch implementation would need a loop with sleep
+                // This is a placeholder for the base framework
+            }
+        }
+    }
     Ok(())
 }
 

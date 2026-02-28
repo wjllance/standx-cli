@@ -550,6 +550,21 @@ pub struct HealthStatus {
     pub version: String,
 }
 
+/// Dashboard snapshot - unified view of account, positions, orders, and market data
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardSnapshot {
+    /// Snapshot timestamp (ISO 8601)
+    pub timestamp: String,
+    /// Account balance information
+    pub account: Option<Balance>,
+    /// Open positions
+    pub positions: Vec<Position>,
+    /// Open orders
+    pub orders: Vec<Order>,
+    /// Market data for tracked symbols
+    pub market: Vec<MarketData>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
