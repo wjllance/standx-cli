@@ -873,11 +873,11 @@ pub async fn handle_dashboard(
                         println!("--- Open Orders ({}) ---", snapshot.orders.len());
                         for order in &snapshot.orders {
                             println!(
-                                "  {} {} {} {} @ {}",
+                                "  {} {} {:?} {:?} @ {}",
                                 order.id,
                                 order.symbol,
-                                format!("{:?}", order.side),
-                                format!("{:?}", order.order_type),
+                                order.side,
+                                order.order_type,
                                 order.price
                             );
                         }
