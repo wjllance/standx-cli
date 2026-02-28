@@ -866,7 +866,12 @@ pub async fn handle_dashboard(
                     // Format orders as table
                     if !snapshot.orders.is_empty() {
                         println!("--- Open Orders ({}) ---", snapshot.orders.len());
-                        println!("{}", output::format_table(snapshot.orders));
+                        for order in &snapshot.orders {
+                            println!(
+                                "  {} {} {:?} {:?} @ {}",
+                                order.id, order.symbol, order.side, order.order_type, order.price
+                            );
+                        }
                         println!();
                     }
 
