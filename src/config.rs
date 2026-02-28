@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn test_load_from_path_with_specific_directory() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut config = Config {
             base_url: "https://specific.test.com".to_string(),
             output_format: "json".to_string(),
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn test_load_from_path_with_string() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut config = Config {
             base_url: "https://string.test.com".to_string(),
             output_format: "csv".to_string(),
@@ -383,7 +383,7 @@ mod tests {
     #[test]
     fn test_load_from_path_with_pathbuf() {
         let temp_dir = TempDir::new().unwrap();
-        
+
         let mut config = Config {
             base_url: "https://pathbuf.test.com".to_string(),
             output_format: "csv".to_string(),
