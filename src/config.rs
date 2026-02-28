@@ -47,7 +47,33 @@ impl Config {
 
     /// Load configuration from file
     pub fn load() -> Result<Self> {
-        let config_dir = Self::default_config_dir();
+        Self::load_from_path(None::<PathBuf>)
+    }
+
+    /// Load configuration from a specific path
+    ///
+    /// If `path` is `None`, uses the default config directory.
+    /// If `path` is `Some(path)`, loads config from that directory.
+    ///
+    /// # Arguments
+    /// * `path` - Optional path to the configuration directory
+    ///
+    /// # Returns
+    /// * `Result<Self>` - The loaded configuration or an error
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Load from default directory
+    /// let config = Config::load_from_path(None)?;
+    ///
+    /// // Load from specific directory
+    /// let config = Config::load_from_path(Some("/tmp/my-config"))?;
+    /// ```
+    pub fn load_from_path<T: Into<PathBuf>>(path: Option<T>) -> Result<Self> {
+        let config_dir = match path {
+            Some(p) => p.into(),
+            None => Self::default_config_dir(),
+        };
         let config_file = config_dir.join("config.toml");
 
         if !config_file.exists() {
@@ -312,5 +338,97 @@ mod tests {
 
         // Cleanup
         std::env::remove_var("TEST_ISOLATION_VAR");
+    }
+
+    #[test]
+    fn test_load_from_path_with_specific_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let mut config = Config {
+            base_url: "https://specific.test.com".to_string(),
+            output_format: "json".to_string(),
+            default_symbol: "ETH-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+        config.save().unwrap();
+
+        let loaded = Config::load_from_path(Some(temp_dir.path())).unwrap();
+        assert_eq!(loaded.base_url, "https://specific.test.com");
+    }
+
+    #[test]
+    fn test_load_from_path_nonexistent_directory() {
+        let nonexistent = PathBuf::from("/tmp/nonexistent_standx_test_dir");
+        let result = Config::load_from_path(Some(&nonexistent));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_load_from_path_with_string() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let mut config = Config {
+            base_url: "https://string.test.com".to_string(),
+            output_format: "csv".to_string(),
+            default_symbol: "DOGE-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+        config.save().unwrap();
+
+        let temp_path = temp_dir.path().to_str().unwrap();
+        let loaded = Config::load_from_path(Some(temp_path)).unwrap();
+        assert_eq!(loaded.base_url, "https://string.test.com");
+    }
+
+    #[test]
+    fn test_load_from_path_with_pathbuf() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        let mut config = Config {
+            base_url: "https://pathbuf.test.com".to_string(),
+            output_format: "csv".to_string(),
+            default_symbol: "DOGE-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+        config.save().unwrap();
+
+        let loaded = Config::load_from_path(Some(temp_dir.path().to_path_buf())).unwrap();
+        assert_eq!(loaded.base_url, "https://pathbuf.test.com");
+    }
+
+    #[test]
+    fn test_load_from_path_none_uses_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = Config::load_from_path(Some(temp_dir.path())).unwrap();
+        assert_eq!(config.base_url, "https://perps.standx.com");
+    }
+
+    #[test]
+    fn test_load_backward_compatibility() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut config = Config {
+            base_url: "https://backward.compat.com".to_string(),
+            output_format: "table".to_string(),
+            default_symbol: "BTC-USD".to_string(),
+            config_dir: temp_dir.path().to_path_buf(),
+        };
+        config.save().unwrap();
+
+        let loaded = Config::load_from_path(Some(temp_dir.path())).unwrap();
+        assert_eq!(loaded.base_url, "https://backward.compat.com");
+    }
+
+    #[test]
+    fn test_load_from_path_corrupted_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_file = temp_dir.path().join("config.toml");
+
+        let mut file = std::fs::File::create(&config_file).unwrap();
+        file.write_all(b"invalid toml content [[[").unwrap();
+        drop(file);
+
+        let result = Config::load_from_path(Some(temp_dir.path()));
+        assert!(result.is_err());
     }
 }
