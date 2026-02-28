@@ -84,6 +84,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: StreamCommands,
     },
+    /// Dashboard - unified view of account, positions, orders, and market data
+    Dashboard {
+        #[command(subcommand)]
+        command: DashboardCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -288,6 +293,22 @@ pub enum StreamCommands {
     Balance,
     /// Stream fill/trade updates (authenticated)
     Fills,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DashboardCommands {
+    /// Get a comprehensive dashboard view
+    Snapshot {
+        /// Filter by specific symbols (comma-separated)
+        #[arg(short, long)]
+        symbols: Option<String>,
+        /// Enable verbose output with more details
+        #[arg(short, long)]
+        verbose: bool,
+        /// Watch mode: refresh every N seconds
+        #[arg(short, long)]
+        watch: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]

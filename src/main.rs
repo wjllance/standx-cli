@@ -144,6 +144,9 @@ async fn execute_command(
         Commands::Stream { command } => {
             commands::handle_stream(command, verbose).await?;
         }
+        Commands::Dashboard { command } => {
+            commands::handle_dashboard(command, output).await?;
+        }
     }
     Ok(())
 }
@@ -160,6 +163,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Leverage { .. } => "⚠️  WOULD MODIFY LEVERAGE - POSITION IMPACT",
         Commands::Margin { .. } => "⚠️  WOULD MODIFY MARGIN - POSITION IMPACT",
         Commands::Stream { .. } => "Would start real-time data stream",
+        Commands::Dashboard { .. } => "Would fetch dashboard data (read-only, safe to execute)",
     };
 
     let dry_run_info = serde_json::json!({
