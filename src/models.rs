@@ -177,16 +177,28 @@ impl OrderBook {
 pub struct Trade {
     #[serde(default)]
     pub id: u64,
-    #[serde(deserialize_with = "string_or_number_to_string")]
+    #[serde(rename = "created_at", deserialize_with = "string_or_number_to_string")]
     pub time: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub price: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub qty: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub side: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "is_taker")]
     pub is_buyer_taker: bool,
+    #[serde(default)]
+    pub fee_asset: Option<String>,
+    #[serde(default)]
+    pub fee_qty: Option<String>,
+    #[serde(default)]
+    pub pnl: Option<String>,
+    #[serde(default, rename = "order_id")]
+    pub order_id: Option<u64>,
+    #[serde(default)]
+    pub symbol: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 /// Kline/candlestick data
