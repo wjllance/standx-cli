@@ -879,25 +879,33 @@ async fn fetch_and_display_dashboard(
     let symbol_list: Vec<String> = if has_filter {
         symbol_filter.to_vec()
     } else {
-        // Default: get all positions' symbols
-        vec!["BTC-USD".to_string(), "ETH-USD".to_string()]
+        // Get all available symbols from API
+        client
+            .get_symbol_info()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.symbol)
+            .collect()
     };
 
     // Try to fetch authenticated data, handle 401 gracefully
-    let auth_error = match client.get_balance().await {
-        Ok(_) => None,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("401") || err_str.contains("Unauthorized") {
-                Some("Not authenticated. Run 'standx auth login' to access account data.")
-            } else {
-                return Err(e.into());
-            }
-        }
+    let (account, auth_warning) = match client.get_balance().await {
+        Ok(balance) => (Some(balance), None),
+        Err(e) if e.to_string().contains("401") => (
+            None,
+            Some("⚠️  Not authenticated. Run 'standx auth login' to access account data."),
+        ),
+        Err(e) => return Err(e.into()),
     };
 
-    // Fetch (may account data fail if not authenticated)
-    let account = client.get_balance().await.ok();
+    // Show auth warning if any
+    if let Some(warning) = auth_warning {
+        println!("{}", warning);
+        println!();
+    };
+
+    // Fetch positions and orders (may fail if not authenticated)
     let all_positions = client.get_positions(None).await.unwrap_or_default();
     let all_orders = client.get_open_orders(None).await.unwrap_or_default();
 
@@ -934,12 +942,6 @@ async fn fetch_and_display_dashboard(
         if let Ok(ticker) = client.get_symbol_market(symbol).await {
             market.push(ticker);
         }
-    }
-
-    // Show auth warning if needed
-    if let Some(warning) = auth_error {
-        println!("⚠️  {}", warning);
-        println!();
     }
 
     // Create dashboard snapshot
