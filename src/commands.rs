@@ -880,14 +880,26 @@ async fn fetch_and_display_dashboard(
         symbol_filter.to_vec()
     } else {
         // Default: get all positions' symbols
-        let positions = client.get_positions(None).await?;
-        positions.into_iter().map(|p| p.symbol).collect()
+        vec!["BTC-USD".to_string(), "ETH-USD".to_string()]
     };
 
-    // Fetch all data
+    // Try to fetch authenticated data, handle 401 gracefully
+    let auth_error = match client.get_balance().await {
+        Ok(_) => None,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("401") || err_str.contains("Unauthorized") {
+                Some("Not authenticated. Run 'standx auth login' to access account data.")
+            } else {
+                return Err(e.into());
+            }
+        }
+    };
+
+    // Fetch (may account data fail if not authenticated)
     let account = client.get_balance().await.ok();
-    let all_positions = client.get_positions(None).await?;
-    let all_orders = client.get_open_orders(None).await?;
+    let all_positions = client.get_positions(None).await.unwrap_or_default();
+    let all_orders = client.get_open_orders(None).await.unwrap_or_default();
 
     // Filter by symbol if specified
     let positions = if has_filter {
@@ -916,12 +928,18 @@ async fn fetch_and_display_dashboard(
         all_orders
     };
 
-    // Fetch market data for tracked symbols
+    // Fetch market data for tracked symbols (always works without auth)
     let mut market = Vec::new();
     for symbol in &symbol_list {
         if let Ok(ticker) = client.get_symbol_market(symbol).await {
             market.push(ticker);
         }
+    }
+
+    // Show auth warning if needed
+    if let Some(warning) = auth_error {
+        println!("⚠️  {}", warning);
+        println!();
     }
 
     // Create dashboard snapshot
