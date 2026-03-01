@@ -89,6 +89,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: DashboardCommands,
     },
+    /// Portfolio - view portfolio summary and performance
+    Portfolio {
+        #[command(subcommand)]
+        command: PortfolioCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -302,6 +307,19 @@ pub enum DashboardCommands {
         /// Filter by specific symbols (comma-separated)
         #[arg(short, long)]
         symbols: Option<String>,
+        /// Enable verbose output with more details
+        #[arg(short, long)]
+        verbose: bool,
+        /// Watch mode: refresh every N seconds
+        #[arg(short, long)]
+        watch: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PortfolioCommands {
+    /// Get portfolio summary and performance
+    Snapshot {
         /// Enable verbose output with more details
         #[arg(short, long)]
         verbose: bool,

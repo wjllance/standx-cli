@@ -147,6 +147,9 @@ async fn execute_command(
         Commands::Dashboard { command } => {
             commands::handle_dashboard(command, output).await?;
         }
+        Commands::Portfolio { command } => {
+            commands::handle_portfolio(command, output).await?;
+        }
     }
     Ok(())
 }
@@ -164,6 +167,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Margin { .. } => "⚠️  WOULD MODIFY MARGIN - POSITION IMPACT",
         Commands::Stream { .. } => "Would start real-time data stream",
         Commands::Dashboard { .. } => "Would fetch dashboard data (read-only, safe to execute)",
+        Commands::Portfolio { .. } => "Would fetch portfolio data (read-only, safe to execute)",
     };
 
     let dry_run_info = serde_json::json!({

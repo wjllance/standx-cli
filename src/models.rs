@@ -584,6 +584,24 @@ pub struct DashboardSnapshot {
     pub market: Vec<MarketData>,
 }
 
+/// Portfolio snapshot - portfolio summary and performance
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PortfolioSnapshot {
+    /// Snapshot timestamp (ISO 8601)
+    pub timestamp: String,
+    /// Total portfolio value in USD
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub total_value_usd: String,
+    /// PnL in the last 24 hours
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub total_pnl_24h: String,
+    /// Total realized PnL (unrealized)
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub total_pnl_realized: String,
+    /// Open positions
+    pub positions: Vec<Position>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
