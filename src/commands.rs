@@ -828,14 +828,14 @@ pub async fn handle_dashboard(
             if watch.is_some() {
                 tokio::spawn(async move {
                     signal::ctrl_c().await.ok();
-                    should_stop_clone.store(true, Ordering::SeqCst);
+                    should_stop_clone.store(true, Ordering::Relaxed);
                 });
             }
 
             // Watch mode loop
             if let Some(interval_secs) = watch {
                 loop {
-                    if should_stop.load(Ordering::SeqCst) {
+                    if should_stop.load(Ordering::Relaxed) {
                         println!("\n👋 Stopping watch mode");
                         break;
                     }
@@ -872,8 +872,11 @@ async fn fetch_and_display_dashboard(
 ) -> Result<()> {
     let client = StandXClient::new()?;
 
+    // Check if filtering by symbols
+    let has_filter = !symbol_filter.is_empty();
+
     // Determine which symbols to track
-    let symbol_list: Vec<String> = if !symbol_filter.is_empty() {
+    let symbol_list: Vec<String> = if has_filter {
         symbol_filter.to_vec()
     } else {
         // Default: get all positions' symbols
@@ -881,13 +884,13 @@ async fn fetch_and_display_dashboard(
         positions.into_iter().map(|p| p.symbol).collect()
     };
 
-    // Fetch all data in parallel
+    // Fetch all data
     let account = client.get_balance().await.ok();
     let all_positions = client.get_positions(None).await?;
     let all_orders = client.get_open_orders(None).await?;
 
-    // Filter positions by symbol if specified
-    let positions = if !symbol_filter.is_empty() {
+    // Filter by symbol if specified
+    let positions = if has_filter {
         all_positions
             .into_iter()
             .filter(|p| {
@@ -900,8 +903,7 @@ async fn fetch_and_display_dashboard(
         all_positions
     };
 
-    // Filter orders by symbol if specified
-    let orders = if !symbol_filter.is_empty() {
+    let orders = if has_filter {
         all_orders
             .into_iter()
             .filter(|o| {
