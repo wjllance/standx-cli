@@ -1,6 +1,6 @@
 [package]
 name = "standx-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Kimi Claw"]
 description = "OpenClaw-first AI Agent trading toolkit - natural language to execution for any AI Agent"
