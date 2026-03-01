@@ -34,6 +34,19 @@ where
     }
 }
 
+/// Helper to deserialize optional OrderSide from string
+fn deserialize_order_side_optional<'de, D>(deserializer: D) -> Result<Option<OrderSide>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.to_lowercase().as_str() {
+        "buy" => Ok(Some(OrderSide::Buy)),
+        "sell" => Ok(Some(OrderSide::Sell)),
+        _ => Ok(None),
+    }
+}
+
 /// Helper to deserialize OrderType from string
 fn deserialize_order_type<'de, D>(deserializer: D) -> Result<OrderType, D::Error>
 where
@@ -379,6 +392,9 @@ impl tabled::Tabled for Order {
 pub struct Position {
     pub id: i64,
     pub symbol: String,
+    /// Position side (Buy/Long or Sell/Short)
+    #[serde(default, deserialize_with = "deserialize_order_side_optional")]
+    pub side: Option<OrderSide>,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub qty: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
@@ -405,6 +421,9 @@ pub struct Position {
     pub status: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub upnl: String,
+    /// Return on Equity (ROE) percentage - calculated as upnl/initial_margin * 100
+    #[serde(default, skip_serializing)]
+    pub roe: Option<String>,
     pub time: String,
     pub created_at: String,
     pub updated_at: String,
@@ -548,6 +567,21 @@ pub struct HealthStatus {
     pub status: String,
     #[serde(default)]
     pub version: String,
+}
+
+/// Dashboard snapshot - unified view of account, positions, orders, and market data
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardSnapshot {
+    /// Snapshot timestamp (ISO 8601)
+    pub timestamp: String,
+    /// Account balance information
+    pub account: Option<Balance>,
+    /// Open positions
+    pub positions: Vec<Position>,
+    /// Open orders
+    pub orders: Vec<Order>,
+    /// Market data for tracked symbols
+    pub market: Vec<MarketData>,
 }
 
 #[cfg(test)]

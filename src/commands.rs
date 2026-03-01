@@ -6,9 +6,12 @@ use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
-use standx_cli::models::{OrderSide, OrderType, TimeInForce};
+use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, TimeInForce};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::signal;
 
 /// Parse time string to timestamp
 /// Supports:
@@ -794,6 +797,202 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Handle dashboard commands - unified view of account, positions, orders, and market data
+pub async fn handle_dashboard(
+    command: DashboardCommands,
+    output_format: OutputFormat,
+) -> Result<()> {
+    match command {
+        DashboardCommands::Snapshot {
+            symbols,
+            verbose,
+            watch,
+        } => {
+            // Build list of symbols to track
+            let symbol_list: Vec<String> = if let Some(s) = symbols {
+                s.split(',').map(|s| s.trim().to_string()).collect()
+            } else {
+                vec![]
+            };
+
+            // Create flag for watch mode interruption
+            let should_stop = Arc::new(AtomicBool::new(false));
+            let should_stop_clone = should_stop.clone();
+
+            // Set up Ctrl+C handler for watch mode
+            if watch.is_some() {
+                tokio::spawn(async move {
+                    signal::ctrl_c().await.ok();
+                    should_stop_clone.store(true, Ordering::Relaxed);
+                });
+            }
+
+            // Watch mode loop
+            if let Some(interval_secs) = watch {
+                loop {
+                    if should_stop.load(Ordering::Relaxed) {
+                        println!("\n👋 Stopping watch mode");
+                        break;
+                    }
+
+                    // Clear screen for better watch mode experience
+                    print!("\x1B[2J\x1B[1H");
+                    println!("=== Dashboard Snapshot (refresh: {}s) ===", interval_secs);
+                    println!(
+                        "Time: {}",
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                    );
+                    println!();
+
+                    // Fetch and display dashboard
+                    fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
+
+                    // Sleep until next refresh
+                    tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+                }
+            } else {
+                // Single snapshot mode
+                fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fetch and display dashboard data with optional symbol filtering
+async fn fetch_and_display_dashboard(
+    symbol_filter: &[String],
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    // Check if filtering by symbols
+    let has_filter = !symbol_filter.is_empty();
+
+    // Determine which symbols to track
+    let symbol_list: Vec<String> = if has_filter {
+        symbol_filter.to_vec()
+    } else {
+        // Default: get all positions' symbols
+        let positions = client.get_positions(None).await?;
+        positions.into_iter().map(|p| p.symbol).collect()
+    };
+
+    // Fetch all data
+    let account = client.get_balance().await.ok();
+    let all_positions = client.get_positions(None).await?;
+    let all_orders = client.get_open_orders(None).await?;
+
+    // Filter by symbol if specified
+    let positions = if has_filter {
+        all_positions
+            .into_iter()
+            .filter(|p| {
+                symbol_filter
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&p.symbol))
+            })
+            .collect()
+    } else {
+        all_positions
+    };
+
+    let orders = if has_filter {
+        all_orders
+            .into_iter()
+            .filter(|o| {
+                symbol_filter
+                    .iter()
+                    .any(|s| s.eq_ignore_ascii_case(&o.symbol))
+            })
+            .collect()
+    } else {
+        all_orders
+    };
+
+    // Fetch market data for tracked symbols
+    let mut market = Vec::new();
+    for symbol in &symbol_list {
+        if let Ok(ticker) = client.get_symbol_market(symbol).await {
+            market.push(ticker);
+        }
+    }
+
+    // Create dashboard snapshot
+    let snapshot = DashboardSnapshot {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        account,
+        positions,
+        orders,
+        market,
+    };
+
+    match output_format {
+        OutputFormat::Table => {
+            println!("=== Dashboard Snapshot ===");
+            println!("Timestamp: {}", snapshot.timestamp);
+            println!();
+
+            // Format account/balance as table (single row)
+            if let Some(ref balance) = snapshot.account {
+                println!("--- Account ---");
+                println!("{}", output::format_item(balance));
+                println!();
+            }
+
+            // Format positions as table
+            if !snapshot.positions.is_empty() {
+                println!("--- Positions ({}) ---", snapshot.positions.len());
+                println!("{}", output::format_table(snapshot.positions));
+                println!();
+            }
+
+            // Format orders as table
+            if !snapshot.orders.is_empty() {
+                println!("--- Open Orders ({}) ---", snapshot.orders.len());
+                for order in &snapshot.orders {
+                    println!(
+                        "  {} {} {:?} {:?} @ {}",
+                        order.id, order.symbol, order.side, order.order_type, order.price
+                    );
+                }
+                println!();
+            }
+
+            // Format market data as table
+            if !snapshot.market.is_empty() {
+                println!("--- Market Data ({}) ---", snapshot.market.len());
+                println!("{}", output::format_table(snapshot.market));
+            }
+
+            if verbose {
+                println!();
+                println!("--- Verbose Details ---");
+                if let Some(ref balance) = snapshot.account {
+                    println!("  Cross Margin: {}", balance.cross_margin);
+                    println!("  Cross UPNL: {}", balance.cross_upnl);
+                    println!("  PnL 24h: {}", balance.pnl_24h);
+                }
+            }
+        }
+        OutputFormat::Json => {
+            println!("{}", output::format_json(&snapshot)?);
+        }
+        OutputFormat::Csv => {
+            // For CSV, output positions as they're the most important
+            if !snapshot.positions.is_empty() {
+                println!("{}", output::format_csv(&snapshot.positions)?);
+            } else {
+                println!("No positions to display");
+            }
+        }
+        OutputFormat::Quiet => {}
     }
 
     Ok(())
