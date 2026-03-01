@@ -5,33 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.0] - 2026-02-27
+## [Unreleased]
+
+## [0.6.0] - 2026-03-01
 
 ### Added
-- OpenClaw Skill configuration (#47)
-  - Added `openclaw/SKILL.md` with security-focused authentication guide
-  - Added `openclaw/skill.json` with credential declarations
-  - Added `.clawhub/` for ClawHub packaging
-- GitHub PR Review skill (#59)
-  - Extracted PR review workflow into reusable skill
-  - Added SKILL.md with workflow definition
-  - Added best practices and key learnings
+- **Dashboard Command** (#35, #75, #83, #84, #100, #101)
+  - Real-time trading dashboard with auto-refresh (`--watch`)
+  - Symbol filtering (`--symbols`)
+  - Table output formatting with color coding
+  - Position, order, and market data in one view
+- **Portfolio Command Base** (#105, #106)
+  - Portfolio snapshot infrastructure
+  - Framework for portfolio PnL analysis
 
-### Security
-- Prioritize environment variables over command-line args
-- Add security warnings for unsafe practices (shell history leakage)
-- Add security checklist for pre-installation verification (#55)
+### Fixed
+- **Dashboard Symbol Filter** (#101)
+  - Simplified symbol filter logic with `has_filter` variable
+  - Changed `Ordering::SeqCst` to `Ordering::Relaxed` for AtomicBool
 
-### Tests
-- Add Ed25519 Signer tests (#57)
-- Add Client mock tests (#58)
-- Add JWT Token tests (#56)
-- Improve Auth Credentials tests (#53)
+## [0.5.0] - 2026-03-01
 
-### Documentation
-- Update authentication section with 4 login methods
-- Add permission requirements table
-- Add comprehensive docs/ directory with 11 guides
+### Added
+- **Phase 3 Integration Tests** (#61, #62)
+  - CLI command integration tests using `assert_cmd`
+  - API flow tests with mock servers (`mockito`)
+  - Output format tests (JSON, Table, CSV, Quiet)
+  - Market data command tests
+- **Phase 4 E2E Tests** (#32)
+  - New user journey test suite
+  - Trader daily workflow test suite
+  - Automated end-to-end testing framework
+- **Config Testability** (#66)
+  - Added `load_from_path` for better testability
+  - Environment variable override tests
+
+### Fixed
+- **E2E Test Parameter Format** (380bd8c)
+  - Fixed market ticker command to use positional arg instead of `--symbol`
+
+### Changed
+- **Test Dependencies**
+  - Added `tokio-test`, `mockito`, `tempfile`, `assert_cmd`, `predicates`
+  - Improved test coverage and reliability
 
 ## [0.4.2] - 2026-02-26
 
