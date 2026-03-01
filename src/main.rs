@@ -4,7 +4,6 @@ mod telemetry;
 
 use clap::Parser;
 use cli::{Cli, Commands, DashboardCommands, OutputFormat};
-use commands::PortfolioCommand;
 use telemetry::Telemetry;
 
 /// Print cool splash screen
