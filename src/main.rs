@@ -4,6 +4,7 @@ mod telemetry;
 
 use clap::Parser;
 use cli::{Cli, Commands, DashboardCommands, OutputFormat};
+use commands::PortfolioCommand;
 use telemetry::Telemetry;
 
 /// Print cool splash screen
@@ -156,7 +157,8 @@ async fn execute_command(
             };
             commands::handle_dashboard(command, output).await?;
         }
-        Commands::Portfolio { command } => {
+        Commands::Portfolio { verbose, watch } => {
+            let command = crate::commands::PortfolioCommand::Snapshot { verbose, watch };
             commands::handle_portfolio(command, output).await?;
         }
     }
