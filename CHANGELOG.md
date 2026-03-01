@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-03-01
+
+### Fixed
+- **Trade Model Field Mapping** (#113)
+  - Correct Trade model field mapping for proper decoding
+  - Fix trade history display issues
+
+### Documentation
+- **README Portfolio Command** (#115)
+  - Add Portfolio command documentation to README
+  - Include usage examples and options
+
 ## [0.6.1] - 2026-03-01
 
 ### Added
