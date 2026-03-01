@@ -13,6 +13,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::signal;
 
+/// Portfolio command for direct execution (without subcommands)
+#[derive(Debug)]
+pub enum PortfolioCommand {
+    Snapshot { verbose: bool, watch: Option<u64> },
+}
+
 /// Parse time string to timestamp
 /// Supports:
 /// - Unix timestamp (e.g., "1704067200")
@@ -1020,11 +1026,11 @@ async fn fetch_and_display_dashboard(
 
 /// Handle portfolio commands - view portfolio summary and performance
 pub async fn handle_portfolio(
-    command: PortfolioCommands,
+    command: PortfolioCommand,
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
-        PortfolioCommands::Snapshot { verbose, watch } => {
+        PortfolioCommand::Snapshot { verbose, watch } => {
             // Create flag for watch mode interruption
             let should_stop = Arc::new(AtomicBool::new(false));
             let should_stop_clone = should_stop.clone();
