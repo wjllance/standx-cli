@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-03-01
+
+### Added
+- **Dashboard Anonymous Mode** (#108)
+  - Show login prompt when user is not authenticated
+  - Support anonymous browsing of market data
+- **Portfolio Base Functionality** (#106)
+  - Add `portfolio` command with `snapshot` subcommand
+  - Portfolio summary and performance view framework
+
+### Fixed
+- **Duplicate Portfolio Command** (#110)
+  - Remove duplicate `Portfolio` enum variant in `Commands`
+  - Fix merge conflict residue from PR #106
+- **Dashboard Duplicate Call** (#109)
+  - Avoid calling `get_balance()` twice in dashboard
+  - Optimize data fetching logic
+
 ## [0.6.0] - 2026-03-01
 
 ### Added
