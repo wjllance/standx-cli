@@ -3,7 +3,7 @@ mod commands;
 mod telemetry;
 
 use clap::Parser;
-use cli::{Cli, Commands, OutputFormat};
+use cli::{Cli, Commands, DashboardCommands, OutputFormat};
 use telemetry::Telemetry;
 
 /// Print cool splash screen
@@ -144,8 +144,20 @@ async fn execute_command(
         Commands::Stream { command } => {
             commands::handle_stream(command, verbose).await?;
         }
-        Commands::Dashboard { command } => {
+        Commands::Dashboard {
+            symbols,
+            verbose,
+            watch,
+        } => {
+            let command = DashboardCommands::Snapshot {
+                symbols,
+                verbose,
+                watch,
+            };
             commands::handle_dashboard(command, output).await?;
+        }
+        Commands::Portfolio { command } => {
+            commands::handle_portfolio(command, output).await?;
         }
     }
     Ok(())
@@ -164,6 +176,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Margin { .. } => "⚠️  WOULD MODIFY MARGIN - POSITION IMPACT",
         Commands::Stream { .. } => "Would start real-time data stream",
         Commands::Dashboard { .. } => "Would fetch dashboard data (read-only, safe to execute)",
+        Commands::Portfolio { .. } => "Would fetch portfolio data (read-only, safe to execute)",
     };
 
     let dry_run_info = serde_json::json!({

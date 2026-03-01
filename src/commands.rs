@@ -6,7 +6,7 @@ use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
-use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, TimeInForce};
+use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, PortfolioSnapshot, TimeInForce};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -880,14 +880,26 @@ async fn fetch_and_display_dashboard(
         symbol_filter.to_vec()
     } else {
         // Default: get all positions' symbols
-        let positions = client.get_positions(None).await?;
-        positions.into_iter().map(|p| p.symbol).collect()
+        vec!["BTC-USD".to_string(), "ETH-USD".to_string()]
     };
 
-    // Fetch all data
+    // Try to fetch authenticated data, handle 401 gracefully
+    let auth_error = match client.get_balance().await {
+        Ok(_) => None,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("401") || err_str.contains("Unauthorized") {
+                Some("Not authenticated. Run 'standx auth login' to access account data.")
+            } else {
+                return Err(e.into());
+            }
+        }
+    };
+
+    // Fetch (may account data fail if not authenticated)
     let account = client.get_balance().await.ok();
-    let all_positions = client.get_positions(None).await?;
-    let all_orders = client.get_open_orders(None).await?;
+    let all_positions = client.get_positions(None).await.unwrap_or_default();
+    let all_orders = client.get_open_orders(None).await.unwrap_or_default();
 
     // Filter by symbol if specified
     let positions = if has_filter {
@@ -916,12 +928,18 @@ async fn fetch_and_display_dashboard(
         all_orders
     };
 
-    // Fetch market data for tracked symbols
+    // Fetch market data for tracked symbols (always works without auth)
     let mut market = Vec::new();
     for symbol in &symbol_list {
         if let Ok(ticker) = client.get_symbol_market(symbol).await {
             market.push(ticker);
         }
+    }
+
+    // Show auth warning if needed
+    if let Some(warning) = auth_error {
+        println!("⚠️  {}", warning);
+        println!();
     }
 
     // Create dashboard snapshot
@@ -986,6 +1004,127 @@ async fn fetch_and_display_dashboard(
         }
         OutputFormat::Csv => {
             // For CSV, output positions as they're the most important
+            if !snapshot.positions.is_empty() {
+                println!("{}", output::format_csv(&snapshot.positions)?);
+            } else {
+                println!("No positions to display");
+            }
+        }
+        OutputFormat::Quiet => {}
+    }
+
+    Ok(())
+}
+
+/// Handle portfolio commands - view portfolio summary and performance
+pub async fn handle_portfolio(
+    command: PortfolioCommands,
+    output_format: OutputFormat,
+) -> Result<()> {
+    match command {
+        PortfolioCommands::Snapshot { verbose, watch } => {
+            // Create flag for watch mode interruption
+            let should_stop = Arc::new(AtomicBool::new(false));
+            let should_stop_clone = should_stop.clone();
+
+            // Set up Ctrl+C handler for watch mode
+            if watch.is_some() {
+                tokio::spawn(async move {
+                    signal::ctrl_c().await.ok();
+                    should_stop_clone.store(true, Ordering::Relaxed);
+                });
+            }
+
+            // Watch mode loop
+            if let Some(interval_secs) = watch {
+                loop {
+                    if should_stop.load(Ordering::Relaxed) {
+                        println!("\n👋 Stopping watch mode");
+                        break;
+                    }
+
+                    // Clear screen for better watch mode experience
+                    print!("\x1B[2J\x1B[1H");
+                    println!("=== Portfolio Snapshot (refresh: {}s) ===", interval_secs);
+                    println!(
+                        "Time: {}",
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                    );
+                    println!();
+
+                    // Fetch and display portfolio
+                    fetch_and_display_portfolio(verbose, output_format).await?;
+
+                    // Sleep until next refresh
+                    tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+                }
+            } else {
+                // Single snapshot mode
+                fetch_and_display_portfolio(verbose, output_format).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fetch and display portfolio data
+async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat) -> Result<()> {
+    let client = StandXClient::new()?;
+
+    // Fetch portfolio data
+    let balance = client.get_balance().await?;
+    let positions = client.get_positions(None).await?;
+
+    // Calculate total values
+    let total_value_usd = balance.equity.clone();
+    let total_pnl_24h = balance.pnl_24h.clone();
+    let total_pnl_realized = balance.upnl.clone();
+
+    // Create portfolio snapshot
+    let snapshot = PortfolioSnapshot {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        total_value_usd,
+        total_pnl_24h,
+        total_pnl_realized,
+        positions,
+    };
+
+    match output_format {
+        OutputFormat::Table => {
+            println!("=== Portfolio Summary ===");
+            println!("Timestamp: {}", snapshot.timestamp);
+            println!();
+
+            // Account summary
+            println!("--- Account ---");
+            println!("  Total Value: ${}", snapshot.total_value_usd);
+            println!("  PnL 24h: ${}", snapshot.total_pnl_24h);
+            println!("  Unrealized PnL: ${}", snapshot.total_pnl_realized);
+            println!();
+
+            // Positions
+            if !snapshot.positions.is_empty() {
+                println!("--- Positions ({}) ---", snapshot.positions.len());
+                println!("{}", output::format_table(snapshot.positions));
+            } else {
+                println!("--- No open positions ---");
+            }
+
+            if verbose {
+                println!();
+                println!("--- Verbose Details ---");
+                println!("  Balance: ${}", balance.balance);
+                println!("  Available: ${}", balance.cross_available);
+                println!("  Equity: ${}", balance.equity);
+                println!("  Cross Margin: ${}", balance.cross_margin);
+                println!("  Cross UPNL: ${}", balance.cross_upnl);
+                println!("  Locked: ${}", balance.locked);
+            }
+        }
+        OutputFormat::Json => {
+            println!("{}", output::format_json(&snapshot)?);
+        }
+        OutputFormat::Csv => {
             if !snapshot.positions.is_empty() {
                 println!("{}", output::format_csv(&snapshot.positions)?);
             } else {
