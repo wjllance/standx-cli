@@ -277,13 +277,62 @@ standx order cancel BTC-USD --order-id ord_xxx
 standx order cancel-all BTC-USD
 ```
 
+### Dashboard
+
+```bash
+# Launch real-time trading dashboard
+standx dashboard
+
+# Watch specific symbols
+standx dashboard --symbols BTC-USD,ETH-USD,SOL-USD
+
+# Auto-refresh mode (updates every 5 seconds)
+standx dashboard --watch
+```
+
+### Leverage & Margin
+
+```bash
+# Get leverage
+standx leverage get BTC-USD
+
+# Set leverage
+standx leverage set BTC-USD 10
+
+# Get margin mode
+standx margin mode BTC-USD
+
+# Set margin mode
+standx margin mode BTC-USD --set isolated
+```
+
+### Trade History
+
+```bash
+# Get recent trades
+standx trade history BTC-USD --from 1d
+
+# With time range
+standx trade history BTC-USD --from 2024-01-01 --to 2024-01-07
+```
+
 ### Streaming
 
 ```bash
-# Real-time data
-standx stream ticker BTC-USD
+# Real-time price stream
+standx stream price BTC-USD
+
+# Order book depth
 standx stream depth BTC-USD --levels 5
-standx stream account
+
+# Public trades
+standx stream trade BTC-USD
+
+# Authenticated streams (requires login)
+standx stream order      # Order updates
+standx stream position   # Position updates
+standx stream balance    # Balance updates
+standx stream fills      # Fill updates
 ```
 
 ---
@@ -328,26 +377,31 @@ await exec("standx order create ...")
 
 ## 🗺️ Roadmap
 
-### Phase 1: OpenClaw Excellence (Now)
+### Phase 1: OpenClaw Excellence ✅ (Completed)
 
 **Goal**: Best-in-class OpenClaw integration
 
 - [x] Structured JSON output
 - [x] Non-interactive mode
+- [x] Dashboard for real-time monitoring
+- [x] WebSocket streaming
+- [x] Complete trading commands (order, leverage, margin)
 - [ ] `--openclaw` optimized defaults
 - [ ] Session persistence
 - [ ] Batch execution
 
-### Phase 2: Universal Agent Toolkit (1-2 months)
+### Phase 2: Universal Agent Toolkit (Current)
 
 **Goal**: Seamless experience across all AI Agents
 
+- [x] Comprehensive testing framework
+- [ ] Portfolio PnL analysis
 - [ ] Python SDK - `pip install standx-agent`
 - [ ] Strategy templates (Grid, DCA, TWAP)
 - [ ] Webhook callbacks
 - [ ] MCP support (optional enhancement)
 
-### Phase 3: AI Trading Ecosystem (3-6 months)
+### Phase 3: AI Trading Ecosystem (Future)
 
 **Goal**: Define the standard for AI-native trading
 
