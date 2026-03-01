@@ -306,7 +306,7 @@ standx margin mode BTC-USD
 standx margin mode BTC-USD --set isolated
 ```
 
-### Trade History
+:### Trade History
 
 ```bash
 # Get recent trades
@@ -314,6 +314,19 @@ standx trade history BTC-USD --from 1d
 
 # With time range
 standx trade history BTC-USD --from 2024-01-01 --to 2024-01-07
+```
+
+### Portfolio
+
+```bash
+# Get portfolio summary
+standx portfolio
+
+# Verbose mode with more details
+standx portfolio --verbose
+
+# Auto-refresh mode
+standx portfolio --watch
 ```
 
 ### Streaming
