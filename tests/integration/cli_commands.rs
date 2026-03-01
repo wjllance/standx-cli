@@ -11,7 +11,7 @@ fn test_cli_version() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("standx"))
-        .stdout(predicate::str::contains("0.5"));
+        .stdout(predicate::str::contains("0.6"));
 }
 
 #[test]
