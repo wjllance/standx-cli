@@ -101,6 +101,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: PortfolioCommands,
     },
+    /// Portfolio - view portfolio summary and performance
+    Portfolio {
+        #[command(subcommand)]
+        command: PortfolioCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
