@@ -81,6 +81,18 @@ standx-cli/
 - [x] Channel subscription management
 - [x] Stream CLI commands
 
+### Phase 8: Testing Framework ✅
+- [x] Phase 3 Integration Tests
+  - [x] CLI command tests with assert_cmd
+  - [x] API flow tests with mockito
+  - [x] Output format tests
+  - [x] Market data command tests
+- [x] Phase 4 E2E Tests
+  - [x] New user journey tests
+  - [x] Trader workflow tests
+  - [x] Automated testing framework
+- [x] Config testability improvements
+
 ## Key Technical Decisions
 
 ### Authentication
@@ -107,26 +119,43 @@ standx-cli/
 
 ## Testing Strategy
 
-### Unit Tests
+### Unit Tests ✅
 - Model serialization/deserialization
 - Authentication logic
 - Output formatting
+- Time parsing utilities
 
-### Integration Tests
+### Integration Tests ✅
+- CLI command tests with `assert_cmd`
 - API endpoint mocking with `mockito`
 - Error response handling
+- Output format validation
+
+### E2E Tests ✅
+- New user journey tests
+- Trader workflow tests
+- Requires API credentials (manual run)
 
 ### Test Coverage
 ```
-✅ 24 tests passing
-├── auth::tests (4 tests)
-├── client::tests (4 tests)
-├── models::tests (5 tests)
-├── config::tests (3 tests)
-├── output::tests (2 tests)
-├── client::account::tests (1 test)
-├── client::order::tests (1 test)
-└── websocket::tests (1 test)
+✅ 40+ tests passing
+├── Unit Tests (30+)
+│   ├── auth::tests (4 tests)
+│   ├── client::tests (4 tests)
+│   ├── models::tests (5 tests)
+│   ├── config::tests (10+ tests)
+│   ├── output::tests (2 tests)
+│   ├── client::account::tests (1 test)
+│   ├── client::order::tests (1 test)
+│   └── websocket::tests (1 test)
+├── Integration Tests (15+)
+│   ├── cli_commands (3 tests)
+│   ├── cli_market_commands (4 tests)
+│   ├── cli_output_formats (4 tests)
+│   └── api_flows (2 tests)
+└── E2E Tests (4)
+    ├── new_user_journey (2 tests)
+    └── trader_workflow (2 tests)
 ```
 
 ## API Endpoint Mapping

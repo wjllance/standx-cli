@@ -1,232 +1,313 @@
-# StandX CLI 本地测试指南
+# StandX CLI 测试指南
 
-本文档说明如何在本地测试 StandX CLI 的各个命令，以及预期的输出结果。
+本文档说明如何运行 StandX CLI 的自动化测试和手动测试。
 
 ---
 
-## 测试环境准备
+## 测试架构
 
-### 1. 构建项目
+StandX CLI 采用三层测试架构：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  E2E Tests (tests/e2e/)                                │
+│  - 端到端测试，模拟真实用户场景                          │
+│  - 需要真实 API 凭证                                     │
+│  - 手动运行                                              │
+├─────────────────────────────────────────────────────────┤
+│  Integration Tests (tests/integration/)                │
+│  - 集成测试，测试 CLI 命令和 API 流程                    │
+│  - 使用 mock 服务器                                      │
+│  - CI 自动运行                                           │
+├─────────────────────────────────────────────────────────┤
+│  Unit Tests (src/*/tests.rs, tests/unit/)              │
+│  - 单元测试，测试独立函数和模块                          │
+│  - 无外部依赖                                            │
+│  - CI 自动运行                                           │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 快速开始
+
+### 运行所有测试
 
 ```bash
-# 克隆仓库
-git clone https://github.com/wjllance/standx-cli.git
-cd standx-cli
+cargo test
+```
 
-# 构建 Release 版本
+### 运行特定测试
+
+```bash
+# 仅单元测试
+cargo test --lib
+
+# 仅集成测试
+cargo test --test integration_tests
+
+# 仅 E2E 测试 (需要凭证)
+cargo test -- --ignored
+```
+
+---
+
+## 单元测试
+
+### 位置
+- `src/config.rs` (内联测试)
+- `tests/unit/models/`
+- `tests/unit/utils/`
+
+### 运行
+```bash
+cargo test --lib
+```
+
+### 覆盖范围
+| 模块 | 测试内容 |
+|------|----------|
+| `config` | 配置加载、保存、环境变量覆盖 |
+| `models/market_data` | MarketData/FundingRate 序列化 |
+| `models/position` | Position 模型测试 |
+| `models/symbol_info` | SymbolInfo 模型测试 |
+| `utils/time_parser` | `parse_time_string()` 函数 |
+| `utils/error` | Error 处理 |
+
+---
+
+## 集成测试
+
+### 位置
+- `tests/integration/`
+
+### 运行
+```bash
+cargo test --test integration_tests
+```
+
+### 测试内容
+
+#### CLI 命令测试 (`cli_commands.rs`)
+```bash
+cargo test test_cli_version
+cargo test test_cli_help
+cargo test test_cli_market_help
+```
+
+#### 市场命令测试 (`cli_market_commands.rs`)
+```bash
+cargo test test_market_symbols_command
+cargo test test_market_ticker_command
+cargo test test_market_depth_command
+cargo test test_market_funding_command
+```
+
+#### 输出格式测试 (`cli_output_formats.rs`)
+```bash
+cargo test test_market_symbols_json_output
+cargo test test_market_symbols_table_output
+cargo test test_market_symbols_csv_output
+cargo test test_output_format_quiet
+```
+
+#### API 流程测试 (`api_flows.rs`)
+使用 `mockito` 模拟 API 服务器：
+```bash
+cargo test test_market_data_flow
+cargo test test_api_error_handling_flow
+```
+
+---
+
+## E2E 测试
+
+### 位置
+- `tests/e2e/`
+
+### 前置条件
+需要设置环境变量：
+```bash
+export TEST_TOKEN="your_jwt_token"
+export TEST_PRIVATE_KEY="your_ed25519_private_key"
+```
+
+### 运行
+```bash
+cargo test -- --ignored
+```
+
+### 测试内容
+
+#### 新用户旅程 (`new_user_journey.rs`)
+模拟新用户从安装到首次交易的完整流程：
+1. 检查 CLI 版本
+2. 查看帮助信息
+3. 查看市场数据 (无需认证)
+4. 设置认证
+5. 执行交易操作
+
+#### 交易员工作流 (`trader_workflow.rs`)
+模拟交易员日常工作：
+1. 检查账户余额
+2. 查看持仓
+3. 市场分析 (订单簿、资金费率)
+4. 执行交易
+
+---
+
+## 手动测试
+
+### 构建 Release 版本
+
+```bash
 cargo build --release
-
-# 验证构建成功
-./target/release/standx --version
-# 预期输出: standx 0.3.1
-```
-
-### 2. 配置认证（可选）
-
-部分命令需要认证，配置环境变量：
-
-```bash
-export STANDX_JWT="your_jwt_token"
-export STANDX_PRIVATE_KEY="your_ed25519_private_key"
-```
-
-获取方式：访问 https://standx.com/user/session
-
----
-
-## 命令测试流程
-
-### Part 1: 基础命令
-
-#### 1.1 版本信息
-```bash
 ./target/release/standx --version
 ```
-**预期输出：**
-```
-standx 0.3.1
-```
 
-#### 1.2 帮助信息
+### 基础命令测试
+
 ```bash
+# 版本信息
+./target/release/standx --version
+
+# 帮助信息
 ./target/release/standx --help
-```
-**预期输出：** 显示所有子命令列表
 
-#### 1.3 配置管理
-```bash
-# 显示配置
+# 配置管理
 ./target/release/standx config show
-
-# 获取单个配置项
 ./target/release/standx config get base_url
-
-# JSON 格式输出
-./target/release/standx -o json config get base_url
-
-# Quiet 模式
-./target/release/standx -o quiet config get base_url
 ```
 
----
+### 市场数据测试 (无需认证)
 
-### Part 2: 市场数据（公共接口，无需认证）
-
-#### 2.1 交易对列表
 ```bash
+# 交易对列表
 ./target/release/standx market symbols
-```
 
-#### 2.2 行情数据
-```bash
+# 行情数据
 ./target/release/standx market ticker BTC-USD
-```
 
-#### 2.3 订单簿深度
-```bash
+# 订单簿深度
 ./target/release/standx market depth BTC-USD --limit 5
-```
 
-#### 2.4 K-line 数据
-```bash
-# 使用相对时间
+# K-line 数据
 ./target/release/standx market kline BTC-USD -r 60 --from 1d
 
-# 使用 ISO 日期
-./target/release/standx market kline BTC-USD -r 1D --from 2024-01-01
-
-# 使用 limit
-./target/release/standx market kline BTC-USD -r 60 -l 10
-```
-
-#### 2.5 资金费率
-```bash
+# 资金费率
 ./target/release/standx market funding BTC-USD --days 7
 ```
 
----
+### 输出格式测试
 
-### Part 3: 认证与账户（需要 JWT）
-
-#### 3.1 认证状态
 ```bash
-./target/release/standx auth status
-```
-
-#### 3.2 账户余额
-```bash
-./target/release/standx account balances
-```
-
-#### 3.3 持仓查询
-```bash
-./target/release/standx account positions
-```
-
----
-
-### Part 4: 订单与交易
-
-#### 4.1 创建订单
-```bash
-./target/release/standx order create BTC-USD buy limit --qty 0.01 --price 60000
-```
-
-#### 4.2 交易历史
-```bash
-./target/release/standx trade history BTC-USD --from 1d
-```
-
----
-
-### Part 5: 杠杆与保证金
-
-#### 5.1 查询杠杆
-```bash
-./target/release/standx leverage get BTC-USD
-```
-
-#### 5.2 设置杠杆
-```bash
-./target/release/standx leverage set BTC-USD 10
-```
-
-#### 5.3 查询保证金模式
-```bash
-./target/release/standx margin mode BTC-USD
-```
-
----
-
-### Part 6: WebSocket 流数据
-
-#### 6.1 价格流（公共）
-```bash
-./target/release/standx stream price BTC-USD
-```
-**预期输出：**
-```
-Streaming price for BTC-USD
-Press Ctrl+C to exit
-
-2024-01-01T00:00:00Z | Mark: 63127.37 | Index: 63126.67 | Last: 63115.80
-...
-```
-
-#### 6.2 深度流（公共）
-```bash
-./target/release/standx stream depth BTC-USD --levels 5
-```
-
-#### 6.3 成交流（公共）
-```bash
-./target/release/standx stream trade BTC-USD
-```
-
----
-
-## 输出格式说明
-
-### Table 格式（默认）
-以表格形式展示数据，适合人类阅读。
-
-### JSON 格式
-```bash
+# JSON 格式
 ./target/release/standx -o json market ticker BTC-USD
-```
-适合程序解析和 AI Agent 处理。
 
-### CSV 格式
-```bash
+# CSV 格式
 ./target/release/standx -o csv market symbols
-```
-适合导入 Excel 或其他工具。
 
-### Quiet 格式
-```bash
+# Quiet 模式
 ./target/release/standx -o quiet config get base_url
-```
-只输出值，适合脚本使用。
 
----
-
-## 特殊功能
-
-### OpenClaw 模式
-```bash
+# OpenClaw 模式
 ./target/release/standx --openclaw market ticker BTC-USD
 ```
-强制 JSON 输出，优化 AI Agent 使用。
 
-### Dry Run 模式
+### 认证命令测试
+
 ```bash
-./target/release/standx --dry-run order create BTC-USD buy limit --qty 0.01 --price 60000
+# 认证状态
+./target/release/standx auth status
+
+# 交互式登录
+./target/release/standx auth login --interactive
+
+# 登出
+./target/release/standx auth logout
 ```
-显示将要执行的操作，但不实际执行。
+
+### 账户命令测试 (需要认证)
+
+```bash
+export STANDX_JWT="your_jwt_token"
+
+# 账户余额
+./target/release/standx account balances
+
+# 持仓查询
+./target/release/standx account positions
+
+# 当前订单
+./target/release/standx account orders
+
+# 订单历史
+./target/release/standx account history
+```
+
+### WebSocket 测试
+
+```bash
+# 价格流 (公共)
+./target/release/standx stream price BTC-USD
+
+# 深度流 (公共)
+./target/release/standx stream depth BTC-USD --levels 5
+
+# 成交流 (公共)
+./target/release/standx stream trade BTC-USD
+
+# 用户流 (需要认证)
+./target/release/standx stream order
+./target/release/standx stream position
+./target/release/standx stream balance
+./target/release/standx stream fills
+```
+
+---
+
+## CI/CD 集成
+
+### GitHub Actions 配置
+
+```yaml
+name: Test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+      
+      - name: Run tests
+        run: cargo test
+      
+      - name: Check formatting
+        run: cargo fmt -- --check
+      
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+```
 
 ---
 
 ## 测试检查清单
+
+### 发布前检查
+
+- [ ] `cargo test` 全部通过
+- [ ] `cargo fmt -- --check` 无警告
+- [ ] `cargo clippy -- -D warnings` 无警告
+- [ ] `cargo build --release` 成功
+- [ ] 版本号正确 (`standx --version`)
+- [ ] 手动测试通过
+
+### 功能检查
 
 - [ ] 基础命令正常（version, help, config）
 - [ ] 市场数据命令正常（symbols, ticker, depth, kline, funding）
@@ -246,22 +327,52 @@ Press Ctrl+C to exit
 
 ## 常见问题
 
-### Q: 构建失败怎么办？
-A: 确保安装了 Rust 工具链：
+### Q: 测试失败怎么办？
+
+**检查步骤：**
+1. 确保 Rust 版本 >= 1.75
+2. 运行 `cargo clean` 清理构建缓存
+3. 更新依赖 `cargo update`
+4. 检查是否有未提交的代码变更
+
+### Q: E2E 测试需要哪些凭证？
+
+需要：
+- `TEST_TOKEN`: JWT Token (从 https://standx.com/user/session 获取)
+- `TEST_PRIVATE_KEY`: Ed25519 私钥 (Base58 编码)
+
+### Q: 如何跳过 E2E 测试？
+
 ```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# 默认运行会跳过 E2E 测试
+cargo test
+
+# 显式跳过被忽略的测试
+cargo test -- --skip ignored
 ```
 
-### Q: 认证失败怎么办？
-A: 检查 JWT token 是否过期，访问 https://standx.com/user/session 重新获取。
+### Q: 如何调试测试？
 
-### Q: K-line 时间格式不支持？
-A: 支持三种格式：
-- 相对时间：`1h`, `1d`, `7d`
-- ISO 日期：`2024-01-01`
-- Unix 时间戳：`1704067200`
+```bash
+# 显示测试输出
+cargo test -- --nocapture
+
+# 运行特定测试并显示输出
+cargo test test_cli_version -- --nocapture
+
+# 使用 dbg! 宏调试
+# 在测试代码中添加: dbg!(&variable);
+```
 
 ---
 
-*文档版本: 0.3.1*  
-*最后更新: 2026-02-26*
+## 相关文档
+
+- [发布说明](RELEASE_NOTES_v0.5.0.md)
+- [CHANGELOG](CHANGELOG.md)
+- [开发计划](DEVELOPMENT_PLAN.md)
+
+---
+
+*文档版本: 0.5.0*  
+*最后更新: 2026-03-01*
