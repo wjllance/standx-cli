@@ -86,8 +86,15 @@ pub enum Commands {
     },
     /// Dashboard - unified view of account, positions, orders, and market data
     Dashboard {
-        #[command(subcommand)]
-        command: DashboardCommands,
+        /// Filter by specific symbols (comma-separated)
+        #[arg(short, long)]
+        symbols: Option<String>,
+        /// Enable verbose output with more details
+        #[arg(short, long)]
+        verbose: bool,
+        /// Watch mode: refresh every N seconds
+        #[arg(short, long)]
+        watch: Option<u64>,
     },
     /// Portfolio - view portfolio summary and performance
     Portfolio {
