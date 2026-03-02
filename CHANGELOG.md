@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3-rc.1] - 2026-03-01
+
+### Fixed
+- **Kline API Response Parsing**
+  - Add KlineResponse struct to handle API response format
+  - API returns {s, t[], o[], h[], l[], c[], v[]} not array of objects
+  - Convert KlineResponse to Vec<Kline> for consistent interface
+  - Fixes ISSUE-2.1 Kline command not working
+
 ## [0.6.2] - 2026-03-01
 
 ### Fixed
