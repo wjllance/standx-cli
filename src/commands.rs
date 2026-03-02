@@ -895,14 +895,24 @@ async fn fetch_and_display_dashboard(
             .collect()
     };
 
-    // Try to fetch authenticated data, handle 401 gracefully
-    let (account, auth_warning) = match client.get_balance().await {
+    // Try to fetch authenticated data, handle auth errors gracefully
+    let result = client.get_balance().await;
+    let (account, auth_warning) = match result {
         Ok(balance) => (Some(balance), None),
-        Err(e) if e.to_string().contains("401") => (
-            None,
-            Some("⚠️  Not authenticated. Run 'standx auth login' to access account data."),
-        ),
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("401")
+                || err_str.contains("Unauthorized")
+                || err_str.contains("Authentication required")
+            {
+                (
+                    None,
+                    Some("⚠️  Not authenticated. Run 'standx auth login' to access account data."),
+                )
+            } else {
+                return Err(e.into());
+            }
+        }
     };
 
     // Show auth warning if any
@@ -1079,14 +1089,41 @@ pub async fn handle_portfolio(
 async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat) -> Result<()> {
     let client = StandXClient::new()?;
 
-    // Fetch portfolio data
-    let balance = client.get_balance().await?;
-    let positions = client.get_positions(None).await?;
+    // Try to fetch authenticated data, handle auth errors gracefully
+    let balance_result = client.get_balance().await;
+    let balance = match balance_result {
+        Ok(b) => Some(b),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("401")
+                || err_str.contains("Unauthorized")
+                || err_str.contains("Authentication required")
+            {
+                eprintln!("⚠️  Not authenticated. Run 'standx auth login' to access account data.");
+                None
+            } else {
+                return Err(e.into());
+            }
+        }
+    };
+
+    // If not authenticated, show market data only
+    let positions = if balance.is_some() {
+        client.get_positions(None).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     // Calculate total values
-    let total_value_usd = balance.equity.clone();
-    let total_pnl_24h = balance.pnl_24h.clone();
-    let total_pnl_realized = balance.upnl.clone();
+    let total_value_usd = balance
+        .as_ref()
+        .map(|b| b.equity.clone())
+        .unwrap_or_default();
+    let total_pnl_24h = balance
+        .as_ref()
+        .map(|b| b.pnl_24h.clone())
+        .unwrap_or_default();
+    let total_pnl_realized = balance.as_ref().map(|b| b.upnl.clone()).unwrap_or_default();
 
     // Create portfolio snapshot
     let snapshot = PortfolioSnapshot {
@@ -1121,12 +1158,16 @@ async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat)
             if verbose {
                 println!();
                 println!("--- Verbose Details ---");
-                println!("  Balance: ${}", balance.balance);
-                println!("  Available: ${}", balance.cross_available);
-                println!("  Equity: ${}", balance.equity);
-                println!("  Cross Margin: ${}", balance.cross_margin);
-                println!("  Cross UPNL: ${}", balance.cross_upnl);
-                println!("  Locked: ${}", balance.locked);
+                if let Some(b) = &balance {
+                    println!("  Balance: ${}", b.balance);
+                    println!("  Available: ${}", b.cross_available);
+                    println!("  Equity: ${}", b.equity);
+                    println!("  Cross Margin: ${}", b.cross_margin);
+                    println!("  Cross UPNL: ${}", b.cross_upnl);
+                    println!("  Locked: ${}", b.locked);
+                } else {
+                    println!("  (Not authenticated - no balance details)");
+                }
             }
         }
         OutputFormat::Json => {
