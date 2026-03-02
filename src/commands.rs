@@ -439,17 +439,27 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
             key_file,
             interactive,
         } => {
-            // Get token
-            let token = if interactive || (token.is_none() && token_file.is_none()) {
+            // Check if stdin is a TTY
+            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+
+            // Get token - use provided token or prompt if in TTY and no token provided
+            let token = if let Some(t) = token {
+                // Token provided via -t flag
+                t
+            } else if let Some(file) = token_file {
+                // Token provided via file
+                std::fs::read_to_string(file)?.trim().to_string()
+            } else if is_tty || interactive {
+                // Interactive prompt
                 println!("Enter JWT Token:");
                 rpassword::prompt_password("Token: ")?.trim().to_string()
-            } else if let Some(file) = token_file {
-                std::fs::read_to_string(file)?.trim().to_string()
             } else {
-                token.unwrap()
+                anyhow::bail!(
+                    "Token required in non-interactive mode. Provide token via -t flag or -t FILE"
+                );
             };
 
-            // Get private key - always interactive if not provided via file or arg
+            // Get private key - skip if not provided and not in TTY
             let private_key = if let Some(key) = private_key {
                 // Provided via --private-key flag
                 Some(key)
@@ -461,8 +471,8 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
                 } else {
                     Some(key)
                 }
-            } else {
-                // Interactive prompt - always ask, but allow empty (optional)
+            } else if is_tty {
+                // Interactive prompt - only if TTY available
                 println!("\nEnter Ed25519 Private Key (Base58) - optional, press Enter to skip:");
                 let key = rpassword::prompt_password("Private Key: ")?
                     .trim()
@@ -472,6 +482,9 @@ pub async fn handle_auth(command: AuthCommands) -> Result<()> {
                 } else {
                     Some(key)
                 }
+            } else {
+                // Non-TTY: skip private key (optional)
+                None
             };
 
             let credentials = Credentials::new(token, private_key.clone());
