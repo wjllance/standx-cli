@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3-rc.1] - 2026-03-02
+
+### Fixed
+- **Auth Non-TTY Support** (#127)
+  - Support non-TTY environments for login
+  - Fix authentication issues in CI/automated environments
+- **Dashboard+Portfolio Auth Handling** (#125)
+  - Properly handle AuthRequired error for anonymous mode
+  - Improve error messages for unauthenticated users
+
 ## [0.6.2] - 2026-03-01
 
 ### Fixed
