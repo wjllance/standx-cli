@@ -629,14 +629,16 @@ pub async fn handle_market(command: MarketCommands, output_format: OutputFormat)
                 OutputFormat::Table => {
                     println!("Kline data for {} ({}):", symbol, resolution);
                     for kline in klines {
+                        // Format timestamp to readable time
+                        let time_str = match kline.time.parse::<i64>() {
+                            Ok(ts) => chrono::DateTime::from_timestamp(ts, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| kline.time.clone()),
+                            Err(_) => kline.time.clone(),
+                        };
                         println!(
                             "  {}: O:{} H:{} L:{} C:{} V:{}",
-                            kline.time,
-                            kline.open,
-                            kline.high,
-                            kline.low,
-                            kline.close,
-                            kline.volume
+                            time_str, kline.open, kline.high, kline.low, kline.close, kline.volume
                         );
                     }
                 }
