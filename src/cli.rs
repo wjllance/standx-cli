@@ -50,21 +50,25 @@ pub enum Commands {
         command: AuthCommands,
     },
     /// Market data (public)
+    #[command(visible_alias = "m")]
     Market {
         #[command(subcommand)]
         command: MarketCommands,
     },
     /// Account information (authenticated)
+    #[command(visible_alias = "a")]
     Account {
         #[command(subcommand)]
         command: AccountCommands,
     },
     /// Order management (authenticated)
+    #[command(visible_alias = "o")]
     Order {
         #[command(subcommand)]
         command: OrderCommands,
     },
     /// Trade history (authenticated)
+    #[command(visible_alias = "t")]
     Trade {
         #[command(subcommand)]
         command: TradeCommands,
@@ -85,6 +89,7 @@ pub enum Commands {
         command: StreamCommands,
     },
     /// Dashboard - unified view of account, positions, orders, and market data
+    #[command(visible_alias = "d")]
     Dashboard {
         /// Filter by specific symbols (comma-separated)
         #[arg(short, long)]
@@ -97,6 +102,7 @@ pub enum Commands {
         watch: Option<u64>,
     },
     /// Portfolio - view portfolio summary and performance (alias for portfolio snapshot)
+    #[command(visible_alias = "p")]
     Portfolio {
         /// Enable verbose output with more details
         #[arg(short, long)]
@@ -150,22 +156,27 @@ pub enum MarketCommands {
     /// List all trading symbols
     Symbols,
     /// Get ticker for a symbol (includes funding rate)
+    #[command(visible_alias = "t")]
     Ticker { symbol: String },
     /// Get all tickers
+    #[command(visible_alias = "ts")]
     Tickers,
     /// Get recent trades
+    #[command(visible_alias = "tr")]
     Trades {
         symbol: String,
         #[arg(short, long)]
         limit: Option<u32>,
     },
     /// Get order book depth
+    #[command(visible_alias = "dep")]
     Depth {
         symbol: String,
         #[arg(short, long)]
         limit: Option<u32>,
     },
     /// Get kline data
+    #[command(visible_alias = "k")]
     Kline {
         symbol: String,
         #[arg(
@@ -185,6 +196,7 @@ pub enum MarketCommands {
         limit: Option<u32>,
     },
     /// Get funding rate history
+    #[command(visible_alias = "f")]
     Funding {
         symbol: String,
         #[arg(short, long, default_value = "7")]
@@ -195,18 +207,22 @@ pub enum MarketCommands {
 #[derive(Subcommand, Debug)]
 pub enum AccountCommands {
     /// Get account balances
+    #[command(visible_alias = "b")]
     Balances,
     /// Get positions
+    #[command(visible_alias = "p")]
     Positions {
         #[arg(short, long)]
         symbol: Option<String>,
     },
     /// Get open orders
+    #[command(visible_alias = "o")]
     Orders {
         #[arg(short, long)]
         symbol: Option<String>,
     },
     /// Get order history
+    #[command(visible_alias = "h")]
     History {
         #[arg(short, long)]
         symbol: Option<String>,
@@ -214,12 +230,14 @@ pub enum AccountCommands {
         limit: u32,
     },
     /// Get position config
+    #[command(visible_alias = "cfg")]
     Config { symbol: String },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum OrderCommands {
     /// Create a new order
+    #[command(visible_alias = "c")]
     Create {
         symbol: String,
         side: String,
@@ -238,12 +256,14 @@ pub enum OrderCommands {
         tp_price: Option<String>,
     },
     /// Cancel an order by ID
+    #[command(visible_alias = "cxl")]
     Cancel {
         symbol: String,
         #[arg(short, long)]
         order_id: String,
     },
     /// Cancel all orders for a symbol
+    #[command(visible_alias = "cxa")]
     CancelAll { symbol: String },
 }
 
