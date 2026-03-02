@@ -158,11 +158,18 @@ impl OrderBook {
     }
 
     /// Get spread between best bid and ask
+    /// Returns format: "$X.XX (Y.YY%)"
     pub fn spread(&self) -> Option<String> {
         match (self.best_bid(), self.best_ask()) {
             (Some(bid), Some(ask)) => {
                 if let (Ok(b), Ok(a)) = (bid.parse::<f64>(), ask.parse::<f64>()) {
-                    Some(format!("{:.2}", a - b))
+                    let spread_value = a - b;
+                    let spread_percent = if a > 0.0 {
+                        (spread_value / a) * 100.0
+                    } else {
+                        0.0
+                    };
+                    Some(format!("${:.2} ({:.2}%)", spread_value, spread_percent))
                 } else {
                     None
                 }
@@ -699,7 +706,7 @@ mod tests {
 
         assert_eq!(book.best_bid(), Some("68000"));
         assert_eq!(book.best_ask(), Some("68100"));
-        assert_eq!(book.spread(), Some("100.00".to_string()));
+        assert_eq!(book.spread(), Some("$100.00 (0.15%)".to_string()));
     }
 
     #[test]
