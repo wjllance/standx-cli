@@ -166,11 +166,11 @@ pub fn format_order_book(book: &OrderBook, limit: usize) -> String {
 
     // Asks (sell orders) - reversed to show highest ask first
     output.push_str("Asks (Sell):\n");
-    output.push_str("Price\t\tQuantity\n");
+    output.push_str(&format!("{:<12} {}\n", "Price", "Quantity"));
 
     let asks_to_show: Vec<_> = book.asks.iter().rev().take(limit).collect();
     for ask in asks_to_show.iter().rev() {
-        output.push_str(&format!("{}\t{}\n", ask[0], ask[1]));
+        output.push_str(&format!("{:<12} {}\n", ask[0], ask[1]));
     }
 
     // Spread
@@ -180,10 +180,10 @@ pub fn format_order_book(book: &OrderBook, limit: usize) -> String {
 
     // Bids (buy orders)
     output.push_str("\nBids (Buy):\n");
-    output.push_str("Price\t\tQuantity\n");
+    output.push_str(&format!("{:<12} {}\n", "Price", "Quantity"));
 
     for bid in book.bids.iter().take(limit) {
-        output.push_str(&format!("{}\t{}\n", bid[0], bid[1]));
+        output.push_str(&format!("{:<12} {}\n", bid[0], bid[1]));
     }
 
     output
