@@ -1,6 +1,7 @@
 //! Output formatting utilities
 
 use crate::models::*;
+use chrono::Utc;
 use tabled::{Table, Tabled};
 
 /// Format data as table
@@ -187,6 +188,171 @@ pub fn format_order_book(book: &OrderBook, limit: usize) -> String {
     }
 
     output
+}
+
+/// Format dashboard in compact three-column layout
+pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
+    let mut output = String::new();
+    let col_width = 25;
+
+    // Top border
+    output.push_str("┌──────────────────────────────────────────────────────────────┐\n");
+
+    // Status bar with time
+    let time = Utc::now().format("%H:%M:%S UTC").to_string();
+    output.push_str(&format!("│ STANDX  {:<68}│\n", time));
+    output.push_str("│                                                                │\n");
+    output.push_str("└──────────────────────────────────────────────────────────────┘\n");
+
+    // Account line (show login prompt if not authenticated)
+    if let Some(balance) = &snapshot.account {
+        let equity = format_currency(&balance.equity);
+        let pnl = format_pnl(&balance.pnl_24h);
+        output.push_str(&format!("│ EQUITY: ${:<15} PnL: {}\n", equity, pnl));
+    } else {
+        output.push_str("│ Not authenticated - Run 'standx auth login' to view account\n");
+    }
+
+    output.push_str("├──────────────────────────────────────────────────────────────┤\n");
+
+    // Fund details (if authenticated)
+    if let Some(balance) = &snapshot.account {
+        let balance_str = format!("Balance: {}", format_currency(&balance.balance));
+        let avail_str = format!("Available: {}", format_currency(&balance.cross_available));
+        let locked_str = format!("Locked: {}", format_currency(&balance.locked));
+
+        output.push_str(&format!(
+            "│ {:<width$}{:<width$}{:<width$}│\n",
+            balance_str,
+            avail_str,
+            locked_str,
+            width = col_width
+        ));
+    }
+
+    output.push_str("├──────────────────────────────────────────────────────────────┤\n");
+
+    // Fund details
+    if let Some(balance) = &snapshot.account {
+        let balance_str = format!("Balance: {}", format_currency(&balance.balance));
+        let avail_str = format!("Available: {}", format_currency(&balance.cross_available));
+        let locked_str = format!("Locked: {}", format_currency(&balance.locked));
+
+        output.push_str(&format!(
+            "│ {:<width$}{:<width$}{:<width$}│\n",
+            balance_str,
+            avail_str,
+            locked_str,
+            width = col_width
+        ));
+    }
+
+    output.push_str("├──────────────────────────────────────────────────────────────┤\n");
+
+    // Column headers
+    output.push_str(&format!(
+        "│ {:<width$}{:<width$}{:<width$}│\n",
+        "POSITION",
+        "ORDER",
+        "MARKET",
+        width = col_width
+    ));
+    output.push_str(&format!(
+        "│ {:<width$}{:<width$}{:<width$}│\n",
+        "─────────",
+        "─────────",
+        "─────────",
+        width = col_width
+    ));
+
+    // Data rows
+    let max_rows = 5
+        .max(snapshot.positions.len())
+        .max(snapshot.orders.len())
+        .max(snapshot.market.len());
+
+    for i in 0..max_rows {
+        output.push_str("│ ");
+
+        // Position column
+        if let Some(pos) = snapshot.positions.get(i) {
+            let _side = match pos.side {
+                Some(OrderSide::Buy) => "LONG",
+                Some(OrderSide::Sell) => "SHORT",
+                None => "N/A",
+            };
+            output.push_str(&format!(
+                "{:<width$}",
+                format!("{} {} @{}", pos.symbol, pos.qty, pos.entry_price),
+                width = col_width
+            ));
+        } else {
+            output.push_str(&" ".repeat(col_width));
+        }
+
+        // Order column
+        if let Some(order) = snapshot.orders.get(i) {
+            let order_type = match &order.order_type {
+                OrderType::Limit => "LIM",
+                OrderType::Market => "MKT",
+            };
+            let side = format!("{:?}", order.side);
+            output.push_str(&format!(
+                "{:<width$}",
+                format!("{} {} {}", side, order_type, order.symbol),
+                width = col_width
+            ));
+        } else {
+            output.push_str(&" ".repeat(col_width));
+        }
+
+        // Market column
+        if let Some(market) = snapshot.market.get(i) {
+            output.push_str(&format!(
+                "{:<width$}",
+                format!("{} {}", market.symbol, market.mark_price),
+                width = col_width
+            ));
+        } else {
+            output.push_str(&" ".repeat(col_width));
+        }
+
+        output.push_str("│\n");
+    }
+
+    // Bottom border
+    output.push_str("└──────────────────────────────────────────────────────────────┘\n");
+
+    output
+}
+
+/// Format currency with $ prefix and 2 decimal places
+fn format_currency(value: &str) -> String {
+    // Try to parse as f64 and format
+    if let Ok(v) = value.parse::<f64>() {
+        if v >= 1000.0 {
+            format!("${:.2}", v)
+        } else {
+            format!("${:.4}", v)
+        }
+    } else {
+        format!("${}", value)
+    }
+}
+
+/// Format PnL with color indicator
+fn format_pnl(value: &str) -> String {
+    if let Ok(v) = value.parse::<f64>() {
+        if v > 0.0 {
+            format!("+${:.2}", v)
+        } else if v < 0.0 {
+            format!("-${:.2}", v.abs())
+        } else {
+            "$0.00".to_string()
+        }
+    } else {
+        value.to_string()
+    }
 }
 
 #[cfg(test)]

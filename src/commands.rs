@@ -987,6 +987,11 @@ async fn fetch_and_display_dashboard(
 
     match output_format {
         OutputFormat::Table => {
+            // Show new compact format first
+            println!("{}", output::format_dashboard_compact(&snapshot));
+            println!();
+
+            // Then show detailed tables
             println!("=== Dashboard Snapshot ===");
             println!("Timestamp: {}", snapshot.timestamp);
             println!();
