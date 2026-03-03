@@ -8,16 +8,7 @@ use crate::error::{Error, Result};
 use crate::models::*;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest::{Client, ClientBuilder};
-use serde::Deserialize;
 
-/// API response wrapper for list responses
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-struct ApiListResponse<T: Default> {
-    code: i32,
-    message: String,
-    result: Vec<T>,
-}
 use std::time::Duration;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -211,7 +202,7 @@ impl StandXClient {
 
         let text = response.text().await.unwrap_or_default();
 
-        // Parse the JSON - API returns array directly
+        // Parse the JSON - API returns array directly, not wrapped
         let trades: Vec<Trade> = serde_json::from_str(&text).map_err(|e| Error::Api {
             code: 0,
             message: format!("error decoding response body: {}", e),
