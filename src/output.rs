@@ -242,7 +242,7 @@ mod tests {
 pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     let mut table = ComfyTable::new();
     table
-        .load_preset(comfy_table::presets::NOTHING)
+        .load_preset(comfy_table::presets::UTF8_FULL)
         .set_content_arrangement(comfy_table::ContentArrangement::Disabled);
     // No fixed width - let it auto-size
 
