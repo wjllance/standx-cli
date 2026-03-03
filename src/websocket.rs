@@ -202,6 +202,8 @@ impl StandXWebSocket {
     }
 }
 
+/// Connect to WebSocket and run message loop
+/// Verbose flag controls debug output - only shows debug logs when enabled
 async fn connect_and_run(
     url: &str,
     token: Option<&str>,
