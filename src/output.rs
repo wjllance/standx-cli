@@ -347,15 +347,28 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     output
 }
 
-/// Format currency with $ prefix and 2 decimal places
+/// Format currency with $ prefix and thousands separator
 fn format_currency(value: &str) -> String {
-    // Try to parse as f64 and format
     if let Ok(v) = value.parse::<f64>() {
-        if v >= 1000.0 {
-            format!("${:.2}", v)
+        // Use basic formatting - Rust doesn't have built-in thousands separator
+        // Format: $X,XXX.XX for larger values
+        let formatted = if v >= 1000.0 {
+            // Simple approach: format with 2 decimals and manually add commas
+            let s = format!("{:.2}", v);
+            let parts: Vec<&str> = s.split('.').collect();
+            let int_part = parts[0];
+            let dec_part = parts.get(1).unwrap_or(&"00");
+            // Add commas to integer part
+            let with_commas: String = int_part.chars().rev()
+                .enumerate()
+                .map(|(i, c)| if i > 0 && i % 3 == 0 { format!(",{}", c) } else { c.to_string() })
+                .collect::<String>()
+                .chars().rev().collect();
+            format!("${}.{}", with_commas, dec_part)
         } else {
             format!("${:.4}", v)
-        }
+        };
+        formatted
     } else {
         format!("${}", value)
     }
