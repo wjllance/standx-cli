@@ -317,7 +317,10 @@ pub async fn handle_account(command: AccountCommands, output_format: OutputForma
             }
         }
         AccountCommands::Positions { symbol } => {
-            let positions = client.get_positions(symbol.as_deref()).await?;
+            let mut positions = client.get_positions(symbol.as_deref()).await?;
+
+            // Filter out positions with qty = 0
+            positions.retain(|p| p.qty.parse::<f64>().unwrap_or(0.0) > 0.0);
 
             match output_format {
                 OutputFormat::Table => println!("{}", output::format_table(positions)),
@@ -940,18 +943,22 @@ async fn fetch_and_display_dashboard(
     let all_positions = client.get_positions(None).await.unwrap_or_default();
     let all_orders = client.get_open_orders(None).await.unwrap_or_default();
 
-    // Filter by symbol if specified
+    // Filter by symbol if specified, and filter out zero-qty positions
     let positions = if has_filter {
         all_positions
             .into_iter()
             .filter(|p| {
-                symbol_filter
-                    .iter()
-                    .any(|s| s.eq_ignore_ascii_case(&p.symbol))
+                p.qty.parse::<f64>().unwrap_or(0.0) > 0.0
+                    && symbol_filter
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&p.symbol))
             })
             .collect()
     } else {
         all_positions
+            .into_iter()
+            .filter(|p| p.qty.parse::<f64>().unwrap_or(0.0) > 0.0)
+            .collect()
     };
 
     let orders = if has_filter {
@@ -1124,7 +1131,12 @@ async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat)
 
     // If not authenticated, show market data only
     let positions = if balance.is_some() {
-        client.get_positions(None).await.unwrap_or_default()
+        let positions = client.get_positions(None).await.unwrap_or_default();
+        // Filter out zero-qty positions
+        positions
+            .into_iter()
+            .filter(|p| p.qty.parse::<f64>().unwrap_or(0.0) > 0.0)
+            .collect()
     } else {
         Vec::new()
     };
