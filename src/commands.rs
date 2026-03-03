@@ -864,14 +864,14 @@ pub async fn handle_dashboard(
                         break;
                     }
 
-                    // Clear screen for better watch mode experience
+                    // Clear screen and move to home for smooth refresh
                     print!("\x1B[2J\x1B[1H");
                     println!("=== Dashboard Snapshot (refresh: {}s) ===", interval_secs);
                     println!(
                         "Time: {}",
                         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
                     );
-                    println!();
+                    eprintln!("Loading...\r");  // Use stderr so it doesn't interfere with output
 
                     // Fetch and display dashboard
                     fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
