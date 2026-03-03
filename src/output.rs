@@ -240,44 +240,60 @@ mod tests {
 /// Format dashboard in compact layout (new UI design - Issue #153)
 pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     let mut output = String::new();
-    
-    // Header with time and LIVE indicator
+    let _col_width = 20;
+
+    // Header
     let time = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
-    output.push_str("┌─────────────────────────────────────────────────────────────┐\n");
-    output.push_str(&format!("│ STANDX  {} LIVE                        │\n", time));
-    output.push_str("└─────────────────────────────────────────────────────────────┘\n");
-    
-    // Account info
-    if let Some(balance) = &snapshot.account {
-        output.push_str(&format!("│ EQUITY: ${:<15} PnL: {:<15}│\n", 
-            balance.equity.clone(), balance.pnl_24h.clone()));
-    } else {
-        output.push_str("│ Not authenticated                                     │\n");
+    output.push_str("┌────────────────────────────────────┐\n");
+    output.push_str(&format!("│ STANDX  {}     LIVE│\n", time));
+    output.push_str("└────────────────────────────────────┘\n");
+
+    // Account line: If not authenticated, show prompt
+    if snapshot.account.is_none() {
+        output.push_str("│ Not authenticated                  │\n");
     }
-    output.push_str("├─────────────────────────────────────────────────────────────┤\n");
-    
+    output.push_str("├────────────────────────────────────┤\n");
+
     // Fund details (3 columns)
-    if let Some(balance) = &snapshot.account {
-        output.push_str(&format!("│ {:<20} {:<20} {:<20}│\n", 
-            format!("Bal: ${}", balance.balance),
-            format!("Avail: ${}", balance.cross_available),
-            format!("Locked: ${}", balance.locked)));
+    if let Some(bal) = &snapshot.account {
+        let b = format!("Bal:${}", bal.balance);
+        let a = format!("Avail:${}", bal.cross_available);
+        let l = format!("Locked:${}", bal.locked);
+        output.push_str(&format!("│ {:<19} {:<19} {:<19}│\n", b, a, l));
     }
-    output.push_str("├─────────────────────────────────────────────────────────────┤\n");
-    
+    output.push_str("├────────────────────────────────────┤\n");
+
     // Column headers
-    output.push_str(&format!("│ {:<20} {:<20} {:<20}│\n", "POSITION", "ORDER", "MARKET"));
-    output.push_str(&format!("│ {:─<20} {:─<20} {:─<20}│\n", "", "", ""));
-    
+    output.push_str(&format!(
+        "│ {:<19} {:<19} {:<19}│\n",
+        "POSITION", "ORDER", "MARKET"
+    ));
+    output.push_str("├────────────────────────────────────┤\n");
+
     // Data rows
-    let max_rows = 5.max(snapshot.positions.len()).max(snapshot.orders.len()).max(snapshot.market.len());
+    let max_rows = 5
+        .max(snapshot.positions.len())
+        .max(snapshot.orders.len())
+        .max(snapshot.market.len());
     for i in 0..max_rows {
-        let pos = snapshot.positions.get(i).map(|p| format!("{} {}", p.symbol, p.qty)).unwrap_or_default();
-        let order = snapshot.orders.get(i).map(|o| format!("{:?} {}", o.order_type, o.symbol.clone())).unwrap_or_default();
-        let market = snapshot.market.get(i).map(|m| format!("{} ${}", m.symbol, m.mark_price)).unwrap_or_default();
-        output.push_str(&format!("│ {:<20} {:<20} {:<20}│\n", pos, order, market));
+        let pos = snapshot
+            .positions
+            .get(i)
+            .map(|p| format!("{} {}", p.symbol, p.qty))
+            .unwrap_or_default();
+        let order = snapshot
+            .orders
+            .get(i)
+            .map(|o| format!("{:?}", o.order_type))
+            .unwrap_or_default();
+        let market = snapshot
+            .market
+            .get(i)
+            .map(|m| format!("{} ${}", m.symbol, m.mark_price))
+            .unwrap_or_default();
+        output.push_str(&format!("│ {:<19} {:<19} {:<19}│\n", pos, order, market));
     }
-    
-    output.push_str("└─────────────────────────────────────────────────────────────┘\n");
+
+    output.push_str("└────────────────────────────────────┘\n");
     output
 }
