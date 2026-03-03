@@ -1,6 +1,7 @@
 //! Output formatting utilities
 
 use crate::models::*;
+use comfy_table::{Row, Table as ComfyTable};
 use tabled::{Table, Tabled};
 
 /// Format data as table
@@ -237,41 +238,36 @@ mod tests {
     }
 }
 
-/// Format dashboard in compact layout using Ratatui layout (Issue #153)
+/// Format dashboard in compact layout using Comfy-table (Issue #153)
 pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
-    // Use Ratatui layout constraints for column widths
-    let col_width = 18;
+    let mut table = ComfyTable::new();
+    table
+        .load_preset(comfy_table::presets::NOTHING)
+        .set_content_arrangement(comfy_table::ContentArrangement::Disabled);
+    // No fixed width - let it auto-size
 
-    let mut output = String::new();
-
-    // Header with time and LIVE indicator
+    // Header row - 3 columns
     let time = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
-    output.push_str("┌────────────────────────────────────────────────────────────┐\n");
-    output.push_str(&format!("│ STANDX  {}             LIVE │\n", time));
-    output.push_str("└────────────────────────────────────────────────────────────┘\n");
+    let header = format!("STANDX  {}  LIVE", time);
+    table.add_row(Row::from([header.as_str(), "", ""]));
 
-    // Account line
+    // Account info - 3 columns
     if let Some(bal) = &snapshot.account {
-        output.push_str(&format!(
-            "│ EQUITY: ${:<15} PnL: {:<15}│\n",
-            bal.equity, bal.pnl_24h
-        ));
+        let equity = format!("EQUITY: ${}", bal.equity);
+        let pnl = format!("PnL: {}", bal.pnl_24h);
+        table.add_row(Row::from([equity.as_str(), pnl.as_str(), ""]));
     } else {
-        output.push_str("│ Not authenticated                                        │\n");
+        table.add_row(Row::from([
+            "Not authenticated",
+            "Run 'standx auth login'",
+            "",
+        ]));
     }
-    output.push_str("├────────────────────────────────────────────────────────────┤\n");
 
-    // Column headers
-    output.push_str(&format!(
-        "│ {:<width$} {:<width$} {:<width$}│\n",
-        "POSITION",
-        "ORDER",
-        "MARKET",
-        width = col_width
-    ));
-    output.push_str("├────────────────────────────────────────────────────────────┤\n");
+    // Column headers - 3 columns
+    table.add_row(Row::from(["POSITION", "ORDER", "MARKET"]));
 
-    // Data rows
+    // Data rows - 3 columns each
     let max_rows = 5
         .max(snapshot.positions.len())
         .max(snapshot.orders.len())
@@ -287,6 +283,7 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
             .get(i)
             .map(|o| format!("{:?}", o.order_type))
             .unwrap_or_default();
+
         let market = snapshot
             .market
             .get(i)
@@ -315,30 +312,8 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
             })
             .unwrap_or_default();
 
-        // Truncate to column width (handle UTF-8)
-        let pos = truncate(&pos, col_width);
-        let order = truncate(&order, col_width);
-        let market = truncate(&market, col_width);
-
-        output.push_str(&format!(
-            "│ {:<width$} {:<width$} {:<width$}│\n",
-            pos,
-            order,
-            market,
-            width = col_width
-        ));
+        table.add_row(Row::from([pos.as_str(), order.as_str(), market.as_str()]));
     }
 
-    output.push_str("└────────────────────────────────────────────────────────────┘\n");
-    output
-}
-
-/// Truncate string to max width (handles UTF-8 properly)
-fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() > max {
-        chars[..max].iter().collect()
-    } else {
-        s.to_string()
-    }
+    table.to_string()
 }

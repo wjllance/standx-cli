@@ -19,8 +19,7 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive", "env", "cargo"] }
 
 # TUI
-ratatui = "0.28"
-crossterm = "0.22"
+comfy-table = "7"
 
 # Async
 tokio = { version = "1.43", features = ["full"] }
