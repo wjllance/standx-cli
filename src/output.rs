@@ -195,6 +195,11 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     let mut output = String::new();
     let col_width = 25;
 
+    // ANSI color codes
+    const RED: &str = "\x1B[31m";
+    const GREEN: &str = "\x1B[32m";
+    const RESET: &str = "\x1B[0m";
+    
     // Top border
     output.push_str("┌──────────────────────────────────────────────────────────────┐\n");
 
@@ -207,8 +212,8 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     // Account line (show login prompt if not authenticated)
     if let Some(balance) = &snapshot.account {
         let equity = format_currency(&balance.equity);
-        let pnl = format_pnl(&balance.pnl_24h);
-        output.push_str(&format!("│ EQUITY: ${:<15} PnL: {}\n", equity, pnl));
+        let (pnl_color, pnl_str) = format_pnl_color(&balance.pnl_24h, RED, GREEN, RESET);
+        output.push_str(&format!("│ EQUITY: ${:<15} PnL: {}{}{}\n", equity, pnl_color, pnl_str, RESET));
     } else {
         output.push_str("│ Not authenticated - Run 'standx auth login' to view account\n");
     }
@@ -306,11 +311,21 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
             output.push_str(&" ".repeat(col_width));
         }
 
-        // Market column
+        // Market column with price change indicator
         if let Some(market) = snapshot.market.get(i) {
+            // Calculate 24h change
+            let change = calculate_change(&market.last_price, &market.high_24h, &market.low_24h);
+            let (color, arrow) = if change > 0.0 {
+                (GREEN, "▲")
+            } else if change < 0.0 {
+                (RED, "▼")
+            } else {
+                ("", "")
+            };
+            let change_str = format!("{color}{arrow}{change:.1}%{RESET}", color = color, arrow = arrow, change = change.abs(), RESET = RESET);
             output.push_str(&format!(
                 "{:<width$}",
-                format!("{} {}", market.symbol, market.mark_price),
+                format!("{} {} {}", market.symbol, format_currency(&market.mark_price), change_str),
                 width = col_width
             ));
         } else {
@@ -353,6 +368,38 @@ fn format_pnl(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// Format PnL with color indicator - returns (color_code, formatted_value)
+fn format_pnl_color(value: &str, red: &str, green: &str, reset: &str) -> (String, String) {
+    if let Ok(v) = value.parse::<f64>() {
+        if v > 0.0 {
+            (green.to_string(), format!("+${:.2}", v))
+        } else if v < 0.0 {
+            (red.to_string(), format!("-${:.2}", v.abs()))
+        } else {
+            (String::new(), "$0.00".to_string())
+        }
+    } else {
+        (String::new(), value.to_string())
+    }
+}
+
+/// Calculate 24h change percentage
+fn calculate_change(last: &str, high: &str, low: &str) -> f64 {
+    let last = last.parse::<f64>().unwrap_or(0.0);
+    let high = high.parse::<f64>().unwrap_or(0.0);
+    let low = low.parse::<f64>().unwrap_or(0.0);
+    
+    if last > 0.0 && high > 0.0 && low > 0.0 {
+        // Simple calculation: (last - open) / open * 100
+        // Using high/low as proxy for open
+        let open = (high + low) / 2.0;
+        if open > 0.0 {
+            return (last - open) / open * 100.0;
+        }
+    }
+    0.0
 }
 
 #[cfg(test)]
