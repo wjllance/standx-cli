@@ -289,7 +289,28 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
         let market = snapshot
             .market
             .get(i)
-            .map(|m| format!("{} ${}", m.symbol, m.mark_price))
+            .map(|m| {
+                // Calculate 24h change from low to last price
+                let low: f64 = m.low_24h.parse().unwrap_or(0.0);
+                let last: f64 = m.last_price.parse().unwrap_or(0.0);
+                let change = if low > 0.0 {
+                    ((last - low) / low) * 100.0
+                } else {
+                    0.0
+                };
+
+                // Format with arrow
+                let arrow = if change > 0.0 {
+                    "▲"
+                } else if change < 0.0 {
+                    "▼"
+                } else {
+                    ""
+                };
+                let change_str = format!("{}{:.1}%", arrow, change.abs());
+
+                format!("{} ${} {}", m.symbol, m.mark_price, change_str)
+            })
             .unwrap_or_default();
         output.push_str(&format!("│ {:<19} {:<19} {:<19}│\n", pos, order, market));
     }
