@@ -301,14 +301,27 @@ mod tests {
 
     #[test]
     fn test_from_env() {
-        // Set environment variables using EnvGuard for automatic cleanup
-        let _token_guard = EnvGuard::set(ENV_JWT_TOKEN, "env_test_token");
-        let _key_guard = EnvGuard::set(ENV_PRIVATE_KEY, "env_test_key");
+        // Save and set environment variables
+        let original_token = std::env::var(ENV_JWT_TOKEN).ok();
+        std::env::set_var(ENV_JWT_TOKEN, "env_test_token");
+        let original_key = std::env::var(ENV_PRIVATE_KEY).ok();
+        std::env::set_var(ENV_PRIVATE_KEY, "env_test_key");
 
         let creds = Credentials::from_env().unwrap();
         assert_eq!(creds.token, "env_test_token");
         assert_eq!(creds.private_key, "env_test_key");
-        // EnvGuard automatically cleans up when dropped
+
+        // Restore original values
+        if let Some(val) = original_token {
+            std::env::set_var(ENV_JWT_TOKEN, val);
+        } else {
+            std::env::remove_var(ENV_JWT_TOKEN);
+        }
+        if let Some(val) = original_key {
+            std::env::set_var(ENV_PRIVATE_KEY, val);
+        } else {
+            std::env::remove_var(ENV_PRIVATE_KEY);
+        }
     }
 
     #[test]
