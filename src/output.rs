@@ -240,35 +240,44 @@ mod tests {
 /// Format dashboard in compact layout (new UI design - Issue #153)
 pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     let mut output = String::new();
-    let _col_width = 20;
+    let col_w = 18; // column width: 18*3 + 4 = 58 (inner width)
 
-    // Header
+    // Header: ┌────────────────────────────────────────────────────────────┐ (60 chars total, 58 inside)
     let time = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
-    output.push_str("┌────────────────────────────────────┐\n");
-    output.push_str(&format!("│ STANDX  {}     LIVE│\n", time));
-    output.push_str("└────────────────────────────────────┘\n");
+    output.push_str("┌────────────────────────────────────────────────────────────┐\n");
+    output.push_str(&format!("│ STANDX  {}             LIVE │\n", time));
+    output.push_str("└────────────────────────────────────────────────────────────┘\n");
 
-    // Account line: If not authenticated, show prompt
+    // Account line
     if snapshot.account.is_none() {
-        output.push_str("│ Not authenticated                  │\n");
+        output.push_str("│ Not authenticated                                        │\n");
     }
-    output.push_str("├────────────────────────────────────┤\n");
+    output.push_str("├────────────────────────────────────────────────────────────┤\n");
 
     // Fund details (3 columns)
     if let Some(bal) = &snapshot.account {
         let b = format!("Bal:${}", bal.balance);
         let a = format!("Avail:${}", bal.cross_available);
         let l = format!("Locked:${}", bal.locked);
-        output.push_str(&format!("│ {:<19} {:<19} {:<19}│\n", b, a, l));
+        output.push_str(&format!(
+            "│ {:<col_w$} {:<col_w$} {:<col_w$} │\n",
+            b,
+            a,
+            l,
+            col_w = col_w
+        ));
     }
-    output.push_str("├────────────────────────────────────┤\n");
+    output.push_str("├────────────────────────────────────────────────────────────┤\n");
 
     // Column headers
     output.push_str(&format!(
-        "│ {:<19} {:<19} {:<19}│\n",
-        "POSITION", "ORDER", "MARKET"
+        "│ {:<col_w$} {:<col_w$} {:<col_w$} │\n",
+        "POSITION",
+        "ORDER",
+        "MARKET",
+        col_w = col_w
     ));
-    output.push_str("├────────────────────────────────────┤\n");
+    output.push_str("├────────────────────────────────────────────────────────────┤\n");
 
     // Data rows
     let max_rows = 5
@@ -290,7 +299,6 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
             .market
             .get(i)
             .map(|m| {
-                // Calculate 24h change from low to last price
                 let low: f64 = m.low_24h.parse().unwrap_or(0.0);
                 let last: f64 = m.last_price.parse().unwrap_or(0.0);
                 let change = if low > 0.0 {
@@ -298,8 +306,6 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
                 } else {
                     0.0
                 };
-
-                // Format with arrow
                 let arrow = if change > 0.0 {
                     "▲"
                 } else if change < 0.0 {
@@ -307,14 +313,30 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
                 } else {
                     ""
                 };
-                let change_str = format!("{}{:.1}%", arrow, change.abs());
-
-                format!("{} ${} {}", m.symbol, m.mark_price, change_str)
+                format!(
+                    "{} ${} {}{:.1}%",
+                    m.symbol,
+                    m.mark_price,
+                    arrow,
+                    change.abs()
+                )
             })
             .unwrap_or_default();
-        output.push_str(&format!("│ {:<19} {:<19} {:<19}│\n", pos, order, market));
+        // Truncate if exceeds column width (use char boundaries for UTF-8)
+        let market = if market.chars().count() > col_w {
+            market.chars().take(col_w).collect::<String>()
+        } else {
+            market
+        };
+        output.push_str(&format!(
+            "│ {:<col_w$} {:<col_w$} {:<col_w$} │\n",
+            pos,
+            order,
+            market,
+            col_w = col_w
+        ));
     }
 
-    output.push_str("└────────────────────────────────────┘\n");
+    output.push_str("└────────────────────────────────────────────────────────────┘\n");
     output
 }
