@@ -281,14 +281,20 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
 
         // Position column
         if let Some(pos) = snapshot.positions.get(i) {
-            let _side = match pos.side {
+            let side = match pos.side {
                 Some(OrderSide::Buy) => "LONG",
                 Some(OrderSide::Sell) => "SHORT",
                 None => "N/A",
             };
+            // Calculate risk bar
+            let lev = pos.leverage.parse::<f64>().unwrap_or(0.0);
+            let (risk_color, risk_bar) = get_risk_bar(lev);
+            let risk_str = format!("{}{}x", risk_color, lev as i32);
+            
+            // Show: SYMBOL QTY @PRICE LEV
             output.push_str(&format!(
                 "{:<width$}",
-                format!("{} {} @{}", pos.symbol, pos.qty, pos.entry_price),
+                format!("{} {} @{} {} {}", pos.symbol, pos.qty, pos.entry_price, risk_str, risk_bar),
                 width = col_width
             ));
         } else {
@@ -400,6 +406,36 @@ fn calculate_change(last: &str, high: &str, low: &str) -> f64 {
         }
     }
     0.0
+}
+
+/// Generate risk bar based on leverage level
+/// Returns (color_code, bar_string)
+fn get_risk_bar(leverage: f64) -> (&'static str, String) {
+    const RED: &str = "\x1B[31m";
+    const YELLOW: &str = "\x1B[33m"; 
+    const GREEN: &str = "\x1B[32m";
+    const RESET: &str = "\x1B[0m";
+    
+    let total = 10;
+    let filled = if leverage >= 50.0 {
+        2 // dangerous
+    } else if leverage >= 30.0 {
+        4 // warning
+    } else if leverage >= 10.0 {
+        6 // caution
+    } else {
+        8 // safe
+    };
+    
+    let (color, bar) = if leverage >= 50.0 {
+        (RED, "█".repeat(filled) + &"░".repeat(total - filled))
+    } else if leverage >= 30.0 {
+        (YELLOW, "█".repeat(filled) + &"░".repeat(total - filled))
+    } else {
+        (GREEN, "█".repeat(filled) + &"░".repeat(total - filled))
+    };
+    
+    (color, bar)
 }
 
 #[cfg(test)]
