@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3-rc.3] - 2026-03-03
+
+### Fixed
+- **Market Trades API Decoding** (#143)
+  - Resolve trades API response decoding error
+  - Fix trade history data parsing issues
+- **Market Depth Table Alignment** (#144)
+  - Fix output table formatting alignment
+  - Improve depth display readability
+- **Zero Quantity Positions** (#140)
+  - Filter out zero-quantity positions from display
+  - Cleaner portfolio view
+- **Quiet Mode Flag** (#141)
+  - Properly handle `-q` (quiet) flag
+  - Suppress non-essential output when quiet mode is enabled
+- **Test Environment** (#142)
+  - Resolve test_from_env failure in CI
+  - Improve test stability
+
 ## [0.6.3-rc.2] - 2026-03-03
 
 ### Added
