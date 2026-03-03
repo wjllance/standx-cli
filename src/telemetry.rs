@@ -237,9 +237,18 @@ mod tests {
 
     #[test]
     fn test_telemetry_disabled() {
+        // Save original value
+        let original = env::var(TELEMETRY_ENV_VAR).ok();
+
         env::set_var(TELEMETRY_ENV_VAR, TELEMETRY_DISABLED);
         let telemetry = Telemetry::new();
         assert!(!telemetry.is_enabled());
+
+        // Restore original
+        match original {
+            Some(v) => env::set_var(TELEMETRY_ENV_VAR, v),
+            None => env::remove_var(TELEMETRY_ENV_VAR),
+        }
     }
 
     #[test]
