@@ -199,8 +199,17 @@ impl StandXClient {
             });
         }
 
-        let data = response.json::<Vec<Trade>>().await?;
-        Ok(data)
+        let text = response.text().await.unwrap_or_default();
+
+        // Parse the JSON - API returns array directly, not wrapped
+        let trades: Vec<Trade> = serde_json::from_str(&text).map_err(|e| Error::Api {
+            code: 0,
+            message: format!("error decoding response body: {}", e),
+            endpoint: Some("/api/query_recent_trades".to_string()),
+            retryable: false,
+        })?;
+
+        Ok(trades)
     }
 
     /// Get order book depth for a symbol

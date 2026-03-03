@@ -184,7 +184,11 @@ impl OrderBook {
 pub struct Trade {
     #[serde(default)]
     pub id: u64,
-    #[serde(rename = "created_at", deserialize_with = "string_or_number_to_string")]
+    #[serde(
+        default,
+        alias = "created_at",
+        deserialize_with = "string_or_number_to_string"
+    )]
     pub time: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub price: String,
