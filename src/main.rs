@@ -91,7 +91,9 @@ async fn main() {
     }
 
     // Set default output to JSON in OpenClaw mode
-    let output = if cli.openclaw {
+    let output = if cli.quiet {
+        OutputFormat::Quiet
+    } else if cli.openclaw {
         OutputFormat::Json
     } else {
         cli.output
