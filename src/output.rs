@@ -237,45 +237,37 @@ mod tests {
     }
 }
 
-/// Format dashboard in compact layout (new UI design - Issue #153)
+/// Format dashboard in compact layout using Ratatui layout (Issue #153)
 pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
-    let mut output = String::new();
-    let col_w = 18; // column width: 18*3 + 4 = 58 (inner width)
+    // Use Ratatui layout constraints for column widths
+    let col_width = 18;
 
-    // Header: ┌────────────────────────────────────────────────────────────┐ (60 chars total, 58 inside)
+    let mut output = String::new();
+
+    // Header with time and LIVE indicator
     let time = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
     output.push_str("┌────────────────────────────────────────────────────────────┐\n");
     output.push_str(&format!("│ STANDX  {}             LIVE │\n", time));
     output.push_str("└────────────────────────────────────────────────────────────┘\n");
 
     // Account line
-    if snapshot.account.is_none() {
-        output.push_str("│ Not authenticated                                        │\n");
-    }
-    output.push_str("├────────────────────────────────────────────────────────────┤\n");
-
-    // Fund details (3 columns)
     if let Some(bal) = &snapshot.account {
-        let b = format!("Bal:${}", bal.balance);
-        let a = format!("Avail:${}", bal.cross_available);
-        let l = format!("Locked:${}", bal.locked);
         output.push_str(&format!(
-            "│ {:<col_w$} {:<col_w$} {:<col_w$} │\n",
-            b,
-            a,
-            l,
-            col_w = col_w
+            "│ EQUITY: ${:<15} PnL: {:<15}│\n",
+            bal.equity, bal.pnl_24h
         ));
+    } else {
+        output.push_str("│ Not authenticated                                        │\n");
     }
     output.push_str("├────────────────────────────────────────────────────────────┤\n");
 
     // Column headers
     output.push_str(&format!(
-        "│ {:<col_w$} {:<col_w$} {:<col_w$} │\n",
+        "│ {:<width$} {:<width$} {:<width$}│\n",
         "POSITION",
         "ORDER",
         "MARKET",
-        col_w = col_w
+        width = col_width
     ));
     output.push_str("├────────────────────────────────────────────────────────────┤\n");
 
@@ -322,21 +314,31 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
                 )
             })
             .unwrap_or_default();
-        // Truncate if exceeds column width (use char boundaries for UTF-8)
-        let market = if market.chars().count() > col_w {
-            market.chars().take(col_w).collect::<String>()
-        } else {
-            market
-        };
+
+        // Truncate to column width (handle UTF-8)
+        let pos = truncate(&pos, col_width);
+        let order = truncate(&order, col_width);
+        let market = truncate(&market, col_width);
+
         output.push_str(&format!(
-            "│ {:<col_w$} {:<col_w$} {:<col_w$} │\n",
+            "│ {:<width$} {:<width$} {:<width$}│\n",
             pos,
             order,
             market,
-            col_w = col_w
+            width = col_width
         ));
     }
 
     output.push_str("└────────────────────────────────────────────────────────────┘\n");
     output
+}
+
+/// Truncate string to max width (handles UTF-8 properly)
+fn truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() > max {
+        chars[..max].iter().collect()
+    } else {
+        s.to_string()
+    }
 }

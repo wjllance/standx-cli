@@ -18,6 +18,10 @@ path = "src/main.rs"
 # CLI
 clap = { version = "4.5", features = ["derive", "env", "cargo"] }
 
+# TUI
+ratatui = "0.28"
+crossterm = "0.22"
+
 # Async
 tokio = { version = "1.43", features = ["full"] }
 futures = "0.3"
