@@ -864,16 +864,10 @@ pub async fn handle_dashboard(
                         break;
                     }
 
-                    // Clear screen for better watch mode experience
+                    // Clear screen and move to home
                     print!("\x1B[2J\x1B[1H");
-                    println!("=== Dashboard Snapshot (refresh: {}s) ===", interval_secs);
-                    println!(
-                        "Time: {}",
-                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-                    );
-                    println!();
 
-                    // Fetch and display dashboard
+                    // Fetch data FIRST (no blank screen while waiting)
                     fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
 
                     // Sleep until next refresh
@@ -1083,16 +1077,10 @@ pub async fn handle_portfolio(
                         break;
                     }
 
-                    // Clear screen for better watch mode experience
+                    // Clear screen and move to home
                     print!("\x1B[2J\x1B[1H");
-                    println!("=== Portfolio Snapshot (refresh: {}s) ===", interval_secs);
-                    println!(
-                        "Time: {}",
-                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-                    );
-                    println!();
 
-                    // Fetch and display portfolio
+                    // Fetch data FIRST (no blank screen while waiting)
                     fetch_and_display_portfolio(verbose, output_format).await?;
 
                     // Sleep until next refresh
