@@ -199,13 +199,13 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     const RED: &str = "\x1B[31m";
     const GREEN: &str = "\x1B[32m";
     const RESET: &str = "\x1B[0m";
-    
+
     // Top border
     output.push_str("┌──────────────────────────────────────────────────────────────┐\n");
 
-    // Status bar with time
+    // Status bar with time and LIVE indicator
     let time = Utc::now().format("%H:%M:%S UTC").to_string();
-    output.push_str(&format!("│ STANDX  {:<68}│\n", time));
+    output.push_str(&format!("│ STANDX  {:<55}{:<8}│\n", time, "LIVE"));
     output.push_str("│                                                                │\n");
     output.push_str("└──────────────────────────────────────────────────────────────┘\n");
 
@@ -213,7 +213,10 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     if let Some(balance) = &snapshot.account {
         let equity = format_currency(&balance.equity);
         let (pnl_color, pnl_str) = format_pnl_color(&balance.pnl_24h, RED, GREEN, RESET);
-        output.push_str(&format!("│ EQUITY: ${:<15} PnL: {}{}{}\n", equity, pnl_color, pnl_str, RESET));
+        output.push_str(&format!(
+            "│ EQUITY: ${:<15} PnL: {}{}{}\n",
+            equity, pnl_color, pnl_str, RESET
+        ));
     } else {
         output.push_str("│ Not authenticated - Run 'standx auth login' to view account\n");
     }
@@ -290,11 +293,14 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
             let lev = pos.leverage.parse::<f64>().unwrap_or(0.0);
             let (risk_color, risk_bar) = get_risk_bar(lev);
             let risk_str = format!("{}{}x", risk_color, lev as i32);
-            
+
             // Show: SYMBOL QTY @PRICE LEV
             output.push_str(&format!(
                 "{:<width$}",
-                format!("{} {} @{} {} {}", pos.symbol, pos.qty, pos.entry_price, risk_str, risk_bar),
+                format!(
+                    "{} {} @{} {} {}",
+                    pos.symbol, pos.qty, pos.entry_price, risk_str, risk_bar
+                ),
                 width = col_width
             ));
         } else {
@@ -328,10 +334,21 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
             } else {
                 ("", "")
             };
-            let change_str = format!("{color}{arrow}{change:.1}%{RESET}", color = color, arrow = arrow, change = change.abs(), RESET = RESET);
+            let change_str = format!(
+                "{color}{arrow}{change:.1}%{RESET}",
+                color = color,
+                arrow = arrow,
+                change = change.abs(),
+                RESET = RESET
+            );
             output.push_str(&format!(
                 "{:<width$}",
-                format!("{} {} {}", market.symbol, format_currency(&market.mark_price), change_str),
+                format!(
+                    "{} {} {}",
+                    market.symbol,
+                    format_currency(&market.mark_price),
+                    change_str
+                ),
                 width = col_width
             ));
         } else {
@@ -359,11 +376,21 @@ fn format_currency(value: &str) -> String {
             let int_part = parts[0];
             let dec_part = parts.get(1).unwrap_or(&"00");
             // Add commas to integer part
-            let with_commas: String = int_part.chars().rev()
+            let with_commas: String = int_part
+                .chars()
+                .rev()
                 .enumerate()
-                .map(|(i, c)| if i > 0 && i % 3 == 0 { format!(",{}", c) } else { c.to_string() })
+                .map(|(i, c)| {
+                    if i > 0 && i % 3 == 0 {
+                        format!(",{}", c)
+                    } else {
+                        c.to_string()
+                    }
+                })
                 .collect::<String>()
-                .chars().rev().collect();
+                .chars()
+                .rev()
+                .collect();
             format!("${}.{}", with_commas, dec_part)
         } else {
             format!("${:.4}", v)
@@ -409,7 +436,7 @@ fn calculate_change(last: &str, high: &str, low: &str) -> f64 {
     let last = last.parse::<f64>().unwrap_or(0.0);
     let high = high.parse::<f64>().unwrap_or(0.0);
     let low = low.parse::<f64>().unwrap_or(0.0);
-    
+
     if last > 0.0 && high > 0.0 && low > 0.0 {
         // Simple calculation: (last - open) / open * 100
         // Using high/low as proxy for open
@@ -425,10 +452,10 @@ fn calculate_change(last: &str, high: &str, low: &str) -> f64 {
 /// Returns (color_code, bar_string)
 fn get_risk_bar(leverage: f64) -> (&'static str, String) {
     const RED: &str = "\x1B[31m";
-    const YELLOW: &str = "\x1B[33m"; 
+    const YELLOW: &str = "\x1B[33m";
     const GREEN: &str = "\x1B[32m";
     const RESET: &str = "\x1B[0m";
-    
+
     let total = 10;
     let filled = if leverage >= 50.0 {
         2 // dangerous
@@ -439,7 +466,7 @@ fn get_risk_bar(leverage: f64) -> (&'static str, String) {
     } else {
         8 // safe
     };
-    
+
     let (color, bar) = if leverage >= 50.0 {
         (RED, "█".repeat(filled) + &"░".repeat(total - filled))
     } else if leverage >= 30.0 {
@@ -447,7 +474,7 @@ fn get_risk_bar(leverage: f64) -> (&'static str, String) {
     } else {
         (GREEN, "█".repeat(filled) + &"░".repeat(total - filled))
     };
-    
+
     (color, bar)
 }
 
