@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3-rc.2] - 2026-03-03
+
+### Added
+- **Command Short Aliases** (#137)
+  - Add short aliases for common commands (e.g., `s` for `snapshot`, `w` for `watch`)
+  - Improve CLI usability and efficiency
+
+### Fixed
+- **Kline Timestamp Format** (#129)
+  - Format timestamp to human-readable time
+  - Improve readability of kline/candlestick data
+- **Depth Spread Display** (#138)
+  - Show spread in both dollar amount and percentage
+  - Better market depth visualization
+- **WebSocket Debug Logs** (#139)
+  - Ensure debug logs only show with verbose flag
+  - Clean up watch mode output
+
 ## [0.6.3-rc.1] - 2026-03-02
 
 ### Fixed
