@@ -244,75 +244,85 @@ pub fn format_dashboard_compact(snapshot: &DashboardSnapshot) -> String {
     table
         .load_preset(comfy_table::presets::UTF8_FULL)
         .set_content_arrangement(comfy_table::ContentArrangement::Disabled);
-    // No fixed width - let it auto-size
 
-    // Header row - 3 columns
+    // Header
     let time = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
     let header = format!("STANDX  {}  LIVE", time);
-    table.add_row(Row::from([header.as_str(), "", ""]));
+    table.add_row(Row::from([header.as_str(), ""]));
 
-    // Account info - 3 columns
-    if let Some(bal) = &snapshot.account {
-        let equity = format!("EQUITY: ${}", bal.equity);
-        let pnl = format!("PnL: {}", bal.pnl_24h);
-        table.add_row(Row::from([equity.as_str(), pnl.as_str(), ""]));
-    } else {
-        table.add_row(Row::from([
-            "Not authenticated",
-            "Run 'standx auth login'",
-            "",
-        ]));
+    // Build MARKET column (left side)
+    let mut market_lines = Vec::new();
+    for m in &snapshot.market {
+        let low: f64 = m.low_24h.parse().unwrap_or(0.0);
+        let last: f64 = m.last_price.parse().unwrap_or(0.0);
+        let change = if low > 0.0 {
+            ((last - low) / low) * 100.0
+        } else {
+            0.0
+        };
+        let arrow = if change > 0.0 {
+            "▲"
+        } else if change < 0.0 {
+            "▼"
+        } else {
+            ""
+        };
+        // Format: SYMBOL $PRICE ARROW%
+        let line = format!(
+            "{}  ${} {} {:.1}%",
+            m.symbol,
+            m.mark_price,
+            arrow,
+            change.abs()
+        );
+        market_lines.push(line);
+    }
+    let market_cell = market_lines.join("\n");
+
+    // Build POSITION + ORDERS column (right side)
+    let mut pos_order_lines = Vec::new();
+
+    // Positions header
+    pos_order_lines.push("📈 POSITION".to_string());
+    for p in &snapshot.positions {
+        if p.qty != "0" {
+            let leverage = if !p.leverage.is_empty() {
+                format!("{}x", p.leverage)
+            } else {
+                "".to_string()
+            };
+            let line = format!("{} {} @ {} {}", p.symbol, p.qty, p.entry_price, leverage);
+            pos_order_lines.push(line);
+        }
+    }
+    if snapshot.positions.is_empty() || snapshot.positions.iter().all(|p| p.qty == "0") {
+        pos_order_lines.push("-".to_string());
     }
 
-    // Column headers - 3 columns
-    table.add_row(Row::from(["POSITION", "ORDER", "MARKET"]));
+    pos_order_lines.push("".to_string());
+    pos_order_lines.push("📝 ORDERS".to_string());
+    for o in &snapshot.orders {
+        let side = format!("{:?}", o.side);
+        let line = format!("{} {:?} {}", side, o.order_type, o.symbol);
+        pos_order_lines.push(line);
+    }
+    if snapshot.orders.is_empty() {
+        pos_order_lines.push("-".to_string());
+    }
+    let pos_order_cell = pos_order_lines.join("\n");
 
-    // Data rows - 3 columns each
-    let max_rows = 5
-        .max(snapshot.positions.len())
-        .max(snapshot.orders.len())
-        .max(snapshot.market.len());
-    for i in 0..max_rows {
-        let pos = snapshot
-            .positions
-            .get(i)
-            .map(|p| format!("{} {}", p.symbol, p.qty))
-            .unwrap_or_default();
-        let order = snapshot
-            .orders
-            .get(i)
-            .map(|o| format!("{:?}", o.order_type))
-            .unwrap_or_default();
+    // Main content row - 2 columns
+    table.add_row(Row::from([market_cell.as_str(), pos_order_cell.as_str()]));
 
-        let market = snapshot
-            .market
-            .get(i)
-            .map(|m| {
-                let low: f64 = m.low_24h.parse().unwrap_or(0.0);
-                let last: f64 = m.last_price.parse().unwrap_or(0.0);
-                let change = if low > 0.0 {
-                    ((last - low) / low) * 100.0
-                } else {
-                    0.0
-                };
-                let arrow = if change > 0.0 {
-                    "▲"
-                } else if change < 0.0 {
-                    "▼"
-                } else {
-                    ""
-                };
-                format!(
-                    "{} ${} {}{:.1}%",
-                    m.symbol,
-                    m.mark_price,
-                    arrow,
-                    change.abs()
-                )
-            })
-            .unwrap_or_default();
-
-        table.add_row(Row::from([pos.as_str(), order.as_str(), market.as_str()]));
+    // Account info footer
+    if let Some(bal) = &snapshot.account {
+        let equity = format!("Equity: ${}  PnL: {}", bal.equity, bal.pnl_24h);
+        table.add_row(Row::from([equity.as_str(), ""]));
+    } else {
+        table.add_row(Row::from([
+            "Not authenticated - Run 'standx auth login'",
+            "",
+        ]));
     }
 
     table.to_string()
