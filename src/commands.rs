@@ -987,6 +987,14 @@ async fn fetch_and_display_dashboard(
         }
     }
 
+    // Fetch order book for first symbol
+    let mut order_book = None;
+    if let Some(first_symbol) = symbol_list.first() {
+        if let Ok(ob) = client.get_depth(first_symbol, Some(5)).await {
+            order_book = Some(ob);
+        }
+    }
+
     // Create dashboard snapshot
     let snapshot = DashboardSnapshot {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -995,6 +1003,7 @@ async fn fetch_and_display_dashboard(
         orders,
         market,
         trades,
+        order_book,
     };
 
     match output_format {

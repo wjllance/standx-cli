@@ -607,6 +607,8 @@ pub struct DashboardSnapshot {
     pub market: Vec<MarketData>,
     /// Recent trades
     pub trades: Vec<Trade>,
+    /// Order book for first symbol
+    pub order_book: Option<OrderBook>,
 }
 
 /// Portfolio snapshot - portfolio summary and performance

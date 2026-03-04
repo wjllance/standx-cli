@@ -323,13 +323,27 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
 
     // ORDER BOOK + ACTIVE ORDERS
     output.push_str("│ ORDER BOOK:\n");
-    // Get order book for first symbol if available
-    if let Some(m) = snapshot.market.first() {
-        output.push_str(&format!(
-            "│   Symbol: {:<width$} │\n",
-            m.symbol,
-            width = width - 14
-        ));
+    // Show order book depth data if available
+    if let Some(ref ob) = snapshot.order_book {
+        // Show top 3 asks (sell orders)
+        let asks: Vec<String> = ob.asks.iter().take(3).map(|a| format!("{} ({})", a[0], a[1])).collect();
+        if !asks.is_empty() {
+            output.push_str(&format!("│   Asks: {:<width$} │\n", asks.join(" "), width = width - 12));
+        }
+        // Show top 3 bids (buy orders)
+        let bids: Vec<String> = ob.bids.iter().take(3).map(|b| format!("{} ({})", b[0], b[1])).collect();
+        if !bids.is_empty() {
+            output.push_str(&format!("│   Bids: {:<width$} │\n", bids.join(" "), width = width - 12));
+        }
+    } else {
+        // Get symbol from market if no order book
+        if let Some(m) = snapshot.market.first() {
+            output.push_str(&format!(
+                "│   Symbol: {:<width$} │\n",
+                m.symbol,
+                width = width - 14
+            ));
+        }
     }
 
     // Active orders
