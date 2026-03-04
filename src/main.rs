@@ -161,7 +161,7 @@ async fn execute_command(
             commands::handle_dashboard(command, output).await?;
         }
         Commands::Portfolio { verbose, watch } => {
-            let command = crate::commands::PortfolioCommand::Snapshot { verbose, watch };
+            let command = crate::commands::PortfolioCommand::Snapshot { _verbose: verbose, watch };
             commands::handle_portfolio(command, output).await?;
         }
     }

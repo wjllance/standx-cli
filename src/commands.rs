@@ -979,6 +979,14 @@ async fn fetch_and_display_dashboard(
         }
     }
 
+    // Fetch recent trades for first symbol
+    let mut trades = Vec::new();
+    if let Some(first_symbol) = symbol_list.first() {
+        if let Ok(t) = client.get_recent_trades(first_symbol, Some(5)).await {
+            trades = t;
+        }
+    }
+
     // Create dashboard snapshot
     let snapshot = DashboardSnapshot {
         timestamp: chrono::Utc::now().to_rfc3339(),
@@ -986,6 +994,7 @@ async fn fetch_and_display_dashboard(
         positions,
         orders,
         market,
+        trades,
     };
 
     match output_format {
@@ -1016,7 +1025,7 @@ pub async fn handle_portfolio(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
-        PortfolioCommand::Snapshot { verbose, watch } => {
+        PortfolioCommand::Snapshot { _verbose, watch } => {
             // Create flag for watch mode interruption
             let should_stop = Arc::new(AtomicBool::new(false));
             let should_stop_clone = should_stop.clone();
@@ -1041,14 +1050,14 @@ pub async fn handle_portfolio(
                     print!("\x1B[2J\x1B[1H");
 
                     // Fetch data FIRST (no blank screen while waiting)
-                    fetch_and_display_portfolio(verbose, output_format).await?;
+                    fetch_and_display_portfolio(_verbose, output_format).await?;
 
                     // Sleep until next refresh
                     tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
                 }
             } else {
                 // Single snapshot mode
-                fetch_and_display_portfolio(verbose, output_format).await?;
+                fetch_and_display_portfolio(_verbose, output_format).await?;
             }
         }
     }
@@ -1056,7 +1065,7 @@ pub async fn handle_portfolio(
 }
 
 /// Fetch and display portfolio data
-async fn fetch_and_display_portfolio(_verbose: bool, output_format: OutputFormat) -> Result<()> {
+async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat) -> Result<()> {
     let client = StandXClient::new()?;
 
     // Try to fetch authenticated data, handle auth errors gracefully

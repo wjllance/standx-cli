@@ -605,6 +605,8 @@ pub struct DashboardSnapshot {
     pub orders: Vec<Order>,
     /// Market data for tracked symbols
     pub market: Vec<MarketData>,
+    /// Recent trades
+    pub trades: Vec<Trade>,
 }
 
 /// Portfolio snapshot - portfolio summary and performance

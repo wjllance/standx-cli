@@ -355,7 +355,21 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     if !compact {
         output.push_str(&sep());
         output.push_str("│ RECENT TRADES:\n");
-        output.push_str("│   (Not implemented yet)\n");
+        if snapshot.trades.is_empty() {
+            output.push_str("│   No recent trades\n");
+        } else {
+            for t in &snapshot.trades {
+                // Format time to HH:MM:SS from ISO format "2026-03-04T02:21:26.633550Z"
+                let time_short = if t.time.contains('T') {
+                    t.time.split('T').nth(1).unwrap_or(&t.time).split('.').next().unwrap_or(&t.time)
+                } else {
+                    &t.time
+                };
+                let side = t.side.as_deref().unwrap_or("");
+                let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
+                output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+            }
+        }
     }
 
     // Footer
