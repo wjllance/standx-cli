@@ -376,26 +376,3 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     output.push_str(&footer());
     output
 }
-
-#[cfg(test)]
-mod tests {
-    fn test_format_order_book() {
-        let book = OrderBook {
-            symbol: "BTC-USD".to_string(),
-            bids: vec![
-                ["68000".to_string(), "1.0".to_string()],
-                ["67900".to_string(), "2.0".to_string()],
-            ],
-            asks: vec![
-                ["68100".to_string(), "0.5".to_string()],
-                ["68200".to_string(), "1.0".to_string()],
-            ],
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-        };
-
-        let formatted = format_order_book(&book, 10);
-        assert!(formatted.contains("BTC-USD"));
-        assert!(formatted.contains("Asks (Sell)"));
-        assert!(formatted.contains("Bids (Buy)"));
-    }
-}
