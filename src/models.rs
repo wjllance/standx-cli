@@ -610,6 +610,9 @@ pub struct DashboardSnapshot {
     pub account: Option<Balance>,
     /// Open positions
     pub positions: Vec<Position>,
+    /// Sum of realized PnL across all queried positions
+    #[serde(default, deserialize_with = "string_or_number_to_string")]
+    pub total_realized_pnl: String,
     /// Open orders
     pub orders: Vec<Order>,
     /// Market data for tracked symbols

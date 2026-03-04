@@ -1053,6 +1053,10 @@ async fn build_dashboard_output(
         Err(e) if is_auth_error(&e) => Vec::new(),
         Err(e) => return Err(e.into()),
     };
+    let total_realized_pnl_all_positions: f64 = all_positions
+        .iter()
+        .map(|p| p.realized_pnl.parse::<f64>().unwrap_or(0.0))
+        .sum();
     let all_orders = match orders_result {
         Ok(orders) => orders,
         Err(e) if is_auth_error(&e) => Vec::new(),
@@ -1160,6 +1164,7 @@ async fn build_dashboard_output(
         timestamp: chrono::Utc::now().to_rfc3339(),
         account,
         positions,
+        total_realized_pnl: total_realized_pnl_all_positions.to_string(),
         orders,
         market,
         trades,

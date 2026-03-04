@@ -345,10 +345,11 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     };
     let account_str = if let Some(ref bal) = snapshot.account {
         format!(
-            "Total={} Available={} uPnL={}",
+            "Total={} Available={} uPnL={} PnL={}",
             fmt2(&bal.balance),
             fmt2(&bal.cross_available),
-            fmt2(&bal.upnl)
+            fmt2(&bal.upnl),
+            fmt2(&snapshot.total_realized_pnl)
         )
     } else {
         "Not authenticated".to_string()
