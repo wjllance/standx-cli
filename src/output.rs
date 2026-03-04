@@ -297,7 +297,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     let now = chrono::Local::now();
     let time_str = now.format("%H:%M:%S").to_string();
     output.push_str(&border());
-    let title = " StandX Dashboard";
+    let title = format!(" StandX CLI Dashboard v{}", env!("CARGO_PKG_VERSION"));
     let right = format!("REFRESH: {}", time_str);
     let spacing = width.saturating_sub(title.chars().count() + right.chars().count());
     output.push_str(&format!("│{}{}{}│\n", title, " ".repeat(spacing), right));
