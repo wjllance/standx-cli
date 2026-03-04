@@ -268,21 +268,31 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     let border = || format!("┌{}┐\n", "─".repeat(width));
     let sep = || format!("├{}┤\n", "─".repeat(width));
     let footer = || format!("└{}┘\n", "─".repeat(width));
-    let fit = |text: &str| -> String {
+    let truncate_pad = |text: &str, target_width: usize| -> String {
         let mut chars: Vec<char> = text.chars().collect();
-        if chars.len() > width {
-            if width > 3 {
-                chars.truncate(width - 3);
+        if chars.len() > target_width {
+            if target_width > 3 {
+                chars.truncate(target_width - 3);
                 let mut trimmed: String = chars.into_iter().collect();
                 trimmed.push_str("...");
-                return format!("{:<width$}", trimmed, width = width);
+                return format!("{:<width$}", trimmed, width = target_width);
             }
-            return ".".repeat(width);
+            return ".".repeat(target_width);
         }
-        format!("{:<width$}", text, width = width)
+        format!("{:<width$}", text, width = target_width)
+    };
+    let fit = |text: &str| -> String {
+        truncate_pad(text, width)
     };
     let push_line = |out: &mut String, text: &str| {
         out.push_str(&format!("│{}│\n", fit(text)));
+    };
+    let left_w = (width.saturating_sub(1)) / 2;
+    let right_w = width.saturating_sub(1 + left_w);
+    let push_two_col = |out: &mut String, left: &str, right: &str| {
+        let l = truncate_pad(left, left_w);
+        let r = truncate_pad(right, right_w);
+        out.push_str(&format!("│{}│{}│\n", l, r));
     };
 
     // Header
@@ -348,64 +358,76 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     push_line(&mut output, &format!(" ACCOUNT: {}", account_str));
     output.push_str(&sep());
 
-    // ORDER BOOK
+    let fmt_book_price = |v: &str| -> String {
+        v.parse::<f64>()
+            .map(|n| format!("{:>10.2}", n))
+            .unwrap_or_else(|_| format!("{:>10}", v))
+    };
+    let fmt_book_qty = |v: &str| -> String {
+        v.parse::<f64>()
+            .map(|n| format!("{:>9.4}", n))
+            .unwrap_or_else(|_| format!("{:>9}", v))
+    };
+    let mut order_book_lines: Vec<String> = Vec::new();
     if let Some(ref ob) = snapshot.order_book {
-        push_line(&mut output, &format!(" ORDER BOOK ({}):", ob.symbol));
-        let asks: Vec<String> = ob
-            .asks
-            .iter()
-            .take(3)
-            .map(|a| format!("{}({})", a[0], a[1]))
-            .collect();
-        let bids: Vec<String> = ob
-            .bids
-            .iter()
-            .take(3)
-            .map(|b| format!("{}({})", b[0], b[1]))
-            .collect();
-        push_line(
-            &mut output,
-            &format!(
-                "   Asks: {}",
-                if asks.is_empty() {
-                    "No asks".to_string()
-                } else {
-                    asks.join(" ")
-                }
-            ),
-        );
-        push_line(
-            &mut output,
-            &format!(
-                "   Bids: {}",
-                if bids.is_empty() {
-                    "No bids".to_string()
-                } else {
-                    bids.join(" ")
-                }
-            ),
-        );
+        order_book_lines.push(format!(" ORDER BOOK ({}):", ob.symbol));
+        if ob.asks.is_empty() {
+            order_book_lines.push("   No asks".to_string());
+        } else {
+            for ask in ob.asks.iter().take(3).rev() {
+                let price = fmt_book_price(&ask[0]);
+                let qty = fmt_book_qty(&ask[1]);
+                order_book_lines.push(format!("   {} {} ASK", price, qty));
+            }
+        }
+        order_book_lines.push("   ---- spread ----".to_string());
+        if ob.bids.is_empty() {
+            order_book_lines.push("   No bids".to_string());
+        } else {
+            for bid in ob.bids.iter().take(3) {
+                let price = fmt_book_price(&bid[0]);
+                let qty = fmt_book_qty(&bid[1]);
+                order_book_lines.push(format!("   {} {} BID", price, qty));
+            }
+        }
     } else {
-        push_line(&mut output, " ORDER BOOK: unavailable");
+        order_book_lines.push(" ORDER BOOK: unavailable".to_string());
     }
 
-    output.push_str(&sep());
-
-    // RECENT TRADES (skip if compact)
+    let mut trade_lines: Vec<String> = Vec::new();
     if !compact {
-        push_line(&mut output, " RECENT TRADES:");
+        trade_lines.push(" RECENT TRADES:".to_string());
         if snapshot.trades.is_empty() {
-            push_line(&mut output, "   No recent trades");
+            trade_lines.push("   No recent trades".to_string());
         } else {
             for t in &snapshot.trades {
                 let time_short = format_trade_time_short(&t.time);
-                // Use is_buyer_taker to determine side
                 let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
-                let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
-                push_line(&mut output, &format!("   {}", line));
+                trade_lines.push(format!("   {} {} {} {}", time_short, t.price, t.qty, side));
             }
         }
+    }
+
+    // ORDER BOOK + RECENT TRADES (2-column when enough space)
+    if !compact && width >= 66 {
+        let max_rows = order_book_lines.len().max(trade_lines.len());
+        for i in 0..max_rows {
+            let left = order_book_lines.get(i).map_or("", String::as_str);
+            let right = trade_lines.get(i).map_or("", String::as_str);
+            push_two_col(&mut output, left, right);
+        }
         output.push_str(&sep());
+    } else {
+        for line in &order_book_lines {
+            push_line(&mut output, line);
+        }
+        output.push_str(&sep());
+        if !compact {
+            for line in &trade_lines {
+                push_line(&mut output, line);
+            }
+            output.push_str(&sep());
+        }
     }
 
     // POSITIONS (moved near bottom)
