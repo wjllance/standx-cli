@@ -364,7 +364,8 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
                 } else {
                     &t.time
                 };
-                let side = t.side.as_deref().unwrap_or("");
+                // Use is_buyer_taker to determine side
+                let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
                 let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
                 output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
             }
