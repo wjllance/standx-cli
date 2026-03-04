@@ -91,15 +91,8 @@ pub enum Commands {
     /// Dashboard - unified view of account, positions, orders, and market data
     #[command(visible_alias = "d")]
     Dashboard {
-        /// Filter by specific symbols (comma-separated)
-        #[arg(short, long)]
-        symbols: Option<String>,
-        /// Enable verbose output with more details
-        #[arg(short, long)]
-        verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
-        watch: Option<u64>,
+        #[command(subcommand)]
+        command: DashboardCommands,
     },
     /// Portfolio - view portfolio summary and performance (alias for portfolio snapshot)
     #[command(visible_alias = "p")]
@@ -331,9 +324,12 @@ pub enum StreamCommands {
     Fills,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Default)]
 pub enum DashboardCommands {
-    /// Get a comprehensive dashboard view
+    /// Compact two-column dashboard view (default)
+    #[default]
+    Compact,
+    /// Get a comprehensive dashboard snapshot view
     Snapshot {
         /// Filter by specific symbols (comma-separated)
         #[arg(short, long)]

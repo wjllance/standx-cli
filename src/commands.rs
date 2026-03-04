@@ -832,6 +832,10 @@ pub async fn handle_dashboard(
     output_format: OutputFormat,
 ) -> Result<()> {
     match command {
+        DashboardCommands::Compact => {
+            // New two-column layout only (no details)
+            fetch_and_display_dashboard(&[], false, output_format, false).await?;
+        }
         DashboardCommands::Snapshot {
             symbols,
             verbose,
@@ -868,14 +872,14 @@ pub async fn handle_dashboard(
                     print!("\x1B[2J\x1B[1H");
 
                     // Fetch data FIRST (no blank screen while waiting)
-                    fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
+                    fetch_and_display_dashboard(&symbol_list, verbose, output_format, true).await?;
 
                     // Sleep until next refresh
                     tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
                 }
             } else {
                 // Single snapshot mode
-                fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
+                fetch_and_display_dashboard(&symbol_list, verbose, output_format, true).await?;
             }
         }
     }
@@ -887,6 +891,7 @@ async fn fetch_and_display_dashboard(
     symbol_filter: &[String],
     verbose: bool,
     output_format: OutputFormat,
+    show_details: bool,
 ) -> Result<()> {
     let client = StandXClient::new()?;
 
@@ -987,14 +992,15 @@ async fn fetch_and_display_dashboard(
 
     match output_format {
         OutputFormat::Table => {
-            // Show new compact format first
+            // Always show compact format
             println!("{}", output::format_dashboard_compact(&snapshot));
-            println!();
-
-            // Then show detailed tables
-            println!("=== Dashboard Snapshot ===");
-            println!("Timestamp: {}", snapshot.timestamp);
-            println!();
+            
+            // Only show detailed tables if requested
+            if show_details {
+                println!();
+                println!("=== Dashboard Snapshot ===");
+                println!("Timestamp: {}", snapshot.timestamp);
+                println!();
 
             // Format account/balance as table (single row)
             if let Some(ref balance) = snapshot.account {
@@ -1037,6 +1043,7 @@ async fn fetch_and_display_dashboard(
                     println!("  PnL 24h: {}", balance.pnl_24h);
                 }
             }
+            } // end of show_details
         }
         OutputFormat::Json => {
             println!("{}", output::format_json(&snapshot)?);
