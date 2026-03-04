@@ -855,7 +855,15 @@ where
 {
     if let Some(interval_secs) = watch {
         loop {
-            match render_once().await {
+            let render_result = tokio::select! {
+                _ = signal::ctrl_c() => {
+                    println!("\n👋 Stopping watch mode");
+                    break;
+                }
+                result = render_once() => result,
+            };
+
+            match render_result {
                 Ok(rendered) => {
                     // Clear only after new frame is ready, reducing flicker.
                     print!("\x1B[2J\x1B[1H");
