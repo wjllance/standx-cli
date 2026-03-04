@@ -289,7 +289,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     let now = chrono::Local::now();
     let time_str = now.format("%H:%M:%S").to_string();
     output.push_str(&border());
-    let title = " standx dashboard";
+    let title = " StandX Dashboard";
     let right = format!("refresh: {}", time_str);
     let spacing = width.saturating_sub(title.chars().count() + right.chars().count());
     output.push_str(&format!("│{}{}{}│\n", title, " ".repeat(spacing), right));
@@ -348,34 +348,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     push_line(&mut output, &format!(" ACCOUNT: {}", account_str));
     output.push_str(&sep());
 
-    // POSITIONS
-    push_line(&mut output, " POSITIONS:");
-    if snapshot.positions.is_empty() {
-        push_line(&mut output, "   No open positions");
-    } else {
-        for (i, p) in snapshot.positions.iter().enumerate() {
-            let side = format!("{:?}", p.side.unwrap_or(crate::models::OrderSide::Buy));
-            let pnl_arrow = if p.upnl.parse::<f64>().unwrap_or(0.0) > 0.0 {
-                "▲"
-            } else {
-                "▼"
-            };
-            let line = format!(
-                "#{} {} {} @{} mark={} pnl={} {}",
-                i + 1,
-                p.symbol,
-                side,
-                p.entry_price,
-                p.mark_price,
-                p.upnl,
-                pnl_arrow
-            );
-            push_line(&mut output, &format!("   {}", line));
-        }
-    }
-    output.push_str(&sep());
-
-    // ORDER BOOK + ACTIVE ORDERS
+    // ORDER BOOK
     if let Some(ref ob) = snapshot.order_book {
         push_line(&mut output, &format!(" ORDER BOOK ({}):", ob.symbol));
         let asks: Vec<String> = ob
@@ -418,7 +391,51 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
 
     output.push_str(&sep());
 
-    // Show order book depth data if available
+    // RECENT TRADES (skip if compact)
+    if !compact {
+        push_line(&mut output, " RECENT TRADES:");
+        if snapshot.trades.is_empty() {
+            push_line(&mut output, "   No recent trades");
+        } else {
+            for t in &snapshot.trades {
+                let time_short = format_trade_time_short(&t.time);
+                // Use is_buyer_taker to determine side
+                let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
+                let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
+                push_line(&mut output, &format!("   {}", line));
+            }
+        }
+        output.push_str(&sep());
+    }
+
+    // POSITIONS (moved near bottom)
+    push_line(&mut output, " POSITIONS:");
+    if snapshot.positions.is_empty() {
+        push_line(&mut output, "   No open positions");
+    } else {
+        for (i, p) in snapshot.positions.iter().enumerate() {
+            let side = format!("{:?}", p.side.unwrap_or(crate::models::OrderSide::Buy));
+            let pnl_arrow = if p.upnl.parse::<f64>().unwrap_or(0.0) > 0.0 {
+                "▲"
+            } else {
+                "▼"
+            };
+            let line = format!(
+                "#{} {} {} @{} mark={} pnl={} {}",
+                i + 1,
+                p.symbol,
+                side,
+                p.entry_price,
+                p.mark_price,
+                p.upnl,
+                pnl_arrow
+            );
+            push_line(&mut output, &format!("   {}", line));
+        }
+    }
+    output.push_str(&sep());
+
+    // ACTIVE ORDERS (moved near bottom)
     push_line(&mut output, " ACTIVE ORDERS:");
     if snapshot.orders.is_empty() {
         push_line(&mut output, "   No open orders");
@@ -441,25 +458,8 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
             push_line(&mut output, &format!("   {}", line));
         }
     }
-
-    // RECENT TRADES (skip if compact)
-    if !compact {
-        output.push_str(&sep());
-        push_line(&mut output, " RECENT TRADES:");
-        if snapshot.trades.is_empty() {
-            push_line(&mut output, "   No recent trades");
-        } else {
-            for t in &snapshot.trades {
-                let time_short = format_trade_time_short(&t.time);
-                // Use is_buyer_taker to determine side
-                let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
-                let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
-                push_line(&mut output, &format!("   {}", line));
-            }
-        }
-    }
-
     output.push_str(&sep());
+
     push_line(
         &mut output,
         " Usage: standx dashboard --symbol BTC-USD --watch 5",
