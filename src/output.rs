@@ -1,7 +1,6 @@
 //! Output formatting utilities
 
 use crate::models::*;
-use comfy_table::Table;
 use tabled::{Table as TabledTable, Tabled};
 
 /// Format data as table
