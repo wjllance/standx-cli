@@ -249,7 +249,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
 
     // Header
     let now = chrono::Utc::now();
-    let time_str = now.format("%H:%M").to_string();
+    let time_str = now.format("%H:%M:%S").to_string();
     output.push_str(&border());
     let title = " standx dashboard";
     let right = format!("refresh: {}", time_str);
@@ -258,7 +258,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     output.push_str(&sep());
 
     // TICKERS
-    let tickers: Vec<String> = snapshot
+    let ticker_items: Vec<String> = snapshot
         .market
         .iter()
         .map(|m| {
@@ -281,12 +281,14 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
         })
         .collect();
 
-    let tickers_str = if tickers.is_empty() {
-        "No market data".to_string()
+    push_line(&mut output, " TICKERS:");
+    if ticker_items.is_empty() {
+        push_line(&mut output, "   No market data");
     } else {
-        tickers.join(" | ")
-    };
-    push_line(&mut output, &format!(" TICKERS: {}", tickers_str));
+        for row in ticker_items.chunks(2) {
+            push_line(&mut output, &format!("   {}", row.join(" | ")));
+        }
+    }
     output.push_str(&sep());
 
     // ACCOUNT
@@ -420,7 +422,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     output.push_str(&sep());
     push_line(
         &mut output,
-        " Usage: standx dashboard --symbol BTCUSDT --watch 5",
+        " Usage: standx dashboard --symbol BTC-USD --watch 5",
     );
 
     // Footer

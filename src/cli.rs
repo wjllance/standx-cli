@@ -97,8 +97,8 @@ pub enum Commands {
         /// Enable verbose output with more details
         #[arg(short, long)]
         verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
+        /// Watch mode: refresh every N seconds (default 5 when flag used without value)
+        #[arg(short, long, num_args = 0..=1, default_missing_value = "5")]
         watch: Option<u64>,
         /// Compact mode: skip RECENT TRADES section
         #[arg(long)]
@@ -110,8 +110,8 @@ pub enum Commands {
         /// Enable verbose output with more details
         #[arg(short, long)]
         verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
+        /// Watch mode: refresh every N seconds (default 5 when flag used without value)
+        #[arg(short, long, num_args = 0..=1, default_missing_value = "5")]
         watch: Option<u64>,
     },
 }

@@ -10,6 +10,7 @@ use standx_cli::error::Error as StandxError;
 use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, PortfolioSnapshot, TimeInForce};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
+use std::collections::HashMap;
 use futures::future::join_all;
 use std::future::Future;
 use std::time::Duration;
@@ -845,15 +846,19 @@ async fn run_watch_loop<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<()>>,
+    Fut: Future<Output = Result<String>>,
 {
     if let Some(interval_secs) = watch {
         loop {
-            // Clear screen and move to home
-            print!("\x1B[2J\x1B[1H");
-
-            if let Err(e) = render_once().await {
-                eprintln!("⚠️  {}: {}", error_prefix, e);
+            match render_once().await {
+                Ok(rendered) => {
+                    // Clear only after new frame is ready, reducing flicker.
+                    print!("\x1B[2J\x1B[1H");
+                    print!("{}", rendered);
+                }
+                Err(e) => {
+                    eprintln!("⚠️  {}: {}", error_prefix, e);
+                }
             }
 
             tokio::select! {
@@ -866,7 +871,9 @@ where
         }
         Ok(())
     } else {
-        render_once().await
+        let rendered = render_once().await?;
+        print!("{}", rendered);
+        Ok(())
     }
 }
 
@@ -892,20 +899,20 @@ pub async fn handle_dashboard(
 
     run_watch_loop(
         watch,
-        || fetch_and_display_dashboard(&client, &symbol_list, verbose, output_format, compact),
+        || build_dashboard_output(&client, &symbol_list, verbose, output_format, compact),
         "Dashboard refresh failed",
     )
     .await
 }
 
-/// Fetch and display dashboard data with optional symbol filtering
-async fn fetch_and_display_dashboard(
+/// Build dashboard output with optional symbol filtering
+async fn build_dashboard_output(
     client: &StandXClient,
     symbol_filter: &[String],
     _verbose: bool,
     output_format: OutputFormat,
     compact: bool,
-) -> Result<()> {
+) -> Result<String> {
     // Check if filtering by symbols
     let has_filter = !symbol_filter.is_empty();
 
@@ -942,12 +949,6 @@ async fn fetch_and_display_dashboard(
                 return Err(e.into());
             }
         }
-    };
-
-    // Show auth warning if any
-    if let Some(warning) = auth_warning {
-        println!("{}", warning);
-        println!();
     };
 
     let all_positions = match positions_result {
@@ -992,17 +993,51 @@ async fn fetch_and_display_dashboard(
         all_orders
     };
 
-    // Fetch market data for tracked symbols (always works without auth)
-    let market_results = join_all(
-        symbol_list
-            .iter()
-            .map(|symbol| client.get_symbol_market(symbol)),
-    )
-    .await;
-    let market = market_results
+    // Fetch market + kline data for tracked symbols in parallel.
+    // Kline open is used as a fallback to compute 24h change when ticker field is missing.
+    let now_ts = chrono::Utc::now().timestamp();
+    let from_ts = now_ts - 86400;
+    let (market_results, kline_results) = tokio::join!(
+        join_all(
+            symbol_list
+                .iter()
+                .map(|symbol| client.get_symbol_market(symbol))
+        ),
+        join_all(
+            symbol_list
+                .iter()
+                .map(|symbol| client.get_kline(symbol, "1D", from_ts, now_ts))
+        )
+    );
+
+    let mut open_prices: HashMap<String, f64> = HashMap::new();
+    for (index, result) in kline_results.into_iter().enumerate() {
+        if let Ok(klines) = result {
+            if let Some(kline) = klines.first() {
+                if let Ok(open) = kline.open.parse::<f64>() {
+                    if open > 0.0 {
+                        open_prices.insert(symbol_list[index].clone(), open);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut market: Vec<_> = market_results
         .into_iter()
         .filter_map(std::result::Result::ok)
         .collect();
+
+    for ticker in &mut market {
+        if ticker.change_24h_percent.is_empty() || ticker.change_24h_percent == "0" {
+            if let Some(open) = open_prices.get(&ticker.symbol) {
+                if let Ok(last) = ticker.last_price.parse::<f64>() {
+                    let change = ((last - open) / open) * 100.0;
+                    ticker.change_24h_percent = format!("{:.2}", change);
+                }
+            }
+        }
+    }
 
     // Fetch recent trades + order book for first symbol in parallel
     let (trades, order_book) = if let Some(first_symbol) = symbol_list.first() {
@@ -1029,26 +1064,30 @@ async fn fetch_and_display_dashboard(
         order_book,
     };
 
-    match output_format {
+    let rendered = match output_format {
         OutputFormat::Table => {
             // Use MVP format (Issue #156)
-            println!("{}", output::format_dashboard_mvp(&snapshot, compact));
+            let mut text = String::new();
+            if let Some(warning) = auth_warning {
+                text.push_str(warning);
+                text.push_str("\n\n");
+            }
+            text.push_str(&output::format_dashboard_mvp(&snapshot, compact));
+            text
         }
-        OutputFormat::Json => {
-            println!("{}", output::format_json(&snapshot)?);
-        }
+        OutputFormat::Json => format!("{}\n", output::format_json(&snapshot)?),
         OutputFormat::Csv => {
             // For CSV, output positions as they're the most important
             if !snapshot.positions.is_empty() {
-                println!("{}", output::format_csv(&snapshot.positions)?);
+                format!("{}\n", output::format_csv(&snapshot.positions)?)
             } else {
-                println!("No positions to display");
+                "No positions to display\n".to_string()
             }
         }
-        OutputFormat::Quiet => {}
-    }
+        OutputFormat::Quiet => String::new(),
+    };
 
-    Ok(())
+    Ok(rendered)
 }
 
 /// Handle portfolio commands - view portfolio summary and performance
@@ -1061,7 +1100,7 @@ pub async fn handle_portfolio(
             let client = StandXClient::new()?;
             run_watch_loop(
                 watch,
-                || fetch_and_display_portfolio(&client, _verbose, output_format),
+                || build_portfolio_output(&client, _verbose, output_format),
                 "Portfolio refresh failed",
             )
             .await?;
@@ -1070,19 +1109,18 @@ pub async fn handle_portfolio(
     Ok(())
 }
 
-/// Fetch and display portfolio data
-async fn fetch_and_display_portfolio(
+/// Build portfolio output
+async fn build_portfolio_output(
     client: &StandXClient,
     verbose: bool,
     output_format: OutputFormat,
-) -> Result<()> {
+) -> Result<String> {
     // Try to fetch authenticated data, handle auth errors gracefully
     let balance_result = client.get_balance().await;
     let balance = match balance_result {
         Ok(b) => Some(b),
         Err(e) => {
             if is_auth_error(&e) {
-                eprintln!("⚠️  Not authenticated. Run 'standx auth login' to access account data.");
                 None
             } else {
                 return Err(e.into());
@@ -1126,56 +1164,56 @@ async fn fetch_and_display_portfolio(
         positions,
     };
 
-    match output_format {
+    let rendered = match output_format {
         OutputFormat::Table => {
-            println!("=== Portfolio Summary ===");
-            println!("Timestamp: {}", snapshot.timestamp);
-            println!();
+            let mut text = String::new();
+            if balance.is_none() {
+                text.push_str("⚠️  Not authenticated. Run 'standx auth login' to access account data.\n\n");
+            }
+            text.push_str("=== Portfolio Summary ===\n");
+            text.push_str(&format!("Timestamp: {}\n\n", snapshot.timestamp));
 
             // Account summary
-            println!("--- Account ---");
-            println!("  Total Value: ${}", snapshot.total_value_usd);
-            println!("  PnL 24h: ${}", snapshot.total_pnl_24h);
-            println!("  Unrealized PnL: ${}", snapshot.total_pnl_realized);
-            println!();
+            text.push_str("--- Account ---\n");
+            text.push_str(&format!("  Total Value: ${}\n", snapshot.total_value_usd));
+            text.push_str(&format!("  PnL 24h: ${}\n", snapshot.total_pnl_24h));
+            text.push_str(&format!("  Unrealized PnL: ${}\n\n", snapshot.total_pnl_realized));
 
             // Positions
             if !snapshot.positions.is_empty() {
-                println!("--- Positions ({}) ---", snapshot.positions.len());
-                println!("{}", output::format_table(snapshot.positions));
+                text.push_str(&format!("--- Positions ({}) ---\n", snapshot.positions.len()));
+                text.push_str(&format!("{}\n", output::format_table(snapshot.positions)));
             } else {
-                println!("--- No open positions ---");
+                text.push_str("--- No open positions ---\n");
             }
 
             if verbose {
-                println!();
-                println!("--- Verbose Details ---");
+                text.push_str("\n--- Verbose Details ---\n");
                 if let Some(b) = &balance {
-                    println!("  Balance: ${}", b.balance);
-                    println!("  Available: ${}", b.cross_available);
-                    println!("  Equity: ${}", b.equity);
-                    println!("  Cross Margin: ${}", b.cross_margin);
-                    println!("  Cross UPNL: ${}", b.cross_upnl);
-                    println!("  Locked: ${}", b.locked);
+                    text.push_str(&format!("  Balance: ${}\n", b.balance));
+                    text.push_str(&format!("  Available: ${}\n", b.cross_available));
+                    text.push_str(&format!("  Equity: ${}\n", b.equity));
+                    text.push_str(&format!("  Cross Margin: ${}\n", b.cross_margin));
+                    text.push_str(&format!("  Cross UPNL: ${}\n", b.cross_upnl));
+                    text.push_str(&format!("  Locked: ${}\n", b.locked));
                 } else {
-                    println!("  (Not authenticated - no balance details)");
+                    text.push_str("  (Not authenticated - no balance details)\n");
                 }
             }
+            text
         }
-        OutputFormat::Json => {
-            println!("{}", output::format_json(&snapshot)?);
-        }
+        OutputFormat::Json => format!("{}\n", output::format_json(&snapshot)?),
         OutputFormat::Csv => {
             if !snapshot.positions.is_empty() {
-                println!("{}", output::format_csv(&snapshot.positions)?);
+                format!("{}\n", output::format_csv(&snapshot.positions)?)
             } else {
-                println!("No positions to display");
+                "No positions to display\n".to_string()
             }
         }
-        OutputFormat::Quiet => {}
-    }
+        OutputFormat::Quiet => String::new(),
+    };
 
-    Ok(())
+    Ok(rendered)
 }
 
 #[cfg(test)]
