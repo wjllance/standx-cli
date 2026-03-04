@@ -16,7 +16,7 @@ use tokio::signal;
 /// Portfolio command for direct execution (without subcommands)
 #[derive(Debug)]
 pub enum PortfolioCommand {
-    Snapshot { verbose: bool, watch: Option<u64> },
+    Snapshot { _verbose: bool, watch: Option<u64> },
 }
 
 /// Parse time string to timestamp
@@ -836,6 +836,7 @@ pub async fn handle_dashboard(
             symbols,
             verbose,
             watch,
+            compact,
         } => {
             // Build list of symbols to track
             let symbol_list: Vec<String> = if let Some(s) = symbols {
@@ -868,14 +869,15 @@ pub async fn handle_dashboard(
                     print!("\x1B[2J\x1B[1H");
 
                     // Fetch data FIRST (no blank screen while waiting)
-                    fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
+                    fetch_and_display_dashboard(&symbol_list, verbose, output_format, compact)
+                        .await?;
 
                     // Sleep until next refresh
                     tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
                 }
             } else {
                 // Single snapshot mode
-                fetch_and_display_dashboard(&symbol_list, verbose, output_format).await?;
+                fetch_and_display_dashboard(&symbol_list, verbose, output_format, compact).await?;
             }
         }
     }
@@ -885,8 +887,9 @@ pub async fn handle_dashboard(
 /// Fetch and display dashboard data with optional symbol filtering
 async fn fetch_and_display_dashboard(
     symbol_filter: &[String],
-    verbose: bool,
+    _verbose: bool,
     output_format: OutputFormat,
+    compact: bool,
 ) -> Result<()> {
     let client = StandXClient::new()?;
 
@@ -987,51 +990,8 @@ async fn fetch_and_display_dashboard(
 
     match output_format {
         OutputFormat::Table => {
-            println!("=== Dashboard Snapshot ===");
-            println!("Timestamp: {}", snapshot.timestamp);
-            println!();
-
-            // Format account/balance as table (single row)
-            if let Some(ref balance) = snapshot.account {
-                println!("--- Account ---");
-                println!("{}", output::format_item(balance));
-                println!();
-            }
-
-            // Format positions as table
-            if !snapshot.positions.is_empty() {
-                println!("--- Positions ({}) ---", snapshot.positions.len());
-                println!("{}", output::format_table(snapshot.positions));
-                println!();
-            }
-
-            // Format orders as table
-            if !snapshot.orders.is_empty() {
-                println!("--- Open Orders ({}) ---", snapshot.orders.len());
-                for order in &snapshot.orders {
-                    println!(
-                        "  {} {} {:?} {:?} @ {}",
-                        order.id, order.symbol, order.side, order.order_type, order.price
-                    );
-                }
-                println!();
-            }
-
-            // Format market data as table
-            if !snapshot.market.is_empty() {
-                println!("--- Market Data ({}) ---", snapshot.market.len());
-                println!("{}", output::format_table(snapshot.market));
-            }
-
-            if verbose {
-                println!();
-                println!("--- Verbose Details ---");
-                if let Some(ref balance) = snapshot.account {
-                    println!("  Cross Margin: {}", balance.cross_margin);
-                    println!("  Cross UPNL: {}", balance.cross_upnl);
-                    println!("  PnL 24h: {}", balance.pnl_24h);
-                }
-            }
+            // Use MVP format (Issue #156)
+            println!("{}", output::format_dashboard_mvp(&snapshot, compact));
         }
         OutputFormat::Json => {
             println!("{}", output::format_json(&snapshot)?);
@@ -1096,7 +1056,7 @@ pub async fn handle_portfolio(
 }
 
 /// Fetch and display portfolio data
-async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat) -> Result<()> {
+async fn fetch_and_display_portfolio(_verbose: bool, output_format: OutputFormat) -> Result<()> {
     let client = StandXClient::new()?;
 
     // Try to fetch authenticated data, handle auth errors gracefully

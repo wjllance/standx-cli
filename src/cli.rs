@@ -100,6 +100,9 @@ pub enum Commands {
         /// Watch mode: refresh every N seconds
         #[arg(short, long)]
         watch: Option<u64>,
+        /// Compact mode: skip RECENT TRADES section
+        #[arg(long)]
+        compact: bool,
     },
     /// Portfolio - view portfolio summary and performance (alias for portfolio snapshot)
     #[command(visible_alias = "p")]
@@ -344,6 +347,9 @@ pub enum DashboardCommands {
         /// Watch mode: refresh every N seconds
         #[arg(short, long)]
         watch: Option<u64>,
+        /// Compact mode: skip RECENT TRADES section
+        #[arg(long)]
+        compact: bool,
     },
 }
 

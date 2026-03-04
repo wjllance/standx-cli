@@ -150,11 +150,13 @@ async fn execute_command(
             symbols,
             verbose,
             watch,
+            compact,
         } => {
             let command = DashboardCommands::Snapshot {
                 symbols,
                 verbose,
                 watch,
+                compact,
             };
             commands::handle_dashboard(command, output).await?;
         }
