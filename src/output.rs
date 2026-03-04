@@ -281,9 +281,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
         }
         format!("{:<width$}", text, width = target_width)
     };
-    let fit = |text: &str| -> String {
-        truncate_pad(text, width)
-    };
+    let fit = |text: &str| -> String { truncate_pad(text, width) };
     let push_line = |out: &mut String, text: &str| {
         out.push_str(&format!("│{}│\n", fit(text)));
     };

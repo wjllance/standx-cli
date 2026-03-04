@@ -2,6 +2,7 @@
 
 use crate::cli::*;
 use anyhow::Result;
+use futures::future::join_all;
 use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
@@ -13,9 +14,8 @@ use standx_cli::models::{
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use futures::future::join_all;
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::{watch, RwLock};
@@ -938,37 +938,41 @@ pub async fn handle_dashboard(
 
         if let Some(first_symbol) = first_symbol {
             // Seed initial trades so first frame has data even before websocket receives updates.
-            if let Ok(initial_trades) = client.get_recent_trades(&first_symbol, Some(5)).await {
+            if let Ok(initial_trades) = client.get_recent_trades(&first_symbol, Some(7)).await {
                 let mut buf = ws_trades.write().await;
                 for trade in initial_trades {
                     buf.push_back(trade);
                 }
-                while buf.len() > 5 {
+                while buf.len() > 7 {
                     buf.pop_back();
                 }
             }
 
             if let Ok(ws) = StandXWebSocket::without_auth() {
-                if ws.subscribe("public_trade", Some(&first_symbol)).await.is_ok() {
+                if ws
+                    .subscribe("public_trade", Some(&first_symbol))
+                    .await
+                    .is_ok()
+                {
                     let (trade_updates_tx, trade_updates_rx) = watch::channel(0_u64);
                     ws_trade_updates_rx = Some(trade_updates_rx);
                     let mut update_seq: u64 = 0;
                     if let Ok(mut rx) = ws.connect().await {
                         ws_trades_enabled = true;
-                    let ws_trades_clone = ws_trades.clone();
-                    tokio::spawn(async move {
-                        while let Some(msg) = rx.recv().await {
-                            if let WsMessage::Trade(trade) = msg {
-                                let mut trades = ws_trades_clone.write().await;
-                                trades.push_front(trade);
-                                while trades.len() > 5 {
-                                    trades.pop_back();
+                        let ws_trades_clone = ws_trades.clone();
+                        tokio::spawn(async move {
+                            while let Some(msg) = rx.recv().await {
+                                if let WsMessage::Trade(trade) = msg {
+                                    let mut trades = ws_trades_clone.write().await;
+                                    trades.push_front(trade);
+                                    while trades.len() > 7 {
+                                        trades.pop_back();
+                                    }
+                                    update_seq = update_seq.wrapping_add(1);
+                                    let _ = trade_updates_tx.send(update_seq);
                                 }
-                                update_seq = update_seq.wrapping_add(1);
-                                let _ = trade_updates_tx.send(update_seq);
                             }
-                        }
-                    });
+                        });
                     }
                 }
             }
@@ -1140,7 +1144,7 @@ async fn build_dashboard_output(
             buf.iter().cloned().collect()
         } else {
             client
-                .get_recent_trades(first_symbol, Some(5))
+                .get_recent_trades(first_symbol, Some(7))
                 .await
                 .unwrap_or_default()
         };
@@ -1267,7 +1271,9 @@ async fn build_portfolio_output(
         OutputFormat::Table => {
             let mut text = String::new();
             if balance.is_none() {
-                text.push_str("⚠️  Not authenticated. Run 'standx auth login' to access account data.\n\n");
+                text.push_str(
+                    "⚠️  Not authenticated. Run 'standx auth login' to access account data.\n\n",
+                );
             }
             text.push_str("=== Portfolio Summary ===\n");
             text.push_str(&format!("Timestamp: {}\n\n", snapshot.timestamp));
@@ -1276,11 +1282,17 @@ async fn build_portfolio_output(
             text.push_str("--- Account ---\n");
             text.push_str(&format!("  Total Value: ${}\n", snapshot.total_value_usd));
             text.push_str(&format!("  PnL 24h: ${}\n", snapshot.total_pnl_24h));
-            text.push_str(&format!("  Unrealized PnL: ${}\n\n", snapshot.total_pnl_realized));
+            text.push_str(&format!(
+                "  Unrealized PnL: ${}\n\n",
+                snapshot.total_pnl_realized
+            ));
 
             // Positions
             if !snapshot.positions.is_empty() {
-                text.push_str(&format!("--- Positions ({}) ---\n", snapshot.positions.len()));
+                text.push_str(&format!(
+                    "--- Positions ({}) ---\n",
+                    snapshot.positions.len()
+                ));
                 text.push_str(&format!("{}\n", output::format_table(snapshot.positions)));
             } else {
                 text.push_str("--- No open positions ---\n");
