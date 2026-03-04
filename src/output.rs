@@ -345,7 +345,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     };
     let account_str = if let Some(ref bal) = snapshot.account {
         format!(
-            "Total={} Available={} uPnL={} PnL={}",
+            "Total={} Available={} uPnL={} rPnL={}",
             fmt2(&bal.balance),
             fmt2(&bal.cross_available),
             fmt2(&bal.upnl),
