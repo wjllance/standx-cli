@@ -7,14 +7,18 @@ use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
 use standx_cli::error::Error as StandxError;
-use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, PortfolioSnapshot, TimeInForce};
+use standx_cli::models::{
+    DashboardSnapshot, OrderSide, OrderType, PortfolioSnapshot, TimeInForce, Trade,
+};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use futures::future::join_all;
 use std::future::Future;
 use std::time::Duration;
 use tokio::signal;
+use tokio::sync::{watch, RwLock};
 
 /// Portfolio command for direct execution (without subcommands)
 #[derive(Debug)]
@@ -843,6 +847,7 @@ async fn run_watch_loop<F, Fut>(
     watch: Option<u64>,
     mut render_once: F,
     error_prefix: &str,
+    mut update_rx: Option<watch::Receiver<u64>>,
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
@@ -867,6 +872,18 @@ where
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
+                ws_updated = async {
+                    if let Some(rx) = update_rx.as_mut() {
+                        rx.changed().await.is_ok()
+                    } else {
+                        std::future::pending::<bool>().await
+                    }
+                } => {
+                    // If sender is dropped, disable event-triggered refresh and keep interval refresh.
+                    if !ws_updated {
+                        update_rx = None;
+                    }
+                }
             }
         }
         Ok(())
@@ -896,11 +913,78 @@ pub async fn handle_dashboard(
         vec![]
     };
     let client = StandXClient::new()?;
+    let ws_trades: Arc<RwLock<VecDeque<Trade>>> = Arc::new(RwLock::new(VecDeque::new()));
+    let mut ws_trade_updates_rx: Option<watch::Receiver<u64>> = None;
+    let mut ws_trades_enabled = false;
+
+    if watch.is_some() {
+        let first_symbol = if let Some(symbol) = symbol_list.first() {
+            Some(symbol.clone())
+        } else {
+            client
+                .get_symbol_info()
+                .await
+                .ok()
+                .and_then(|symbols| symbols.into_iter().next().map(|s| s.symbol))
+        };
+
+        if let Some(first_symbol) = first_symbol {
+            // Seed initial trades so first frame has data even before websocket receives updates.
+            if let Ok(initial_trades) = client.get_recent_trades(&first_symbol, Some(5)).await {
+                let mut buf = ws_trades.write().await;
+                for trade in initial_trades {
+                    buf.push_back(trade);
+                }
+                while buf.len() > 5 {
+                    buf.pop_back();
+                }
+            }
+
+            if let Ok(ws) = StandXWebSocket::without_auth() {
+                if ws.subscribe("public_trade", Some(&first_symbol)).await.is_ok() {
+                    let (trade_updates_tx, trade_updates_rx) = watch::channel(0_u64);
+                    ws_trade_updates_rx = Some(trade_updates_rx);
+                    let mut update_seq: u64 = 0;
+                    if let Ok(mut rx) = ws.connect().await {
+                        ws_trades_enabled = true;
+                    let ws_trades_clone = ws_trades.clone();
+                    tokio::spawn(async move {
+                        while let Some(msg) = rx.recv().await {
+                            if let WsMessage::Trade(trade) = msg {
+                                let mut trades = ws_trades_clone.write().await;
+                                trades.push_front(trade);
+                                while trades.len() > 5 {
+                                    trades.pop_back();
+                                }
+                                update_seq = update_seq.wrapping_add(1);
+                                let _ = trade_updates_tx.send(update_seq);
+                            }
+                        }
+                    });
+                    }
+                }
+            }
+        }
+    }
 
     run_watch_loop(
         watch,
-        || build_dashboard_output(&client, &symbol_list, verbose, output_format, compact),
+        || {
+            build_dashboard_output(
+                &client,
+                &symbol_list,
+                verbose,
+                output_format,
+                compact,
+                if ws_trades_enabled {
+                    Some(ws_trades.clone())
+                } else {
+                    None
+                },
+            )
+        },
         "Dashboard refresh failed",
+        ws_trade_updates_rx,
     )
     .await
 }
@@ -912,6 +996,7 @@ async fn build_dashboard_output(
     _verbose: bool,
     output_format: OutputFormat,
     compact: bool,
+    ws_trades: Option<Arc<RwLock<VecDeque<Trade>>>>,
 ) -> Result<String> {
     // Check if filtering by symbols
     let has_filter = !symbol_filter.is_empty();
@@ -1039,16 +1124,21 @@ async fn build_dashboard_output(
         }
     }
 
-    // Fetch recent trades + order book for first symbol in parallel
+    // Fetch recent trades + order book for first symbol.
+    // In watch mode we prefer websocket-fed trades buffer to avoid polling for trades.
     let (trades, order_book) = if let Some(first_symbol) = symbol_list.first() {
-        let (trades_result, order_book_result) = tokio::join!(
-            client.get_recent_trades(first_symbol, Some(5)),
-            client.get_depth(first_symbol, Some(5))
-        );
-        (
-            trades_result.unwrap_or_default(),
-            order_book_result.ok(),
-        )
+        let trades = if let Some(ws_buf) = ws_trades {
+            let buf = ws_buf.read().await;
+            buf.iter().cloned().collect()
+        } else {
+            client
+                .get_recent_trades(first_symbol, Some(5))
+                .await
+                .unwrap_or_default()
+        };
+
+        let order_book = client.get_depth(first_symbol, Some(5)).await.ok();
+        (trades, order_book)
     } else {
         (Vec::new(), None)
     };
@@ -1102,6 +1192,7 @@ pub async fn handle_portfolio(
                 watch,
                 || build_portfolio_output(&client, _verbose, output_format),
                 "Portfolio refresh failed",
+                None,
             )
             .await?;
         }

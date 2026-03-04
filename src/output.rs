@@ -1,7 +1,45 @@
 //! Output formatting utilities
 
 use crate::models::*;
+use chrono::{DateTime, TimeZone, Utc};
 use tabled::{Table as TabledTable, Tabled};
+
+fn format_trade_time_short(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // Handle unix timestamps from API/websocket (seconds or milliseconds).
+    if let Ok(ts) = raw.parse::<i64>() {
+        let dt = if raw.len() >= 13 {
+            Utc.timestamp_millis_opt(ts).single()
+        } else {
+            Utc.timestamp_opt(ts, 0).single()
+        };
+        if let Some(dt) = dt {
+            return dt.format("%H:%M:%S").to_string();
+        }
+    }
+
+    // Handle RFC3339-like strings: "2026-03-04T02:21:26.633550Z"
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return dt.with_timezone(&Utc).format("%H:%M:%S").to_string();
+    }
+
+    // Fallback to the previous best-effort splitter.
+    if raw.contains('T') {
+        return raw
+            .split('T')
+            .nth(1)
+            .unwrap_or(raw)
+            .split('.')
+            .next()
+            .unwrap_or(raw)
+            .to_string();
+    }
+
+    raw.to_string()
+}
 
 /// Format data as table
 pub fn format_table<T: Tabled>(data: Vec<T>) -> String {
@@ -399,18 +437,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
             push_line(&mut output, "   No recent trades");
         } else {
             for t in &snapshot.trades {
-                // Format time to HH:MM:SS from ISO format "2026-03-04T02:21:26.633550Z"
-                let time_short = if t.time.contains('T') {
-                    t.time
-                        .split('T')
-                        .nth(1)
-                        .unwrap_or(&t.time)
-                        .split('.')
-                        .next()
-                        .unwrap_or(&t.time)
-                } else {
-                    &t.time
-                };
+                let time_short = format_trade_time_short(&t.time);
                 // Use is_buyer_taker to determine side
                 let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
                 let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
