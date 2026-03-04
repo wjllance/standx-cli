@@ -330,10 +330,17 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     output.push_str(&sep());
 
     // ACCOUNT
+    let fmt2 = |v: &str| -> String {
+        v.parse::<f64>()
+            .map(|n| format!("{:.2}", n))
+            .unwrap_or_else(|_| v.to_string())
+    };
     let account_str = if let Some(ref bal) = snapshot.account {
         format!(
             "Total={} Available={} PnL={}",
-            bal.balance, bal.cross_available, bal.pnl_24h
+            fmt2(&bal.balance),
+            fmt2(&bal.cross_available),
+            fmt2(&bal.pnl_24h)
         )
     } else {
         "Not authenticated".to_string()
