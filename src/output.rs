@@ -1,7 +1,7 @@
 //! Output formatting utilities
 
 use crate::models::*;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use tabled::{Table as TabledTable, Tabled};
 
 fn format_trade_time_short(raw: &str) -> String {
@@ -11,19 +11,19 @@ fn format_trade_time_short(raw: &str) -> String {
 
     // Handle unix timestamps from API/websocket (seconds or milliseconds).
     if let Ok(ts) = raw.parse::<i64>() {
-        let dt = if raw.len() >= 13 {
+        let dt_utc = if raw.len() >= 13 {
             Utc.timestamp_millis_opt(ts).single()
         } else {
             Utc.timestamp_opt(ts, 0).single()
         };
-        if let Some(dt) = dt {
-            return dt.format("%H:%M:%S").to_string();
+        if let Some(dt) = dt_utc {
+            return dt.with_timezone(&Local).format("%H:%M:%S").to_string();
         }
     }
 
     // Handle RFC3339-like strings: "2026-03-04T02:21:26.633550Z"
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        return dt.with_timezone(&Utc).format("%H:%M:%S").to_string();
+        return dt.with_timezone(&Local).format("%H:%M:%S").to_string();
     }
 
     // Fallback to the previous best-effort splitter.
@@ -286,7 +286,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     };
 
     // Header
-    let now = chrono::Utc::now();
+    let now = chrono::Local::now();
     let time_str = now.format("%H:%M:%S").to_string();
     output.push_str(&border());
     let title = " standx dashboard";
