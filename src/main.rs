@@ -3,7 +3,7 @@ mod commands;
 mod telemetry;
 
 use clap::Parser;
-use cli::{Cli, Commands, DashboardCommands, OutputFormat};
+use cli::{Cli, Commands, OutputFormat};
 use telemetry::Telemetry;
 
 /// Print cool splash screen
@@ -152,13 +152,7 @@ async fn execute_command(
             watch,
             compact,
         } => {
-            let command = DashboardCommands::Snapshot {
-                symbols,
-                verbose,
-                watch,
-                compact,
-            };
-            commands::handle_dashboard(command, output).await?;
+            commands::handle_dashboard(symbols, verbose, watch, compact, output).await?;
         }
         Commands::Portfolio { verbose, watch } => {
             let command = crate::commands::PortfolioCommand::Snapshot { _verbose: verbose, watch };

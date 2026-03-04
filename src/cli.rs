@@ -92,7 +92,7 @@ pub enum Commands {
     #[command(visible_alias = "d")]
     Dashboard {
         /// Filter by specific symbols (comma-separated)
-        #[arg(short, long)]
+        #[arg(short, long = "symbols", alias = "symbol")]
         symbols: Option<String>,
         /// Enable verbose output with more details
         #[arg(short, long)]
@@ -332,25 +332,6 @@ pub enum StreamCommands {
     Balance,
     /// Stream fill/trade updates (authenticated)
     Fills,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum DashboardCommands {
-    /// Get a comprehensive dashboard view
-    Snapshot {
-        /// Filter by specific symbols (comma-separated)
-        #[arg(short, long)]
-        symbols: Option<String>,
-        /// Enable verbose output with more details
-        #[arg(short, long)]
-        verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
-        watch: Option<u64>,
-        /// Compact mode: skip RECENT TRADES section
-        #[arg(long)]
-        compact: bool,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]

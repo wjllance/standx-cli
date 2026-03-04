@@ -109,6 +109,15 @@ pub struct MarketData {
     pub low_24h: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub funding_rate: String,
+    /// Optional 24h change percentage from API, when available
+    #[serde(
+        default,
+        alias = "price_change_percent_24h",
+        alias = "price_change_24h",
+        alias = "change_24h",
+        deserialize_with = "string_or_number_to_string"
+    )]
+    pub change_24h_percent: String,
     pub next_funding_time: String,
 }
 

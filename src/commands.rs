@@ -6,11 +6,13 @@ use standx_cli::auth::Credentials;
 use standx_cli::client::order::CreateOrderParams;
 use standx_cli::client::StandXClient;
 use standx_cli::config::Config;
+use standx_cli::error::Error as StandxError;
 use standx_cli::models::{DashboardSnapshot, OrderSide, OrderType, PortfolioSnapshot, TimeInForce};
 use standx_cli::output;
 use standx_cli::websocket::{StandXWebSocket, WsMessage};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use futures::future::join_all;
+use std::future::Future;
+use std::time::Duration;
 use tokio::signal;
 
 /// Portfolio command for direct execution (without subcommands)
@@ -826,73 +828,84 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
     Ok(())
 }
 
-/// Handle dashboard commands - unified view of account, positions, orders, and market data
-pub async fn handle_dashboard(
-    command: DashboardCommands,
-    output_format: OutputFormat,
-) -> Result<()> {
-    match command {
-        DashboardCommands::Snapshot {
-            symbols,
-            verbose,
-            watch,
-            compact,
-        } => {
-            // Build list of symbols to track
-            let symbol_list: Vec<String> = if let Some(s) = symbols {
-                s.split(',').map(|s| s.trim().to_string()).collect()
-            } else {
-                vec![]
-            };
+fn is_auth_error(error: &StandxError) -> bool {
+    matches!(
+        error,
+        StandxError::AuthRequired { .. }
+            | StandxError::TokenExpired { .. }
+            | StandxError::InvalidCredentials { .. }
+            | StandxError::Api { code: 401, .. }
+    )
+}
 
-            // Create flag for watch mode interruption
-            let should_stop = Arc::new(AtomicBool::new(false));
-            let should_stop_clone = should_stop.clone();
+async fn run_watch_loop<F, Fut>(
+    watch: Option<u64>,
+    mut render_once: F,
+    error_prefix: &str,
+) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    if let Some(interval_secs) = watch {
+        loop {
+            // Clear screen and move to home
+            print!("\x1B[2J\x1B[1H");
 
-            // Set up Ctrl+C handler for watch mode
-            if watch.is_some() {
-                tokio::spawn(async move {
-                    signal::ctrl_c().await.ok();
-                    should_stop_clone.store(true, Ordering::Relaxed);
-                });
+            if let Err(e) = render_once().await {
+                eprintln!("⚠️  {}: {}", error_prefix, e);
             }
 
-            // Watch mode loop
-            if let Some(interval_secs) = watch {
-                loop {
-                    if should_stop.load(Ordering::Relaxed) {
-                        println!("\n👋 Stopping watch mode");
-                        break;
-                    }
-
-                    // Clear screen and move to home
-                    print!("\x1B[2J\x1B[1H");
-
-                    // Fetch data FIRST (no blank screen while waiting)
-                    fetch_and_display_dashboard(&symbol_list, verbose, output_format, compact)
-                        .await?;
-
-                    // Sleep until next refresh
-                    tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    println!("\n👋 Stopping watch mode");
+                    break;
                 }
-            } else {
-                // Single snapshot mode
-                fetch_and_display_dashboard(&symbol_list, verbose, output_format, compact).await?;
+                _ = tokio::time::sleep(Duration::from_secs(interval_secs)) => {}
             }
         }
+        Ok(())
+    } else {
+        render_once().await
     }
-    Ok(())
+}
+
+/// Handle dashboard commands - unified view of account, positions, orders, and market data
+pub async fn handle_dashboard(
+    symbols: Option<String>,
+    verbose: bool,
+    watch: Option<u64>,
+    compact: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
+    // Build list of symbols to track
+    let symbol_list: Vec<String> = if let Some(s) = symbols {
+        s.split(',')
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .collect()
+    } else {
+        vec![]
+    };
+    let client = StandXClient::new()?;
+
+    run_watch_loop(
+        watch,
+        || fetch_and_display_dashboard(&client, &symbol_list, verbose, output_format, compact),
+        "Dashboard refresh failed",
+    )
+    .await
 }
 
 /// Fetch and display dashboard data with optional symbol filtering
 async fn fetch_and_display_dashboard(
+    client: &StandXClient,
     symbol_filter: &[String],
     _verbose: bool,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
-    let client = StandXClient::new()?;
-
     // Check if filtering by symbols
     let has_filter = !symbol_filter.is_empty();
 
@@ -903,23 +916,24 @@ async fn fetch_and_display_dashboard(
         // Get all available symbols from API
         client
             .get_symbol_info()
-            .await
-            .unwrap_or_default()
+            .await?
             .into_iter()
             .map(|s| s.symbol)
             .collect()
     };
 
+    // Fetch authenticated endpoints concurrently
+    let (balance_result, positions_result, orders_result) = tokio::join!(
+        client.get_balance(),
+        client.get_positions(None),
+        client.get_open_orders(None)
+    );
+
     // Try to fetch authenticated data, handle auth errors gracefully
-    let result = client.get_balance().await;
-    let (account, auth_warning) = match result {
+    let (account, auth_warning) = match balance_result {
         Ok(balance) => (Some(balance), None),
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("401")
-                || err_str.contains("Unauthorized")
-                || err_str.contains("Authentication required")
-            {
+            if is_auth_error(&e) {
                 (
                     None,
                     Some("⚠️  Not authenticated. Run 'standx auth login' to access account data."),
@@ -936,9 +950,16 @@ async fn fetch_and_display_dashboard(
         println!();
     };
 
-    // Fetch positions and orders (may fail if not authenticated)
-    let all_positions = client.get_positions(None).await.unwrap_or_default();
-    let all_orders = client.get_open_orders(None).await.unwrap_or_default();
+    let all_positions = match positions_result {
+        Ok(positions) => positions,
+        Err(e) if is_auth_error(&e) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    let all_orders = match orders_result {
+        Ok(orders) => orders,
+        Err(e) if is_auth_error(&e) => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
 
     // Filter by symbol if specified, and filter out zero-qty positions
     let positions = if has_filter {
@@ -972,28 +993,30 @@ async fn fetch_and_display_dashboard(
     };
 
     // Fetch market data for tracked symbols (always works without auth)
-    let mut market = Vec::new();
-    for symbol in &symbol_list {
-        if let Ok(ticker) = client.get_symbol_market(symbol).await {
-            market.push(ticker);
-        }
-    }
+    let market_results = join_all(
+        symbol_list
+            .iter()
+            .map(|symbol| client.get_symbol_market(symbol)),
+    )
+    .await;
+    let market = market_results
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .collect();
 
-    // Fetch recent trades for first symbol
-    let mut trades = Vec::new();
-    if let Some(first_symbol) = symbol_list.first() {
-        if let Ok(t) = client.get_recent_trades(first_symbol, Some(5)).await {
-            trades = t;
-        }
-    }
-
-    // Fetch order book for first symbol
-    let mut order_book = None;
-    if let Some(first_symbol) = symbol_list.first() {
-        if let Ok(ob) = client.get_depth(first_symbol, Some(5)).await {
-            order_book = Some(ob);
-        }
-    }
+    // Fetch recent trades + order book for first symbol in parallel
+    let (trades, order_book) = if let Some(first_symbol) = symbol_list.first() {
+        let (trades_result, order_book_result) = tokio::join!(
+            client.get_recent_trades(first_symbol, Some(5)),
+            client.get_depth(first_symbol, Some(5))
+        );
+        (
+            trades_result.unwrap_or_default(),
+            order_book_result.ok(),
+        )
+    } else {
+        (Vec::new(), None)
+    };
 
     // Create dashboard snapshot
     let snapshot = DashboardSnapshot {
@@ -1035,58 +1058,30 @@ pub async fn handle_portfolio(
 ) -> Result<()> {
     match command {
         PortfolioCommand::Snapshot { _verbose, watch } => {
-            // Create flag for watch mode interruption
-            let should_stop = Arc::new(AtomicBool::new(false));
-            let should_stop_clone = should_stop.clone();
-
-            // Set up Ctrl+C handler for watch mode
-            if watch.is_some() {
-                tokio::spawn(async move {
-                    signal::ctrl_c().await.ok();
-                    should_stop_clone.store(true, Ordering::Relaxed);
-                });
-            }
-
-            // Watch mode loop
-            if let Some(interval_secs) = watch {
-                loop {
-                    if should_stop.load(Ordering::Relaxed) {
-                        println!("\n👋 Stopping watch mode");
-                        break;
-                    }
-
-                    // Clear screen and move to home
-                    print!("\x1B[2J\x1B[1H");
-
-                    // Fetch data FIRST (no blank screen while waiting)
-                    fetch_and_display_portfolio(_verbose, output_format).await?;
-
-                    // Sleep until next refresh
-                    tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-                }
-            } else {
-                // Single snapshot mode
-                fetch_and_display_portfolio(_verbose, output_format).await?;
-            }
+            let client = StandXClient::new()?;
+            run_watch_loop(
+                watch,
+                || fetch_and_display_portfolio(&client, _verbose, output_format),
+                "Portfolio refresh failed",
+            )
+            .await?;
         }
     }
     Ok(())
 }
 
 /// Fetch and display portfolio data
-async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat) -> Result<()> {
-    let client = StandXClient::new()?;
-
+async fn fetch_and_display_portfolio(
+    client: &StandXClient,
+    verbose: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
     // Try to fetch authenticated data, handle auth errors gracefully
     let balance_result = client.get_balance().await;
     let balance = match balance_result {
         Ok(b) => Some(b),
         Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("401")
-                || err_str.contains("Unauthorized")
-                || err_str.contains("Authentication required")
-            {
+            if is_auth_error(&e) {
                 eprintln!("⚠️  Not authenticated. Run 'standx auth login' to access account data.");
                 None
             } else {
@@ -1097,7 +1092,11 @@ async fn fetch_and_display_portfolio(verbose: bool, output_format: OutputFormat)
 
     // If not authenticated, show market data only
     let positions = if balance.is_some() {
-        let positions = client.get_positions(None).await.unwrap_or_default();
+        let positions = match client.get_positions(None).await {
+            Ok(positions) => positions,
+            Err(e) if is_auth_error(&e) => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
         // Filter out zero-qty positions
         positions
             .into_iter()

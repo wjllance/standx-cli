@@ -219,22 +219,42 @@ mod tests {
 /// Format dashboard as MVP compact view (Issue #156)
 pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> String {
     let mut output = String::new();
-    let width = 65;
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.saturating_sub(2))
+        .filter(|v| *v >= 60)
+        .unwrap_or(78);
 
     // Helper for border
     let border = || format!("┌{}┐\n", "─".repeat(width));
     let sep = || format!("├{}┤\n", "─".repeat(width));
     let footer = || format!("└{}┘\n", "─".repeat(width));
+    let fit = |text: &str| -> String {
+        let mut chars: Vec<char> = text.chars().collect();
+        if chars.len() > width {
+            if width > 3 {
+                chars.truncate(width - 3);
+                let mut trimmed: String = chars.into_iter().collect();
+                trimmed.push_str("...");
+                return format!("{:<width$}", trimmed, width = width);
+            }
+            return ".".repeat(width);
+        }
+        format!("{:<width$}", text, width = width)
+    };
+    let push_line = |out: &mut String, text: &str| {
+        out.push_str(&format!("│{}│\n", fit(text)));
+    };
 
     // Header
     let now = chrono::Utc::now();
     let time_str = now.format("%H:%M").to_string();
     output.push_str(&border());
-    output.push_str(&format!(
-        "│ standx dashboard refresh: {:<width$} │\n",
-        time_str,
-        width = width - 6
-    ));
+    let title = " standx dashboard";
+    let right = format!("refresh: {}", time_str);
+    let spacing = width.saturating_sub(title.chars().count() + right.chars().count());
+    output.push_str(&format!("│{}{}{}│\n", title, " ".repeat(spacing), right));
     output.push_str(&sep());
 
     // TICKERS
@@ -242,27 +262,22 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
         .market
         .iter()
         .map(|m| {
-            let last: f64 = m.last_price.parse().unwrap_or(0.0);
-            let low: f64 = m.low_24h.parse().unwrap_or(0.0);
-            let change = if low > 0.0 {
-                ((last - low) / low) * 100.0
-            } else {
-                0.0
-            };
-            let arrow = if change > 0.0 {
-                "▲"
-            } else if change < 0.0 {
-                "▼"
-            } else {
-                ""
-            };
-            format!(
-                "{} ${} {}{:.2}%",
-                m.symbol,
-                m.mark_price,
-                arrow,
-                change.abs()
-            )
+            let change_display = m
+                .change_24h_percent
+                .parse::<f64>()
+                .ok()
+                .map(|change| {
+                    let arrow = if change > 0.0 {
+                        "▲"
+                    } else if change < 0.0 {
+                        "▼"
+                    } else {
+                        ""
+                    };
+                    format!("{} {:.2}%", arrow, change.abs())
+                })
+                .unwrap_or_else(|| "N/A".to_string());
+            format!("{} ${} {}", m.symbol, m.mark_price, change_display)
         })
         .collect();
 
@@ -271,11 +286,7 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     } else {
         tickers.join(" | ")
     };
-    output.push_str(&format!(
-        "│ TICKERS: {:<width$} │\n",
-        tickers_str,
-        width = width - 12
-    ));
+    push_line(&mut output, &format!(" TICKERS: {}", tickers_str));
     output.push_str(&sep());
 
     // ACCOUNT
@@ -287,17 +298,13 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     } else {
         "Not authenticated".to_string()
     };
-    output.push_str(&format!(
-        "│ ACCOUNT: {:<width$} │\n",
-        account_str,
-        width = width - 12
-    ));
+    push_line(&mut output, &format!(" ACCOUNT: {}", account_str));
     output.push_str(&sep());
 
     // POSITIONS
-    output.push_str("│ POSITIONS:\n");
+    push_line(&mut output, " POSITIONS:");
     if snapshot.positions.is_empty() {
-        output.push_str("│   No open positions\n");
+        push_line(&mut output, "   No open positions");
     } else {
         for (i, p) in snapshot.positions.iter().enumerate() {
             let side = format!("{:?}", p.side.unwrap_or(crate::models::OrderSide::Buy));
@@ -316,40 +323,58 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
                 p.upnl,
                 pnl_arrow
             );
-            output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+            push_line(&mut output, &format!("   {}", line));
         }
     }
     output.push_str(&sep());
 
     // ORDER BOOK + ACTIVE ORDERS
-    output.push_str("│ ORDER BOOK:\n");
-    // Show order book depth data if available
     if let Some(ref ob) = snapshot.order_book {
-        // Show top 3 asks (sell orders)
-        let asks: Vec<String> = ob.asks.iter().take(3).map(|a| format!("{} ({})", a[0], a[1])).collect();
-        if !asks.is_empty() {
-            output.push_str(&format!("│   Asks: {:<width$} │\n", asks.join(" "), width = width - 12));
-        }
-        // Show top 3 bids (buy orders)
-        let bids: Vec<String> = ob.bids.iter().take(3).map(|b| format!("{} ({})", b[0], b[1])).collect();
-        if !bids.is_empty() {
-            output.push_str(&format!("│   Bids: {:<width$} │\n", bids.join(" "), width = width - 12));
-        }
+        push_line(&mut output, &format!(" ORDER BOOK ({}):", ob.symbol));
+        let asks: Vec<String> = ob
+            .asks
+            .iter()
+            .take(3)
+            .map(|a| format!("{}({})", a[0], a[1]))
+            .collect();
+        let bids: Vec<String> = ob
+            .bids
+            .iter()
+            .take(3)
+            .map(|b| format!("{}({})", b[0], b[1]))
+            .collect();
+        push_line(
+            &mut output,
+            &format!(
+                "   Asks: {}",
+                if asks.is_empty() {
+                    "No asks".to_string()
+                } else {
+                    asks.join(" ")
+                }
+            ),
+        );
+        push_line(
+            &mut output,
+            &format!(
+                "   Bids: {}",
+                if bids.is_empty() {
+                    "No bids".to_string()
+                } else {
+                    bids.join(" ")
+                }
+            ),
+        );
     } else {
-        // Get symbol from market if no order book
-        if let Some(m) = snapshot.market.first() {
-            output.push_str(&format!(
-                "│   Symbol: {:<width$} │\n",
-                m.symbol,
-                width = width - 14
-            ));
-        }
+        push_line(&mut output, " ORDER BOOK: unavailable");
     }
 
-    // Active orders
-    output.push_str("│ ACTIVE ORDERS:\n");
+    output.push_str(&sep());
+
+    // Show order book depth data if available
+    push_line(&mut output, " ACTIVE ORDERS:");
     if snapshot.orders.is_empty() {
-        output.push_str("│   No open orders\n");
+        push_line(&mut output, "   No open orders");
     } else {
         for (i, o) in snapshot.orders.iter().enumerate() {
             let line = format!(
@@ -360,31 +385,43 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
                 o.qty,
                 o.price
             );
-            output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+            push_line(&mut output, &format!("   {}", line));
         }
     }
 
     // RECENT TRADES (skip if compact)
     if !compact {
         output.push_str(&sep());
-        output.push_str("│ RECENT TRADES:\n");
+        push_line(&mut output, " RECENT TRADES:");
         if snapshot.trades.is_empty() {
-            output.push_str("│   No recent trades\n");
+            push_line(&mut output, "   No recent trades");
         } else {
             for t in &snapshot.trades {
                 // Format time to HH:MM:SS from ISO format "2026-03-04T02:21:26.633550Z"
                 let time_short = if t.time.contains('T') {
-                    t.time.split('T').nth(1).unwrap_or(&t.time).split('.').next().unwrap_or(&t.time)
+                    t.time
+                        .split('T')
+                        .nth(1)
+                        .unwrap_or(&t.time)
+                        .split('.')
+                        .next()
+                        .unwrap_or(&t.time)
                 } else {
                     &t.time
                 };
                 // Use is_buyer_taker to determine side
                 let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
                 let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
-                output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+                push_line(&mut output, &format!("   {}", line));
             }
         }
     }
+
+    output.push_str(&sep());
+    push_line(
+        &mut output,
+        " Usage: standx dashboard --symbol BTCUSDT --watch 5",
+    );
 
     // Footer
     output.push_str(&footer());
