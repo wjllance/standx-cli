@@ -424,12 +424,18 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
         push_line(&mut output, "   No open orders");
     } else {
         for (i, o) in snapshot.orders.iter().enumerate() {
+            let side = format!("{:?}", o.side);
+            let qty_display = if o.qty.parse::<f64>().unwrap_or(-1.0).abs() < f64::EPSILON {
+                "All".to_string()
+            } else {
+                o.qty.clone()
+            };
             let line = format!(
-                "#{} {} {:?} {} @{}",
+                "#{} {} {} {} @{}",
                 i + 1,
                 o.symbol,
-                o.side,
-                o.qty,
+                side,
+                qty_display,
                 o.price
             );
             push_line(&mut output, &format!("   {}", line));
