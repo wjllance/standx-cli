@@ -109,6 +109,15 @@ pub struct MarketData {
     pub low_24h: String,
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub funding_rate: String,
+    /// Optional 24h change percentage from API, when available
+    #[serde(
+        default,
+        alias = "price_change_percent_24h",
+        alias = "price_change_24h",
+        alias = "change_24h",
+        deserialize_with = "string_or_number_to_string"
+    )]
+    pub change_24h_percent: String,
     pub next_funding_time: String,
 }
 
@@ -601,10 +610,17 @@ pub struct DashboardSnapshot {
     pub account: Option<Balance>,
     /// Open positions
     pub positions: Vec<Position>,
+    /// Sum of realized PnL across all queried positions
+    #[serde(default, deserialize_with = "string_or_number_to_string")]
+    pub total_realized_pnl: String,
     /// Open orders
     pub orders: Vec<Order>,
     /// Market data for tracked symbols
     pub market: Vec<MarketData>,
+    /// Recent trades
+    pub trades: Vec<Trade>,
+    /// Order book for first symbol
+    pub order_book: Option<OrderBook>,
 }
 
 /// Portfolio snapshot - portfolio summary and performance

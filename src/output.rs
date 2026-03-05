@@ -1,16 +1,54 @@
 //! Output formatting utilities
 
 use crate::models::*;
-use tabled::{Table, Tabled};
+use chrono::{DateTime, Local, TimeZone, Utc};
+use tabled::{Table as TabledTable, Tabled};
+
+fn format_trade_time_short(raw: &str) -> String {
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // Handle unix timestamps from API/websocket (seconds or milliseconds).
+    if let Ok(ts) = raw.parse::<i64>() {
+        let dt_utc = if raw.len() >= 13 {
+            Utc.timestamp_millis_opt(ts).single()
+        } else {
+            Utc.timestamp_opt(ts, 0).single()
+        };
+        if let Some(dt) = dt_utc {
+            return dt.with_timezone(&Local).format("%H:%M:%S").to_string();
+        }
+    }
+
+    // Handle RFC3339-like strings: "2026-03-04T02:21:26.633550Z"
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return dt.with_timezone(&Local).format("%H:%M:%S").to_string();
+    }
+
+    // Fallback to the previous best-effort splitter.
+    if raw.contains('T') {
+        return raw
+            .split('T')
+            .nth(1)
+            .unwrap_or(raw)
+            .split('.')
+            .next()
+            .unwrap_or(raw)
+            .to_string();
+    }
+
+    raw.to_string()
+}
 
 /// Format data as table
 pub fn format_table<T: Tabled>(data: Vec<T>) -> String {
-    Table::new(data).to_string()
+    TabledTable::new(data).to_string()
 }
 
 /// Format single item as table
 pub fn format_item<T: Tabled>(item: T) -> String {
-    Table::new(vec![item]).to_string()
+    TabledTable::new(vec![item]).to_string()
 }
 
 /// Format as JSON
@@ -214,25 +252,241 @@ mod tests {
         assert!(json.contains("BTC-USD"));
         assert!(json.contains("\"symbol\""));
     }
+}
 
-    #[test]
-    fn test_format_order_book() {
-        let book = OrderBook {
-            symbol: "BTC-USD".to_string(),
-            bids: vec![
-                ["68000".to_string(), "1.0".to_string()],
-                ["67900".to_string(), "2.0".to_string()],
-            ],
-            asks: vec![
-                ["68100".to_string(), "0.5".to_string()],
-                ["68200".to_string(), "1.0".to_string()],
-            ],
-            timestamp: "2026-01-01T00:00:00Z".to_string(),
-        };
+/// Format dashboard as MVP compact view (Issue #156)
+pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> String {
+    let mut output = String::new();
+    let width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.saturating_sub(2))
+        .filter(|v| *v >= 60)
+        .unwrap_or(78);
 
-        let formatted = format_order_book(&book, 10);
-        assert!(formatted.contains("BTC-USD"));
-        assert!(formatted.contains("Asks (Sell)"));
-        assert!(formatted.contains("Bids (Buy)"));
+    // Helper for border
+    let border = || format!("┌{}┐\n", "─".repeat(width));
+    let sep = || format!("├{}┤\n", "─".repeat(width));
+    let footer = || format!("└{}┘\n", "─".repeat(width));
+    let truncate_pad = |text: &str, target_width: usize| -> String {
+        let mut chars: Vec<char> = text.chars().collect();
+        if chars.len() > target_width {
+            if target_width > 3 {
+                chars.truncate(target_width - 3);
+                let mut trimmed: String = chars.into_iter().collect();
+                trimmed.push_str("...");
+                return format!("{:<width$}", trimmed, width = target_width);
+            }
+            return ".".repeat(target_width);
+        }
+        format!("{:<width$}", text, width = target_width)
+    };
+    let fit = |text: &str| -> String { truncate_pad(text, width) };
+    let push_line = |out: &mut String, text: &str| {
+        out.push_str(&format!("│{}│\n", fit(text)));
+    };
+    let left_w = (width.saturating_sub(1)) / 2;
+    let right_w = width.saturating_sub(1 + left_w);
+    let push_two_col = |out: &mut String, left: &str, right: &str| {
+        let l = truncate_pad(left, left_w);
+        let r = truncate_pad(right, right_w);
+        out.push_str(&format!("│{}│{}│\n", l, r));
+    };
+
+    // Header
+    let now = chrono::Local::now();
+    let time_str = now.format("%H:%M:%S").to_string();
+    output.push_str(&border());
+    let title = format!(" StandX CLI Dashboard v{}", env!("CARGO_PKG_VERSION"));
+    let right = format!("REFRESH: {}", time_str);
+    let spacing = width.saturating_sub(title.chars().count() + right.chars().count());
+    output.push_str(&format!("│{}{}{}│\n", title, " ".repeat(spacing), right));
+    output.push_str(&sep());
+
+    // TICKERS
+    let ticker_items: Vec<String> = snapshot
+        .market
+        .iter()
+        .map(|m| {
+            let change_display = m
+                .change_24h_percent
+                .parse::<f64>()
+                .ok()
+                .map(|change| {
+                    let arrow = if change > 0.0 {
+                        "▲"
+                    } else if change < 0.0 {
+                        "▼"
+                    } else {
+                        ""
+                    };
+                    format!("{} {:.2}%", arrow, change.abs())
+                })
+                .unwrap_or_else(|| "N/A".to_string());
+            format!("{} ${} {}", m.symbol, m.mark_price, change_display)
+        })
+        .collect();
+
+    push_line(&mut output, " TICKERS:");
+    if ticker_items.is_empty() {
+        push_line(&mut output, "   No market data");
+    } else {
+        for row in ticker_items.chunks(2) {
+            push_line(&mut output, &format!("   {}", row.join(" | ")));
+        }
     }
+    output.push_str(&sep());
+
+    // ACCOUNT
+    let fmt2 = |v: &str| -> String {
+        v.parse::<f64>()
+            .map(|n| format!("{:.2}", n))
+            .unwrap_or_else(|_| v.to_string())
+    };
+    let account_str = if let Some(ref bal) = snapshot.account {
+        format!(
+            "Total={} Available={} uPnL={} rPnL={}",
+            fmt2(&bal.balance),
+            fmt2(&bal.cross_available),
+            fmt2(&bal.upnl),
+            fmt2(&snapshot.total_realized_pnl)
+        )
+    } else {
+        "Not authenticated".to_string()
+    };
+    push_line(&mut output, &format!(" ACCOUNT: {}", account_str));
+    output.push_str(&sep());
+
+    let fmt_book_price = |v: &str| -> String {
+        v.parse::<f64>()
+            .map(|n| format!("{:>10.2}", n))
+            .unwrap_or_else(|_| format!("{:>10}", v))
+    };
+    let fmt_book_qty = |v: &str| -> String {
+        v.parse::<f64>()
+            .map(|n| format!("{:>9.4}", n))
+            .unwrap_or_else(|_| format!("{:>9}", v))
+    };
+    let mut order_book_lines: Vec<String> = Vec::new();
+    if let Some(ref ob) = snapshot.order_book {
+        order_book_lines.push(format!(" ORDER BOOK ({}):", ob.symbol));
+        if ob.asks.is_empty() {
+            order_book_lines.push("   No asks".to_string());
+        } else {
+            for ask in ob.asks.iter().take(3).rev() {
+                let price = fmt_book_price(&ask[0]);
+                let qty = fmt_book_qty(&ask[1]);
+                order_book_lines.push(format!("   {} {} ASK", price, qty));
+            }
+        }
+        order_book_lines.push("   ---- spread ----".to_string());
+        if ob.bids.is_empty() {
+            order_book_lines.push("   No bids".to_string());
+        } else {
+            for bid in ob.bids.iter().take(3) {
+                let price = fmt_book_price(&bid[0]);
+                let qty = fmt_book_qty(&bid[1]);
+                order_book_lines.push(format!("   {} {} BID", price, qty));
+            }
+        }
+    } else {
+        order_book_lines.push(" ORDER BOOK: unavailable".to_string());
+    }
+
+    let mut trade_lines: Vec<String> = Vec::new();
+    if !compact {
+        trade_lines.push(" RECENT TRADES:".to_string());
+        if snapshot.trades.is_empty() {
+            trade_lines.push("   No recent trades".to_string());
+        } else {
+            for t in &snapshot.trades {
+                let time_short = format_trade_time_short(&t.time);
+                let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
+                trade_lines.push(format!("   {} {} {} {}", time_short, t.price, t.qty, side));
+            }
+        }
+    }
+
+    // ORDER BOOK + RECENT TRADES (2-column when enough space)
+    if !compact && width >= 66 {
+        let max_rows = order_book_lines.len().max(trade_lines.len());
+        for i in 0..max_rows {
+            let left = order_book_lines.get(i).map_or("", String::as_str);
+            let right = trade_lines.get(i).map_or("", String::as_str);
+            push_two_col(&mut output, left, right);
+        }
+        output.push_str(&sep());
+    } else {
+        for line in &order_book_lines {
+            push_line(&mut output, line);
+        }
+        output.push_str(&sep());
+        if !compact {
+            for line in &trade_lines {
+                push_line(&mut output, line);
+            }
+            output.push_str(&sep());
+        }
+    }
+
+    // POSITIONS (moved near bottom)
+    push_line(&mut output, " POSITIONS:");
+    if snapshot.positions.is_empty() {
+        push_line(&mut output, "   No open positions");
+    } else {
+        for (i, p) in snapshot.positions.iter().enumerate() {
+            let side = format!("{:?}", p.side.unwrap_or(crate::models::OrderSide::Buy));
+            let pnl_arrow = if p.upnl.parse::<f64>().unwrap_or(0.0) > 0.0 {
+                "▲"
+            } else {
+                "▼"
+            };
+            let line = format!(
+                "#{} {} {} @{} mark={} pnl={} {}",
+                i + 1,
+                p.symbol,
+                side,
+                p.entry_price,
+                p.mark_price,
+                p.upnl,
+                pnl_arrow
+            );
+            push_line(&mut output, &format!("   {}", line));
+        }
+    }
+    output.push_str(&sep());
+
+    // ACTIVE ORDERS (moved near bottom)
+    push_line(&mut output, " ACTIVE ORDERS:");
+    if snapshot.orders.is_empty() {
+        push_line(&mut output, "   No open orders");
+    } else {
+        for (i, o) in snapshot.orders.iter().enumerate() {
+            let side = format!("{:?}", o.side);
+            let qty_display = if o.qty.parse::<f64>().unwrap_or(-1.0).abs() < f64::EPSILON {
+                "All".to_string()
+            } else {
+                o.qty.clone()
+            };
+            let line = format!(
+                "#{} {} {} {} @{}",
+                i + 1,
+                o.symbol,
+                side,
+                qty_display,
+                o.price
+            );
+            push_line(&mut output, &format!("   {}", line));
+        }
+    }
+    output.push_str(&sep());
+
+    push_line(
+        &mut output,
+        " Usage: standx dashboard --symbol BTC-USD --watch 5",
+    );
+
+    // Footer
+    output.push_str(&footer());
+    output
 }

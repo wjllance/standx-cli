@@ -92,14 +92,17 @@ pub enum Commands {
     #[command(visible_alias = "d")]
     Dashboard {
         /// Filter by specific symbols (comma-separated)
-        #[arg(short, long)]
+        #[arg(short, long = "symbols", alias = "symbol")]
         symbols: Option<String>,
         /// Enable verbose output with more details
         #[arg(short, long)]
         verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
+        /// Watch mode: refresh every N seconds (default 5 when flag used without value)
+        #[arg(short, long, num_args = 0..=1, default_missing_value = "5")]
         watch: Option<u64>,
+        /// Compact mode: skip RECENT TRADES section
+        #[arg(long)]
+        compact: bool,
     },
     /// Portfolio - view portfolio summary and performance (alias for portfolio snapshot)
     #[command(visible_alias = "p")]
@@ -107,8 +110,8 @@ pub enum Commands {
         /// Enable verbose output with more details
         #[arg(short, long)]
         verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
+        /// Watch mode: refresh every N seconds (default 5 when flag used without value)
+        #[arg(short, long, num_args = 0..=1, default_missing_value = "5")]
         watch: Option<u64>,
     },
 }
@@ -329,22 +332,6 @@ pub enum StreamCommands {
     Balance,
     /// Stream fill/trade updates (authenticated)
     Fills,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum DashboardCommands {
-    /// Get a comprehensive dashboard view
-    Snapshot {
-        /// Filter by specific symbols (comma-separated)
-        #[arg(short, long)]
-        symbols: Option<String>,
-        /// Enable verbose output with more details
-        #[arg(short, long)]
-        verbose: bool,
-        /// Watch mode: refresh every N seconds
-        #[arg(short, long)]
-        watch: Option<u64>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
