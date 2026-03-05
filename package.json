@@ -1,0 +1,16 @@
+{
+  "name": "standx-cli",
+  "version": "0.3.5",
+  "description": "Crypto trading CLI for StandX exchange with OpenClaw integration",
+  "author": "wjllance",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wjllance/standx-cli-skill.git"
+  },
+  "openclaw": {
+    "minVersion": "0.5.0",
+    "categories": ["finance", "trading", "crypto"],
+    "keywords": ["standx", "crypto", "trading", "btc", "eth", "perpetual", "futures"]
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "name": "standx-cli",
+  "version": "0.5.0",
+  "openclaw": {
+    "emoji": "📈",
+    "requires": {
+      "bins": ["standx"]
+    },
+    "primaryCredential": {
+      "kind": "env",
+      "env": "STANDX_JWT",
+      "description": "StandX JWT token from https://standx.com/user/session (valid 7 days)"
+    },
+    "optionalEnvVars": [
+      {
+        "name": "STANDX_PRIVATE_KEY",
+        "description": "Ed25519 private key (Base58) for trading operations",
+        "sensitive": true
+      }
+    ],
+    "install": [
+      {
+        "id": "brew",
+        "kind": "brew",
+        "formula": "wjllance/standx-cli/standx-cli",
+        "bins": ["standx"],
+        "label": "Install StandX CLI via Homebrew"
+      },
+      {
+        "id": "github-linux",
+        "kind": "script",
+        "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.3.5/standx-v0.3.5-x86_64-unknown-linux-gnu.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
+        "bins": ["standx"],
+        "label": "Install StandX CLI on Linux"
+      },
+      {
+        "id": "github-macos",
+        "kind": "script",
+        "script": "curl -L -o /tmp/standx.tar.gz https://github.com/wjllance/standx-cli/releases/download/v0.3.5/standx-v0.3.5-aarch64-apple-darwin.tar.gz && tar -xzf /tmp/standx.tar.gz -C /tmp && sudo mv /tmp/standx /usr/local/bin/ && sudo chmod +x /usr/local/bin/standx",
+        "bins": ["standx"],
+        "label": "Install StandX CLI on macOS"
+      },
+      {
+        "id": "manual",
+        "kind": "script",
+        "script": "git clone https://github.com/wjllance/standx-cli-skill.git ~/.openclaw/skills/standx-cli && echo 'Skill installed. Please install standx binary separately via Homebrew or direct download.'",
+        "bins": ["standx"],
+        "label": "Manual install (skill only, binary separate)"
+      }
+    ]
+  }
+}

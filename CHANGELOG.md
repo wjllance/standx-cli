@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0-rc.1] - 2026-03-04
+
+### Added
+- **Dashboard MVP** (#157)
+  - Complete dashboard redesign with comfy-table formatting
+  - Real-time order book depth display
+  - Recent trades panel showing BUY/SELL activity
+  - Enhanced account balance formatting with local timezone
+  - Watch mode with graceful exit handling (Ctrl+C)
+  - Instant refresh: fetch data before clearing screen
+  - Dashboard title includes version number
+
+### Changed
+- **Dashboard Output Structure**
+  - Reorganized display sections for improved clarity
+  - Enhanced order display formatting
+  - Better refresh label formatting
+  - Cleaner table alignment
+
+### Fixed
+- **Dashboard Data Flow**
+  - Improved dashboard and portfolio command handling
+  - Enhanced trade handling and output formatting
+  - Removed duplicate tests module in output.rs
+
 ## [0.6.3-rc.3] - 2026-03-03
 
 ### Fixed
