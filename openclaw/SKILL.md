@@ -1,6 +1,6 @@
 ---
 name: standx-cli
-description: "Crypto trading CLI for StandX exchange v0.6.3-rc.1. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings, (6) Monitor real-time dashboard, (7) View portfolio summary. Supports BTC, ETH, SOL, XRP and other trading pairs."
+description: "Crypto trading CLI for StandX exchange v0.7.0-rc.1. Use when users need to: (1) Query crypto market data (prices, order books, klines, funding rates), (2) Manage trading orders (create, cancel, view), (3) Check account balances, positions, and trade history, (4) Stream real-time market data via WebSocket, (5) Manage leverage and margin settings, (6) Monitor real-time dashboard, (7) View portfolio summary. Supports BTC, ETH, SOL, XRP and other trading pairs."
 metadata:
   {
     "openclaw":
@@ -76,7 +76,24 @@ View BTC price:
 
 ```bash
 standx market ticker BTC-USD
+# Or use short alias
+standx m t BTC-USD
 ```
+
+### Command Short Aliases
+
+StandX CLI supports short aliases for faster typing:
+
+| Full Command | Short Alias |
+|--------------|-------------|
+| `standx market ticker` | `standx m t` |
+| `standx market depth` | `standx m d` |
+| `standx market kline` | `standx m k` |
+| `standx account balances` | `standx a b` |
+| `standx account positions` | `standx a p` |
+| `standx account orders` | `standx a o` |
+| `standx portfolio snapshot` | `standx p s` |
+| `standx dashboard --watch` | `standx d -w` |
 
 ## Authentication
 
@@ -224,6 +241,43 @@ standx order cancel-all BTC-USD
 
 ```bash
 standx trade history BTC-USD --from 7d
+```
+
+## Dashboard & Portfolio (Auth required)
+
+### Real-time Dashboard
+
+Interactive trading dashboard with auto-refresh:
+
+```bash
+# Launch dashboard with auto-refresh (watch mode)
+standx dashboard --watch
+
+# Dashboard for specific symbols
+standx dashboard --symbols BTC-USD,ETH-USD
+
+# Dashboard with custom refresh interval (seconds)
+standx dashboard --watch --interval 5
+```
+
+**Dashboard Features:**
+- Real-time account balance display
+- Active positions with PnL
+- Open orders summary
+- Order book depth visualization
+- Recent trades panel (BUY/SELL)
+- Auto-refresh with graceful exit (Ctrl+C)
+
+### Portfolio Snapshot
+
+View portfolio summary and performance:
+
+```bash
+# Portfolio snapshot
+standx portfolio snapshot
+
+# Short alias
+standx p s
 ```
 
 ## Leverage & Margin (Auth required)
