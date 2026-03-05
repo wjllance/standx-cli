@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    tags:
+      - 'v*'  # 推送 v 开头的 tag 时触发自动发布
   pull_request:
     branches: [main]
   release:
@@ -102,7 +104,7 @@ jobs:
           name: standx-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/standx
 
-  # 发布 Release
+  # 发布 Release (手动创建 release 时触发)
   release:
     needs: [check, build-matrix]
     runs-on: ubuntu-latest
@@ -147,11 +149,64 @@ jobs:
             ./packages/install.sh
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # 更新 Homebrew
+  # 自动发布 Pre-release (推送 tag 时触发)
+  auto-prerelease:
+    needs: [check, build-matrix]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref, '-')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: ./binaries
+
+      - name: Package binaries
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          mkdir -p ./packages
+
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            if [ -f "./binaries/standx-${target}/standx" ]; then
+              chmod +x "./binaries/standx-${target}/standx"
+              tar -czf "./packages/standx-${VERSION}-${target}.tar.gz" -C "./binaries/standx-${target}" standx
+              echo "Packaged: standx-${VERSION}-${target}.tar.gz"
+            fi
+          done
+
+      - name: Generate checksums
+        run: |
+          cd ./packages
+          sha256sum *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Read release notes
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          if [ -f "RELEASE_NOTES_${VERSION}.md" ]; then
+            echo "body<<EOF" >> $GITHUB_OUTPUT
+            cat "RELEASE_NOTES_${VERSION}.md" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create/Update Pre-release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          prerelease: true
+          files: |
+            ./packages/*.tar.gz
+            ./packages/checksums.txt
+
+  # 更新 Homebrew (稳定版发布时触发)
   update-homebrew:
     needs: release
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' && !contains(github.event.release.tag_name, '-')
     steps:
       - name: Checkout homebrew tap
         uses: actions/checkout@v4
