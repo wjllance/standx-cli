@@ -33,6 +33,7 @@ pub enum WsMessage {
     Position(Position),
     Balance(Balance),
     Order(Order),
+    Kline(KlineData),
     AccountUpdate(String),
     Error(String),
     Heartbeat,
@@ -196,6 +197,20 @@ impl StandXWebSocket {
         Ok(())
     }
 
+    /// Subscribe to a channel with interval (for kline)
+    pub async fn subscribe_with_interval(&self, channel: &str, symbol: Option<&str>, interval: Option<&str>) -> Result<()> {
+        let mut subs = self.subscriptions.write().await;
+        let topic = if let (Some(sym), Some(int)) = (symbol, interval) {
+            format!("{}:{}:{}", channel, sym, int)
+        } else if let Some(sym) = symbol {
+            format!("{}:{}", channel, sym)
+        } else {
+            channel.to_string()
+        };
+        subs.push(topic);
+        Ok(())
+    }
+
     /// Get current state
     pub async fn state(&self) -> WsState {
         self.state.read().await.clone()
@@ -274,19 +289,28 @@ async fn connect_and_run(
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     for topic in subs.iter() {
-        // Parse topic to get channel and symbol (format: "price:BTC-USD")
+        // Parse topic to get channel, symbol, and optional interval
+        // Format: "price:BTC-USD" or "kline:BTC-USD:3S"
         let parts: Vec<&str> = topic.split(':').collect();
-        let (channel, symbol) = if parts.len() == 2 {
-            (parts[0], parts[1])
-        } else {
-            (topic.as_str(), "")
-        };
+        let channel = parts.first().copied().unwrap_or(topic.as_str());
+        let symbol = parts.get(1).copied().unwrap_or("");
+        let interval = parts.get(2).copied();
 
-        let sub_msg = serde_json::json!({
-            "subscribe": {
-                "channel": channel,
-                "symbol": symbol
+        // Build subscription message
+        let mut sub_obj = serde_json::json!({
+            "channel": channel,
+            "symbol": symbol
+        });
+        
+        // Add interval for kline channel
+        if channel == "kline" {
+            if let Some(int) = interval {
+                sub_obj["interval"] = serde_json::json!(int);
             }
+        }
+        
+        let sub_msg = serde_json::json!({
+            "subscribe": sub_obj
         });
         if verbose {
             eprintln!("[WebSocket Debug] Sending subscribe: {}", sub_msg);
@@ -375,6 +399,25 @@ async fn connect_and_run(
                                         serde_json::from_value::<Trade>(data_obj.clone())
                                     {
                                         let _ = message_tx.send(WsMessage::Trade(trade)).await;
+                                    }
+                                }
+                                "kline" => {
+                                    // Kline data is an array, take first element
+                                    if let Some(kline_array) = data_obj.as_array() {
+                                        if let Some(kline_item) = kline_array.first() {
+                                            if let Ok(mut kline) =
+                                                serde_json::from_value::<KlineData>(kline_item.clone())
+                                            {
+                                                // Get symbol and interval from parent message
+                                                if kline.symbol.is_none() {
+                                                    kline.symbol = data.get("symbol").and_then(|s| s.as_str()).map(String::from);
+                                                }
+                                                if kline.interval.is_none() {
+                                                    kline.interval = data.get("interval").and_then(|i| i.as_str()).map(String::from);
+                                                }
+                                                let _ = message_tx.send(WsMessage::Kline(kline)).await;
+                                            }
+                                        }
                                     }
                                 }
                                 "order" | "position" | "balance" | "trade" => {

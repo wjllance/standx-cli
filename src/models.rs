@@ -135,6 +135,24 @@ pub struct PriceData {
     pub timestamp: String,
 }
 
+/// Kline/candlestick data
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KlineData {
+    pub symbol: Option<String>,
+    pub interval: Option<String>,
+    pub time: i64,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub open: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub high: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub low: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub close: String,
+    pub volume: f64,
+    pub volume_quote: f64,
+}
+
 /// Order book level
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OrderBookLevel {
