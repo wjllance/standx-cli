@@ -762,7 +762,6 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
         StreamCommands::Kline { symbol, interval } => {
             let ws = StandXWebSocket::without_auth_with_verbose(verbose)?;
             // Subscribe with interval parameter embedded in topic
-            let topic = format!("{}:{}:{}", "kline", symbol, interval);
             ws.subscribe_with_interval("kline", Some(&symbol), Some(&interval))
                 .await?;
             let mut rx = ws.connect().await?;
