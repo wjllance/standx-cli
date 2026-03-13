@@ -763,7 +763,8 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
             let ws = StandXWebSocket::without_auth_with_verbose(verbose)?;
             // Subscribe with interval parameter embedded in topic
             let topic = format!("{}:{}:{}", "kline", symbol, interval);
-            ws.subscribe_with_interval("kline", Some(&symbol), Some(&interval)).await?;
+            ws.subscribe_with_interval("kline", Some(&symbol), Some(&interval))
+                .await?;
             let mut rx = ws.connect().await?;
 
             println!("Streaming kline for {} [{}]", symbol, interval);
@@ -775,7 +776,7 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
                     let time_str = chrono::DateTime::from_timestamp_millis(data.time)
                         .map(|dt| dt.format("%H:%M:%S").to_string())
                         .unwrap_or_else(|| data.time.to_string());
-                    
+
                     println!(
                         "📊 Kline: {} [{}] {}\nO: {}  H: {}  L: {}  C: {}  Vol: {:.3}",
                         data.symbol.unwrap_or_default(),
