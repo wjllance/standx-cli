@@ -198,7 +198,12 @@ impl StandXWebSocket {
     }
 
     /// Subscribe to a channel with interval (for kline)
-    pub async fn subscribe_with_interval(&self, channel: &str, symbol: Option<&str>, interval: Option<&str>) -> Result<()> {
+    pub async fn subscribe_with_interval(
+        &self,
+        channel: &str,
+        symbol: Option<&str>,
+        interval: Option<&str>,
+    ) -> Result<()> {
         let mut subs = self.subscriptions.write().await;
         let topic = if let (Some(sym), Some(int)) = (symbol, interval) {
             format!("{}:{}:{}", channel, sym, int)
@@ -301,14 +306,14 @@ async fn connect_and_run(
             "channel": channel,
             "symbol": symbol
         });
-        
+
         // Add interval for kline channel
         if channel == "kline" {
             if let Some(int) = interval {
                 sub_obj["interval"] = serde_json::json!(int);
             }
         }
-        
+
         let sub_msg = serde_json::json!({
             "subscribe": sub_obj
         });
@@ -405,17 +410,24 @@ async fn connect_and_run(
                                     // Kline data is an array, take first element
                                     if let Some(kline_array) = data_obj.as_array() {
                                         if let Some(kline_item) = kline_array.first() {
-                                            if let Ok(mut kline) =
-                                                serde_json::from_value::<KlineData>(kline_item.clone())
-                                            {
+                                            if let Ok(mut kline) = serde_json::from_value::<KlineData>(
+                                                kline_item.clone(),
+                                            ) {
                                                 // Get symbol and interval from parent message
                                                 if kline.symbol.is_none() {
-                                                    kline.symbol = data.get("symbol").and_then(|s| s.as_str()).map(String::from);
+                                                    kline.symbol = data
+                                                        .get("symbol")
+                                                        .and_then(|s| s.as_str())
+                                                        .map(String::from);
                                                 }
                                                 if kline.interval.is_none() {
-                                                    kline.interval = data.get("interval").and_then(|i| i.as_str()).map(String::from);
+                                                    kline.interval = data
+                                                        .get("interval")
+                                                        .and_then(|i| i.as_str())
+                                                        .map(String::from);
                                                 }
-                                                let _ = message_tx.send(WsMessage::Kline(kline)).await;
+                                                let _ =
+                                                    message_tx.send(WsMessage::Kline(kline)).await;
                                             }
                                         }
                                     }
