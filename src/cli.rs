@@ -324,6 +324,13 @@ pub enum StreamCommands {
     },
     /// Stream public trades (public channel)
     Trade { symbol: String },
+    /// Stream candlestick/kline data (public channel)
+    Kline {
+        symbol: String,
+        /// Interval: 3S, 1, 5, 15, 60 (minutes), 1D (day)
+        #[arg(short, long, default_value = "3S")]
+        interval: String,
+    },
     /// Stream order updates (authenticated)
     Order,
     /// Stream position updates (authenticated)

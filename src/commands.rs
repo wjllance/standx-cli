@@ -759,6 +759,37 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
                 }
             }
         }
+        StreamCommands::Kline { symbol, interval } => {
+            let ws = StandXWebSocket::without_auth_with_verbose(verbose)?;
+            // Subscribe with interval parameter embedded in topic
+            let topic = format!("{}:{}:{}", "kline", symbol, interval);
+            ws.subscribe_with_interval("kline", Some(&symbol), Some(&interval)).await?;
+            let mut rx = ws.connect().await?;
+
+            println!("Streaming kline for {} [{}]", symbol, interval);
+            println!("Press Ctrl+C to exit\n");
+
+            while let Some(msg) = rx.recv().await {
+                if let WsMessage::Kline(data) = msg {
+                    // Convert timestamp to readable time
+                    let time_str = chrono::DateTime::from_timestamp_millis(data.time)
+                        .map(|dt| dt.format("%H:%M:%S").to_string())
+                        .unwrap_or_else(|| data.time.to_string());
+                    
+                    println!(
+                        "📊 Kline: {} [{}] {}\nO: {}  H: {}  L: {}  C: {}  Vol: {:.3}",
+                        data.symbol.unwrap_or_default(),
+                        data.interval.unwrap_or_default(),
+                        time_str,
+                        data.open,
+                        data.high,
+                        data.low,
+                        data.close,
+                        data.volume
+                    );
+                }
+            }
+        }
         // User-level authenticated channels
         StreamCommands::Order => {
             let ws = StandXWebSocket::new_with_verbose(verbose)?;

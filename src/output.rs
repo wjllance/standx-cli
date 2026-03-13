@@ -490,3 +490,239 @@ pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> Stri
     output.push_str(&footer());
     output
 }
+
+// =============================================================================
+// Refactored dashboard functions (Issue #156)
+// =============================================================================
+
+/// Format the dashboard header with timestamp
+pub fn format_dashboard_header(time_str: &str, width: usize) -> String {
+    let mut output = String::new();
+    let border = format!("┌{}��\n", "─".repeat(width));
+    let sep = format!("├{}┤\n", "─".repeat(width));
+
+    output.push_str(&border);
+    output.push_str(&format!(
+        "│ standx dashboard refresh: {:<width$} │\n",
+        time_str,
+        width = width - 6
+    ));
+    output.push_str(&sep);
+
+    output
+}
+
+/// Format market tickers section
+pub fn format_dashboard_tickers(market: &[MarketData], width: usize) -> String {
+    let mut output = String::new();
+    let sep = format!("├{}┤\n", "─".repeat(width));
+
+    let tickers: Vec<String> = market
+        .iter()
+        .map(|m| {
+            let last: f64 = m.last_price.parse().unwrap_or(0.0);
+            let low: f64 = m.low_24h.parse().unwrap_or(0.0);
+            let change = if low > 0.0 {
+                ((last - low) / low) * 100.0
+            } else {
+                0.0
+            };
+            let arrow = if change > 0.0 {
+                "▲"
+            } else if change < 0.0 {
+                "▼"
+            } else {
+                ""
+            };
+            format!(
+                "{} ${} {}{:.2}%",
+                m.symbol,
+                m.mark_price,
+                arrow,
+                change.abs()
+            )
+        })
+        .collect();
+
+    let tickers_str = if tickers.is_empty() {
+        "No market data".to_string()
+    } else {
+        tickers.join(" | ")
+    };
+    output.push_str(&format!(
+        "│ TICKERS: {:<width$} │\n",
+        tickers_str,
+        width = width - 12
+    ));
+    output.push_str(&sep);
+
+    output
+}
+
+/// Format account balance section
+pub fn format_dashboard_account(account: &Option<Balance>, width: usize) -> String {
+    let mut output = String::new();
+    let sep = format!("├{}┤\n", "─".repeat(width));
+
+    let account_str = if let Some(ref bal) = account {
+        format!(
+            "Total={} Available={} PnL={}",
+            bal.balance, bal.cross_available, bal.pnl_24h
+        )
+    } else {
+        "Not authenticated".to_string()
+    };
+    output.push_str(&format!(
+        "│ ACCOUNT: {:<width$} │\n",
+        account_str,
+        width = width - 12
+    ));
+    output.push_str(&sep);
+
+    output
+}
+
+/// Format positions section
+pub fn format_dashboard_positions(positions: &[Position], width: usize) -> String {
+    let mut output = String::new();
+    let sep = format!("├{}┤\n", "─".repeat(width));
+
+    output.push_str("│ POSITIONS:\n");
+    if positions.is_empty() {
+        output.push_str("│   No open positions\n");
+    } else {
+        for (i, p) in positions.iter().enumerate() {
+            let side = format!("{:?}", p.side.unwrap_or(crate::models::OrderSide::Buy));
+            let pnl_arrow = if p.upnl.parse::<f64>().unwrap_or(0.0) > 0.0 {
+                "▲"
+            } else {
+                "▼"
+            };
+            let line = format!(
+                "#{} {} {} @{} mark={} pnl={} {}",
+                i + 1,
+                p.symbol,
+                side,
+                p.entry_price,
+                p.mark_price,
+                p.upnl,
+                pnl_arrow
+            );
+            output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+        }
+    }
+    output.push_str(&sep);
+
+    output
+}
+
+/// Format order book and active orders section
+pub fn format_dashboard_orderbook(order_book: &Option<OrderBook>, orders: &[Order], width: usize) -> String {
+    let mut output = String::new();
+
+    output.push_str("│ ORDER BOOK:\n");
+    // Show order book depth data if available
+    if let Some(ref ob) = order_book {
+        // Show top 3 asks (sell orders)
+        let asks: Vec<String> = ob.asks.iter().take(3).map(|a| format!("{} ({})", a[0], a[1])).collect();
+        if !asks.is_empty() {
+            output.push_str(&format!(
+                "│   Asks: {:<width$} │\n",
+                asks.join(" "),
+                width = width - 12
+            ));
+        }
+        // Show top 3 bids (buy orders)
+        let bids: Vec<String> = ob.bids.iter().take(3).map(|b| format!("{} ({})", b[0], b[1])).collect();
+        if !bids.is_empty() {
+            output.push_str(&format!(
+                "│   Bids: {:<width$} │\n",
+                bids.join(" "),
+                width = width - 12
+            ));
+        }
+    }
+
+    // Active orders
+    output.push_str("│ ACTIVE ORDERS:\n");
+    if orders.is_empty() {
+        output.push_str("│   No open orders\n");
+    } else {
+        for (i, o) in orders.iter().enumerate() {
+            let line = format!(
+                "#{} {} {:?} {} @{}",
+                i + 1,
+                o.symbol,
+                o.side,
+                o.qty,
+                o.price
+            );
+            output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+        }
+    }
+
+    output
+}
+
+/// Format recent trades section (skipped if compact mode)
+pub fn format_dashboard_trades(trades: &[Trade], compact: bool, width: usize) -> String {
+    let mut output = String::new();
+    let sep = format!("├{}��\n", "─".repeat(width));
+    let footer = format!("└{}┘\n", "─".repeat(width));
+
+    if compact {
+        output.push_str(&footer);
+        return output;
+    }
+
+    output.push_str(&sep);
+    output.push_str("│ RECENT TRADES:\n");
+    if trades.is_empty() {
+        output.push_str("│   No recent trades\n");
+    } else {
+        for t in trades {
+            // Format time to HH:MM:SS from ISO format "2026-03-04T02:21:26.633550Z"
+            let time_short = if t.time.contains('T') {
+                t.time.split('T').nth(1).unwrap_or(&t.time).split('.').next().unwrap_or(&t.time)
+            } else {
+                &t.time
+            };
+            // Use is_buyer_taker to determine side
+            let side = if t.is_buyer_taker { "BUY" } else { "SELL" };
+            let line = format!("{} {} {} {}", time_short, t.price, t.qty, side);
+            output.push_str(&format!("│   {:<width$} │\n", line, width = width - 4));
+        }
+    }
+
+    // Footer
+    output.push_str(&footer);
+
+    output
+}
+
+/// Render full dashboard using refactored components
+pub fn render_dashboard(snapshot: &DashboardSnapshot, compact: bool) -> String {
+    let width = 65;
+
+    // Header
+    let now = chrono::Utc::now();
+    let time_str = now.format("%H:%M").to_string();
+    let mut output = format_dashboard_header(&time_str, width);
+
+    // Tickers
+    output.push_str(&format_dashboard_tickers(&snapshot.market, width));
+
+    // Account
+    output.push_str(&format_dashboard_account(&snapshot.account, width));
+
+    // Positions
+    output.push_str(&format_dashboard_positions(&snapshot.positions, width));
+
+    // Order book and orders (without trailing sep)
+    output.push_str(&format_dashboard_orderbook(&snapshot.order_book, &snapshot.orders, width));
+
+    // Trades (includes footer)
+    output.push_str(&format_dashboard_trades(&snapshot.trades, compact, width));
+
+    output
+}
