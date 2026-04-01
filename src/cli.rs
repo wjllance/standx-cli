@@ -114,6 +114,12 @@ pub enum Commands {
         #[arg(short, long, num_args = 0..=1, default_missing_value = "5")]
         watch: Option<u64>,
     },
+    /// Block trade operations (authenticated)
+    #[command(visible_alias = "b")]
+    Block {
+        #[command(subcommand)]
+        command: BlockCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -339,6 +345,31 @@ pub enum StreamCommands {
     Balance,
     /// Stream fill/trade updates (authenticated)
     Fills,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BlockCommands {
+    /// List block trades
+    List {
+        /// Filter by symbol (e.g., BTC-USD)
+        #[arg(short, long)]
+        symbol: Option<String>,
+        /// Limit number of results
+        #[arg(short, long, default_value = "30")]
+        limit: u32,
+        /// Filter by status: completed, pending, all
+        #[arg(short, long, default_value = "all")]
+        status: String,
+    },
+    /// Watch block trades (polling mode)
+    Watch {
+        /// Filter by symbol
+        #[arg(short, long)]
+        symbol: Option<String>,
+        /// Poll interval in seconds
+        #[arg(short, long, default_value = "10")]
+        interval: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]

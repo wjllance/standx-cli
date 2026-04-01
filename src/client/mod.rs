@@ -330,6 +330,69 @@ impl StandXClient {
         Ok(data)
     }
 
+    /// Get block trades from the block trade API
+    pub async fn get_block_trades(
+        &self,
+        symbol: Option<&str>,
+        limit: u32,
+        is_completed: Option<bool>,
+    ) -> Result<Vec<crate::models::BlockTrade>> {
+        let url = format!("{}/v1/block", self.base_url);
+
+        let mut body = serde_json::json!({ "limit": limit });
+        if let Some(s) = symbol {
+            body["symbol"] = serde_json::json!(s);
+        }
+        if let Some(completed) = is_completed {
+            body["isCompleted"] = serde_json::json!(completed);
+        }
+
+        let body_str = body.to_string();
+        let headers = self.build_auth_headers(Some(&body_str)).await?;
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(body_str)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/v1/block".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        let result: serde_json::Value = response.json().await?;
+
+        // API returns { "data": [...] } wrapper
+        let trades = result["data"]
+            .as_array()
+            .ok_or_else(|| Error::Api {
+                code: 0,
+                message: "Expected 'data' array in block trade response".to_string(),
+                endpoint: Some("/v1/block".to_string()),
+                retryable: false,
+            })?
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()))
+            .collect::<serde_json::Result<Vec<crate::models::BlockTrade>>>()
+            .map_err(|e| Error::Api {
+                code: 0,
+                message: format!("error decoding block trade: {}", e),
+                endpoint: Some("/v1/block".to_string()),
+                retryable: false,
+            })?;
+
+        Ok(trades)
+    }
+
     /// Health check - returns true if API is available
     pub async fn health_check(&self) -> Result<bool> {
         // Use query_symbol_info as health check since /api/health doesn't exist

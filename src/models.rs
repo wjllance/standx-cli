@@ -308,6 +308,45 @@ pub struct FundingRate {
     pub updated_at: String,
 }
 
+/// Block trade taker info
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TakerInfo {
+    pub address: String,
+    #[serde(default)]
+    pub side: Option<String>,
+}
+
+/// Block trade information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockTrade {
+    pub id: i64,
+    pub symbol: String,
+    pub side: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub price: String,
+    #[serde(deserialize_with = "string_or_number_to_string")]
+    pub qty: String,
+    #[serde(
+        rename = "blockStatus",
+        deserialize_with = "string_or_number_to_string"
+    )]
+    pub block_status: String,
+    #[serde(
+        rename = "matchPolicy",
+        deserialize_with = "string_or_number_to_string"
+    )]
+    pub match_policy: String,
+    #[serde(
+        rename = "makerAddress",
+        deserialize_with = "string_or_number_to_string"
+    )]
+    pub maker_address: String,
+    #[serde(rename = "takerInfoList", default)]
+    pub taker_info_list: Vec<TakerInfo>,
+    #[serde(rename = "expireTime")]
+    pub expire_time: i64,
+}
+
 /// Order side
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]

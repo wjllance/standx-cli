@@ -161,6 +161,9 @@ async fn execute_command(
             };
             commands::handle_portfolio(command, output).await?;
         }
+        Commands::Block { command } => {
+            commands::handle_block(command, output).await?;
+        }
     }
     Ok(())
 }
@@ -179,6 +182,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Stream { .. } => "Would start real-time data stream",
         Commands::Dashboard { .. } => "Would fetch dashboard data (read-only, safe to execute)",
         Commands::Portfolio { .. } => "Would fetch portfolio data (read-only, safe to execute)",
+        Commands::Block { .. } => "Would fetch block trades (authenticated, read-only)",
     };
 
     let dry_run_info = serde_json::json!({
