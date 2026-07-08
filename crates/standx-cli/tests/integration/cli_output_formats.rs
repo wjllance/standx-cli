@@ -1,11 +1,11 @@
 //! CLI Output Format Integration Tests
 
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 
 #[test]
 fn test_market_symbols_json_output() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "symbols", "--output", "json"]);
     cmd.assert()
         .success()
@@ -19,7 +19,7 @@ fn test_market_symbols_json_output() {
 
 #[test]
 fn test_market_symbols_table_output() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "symbols", "--output", "table"]);
     cmd.assert()
         .success()
@@ -28,7 +28,7 @@ fn test_market_symbols_table_output() {
 
 #[test]
 fn test_market_symbols_csv_output() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "symbols", "--output", "csv"]);
     cmd.assert()
         .success()
@@ -37,7 +37,7 @@ fn test_market_symbols_csv_output() {
 
 #[test]
 fn test_output_format_quiet() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "symbols", "--quiet"]);
     cmd.assert()
         .success()

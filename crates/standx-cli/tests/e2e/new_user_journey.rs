@@ -1,7 +1,7 @@
 //! E2E Test: New User Journey
 //! Simulates a new user from installation to first trade
 
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use std::fs;
 use tempfile::TempDir;
 
@@ -16,22 +16,22 @@ fn test_new_user_journey() {
     fs::create_dir_all(&config_dir).unwrap();
 
     // Step 1: Check CLI version
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.arg("--version");
     cmd.assert().success();
 
     // Step 2: View help
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.arg("--help");
     cmd.assert().success();
 
     // Step 3: View market symbols (public API, no auth needed)
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "symbols"]);
     cmd.assert().success();
 
     // Step 4: View market ticker
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "ticker", "--symbol", "BTC-USD"]);
     cmd.assert().success();
 
@@ -45,7 +45,7 @@ fn test_cli_without_config() {
     // Ensure no config exists in temp environment
     let temp_dir = TempDir::new().unwrap();
 
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.env("HOME", temp_dir.path());
     cmd.args(["market", "symbols", "--output", "json"]);
     cmd.assert().success();

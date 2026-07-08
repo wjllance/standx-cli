@@ -1,11 +1,11 @@
 //! CLI Market Commands Integration Tests
 
-use assert_cmd::Command;
+use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 
 #[test]
 fn test_market_symbols_command() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "symbols"]);
     cmd.assert().success().stdout(
         predicate::str::contains("BTC")
@@ -16,7 +16,7 @@ fn test_market_symbols_command() {
 
 #[test]
 fn test_market_ticker_command() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "ticker", "BTC-USD"]);
     cmd.assert().success().stdout(
         predicate::str::contains("BTC-USD")
@@ -27,7 +27,7 @@ fn test_market_ticker_command() {
 
 #[test]
 fn test_market_depth_command() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "depth", "BTC-USD"]);
     cmd.assert().success().stdout(
         predicate::str::contains("Asks")
@@ -38,7 +38,7 @@ fn test_market_depth_command() {
 
 #[test]
 fn test_market_funding_command() {
-    let mut cmd = Command::cargo_bin("standx").unwrap();
+    let mut cmd = cargo_bin_cmd!("standx");
     cmd.args(["market", "funding", "BTC-USD"]);
     cmd.assert()
         .success()

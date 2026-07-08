@@ -139,7 +139,7 @@ fn test_parse_time_edge_cases() {
 /// 测试大小写不敏感
 #[test]
 fn test_parse_time_case_insensitive() {
-    let now = chrono::Utc::now().timestamp();
+    let _now = chrono::Utc::now().timestamp();
 
     // 大写应该也支持
     let result_lower = parse_time_string("1d", false).unwrap();

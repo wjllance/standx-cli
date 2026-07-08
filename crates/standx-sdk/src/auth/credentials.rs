@@ -246,6 +246,7 @@ mod tests {
     }
 
     impl EnvGuard {
+        #[allow(dead_code)]
         fn set(key: &str, value: &str) -> Self {
             let original_value = std::env::var(key).ok();
             std::env::set_var(key, value);
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_credentials_new() {
-        let mut creds = Credentials::new("test_token".to_string(), Some("test_key".to_string()));
+        let creds = Credentials::new("test_token".to_string(), Some("test_key".to_string()));
 
         assert_eq!(creds.token, "test_token");
         assert_eq!(creds.private_key, "test_key");

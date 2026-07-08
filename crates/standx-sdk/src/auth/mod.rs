@@ -87,9 +87,6 @@ impl StandXSigner {
 mod tests {
     use super::*;
 
-    // Test private key (Base58) - DO NOT USE IN PRODUCTION
-    const TEST_PRIVATE_KEY: &str = "HdsyJD7oWgT7tRZ7L8QJ9K3mP5nQ8rS2vX4wY6zA1bC3dE5fG7hI9jK0lM2nO4pQ6rS8tU0vW1xY2zA3bC4dE5fG6h";
-
     #[test]
     fn test_signer_from_base58() {
         // Generate a random key for testing

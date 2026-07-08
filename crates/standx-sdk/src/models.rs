@@ -919,7 +919,7 @@ mod tests {
     #[test]
     fn test_order_book_sorting() {
         // Server might return unsorted data
-        let book = OrderBook {
+        let _book = OrderBook {
             symbol: "BTC-USD".to_string(),
             bids: vec![
                 ["67900".to_string(), "2.0".to_string()],
@@ -1197,7 +1197,7 @@ mod tests {
     #[test]
     fn test_order_status_untriggered() {
         // Test new Untriggered status
-        let json = r#"{"status": "untriggered"}"#;
+        let _json = r#"{"status": "untriggered"}"#;
         // We need to test this via Order since OrderStatus is not directly deserializable
         let order_json = r#"{
             "id": "123",
