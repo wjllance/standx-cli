@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Maker bot: `standx maker run <SYMBOL>`** (alias `mk`) — two-sided quoting loop targeting SIP-5A community maker yield
+  - Anti-flicker reconcile: quotes rest inside the eligibility band and only re-quote when mark drifts past `--refresh-bps`
+  - Flags: `--spread-bps`, `--band-bps`, `--size`, `--levels`, `--level-step-bps`, `--refresh-bps`, `--interval`, `--max-position`
+  - **Paper mode by default** (full loop, prints intended actions, no orders); `--live` implements real post-only quoting but is locked behind `STANDX_ENABLE_LIVE_MAKER=1` pending supervised production testing
+  - Live safety rails: startup cancel-all, exchange open-orders as reconciliation truth, cancel-all-with-retry + verification on exit, fail-safe stop after 3 consecutive API errors
+  - JSON-lines output for agents (`--output json` / `--openclaw`)
+  - Pure quoting/reconcile core in `standx_sdk::maker` with 15 unit tests
+- `TimeInForce::Alo` (post-only / add-liquidity-only), matching the backend enum; `standx order create --tif ALO` now supported
+- Block trade commands: `standx block list` / `standx block watch`
+
 ### Changed
 - **Workspace split: `standx-sdk` extracted as an independent crate**
   - `crates/standx-sdk` (v0.1.0): REST client, WebSocket streams, models, auth/signing, errors — reusable by any Rust agent/bot; zero presentation dependencies by default (table rendering behind the optional `tabled` feature)
@@ -15,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed unused dependencies: `comfy-table`, `once_cell`, `config`, `keyring` (and the vestigial `no-keyring` feature)
 
 ### Fixed
+- Kline streaming: handle symbol/interval in parent message
 - `order create`: removed `-q` short flag (collided with global `--quiet`; clap panics on the collision in debug builds). Use `--qty`.
 - Deflaked env-var tests (config + credentials) by serializing them with a lock
 - Version integration test no longer hardcodes the version number

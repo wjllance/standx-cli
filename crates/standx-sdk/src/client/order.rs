@@ -60,6 +60,7 @@ impl StandXClient {
                 TimeInForce::Gtc => "gtc",
                 TimeInForce::Ioc => "ioc",
                 TimeInForce::Fok => "fok",
+                TimeInForce::Alo => "alo",
             })
             .unwrap_or("gtc");
 

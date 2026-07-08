@@ -161,6 +161,9 @@ async fn execute_command(
         Commands::Block { command } => {
             commands::handle_block(command, output).await?;
         }
+        Commands::Maker { command } => {
+            commands::handle_maker(command, output, verbose).await?;
+        }
     }
     Ok(())
 }
@@ -180,13 +183,16 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Dashboard { .. } => "Would fetch dashboard data (read-only, safe to execute)",
         Commands::Portfolio { .. } => "Would fetch portfolio data (read-only, safe to execute)",
         Commands::Block { .. } => "Would fetch block trades (authenticated, read-only)",
+        Commands::Maker { .. } => {
+            "⚠️  WOULD RUN MAKER BOT - PLACES/CANCELS ORDERS WITH --live (paper mode without)"
+        }
     };
 
     let dry_run_info = serde_json::json!({
         "dry_run": true,
         "command": format!("{:?}", command),
         "description": description,
-        "would_execute": !matches!(command, Commands::Order { .. } | Commands::Leverage { .. } | Commands::Margin { .. }),
+        "would_execute": !matches!(command, Commands::Order { .. } | Commands::Leverage { .. } | Commands::Margin { .. } | Commands::Maker { .. }),
         "note": "Remove --dry-run to execute"
     });
 

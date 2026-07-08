@@ -110,6 +110,7 @@ pub async fn handle_order(command: OrderCommands) -> Result<()> {
                 "GTC" => TimeInForce::Gtc,
                 "IOC" => TimeInForce::Ioc,
                 "FOK" => TimeInForce::Fok,
+                "ALO" => TimeInForce::Alo,
                 _ => TimeInForce::Gtc,
             });
 
@@ -1483,6 +1484,709 @@ async fn build_portfolio_output(
     };
 
     Ok(rendered)
+}
+
+// ============================================================================
+// Maker bot (SIP-5A community maker yield)
+// ============================================================================
+
+/// Env var gating live order placement. The live path ships code-complete but
+/// locked until it has been supervised-tested against production.
+const LIVE_MAKER_ENV: &str = "STANDX_ENABLE_LIVE_MAKER";
+
+/// Why the maker loop stopped.
+enum MakerExit {
+    CtrlC,
+    /// Too many consecutive API errors — fail safe, not open.
+    FailSafe(String),
+}
+
+/// Pending place awaiting order-id adoption (live mode): create_order only
+/// returns a request id, so new open orders are matched back to recent
+/// places by (side, price, qty) on the next cycle.
+struct PendingPlace {
+    side: OrderSide,
+    price: f64,
+    qty: f64,
+    level: u32,
+    ref_mark: f64,
+    cycle: u64,
+}
+
+/// Handle maker commands
+pub async fn handle_maker(
+    command: MakerCommands,
+    output_format: OutputFormat,
+    _verbose: bool,
+) -> Result<()> {
+    match command {
+        MakerCommands::Run {
+            symbol,
+            spread_bps,
+            band_bps,
+            size,
+            levels,
+            level_step_bps,
+            refresh_bps,
+            interval,
+            max_position,
+            live,
+        } => {
+            run_maker(
+                symbol,
+                MakerRunArgs {
+                    spread_bps,
+                    band_bps,
+                    size,
+                    levels,
+                    level_step_bps,
+                    refresh_bps,
+                    interval,
+                    max_position,
+                    live,
+                },
+                output_format,
+            )
+            .await
+        }
+    }
+}
+
+struct MakerRunArgs {
+    spread_bps: f64,
+    band_bps: f64,
+    size: f64,
+    levels: u32,
+    level_step_bps: f64,
+    refresh_bps: f64,
+    interval: u64,
+    max_position: f64,
+    live: bool,
+}
+
+async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
+    use standx_sdk::maker::{self, MakerConfig, RestingQuote};
+
+    let client = StandXClient::new()?;
+
+    // ---- Startup: symbol metadata + invariants (fail fast) ----
+    let infos = client.get_symbol_info().await?;
+    let info = infos
+        .iter()
+        .find(|i| i.symbol.eq_ignore_ascii_case(&symbol))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown symbol '{}'. Available: {}",
+                symbol,
+                infos
+                    .iter()
+                    .map(|i| i.symbol.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    if info.status != "trading" {
+        return Err(anyhow::anyhow!(
+            "Symbol {} is not trading (status: {})",
+            info.symbol,
+            info.status
+        ));
+    }
+    let symbol = info.symbol.clone(); // canonical casing
+
+    let min_order_qty: f64 = info.min_order_qty.parse().unwrap_or(0.0);
+    let cfg = MakerConfig {
+        spread_bps: args.spread_bps,
+        band_bps: args.band_bps,
+        level_step_bps: args.level_step_bps,
+        refresh_bps: args.refresh_bps,
+        levels: args.levels.max(1),
+        size: args.size,
+        max_position: args.max_position,
+        price_decimals: info.price_tick_decimals,
+        qty_decimals: info.qty_tick_decimals,
+        min_order_qty,
+    };
+
+    if cfg.spread_bps <= 0.0 {
+        return Err(anyhow::anyhow!("--spread-bps must be > 0"));
+    }
+    if cfg.band_bps <= cfg.spread_bps {
+        return Err(anyhow::anyhow!(
+            "--band-bps ({}) must be greater than --spread-bps ({}): quotes clamped to the band edge would sit exactly at the boundary",
+            cfg.band_bps,
+            cfg.spread_bps
+        ));
+    }
+    let rounded_size = maker::round_to_decimals(cfg.size, cfg.qty_decimals);
+    if rounded_size < cfg.min_order_qty || rounded_size <= 0.0 {
+        return Err(anyhow::anyhow!(
+            "--size {} (rounded to {} at {} decimals) is below min order qty {} for {}",
+            cfg.size,
+            rounded_size,
+            cfg.qty_decimals,
+            cfg.min_order_qty,
+            symbol
+        ));
+    }
+    if cfg.refresh_bps >= cfg.spread_bps {
+        eprintln!(
+            "⚠️  --refresh-bps ({}) >= --spread-bps ({}): quotes will be held through large drifts",
+            cfg.refresh_bps, cfg.spread_bps
+        );
+    }
+    if cfg.levels > 1
+        && cfg.spread_bps + (cfg.levels - 1) as f64 * cfg.level_step_bps >= cfg.band_bps
+    {
+        eprintln!("⚠️  outer quote levels exceed the band and will be clamped/collapsed");
+    }
+
+    // ---- Live gating & clean start ----
+    if args.live {
+        if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
+            return Err(anyhow::anyhow!(
+                "live mode not yet enabled: it has not been supervised-tested against production. Set {}=1 to unlock (at your own risk).",
+                LIVE_MAKER_ENV
+            ));
+        }
+        let creds = Credentials::load()?;
+        if creds.is_expired() {
+            return Err(anyhow::anyhow!(
+                "Credentials expired. Run 'standx auth login' first."
+            ));
+        }
+        if creds.private_key.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Live mode requires a private key for order signing. Run 'standx auth login' with --private-key."
+            ));
+        }
+        // Start from a clean book so reconciliation isn't confused by
+        // leftovers from a previous run. The bot owns ALL orders on this
+        // symbol while running.
+        client.cancel_all_orders(&symbol).await?;
+    }
+
+    let mode = if args.live { "LIVE" } else { "PAPER" };
+    if output_format == OutputFormat::Table {
+        println!("┌──────────────────────────────────────────────────────────┐");
+        println!("│ standx maker — {} mode on {}", mode, symbol);
+        println!(
+            "│ spread {}bps | band {}bps | refresh {}bps | {} level(s)",
+            cfg.spread_bps, cfg.band_bps, cfg.refresh_bps, cfg.levels
+        );
+        println!(
+            "│ size {} | max-position {} | interval {}s",
+            cfg.size, cfg.max_position, args.interval
+        );
+        println!(
+            "│ ticks: price {}dp, qty {}dp | min qty {}",
+            cfg.price_decimals, cfg.qty_decimals, cfg.min_order_qty
+        );
+        if !args.live {
+            println!("│ paper mode: no orders are placed; fills are NOT simulated");
+            println!("│ (position stays 0). Add --live for real quoting.");
+        } else {
+            println!(
+                "│ ⚠️  LIVE: the bot manages ALL orders on {} — manual",
+                symbol
+            );
+            println!("│ orders on this symbol will be cancelled as stale.");
+        }
+        println!("│ Ctrl+C to stop (cancels all resting orders on exit)");
+        println!("└──────────────────────────────────────────────────────────┘");
+    }
+
+    // ---- Loop state ----
+    let mut cycle: u64 = 0;
+    let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
+    let mut adopted: HashMap<String, (u32, f64, u64)> = HashMap::new(); // id -> (level, ref_mark, cycle)
+    let mut pending: Vec<PendingPlace> = Vec::new();
+    let mut consecutive_errors: u32 = 0;
+    let mut total_places: u64 = 0;
+    let mut total_cancels: u64 = 0;
+    let mut total_holds: u64 = 0;
+
+    let exit = loop {
+        // Work phase raced against Ctrl+C so a slow API call can be
+        // interrupted (mirrors run_watch_loop).
+        let work = maker_cycle(
+            &client,
+            &symbol,
+            &cfg,
+            args.live,
+            cycle,
+            &mut resting,
+            &mut adopted,
+            &mut pending,
+            output_format,
+        );
+        let cycle_result = tokio::select! {
+            _ = signal::ctrl_c() => break MakerExit::CtrlC,
+            result = work => result,
+        };
+
+        match cycle_result {
+            Ok((places, cancels, holds)) => {
+                consecutive_errors = 0;
+                total_places += places;
+                total_cancels += cancels;
+                total_holds += holds;
+            }
+            Err(e) => {
+                consecutive_errors += 1;
+                eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
+                if consecutive_errors >= 3 {
+                    break MakerExit::FailSafe(e.to_string());
+                }
+            }
+        }
+
+        cycle += 1;
+
+        tokio::select! {
+            _ = signal::ctrl_c() => break MakerExit::CtrlC,
+            _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {}
+        }
+    };
+
+    // ---- Cleanup on ALL exit paths ----
+    if output_format == OutputFormat::Table {
+        println!(
+            "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
+            cycle, total_places, total_cancels, total_holds
+        );
+    }
+    if args.live {
+        cancel_all_with_retry(&client, &symbol, 3).await?;
+    }
+
+    match exit {
+        MakerExit::CtrlC => Ok(()),
+        MakerExit::FailSafe(e) => Err(anyhow::anyhow!(
+            "maker stopped after 3 consecutive errors (fail-safe): {}",
+            e
+        )),
+    }
+}
+
+/// One reconcile cycle. Returns (places, cancels, holds) counts.
+#[allow(clippy::too_many_arguments)]
+async fn maker_cycle(
+    client: &StandXClient,
+    symbol: &str,
+    cfg: &standx_sdk::maker::MakerConfig,
+    live: bool,
+    cycle: u64,
+    resting: &mut Vec<standx_sdk::maker::RestingQuote>,
+    adopted: &mut HashMap<String, (u32, f64, u64)>,
+    pending: &mut Vec<PendingPlace>,
+    output_format: OutputFormat,
+) -> Result<(u64, u64, u64)> {
+    use standx_sdk::maker::{
+        compute_desired_quotes, format_decimals, reconcile, Action, RestingQuote,
+    };
+
+    // 1. Market snapshot.
+    let (price, depth) = tokio::join!(
+        client.get_symbol_price(symbol),
+        client.get_depth(symbol, Some(5))
+    );
+    let price = price?;
+    let depth = depth?;
+    let mark: f64 = price
+        .mark_price
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unparseable mark price: {}", price.mark_price))?;
+    let best_bid: Option<f64> = depth.best_bid().and_then(|s| s.parse().ok());
+    let best_ask: Option<f64> = depth.best_ask().and_then(|s| s.parse().ok());
+
+    if live && (best_bid.is_none() || best_ask.is_none()) {
+        // Fail-safe: without a touch we cannot guarantee no-cross pricing.
+        eprintln!("⚠️  empty order book on {}; skipping this cycle", symbol);
+        return Ok((0, 0, 0));
+    }
+
+    // 2. Rebuild resting + position from the exchange (live) or keep the
+    //    simulated book (paper).
+    let position: f64;
+    if live {
+        let (orders, positions) = tokio::join!(
+            client.get_open_orders(Some(symbol)),
+            client.get_positions(Some(symbol))
+        );
+        let orders = orders?;
+        let positions = positions?;
+
+        position = positions
+            .iter()
+            .filter(|p| p.symbol.eq_ignore_ascii_case(symbol))
+            .map(|p| {
+                let qty: f64 = p.qty.parse().unwrap_or(0.0);
+                match p.side {
+                    Some(OrderSide::Sell) => -qty,
+                    _ => qty,
+                }
+            })
+            .sum();
+
+        let tick = cfg.price_tick();
+        *resting = orders
+            .into_iter()
+            .map(|o| {
+                let price: f64 = o.price.parse().unwrap_or(0.0);
+                let qty: f64 = o.qty.parse().unwrap_or(0.0);
+                let (level, ref_mark, placed_at_cycle) = match adopted.get(&o.id) {
+                    Some(&meta) => meta,
+                    None => {
+                        // Try to adopt from a recent place by (side, price, qty).
+                        let matched = pending.iter().position(|p| {
+                            p.side == o.side
+                                && (p.price - price).abs() < tick / 2.0
+                                && (p.qty - qty).abs() < f64::EPSILON.max(qty * 1e-6)
+                        });
+                        let meta = match matched {
+                            Some(idx) => {
+                                let p = pending.remove(idx);
+                                (p.level, p.ref_mark, p.cycle)
+                            }
+                            // Unknown order (manual or unmatched): sentinel
+                            // level so reconcile cancels it as stale — the
+                            // bot owns all orders on this symbol.
+                            None => (u32::MAX, mark, cycle),
+                        };
+                        adopted.insert(o.id.clone(), meta);
+                        meta
+                    }
+                };
+                RestingQuote {
+                    order_id: Some(o.id),
+                    side: o.side,
+                    level,
+                    price,
+                    qty,
+                    ref_mark,
+                    placed_at_cycle,
+                }
+            })
+            .collect();
+        // Places older than 2 cycles never showed up as open orders —
+        // likely rejected (e.g. ALO would-cross) or instantly filled.
+        pending.retain(|p| cycle.saturating_sub(p.cycle) <= 2);
+        adopted.retain(|id, _| resting.iter().any(|r| r.order_id.as_deref() == Some(id)));
+    } else {
+        position = 0.0; // fills are not simulated in paper mode
+    }
+
+    // 3. Decide.
+    let desired = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
+    let actions = reconcile(cfg, mark, best_bid, best_ask, &desired, resting, cycle);
+
+    // 4. Execute.
+    let mut places: u64 = 0;
+    let mut cancels: u64 = 0;
+    let mut holds: u64 = 0;
+    for action in &actions {
+        match action {
+            Action::Cancel {
+                order_id,
+                side,
+                level,
+                ..
+            } => {
+                cancels += 1;
+                if live {
+                    if let Some(id) = order_id {
+                        client.cancel_order(symbol, id).await?;
+                        adopted.remove(id);
+                    }
+                } else {
+                    resting.retain(|r| !(r.side == *side && r.level == *level));
+                }
+            }
+            Action::Place(q) => {
+                places += 1;
+                if live {
+                    client
+                        .create_order(CreateOrderParams {
+                            symbol: symbol.to_string(),
+                            side: q.side,
+                            order_type: OrderType::Limit,
+                            quantity: format_decimals(q.qty, cfg.qty_decimals),
+                            price: Some(format_decimals(q.price, cfg.price_decimals)),
+                            // Post-only: reject instead of taking if the
+                            // price would cross by arrival time.
+                            time_in_force: Some(TimeInForce::Alo),
+                            reduce_only: false,
+                            stop_price: None,
+                            sl_price: None,
+                            tp_price: None,
+                        })
+                        .await?;
+                    pending.push(PendingPlace {
+                        side: q.side,
+                        price: q.price,
+                        qty: q.qty,
+                        level: q.level,
+                        ref_mark: mark,
+                        cycle,
+                    });
+                } else {
+                    resting.push(RestingQuote {
+                        order_id: None,
+                        side: q.side,
+                        level: q.level,
+                        price: q.price,
+                        qty: q.qty,
+                        ref_mark: mark,
+                        placed_at_cycle: cycle,
+                    });
+                }
+            }
+            Action::Hold { .. } => holds += 1,
+        }
+    }
+
+    // 5. Emit.
+    emit_maker_cycle(
+        output_format,
+        live,
+        symbol,
+        cycle,
+        mark,
+        best_bid,
+        best_ask,
+        position,
+        &actions,
+        cfg,
+    );
+
+    Ok((places, cancels, holds))
+}
+
+/// Cancel-all with retries; verifies the book is actually clean afterwards.
+async fn cancel_all_with_retry(client: &StandXClient, symbol: &str, attempts: u32) -> Result<()> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for attempt in 1..=attempts {
+        match client.cancel_all_orders(symbol).await {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                eprintln!(
+                    "⚠️  cancel-all attempt {}/{} failed: {}",
+                    attempt, attempts, e
+                );
+                last_err = Some(e.into());
+                if attempt < attempts {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    // Verify: a failed cancel leaves live orders unattended.
+    match client.get_open_orders(Some(symbol)).await {
+        Ok(orders) if orders.is_empty() => {
+            println!("✅ All {} orders cancelled", symbol);
+            Ok(())
+        }
+        Ok(orders) => {
+            let ids: Vec<_> = orders.iter().map(|o| o.id.as_str()).collect();
+            Err(anyhow::anyhow!(
+                "⚠️  RESIDUAL ORDERS on {} after cancel-all: [{}] — cancel manually with 'standx order cancel-all {}'",
+                symbol,
+                ids.join(", "),
+                symbol
+            ))
+        }
+        Err(e) => match last_err {
+            Some(cancel_err) => Err(anyhow::anyhow!(
+                "cancel-all failed ({}) and verification failed ({}) — check open orders manually",
+                cancel_err,
+                e
+            )),
+            None => Err(anyhow::anyhow!(
+                "cancel-all succeeded but verification failed ({}) — check open orders manually",
+                e
+            )),
+        },
+    }
+}
+
+/// Per-cycle output: one human line + indented actions, or JSON lines.
+#[allow(clippy::too_many_arguments)]
+fn emit_maker_cycle(
+    output_format: OutputFormat,
+    live: bool,
+    symbol: &str,
+    cycle: u64,
+    mark: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    position: f64,
+    actions: &[standx_sdk::maker::Action],
+    cfg: &standx_sdk::maker::MakerConfig,
+) {
+    use standx_sdk::maker::{format_decimals, Action};
+
+    let mode = if live { "live" } else { "paper" };
+    let counts = actions.iter().fold((0, 0, 0), |mut acc, a| {
+        match a {
+            Action::Place(_) => acc.1 += 1,
+            Action::Cancel { .. } => acc.2 += 1,
+            Action::Hold { .. } => acc.0 += 1,
+        }
+        acc
+    });
+    let (holds, places, cancels) = counts;
+
+    match output_format {
+        OutputFormat::Json => {
+            let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            for a in actions {
+                let obj = match a {
+                    Action::Place(q) => serde_json::json!({
+                        "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                        "mark": format_decimals(mark, cfg.price_decimals),
+                        "action": "place", "side": q.side, "level": q.level,
+                        "price": format_decimals(q.price, cfg.price_decimals),
+                        "qty": format_decimals(q.qty, cfg.qty_decimals),
+                    }),
+                    Action::Cancel {
+                        order_id,
+                        side,
+                        level,
+                        price,
+                        reason,
+                    } => serde_json::json!({
+                        "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                        "mark": format_decimals(mark, cfg.price_decimals),
+                        "action": "cancel", "side": side, "level": level,
+                        "price": format_decimals(*price, cfg.price_decimals),
+                        "reason": reason.as_str(), "order_id": order_id,
+                    }),
+                    Action::Hold {
+                        side,
+                        level,
+                        price,
+                        age_cycles,
+                        drift_bps,
+                    } => serde_json::json!({
+                        "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                        "mark": format_decimals(mark, cfg.price_decimals),
+                        "action": "hold", "side": side, "level": level,
+                        "price": format_decimals(*price, cfg.price_decimals),
+                        "age_cycles": age_cycles,
+                        "drift_bps": (drift_bps * 100.0).round() / 100.0,
+                    }),
+                };
+                println!("{}", obj);
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                    "action": "cycle_summary",
+                    "mark": format_decimals(mark, cfg.price_decimals),
+                    "best_bid": best_bid, "best_ask": best_ask,
+                    "position": position,
+                    "holds": holds, "places": places, "cancels": cancels,
+                })
+            );
+        }
+        OutputFormat::Quiet => {
+            // Only mutations and their reasons.
+            for a in actions {
+                match a {
+                    Action::Place(q) => println!(
+                        "place {} L{} @ {}",
+                        side_str(q.side),
+                        q.level,
+                        format_decimals(q.price, cfg.price_decimals)
+                    ),
+                    Action::Cancel {
+                        side,
+                        level,
+                        price,
+                        reason,
+                        ..
+                    } => println!(
+                        "cancel {} L{} @ {} ({})",
+                        side_str(*side),
+                        level,
+                        format_decimals(*price, cfg.price_decimals),
+                        reason.as_str()
+                    ),
+                    Action::Hold { .. } => {}
+                }
+            }
+        }
+        _ => {
+            let now = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "[{}] #{} mark={} bid={} ask={} pos={} | hold={} place={} cancel={}",
+                now,
+                cycle,
+                format_decimals(mark, cfg.price_decimals),
+                best_bid
+                    .map(|b| format_decimals(b, cfg.price_decimals))
+                    .unwrap_or_else(|| "-".into()),
+                best_ask
+                    .map(|a| format_decimals(a, cfg.price_decimals))
+                    .unwrap_or_else(|| "-".into()),
+                position,
+                holds,
+                places,
+                cancels
+            );
+            for a in actions {
+                match a {
+                    Action::Place(q) => println!(
+                        "    PLACE  {} L{} @ {} x {}",
+                        side_str(q.side),
+                        q.level,
+                        format_decimals(q.price, cfg.price_decimals),
+                        format_decimals(q.qty, cfg.qty_decimals)
+                    ),
+                    Action::Cancel {
+                        side,
+                        level,
+                        price,
+                        reason,
+                        ..
+                    } => println!(
+                        "    CANCEL {} L{} @ {} ({})",
+                        side_str(*side),
+                        level,
+                        format_decimals(*price, cfg.price_decimals),
+                        reason.as_str()
+                    ),
+                    Action::Hold {
+                        side,
+                        level,
+                        price,
+                        age_cycles,
+                        drift_bps,
+                    } => println!(
+                        "    HOLD   {} L{} @ {} (age {} cycles, drift {:.1}bps)",
+                        side_str(*side),
+                        level,
+                        format_decimals(*price, cfg.price_decimals),
+                        age_cycles,
+                        drift_bps
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn side_str(side: OrderSide) -> &'static str {
+    match side {
+        OrderSide::Buy => "buy ",
+        OrderSide::Sell => "sell",
+    }
 }
 
 #[cfg(test)]
