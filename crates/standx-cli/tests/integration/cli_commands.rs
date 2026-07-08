@@ -11,7 +11,7 @@ fn test_cli_version() {
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("standx"))
-        .stdout(predicate::str::contains("0.7"));
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]

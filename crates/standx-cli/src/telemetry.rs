@@ -50,6 +50,12 @@ pub struct Telemetry {
     command_start: Option<Instant>,
 }
 
+impl Default for Telemetry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[allow(dead_code)]
 impl Telemetry {
     /// Create new telemetry instance

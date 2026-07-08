@@ -1,18 +1,18 @@
 //! Command implementations
 
 use crate::cli::*;
+use crate::config::Config;
+use crate::output;
 use anyhow::Result;
 use futures::future::join_all;
-use standx_cli::auth::Credentials;
-use standx_cli::client::order::CreateOrderParams;
-use standx_cli::client::StandXClient;
-use standx_cli::config::Config;
-use standx_cli::error::Error as StandxError;
-use standx_cli::models::{
+use standx_sdk::auth::Credentials;
+use standx_sdk::client::order::CreateOrderParams;
+use standx_sdk::client::StandXClient;
+use standx_sdk::error::Error as StandxError;
+use standx_sdk::models::{
     BlockTrade, DashboardSnapshot, OrderSide, OrderType, PortfolioSnapshot, TimeInForce, Trade,
 };
-use standx_cli::output;
-use standx_cli::websocket::{StandXWebSocket, WsMessage};
+use standx_sdk::websocket::{StandXWebSocket, WsMessage};
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
@@ -218,7 +218,7 @@ pub async fn handle_leverage(command: LeverageCommands, output_format: OutputFor
                         .find(|s| s.symbol == symbol)
                         .ok_or_else(|| anyhow::anyhow!("Symbol {} not found", symbol))?;
 
-                    let config = standx_cli::models::PositionConfig {
+                    let config = standx_sdk::models::PositionConfig {
                         symbol: symbol.clone(),
                         leverage: symbol_info.def_leverage.clone(),
                         max_leverage: symbol_info.max_leverage.clone(),

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Workspace split: `standx-sdk` extracted as an independent crate**
+  - `crates/standx-sdk` (v0.1.0): REST client, WebSocket streams, models, auth/signing, errors — reusable by any Rust agent/bot; zero presentation dependencies by default (table rendering behind the optional `tabled` feature)
+  - `crates/standx-cli` (v0.8.0): the `standx` binary — commands, output formatting, config, telemetry; re-exports the SDK surface for backward compatibility
+  - Release artifacts unchanged (binary name `standx`, same CI/homebrew/install.sh flow)
+- Removed unused dependencies: `comfy-table`, `once_cell`, `config`, `keyring` (and the vestigial `no-keyring` feature)
+
+### Fixed
+- `order create`: removed `-q` short flag (collided with global `--quiet`; clap panics on the collision in debug builds). Use `--qty`.
+- Deflaked env-var tests (config + credentials) by serializing them with a lock
+- Version integration test no longer hardcodes the version number
+- Wired the previously-orphaned `tests/unit/` tree into a compiled test target
+
 ## [0.7.0] - 2026-03-05
 
 ### Added

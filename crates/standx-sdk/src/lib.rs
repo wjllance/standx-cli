@@ -1,9 +1,9 @@
-//! StandX Agent Toolkit
+//! StandX SDK
 //!
-//! The first AI Agent-native trading infrastructure for StandX.
+//! Rust SDK for the StandX perpetual DEX: REST client, WebSocket streams,
+//! data models, and Ed25519 request signing.
 //!
-//! This crate provides a Rust client designed specifically for AI Agents and automated systems:
-//! - Native MCP (Model Context Protocol) support
+//! This crate is designed for AI Agents and automated systems:
 //! - Structured output by default
 //! - Non-interactive design for automation
 //! - Sub-100ms latency for real-time decisions
@@ -11,7 +11,7 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use standx_cli::client::StandXClient;
+//! use standx_sdk::client::StandXClient;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -22,20 +22,11 @@
 //! }
 //! ```
 //!
-//! ## Agent Integration
+//! ## Features
 //!
-//! This library is designed to be used by AI Agents through MCP:
-//!
-//! ```json
-//! {
-//!   "mcpServers": {
-//!     "standx": {
-//!       "command": "standx",
-//!       "args": ["mcp", "serve"]
-//!     }
-//!   }
-//! }
-//! ```
+//! - `tabled`: implements [`tabled::Tabled`] for core models so they can be
+//!   rendered as tables (used by the `standx` CLI; off by default so SDK
+//!   consumers carry no presentation dependencies).
 //!
 //! ## Design Principles
 //!
@@ -48,10 +39,8 @@
 
 pub mod auth;
 pub mod client;
-pub mod config;
 pub mod error;
 pub mod models;
-pub mod output;
 pub mod websocket;
 
 pub use error::{Error, Result};

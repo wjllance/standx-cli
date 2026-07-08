@@ -1,0 +1,60 @@
+[package]
+name = "standx-sdk"
+version = "0.1.0"
+description = "Rust SDK for the StandX perpetual DEX - REST client, WebSocket streams, models, and signing"
+keywords = ["standx", "trading", "crypto", "sdk", "perpetual"]
+categories = ["api-bindings", "cryptography::cryptocurrencies"]
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Async
+tokio.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+
+# HTTP
+reqwest.workspace = true
+
+# WebSocket
+tokio-tungstenite.workspace = true
+url.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Cryptography (Ed25519)
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+bs58 = "0.5"
+rand = "0.8"
+
+# Time
+chrono.workspace = true
+
+# Utilities
+dirs.workspace = true
+hex = "0.4"
+base64 = "0.22"
+
+# Optional table rendering for models (enabled by the CLI)
+tabled = { workspace = true, optional = true }
+
+[features]
+default = []
+tabled = ["dep:tabled"]
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockito = "1.6"
+tempfile = "3.0"

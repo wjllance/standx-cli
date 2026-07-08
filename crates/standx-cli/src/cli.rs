@@ -251,7 +251,9 @@ pub enum OrderCommands {
         symbol: String,
         side: String,
         order_type: String,
-        #[arg(short, long)]
+        // No short: `-q` is taken by the global `--quiet` flag (clap
+        // debug-asserts on the collision in debug builds).
+        #[arg(long)]
         qty: String,
         #[arg(short, long)]
         price: Option<String>,

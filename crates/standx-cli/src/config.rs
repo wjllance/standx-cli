@@ -141,22 +141,34 @@ impl Config {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
+    /// Serializes tests that mutate process environment variables.
+    /// Tests run in parallel threads within one binary, so concurrent
+    /// EnvGuards on the same variable race without this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     /// Helper struct to temporarily set environment variables
-    /// Restores original value (or removes if not set) when dropped
+    /// Restores original value (or removes if not set) when dropped.
+    /// Holds the ENV_LOCK for its lifetime so env tests never overlap.
     struct EnvGuard {
         key: String,
         original_value: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let original_value = std::env::var(key).ok();
             std::env::set_var(key, value);
             Self {
                 key: key.to_string(),
                 original_value,
+                _lock: lock,
             }
         }
     }
