@@ -68,33 +68,6 @@ pub fn format_order_book(book: &OrderBook, limit: usize) -> String {
     output
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_format_json() {
-        let symbol = SymbolInfo {
-            symbol: "BTC-USD".to_string(),
-            base_asset: "BTC".to_string(),
-            quote_asset: "DUSD".to_string(),
-            base_decimals: 9,
-            price_tick_decimals: 2,
-            qty_tick_decimals: 4,
-            min_order_qty: "0.0001".to_string(),
-            def_leverage: "10".to_string(),
-            max_leverage: "40".to_string(),
-            maker_fee: "0.0001".to_string(),
-            taker_fee: "0.0004".to_string(),
-            status: "trading".to_string(),
-        };
-
-        let json = format_json(&symbol).unwrap();
-        assert!(json.contains("BTC-USD"));
-        assert!(json.contains("\"symbol\""));
-    }
-}
-
 /// Format dashboard as MVP compact view (Issue #156)
 pub fn format_dashboard_mvp(snapshot: &DashboardSnapshot, compact: bool) -> String {
     let mut output = String::new();
@@ -552,4 +525,31 @@ pub fn render_dashboard(snapshot: &DashboardSnapshot, compact: bool) -> String {
     output.push_str(&format_dashboard_trades(&snapshot.trades, compact, width));
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_json() {
+        let symbol = SymbolInfo {
+            symbol: "BTC-USD".to_string(),
+            base_asset: "BTC".to_string(),
+            quote_asset: "DUSD".to_string(),
+            base_decimals: 9,
+            price_tick_decimals: 2,
+            qty_tick_decimals: 4,
+            min_order_qty: "0.0001".to_string(),
+            def_leverage: "10".to_string(),
+            max_leverage: "40".to_string(),
+            maker_fee: "0.0001".to_string(),
+            taker_fee: "0.0004".to_string(),
+            status: "trading".to_string(),
+        };
+
+        let json = format_json(&symbol).unwrap();
+        assert!(json.contains("BTC-USD"));
+        assert!(json.contains("\"symbol\""));
+    }
 }

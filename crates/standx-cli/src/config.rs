@@ -266,13 +266,13 @@ mod tests {
         config.save().unwrap();
 
         // 然后损坏文件
-        let mut file = std::fs::File::create(&config.config_file()).unwrap();
+        let mut file = std::fs::File::create(config.config_file()).unwrap();
         file.write_all(b"invalid toml [[[").unwrap();
         drop(file);
 
         // 尝试加载损坏的配置文件
         // 注意：Config::load() 使用默认路径，这里我们手动测试解析错误
-        let content = std::fs::read_to_string(&config.config_file()).unwrap();
+        let content = std::fs::read_to_string(config.config_file()).unwrap();
         let result: std::result::Result<Config, _> = toml::from_str(&content);
         assert!(result.is_err());
     }
@@ -309,7 +309,7 @@ mod tests {
         // Test environment variable priority: Env > File > Default
         // Create a config file with specific values
         let temp_dir = TempDir::new().unwrap();
-        let mut config = Config {
+        let config = Config {
             base_url: "https://file.standx.com".to_string(),
             output_format: "table".to_string(),
             default_symbol: "BTC-USD".to_string(),
@@ -356,7 +356,7 @@ mod tests {
     fn test_load_from_path_with_specific_directory() {
         let temp_dir = TempDir::new().unwrap();
 
-        let mut config = Config {
+        let config = Config {
             base_url: "https://specific.test.com".to_string(),
             output_format: "json".to_string(),
             default_symbol: "ETH-USD".to_string(),
@@ -379,7 +379,7 @@ mod tests {
     fn test_load_from_path_with_string() {
         let temp_dir = TempDir::new().unwrap();
 
-        let mut config = Config {
+        let config = Config {
             base_url: "https://string.test.com".to_string(),
             output_format: "csv".to_string(),
             default_symbol: "DOGE-USD".to_string(),
@@ -396,7 +396,7 @@ mod tests {
     fn test_load_from_path_with_pathbuf() {
         let temp_dir = TempDir::new().unwrap();
 
-        let mut config = Config {
+        let config = Config {
             base_url: "https://pathbuf.test.com".to_string(),
             output_format: "csv".to_string(),
             default_symbol: "DOGE-USD".to_string(),
@@ -419,7 +419,7 @@ mod tests {
     fn test_load_backward_compatibility() {
         let temp_dir = TempDir::new().unwrap();
 
-        let mut config = Config {
+        let config = Config {
             base_url: "https://backward.compat.com".to_string(),
             output_format: "table".to_string(),
             default_symbol: "BTC-USD".to_string(),

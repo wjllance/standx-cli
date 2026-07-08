@@ -79,7 +79,7 @@ fn test_api_error_json_serialization() {
 #[test]
 fn test_error_retryable() {
     // 5xx 错误应该可重试
-    let err = Error::Http {
+    let _err = Error::Http {
         code: 500,
         message: "Server Error".to_string(),
         retryable: Some(true),
@@ -87,7 +87,7 @@ fn test_error_retryable() {
     // retryable 字段已设置
 
     // 4xx 错误不应该重试
-    let err = Error::Http {
+    let _err = Error::Http {
         code: 400,
         message: "Bad Request".to_string(),
         retryable: Some(false),

@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn test_telemetry_enabled_by_default() {
         env::remove_var(TELEMETRY_ENV_VAR);
-        let telemetry = Telemetry::new();
+        let _telemetry = Telemetry::new();
         // Note: This might fail if user has env var set
         // In real tests, use a temp directory
     }
