@@ -40,6 +40,7 @@
 pub mod auth;
 pub mod client;
 pub mod error;
+pub mod maker;
 pub mod models;
 pub mod websocket;
 

@@ -120,6 +120,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: BlockCommands,
     },
+    /// Market-maker bot (SIP-5A community maker yield)
+    #[command(visible_alias = "mk")]
+    Maker {
+        #[command(subcommand)]
+        command: MakerCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -374,7 +380,45 @@ pub enum BlockCommands {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+#[derive(Subcommand, Debug)]
+pub enum MakerCommands {
+    /// Run the maker quoting loop (paper mode by default; --live to place orders)
+    Run {
+        /// Symbol to quote (e.g., BTC-USD)
+        symbol: String,
+        /// Half-spread from mark price in basis points
+        #[arg(long, default_value = "5")]
+        spread_bps: f64,
+        /// Eligibility band guard in bps: never quote outside mark ± band
+        #[arg(long, default_value = "20")]
+        band_bps: f64,
+        /// Per-side, per-level order quantity
+        #[arg(long, default_value = "0.01")]
+        size: f64,
+        /// Number of quote levels per side
+        #[arg(long, default_value = "1")]
+        levels: u32,
+        /// Spacing between levels in bps (when levels > 1)
+        #[arg(long, default_value = "2")]
+        level_step_bps: f64,
+        /// Anti-flicker: re-quote only when mark moved more than this (bps)
+        /// since the order was placed
+        #[arg(long, default_value = "3")]
+        refresh_bps: f64,
+        /// Loop interval in seconds
+        #[arg(short, long, default_value = "5")]
+        interval: u64,
+        /// Max absolute position; suppress the side that would exceed it
+        #[arg(long, default_value = "0.05")]
+        max_position: f64,
+        /// Place real orders (without this flag the bot runs in paper mode:
+        /// full loop, prints intended actions, no orders placed)
+        #[arg(long)]
+        live: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
     #[default]
     Table,

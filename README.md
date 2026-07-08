@@ -348,6 +348,41 @@ standx stream balance    # Balance updates
 standx stream fills      # Fill updates
 ```
 
+### Maker Bot (SIP-5A Community Maker Yield)
+
+A simple two-sided quoting loop optimized for
+[SIP-5A](https://docs.standx.com/sip/sip-5a-community-maker-yield): it keeps
+quotes resting inside the eligibility band (uptime is what earns) and only
+re-quotes when mark price drifts past a threshold — no flicker-cancelling.
+
+```bash
+# Paper mode (default): runs the full loop, prints intended actions,
+# places NO orders. Safe to run without credentials.
+standx maker run BTC-USD --size 0.001 --interval 3
+
+# Tune the strategy
+standx maker run BTC-USD \
+  --spread-bps 5      # half-spread from mark price
+  --band-bps 20       # never quote outside mark ± band
+  --refresh-bps 3     # anti-flicker: re-quote only after this much drift
+  --levels 2          # quote levels per side
+  --max-position 0.05 # suppress the side that would exceed this
+
+# Machine-readable JSON lines (one object per action)
+standx maker run BTC-USD --output json
+
+# Live mode places real post-only (ALO) orders and requires a private key.
+# It is currently locked behind STANDX_ENABLE_LIVE_MAKER=1 until
+# supervised production testing completes.
+standx maker run BTC-USD --live
+```
+
+In live mode the bot manages **all** orders on the quoted symbol (it starts
+with a cancel-all and cancels unknown orders as stale), cancels everything on
+exit (with retries and verification), and stops quoting after 3 consecutive
+API errors (fail-safe). Paper mode does not simulate fills, so position
+stays 0.
+
 ---
 
 ## 💡 Use Cases

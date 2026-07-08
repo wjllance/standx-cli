@@ -370,6 +370,7 @@ pub enum TimeInForce {
     Gtc, // Good Till Cancel
     Ioc, // Immediate or Cancel
     Fok, // Fill or Kill
+    Alo, // Add Liquidity Only (post-only: rejected instead of taking)
 }
 
 /// Order status
