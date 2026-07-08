@@ -224,9 +224,22 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process environment variables.
+    /// Tests run in parallel threads within one binary, so concurrent
+    /// mutations of STANDX_JWT / STANDX_PRIVATE_KEY race without this lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Helper struct to temporarily set environment variables
     /// Restores original value (or removes if not set) when dropped
+    #[allow(dead_code)]
     struct EnvGuard {
         key: String,
         original_value: Option<String>,
@@ -301,6 +314,7 @@ mod tests {
 
     #[test]
     fn test_from_env() {
+        let _lock = env_lock();
         // Save and set environment variables
         let original_token = std::env::var(ENV_JWT_TOKEN).ok();
         std::env::set_var(ENV_JWT_TOKEN, "env_test_token");
@@ -326,6 +340,7 @@ mod tests {
 
     #[test]
     fn test_from_env_missing() {
+        let _lock = env_lock();
         // Ensure env vars are not set
         std::env::remove_var(ENV_JWT_TOKEN);
         std::env::remove_var(ENV_PRIVATE_KEY);

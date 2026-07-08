@@ -440,6 +440,7 @@ pub struct Order {
     pub updated_at: String,
 }
 
+#[cfg(feature = "tabled")]
 impl tabled::Tabled for Order {
     const LENGTH: usize = 100;
 
@@ -523,6 +524,7 @@ pub struct Position {
     pub user: String,
 }
 
+#[cfg(feature = "tabled")]
 impl tabled::Tabled for Position {
     const LENGTH: usize = 100;
 
@@ -567,6 +569,7 @@ pub struct PositionConfig {
     pub margin_mode: String,
 }
 
+#[cfg(feature = "tabled")]
 impl tabled::Tabled for PositionConfig {
     const LENGTH: usize = 4;
 
@@ -618,6 +621,7 @@ pub struct Balance {
     pub upnl: String,
 }
 
+#[cfg(feature = "tabled")]
 impl tabled::Tabled for Balance {
     const LENGTH: usize = 100;
 
@@ -696,6 +700,131 @@ pub struct PortfolioSnapshot {
     pub total_pnl_realized: String,
     /// Open positions
     pub positions: Vec<Position>,
+}
+
+/// Format symbol info for display
+#[cfg(feature = "tabled")]
+impl tabled::Tabled for SymbolInfo {
+    const LENGTH: usize = 100;
+
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.symbol.clone().into(),
+            self.base_asset.clone().into(),
+            self.quote_asset.clone().into(),
+            self.status.clone().into(),
+            format!("{}x", self.max_leverage).into(),
+            self.maker_fee.clone().into(),
+            self.taker_fee.clone().into(),
+        ]
+    }
+
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Symbol".into(),
+            "Base".into(),
+            "Quote".into(),
+            "Status".into(),
+            "Max Lev".into(),
+            "Maker Fee".into(),
+            "Taker Fee".into(),
+        ]
+    }
+}
+
+/// Format market data for display
+#[cfg(feature = "tabled")]
+impl tabled::Tabled for MarketData {
+    const LENGTH: usize = 100;
+
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.symbol.clone().into(),
+            self.mark_price.clone().into(),
+            self.index_price.clone().into(),
+            self.last_price.clone().into(),
+            self.volume_24h.clone().into(),
+            self.high_24h.clone().into(),
+            self.low_24h.clone().into(),
+            self.funding_rate.clone().into(),
+        ]
+    }
+
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Symbol".into(),
+            "Mark Price".into(),
+            "Index Price".into(),
+            "Last Price".into(),
+            "Volume 24h".into(),
+            "High 24h".into(),
+            "Low 24h".into(),
+            "Funding Rate".into(),
+        ]
+    }
+}
+
+/// Format trade for display
+#[cfg(feature = "tabled")]
+impl tabled::Tabled for Trade {
+    const LENGTH: usize = 100;
+
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.time.split('.').next().unwrap_or(&self.time).into(),
+            self.price.clone().into(),
+            self.qty.clone().into(),
+            if self.is_buyer_taker {
+                "Buy".into()
+            } else {
+                "Sell".into()
+            },
+        ]
+    }
+
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Time".into(),
+            "Price".into(),
+            "Quantity".into(),
+            "Side".into(),
+        ]
+    }
+}
+
+/// Format funding rate for display
+#[cfg(feature = "tabled")]
+impl tabled::Tabled for FundingRate {
+    const LENGTH: usize = 6;
+
+    fn fields(&self) -> Vec<std::borrow::Cow<'_, str>> {
+        vec![
+            self.time.split('T').next().unwrap_or(&self.time).into(),
+            self.time
+                .split('T')
+                .nth(1)
+                .unwrap_or("")
+                .split('.')
+                .next()
+                .unwrap_or("")
+                .into(),
+            self.funding_rate.clone().into(),
+            self.mark_price.clone().into(),
+            self.index_price.clone().into(),
+            self.premium.clone().into(),
+        ]
+    }
+
+    fn headers() -> Vec<std::borrow::Cow<'static, str>> {
+        vec![
+            "Date".into(),
+            "Time".into(),
+            "Funding Rate".into(),
+            "Mark Price".into(),
+            "Index Price".into(),
+            "Premium".into(),
+        ]
+    }
 }
 
 #[cfg(test)]

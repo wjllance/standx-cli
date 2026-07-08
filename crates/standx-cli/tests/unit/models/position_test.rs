@@ -32,7 +32,7 @@ fn test_position_full_deserialization() {
 
     let positions: Vec<Position> = serde_json::from_str(json).unwrap();
     assert_eq!(positions.len(), 1);
-    
+
     let pos = &positions[0];
     assert_eq!(pos.id, 80374);
     assert_eq!(pos.symbol, "BTC-USD");

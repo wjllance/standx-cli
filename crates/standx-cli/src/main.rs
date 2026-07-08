@@ -1,10 +1,7 @@
-mod cli;
-mod commands;
-mod telemetry;
-
 use clap::Parser;
-use cli::{Cli, Commands, OutputFormat};
-use telemetry::Telemetry;
+use standx_cli::cli::{Cli, Commands, OutputFormat};
+use standx_cli::commands;
+use standx_cli::telemetry::Telemetry;
 
 /// Print cool splash screen
 fn print_splash_screen() {
@@ -155,7 +152,7 @@ async fn execute_command(
             commands::handle_dashboard(symbols, verbose, watch, compact, output).await?;
         }
         Commands::Portfolio { verbose, watch } => {
-            let command = crate::commands::PortfolioCommand::Snapshot {
+            let command = commands::PortfolioCommand::Snapshot {
                 _verbose: verbose,
                 watch,
             };
