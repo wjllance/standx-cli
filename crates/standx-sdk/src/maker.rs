@@ -319,6 +319,80 @@ impl MakerStats {
     }
 }
 
+/// Volatility circuit breaker: halts quoting during fast mark moves so the
+/// maker isn't run over (adverse selection). Volatility is the peak-to-trough
+/// range of the last `window` marks, in bps; quoting halts when it reaches
+/// `pause_bps` and resumes once it falls back below `pause_bps/2` (hysteresis
+/// — the big move must roll out of the window first). Disabled when
+/// `pause_bps <= 0`.
+#[derive(Debug, Clone)]
+pub struct VolBreaker {
+    marks: std::collections::VecDeque<f64>,
+    window: usize,
+    pause_bps: f64,
+    rearm_bps: f64,
+    halted: bool,
+    last_vol_bps: f64,
+}
+
+impl VolBreaker {
+    pub fn new(window: usize, pause_bps: f64) -> Self {
+        Self {
+            marks: std::collections::VecDeque::with_capacity(window.max(1)),
+            window: window.max(1),
+            pause_bps,
+            rearm_bps: pause_bps * 0.5,
+            halted: false,
+            last_vol_bps: 0.0,
+        }
+    }
+
+    /// Whether the breaker is armed (a positive threshold was configured).
+    pub fn enabled(&self) -> bool {
+        self.pause_bps > 0.0
+    }
+
+    /// Feed the current mark and update state; returns whether quoting is
+    /// halted this cycle.
+    pub fn observe(&mut self, mark: f64) -> bool {
+        if !self.enabled() || mark <= 0.0 {
+            return false;
+        }
+        if self.marks.len() == self.window {
+            self.marks.pop_front();
+        }
+        self.marks.push_back(mark);
+
+        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+        for &m in &self.marks {
+            lo = lo.min(m);
+            hi = hi.max(m);
+        }
+        self.last_vol_bps = if lo > 0.0 && self.marks.len() >= 2 {
+            (hi - lo) / lo * 10_000.0
+        } else {
+            0.0
+        };
+
+        if self.halted {
+            if self.last_vol_bps < self.rearm_bps {
+                self.halted = false;
+            }
+        } else if self.last_vol_bps >= self.pause_bps {
+            self.halted = true;
+        }
+        self.halted
+    }
+
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+
+    pub fn vol_bps(&self) -> f64 {
+        self.last_vol_bps
+    }
+}
+
 /// Compute the desired quote set for the current market snapshot.
 ///
 /// Applies, in order: the inventory-skewed spread/level ladder, the band clamp,
@@ -1019,5 +1093,47 @@ mod tests {
         let actions2 = reconcile(&c, mark, pos2, None, None, &desired2, &rest2, 1);
         assert!(actions2.iter().any(|a| matches!(a, Action::Hold { .. })));
         assert!(!actions2.iter().any(|a| matches!(a, Action::Cancel { .. })));
+    }
+
+    // 25. Vol breaker: disabled is a no-op.
+    #[test]
+    fn vol_breaker_disabled() {
+        let mut b = VolBreaker::new(5, 0.0);
+        assert!(!b.enabled());
+        assert!(!b.observe(100.0));
+        assert!(!b.observe(200.0)); // huge move, but disabled -> never halts
+        assert!(!b.halted());
+    }
+
+    // 26. Vol breaker: trips on a fast move, resumes with hysteresis.
+    #[test]
+    fn vol_breaker_trip_and_rearm() {
+        // window 4, pause 30bps -> rearm 15bps.
+        let mut b = VolBreaker::new(4, 30.0);
+        assert!(!b.observe(100.0));
+        assert!(!b.observe(100.1)); // 10bps range, calm
+        assert!(!b.halted());
+        // Jump to 100.4: range now (100.4-100.0)/100 = 40bps >= 30 -> halt.
+        assert!(b.observe(100.4));
+        assert!(b.halted());
+        // Still elevated while the low sample (100.0) is in the window.
+        assert!(b.observe(100.4)); // range 40bps, still halted
+                                   // Push new samples near 100.4 so old lows roll out; range collapses.
+        b.observe(100.4);
+        let halted = b.observe(100.4); // window now all ~100.4 -> range ~0 < 15
+        assert!(!halted);
+        assert!(!b.halted());
+    }
+
+    // 27. Vol breaker: hysteresis holds between rearm and pause.
+    #[test]
+    fn vol_breaker_hysteresis_band() {
+        let mut b = VolBreaker::new(3, 40.0); // rearm 20bps
+        b.observe(100.0);
+        assert!(b.observe(100.5)); // 50bps -> halt
+                                   // Range drifts to ~25bps (between rearm 20 and pause 40): stays halted.
+        b.observe(100.25);
+        let halted = b.observe(100.25); // window {100.5,100.25,100.25} range 25bps
+        assert!(halted, "should stay halted in the hysteresis band");
     }
 }

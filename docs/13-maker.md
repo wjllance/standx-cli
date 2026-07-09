@@ -64,6 +64,8 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--max-position` | `0.05` | 最大绝对持仓；会把继续加仓的一侧压制掉 |
 | `--skew-bps` | `0` | 库存 skew：满仓时把报价中心向减仓侧偏移的最大幅度（bps），0 关闭。见 [13.3](#库存-skew) |
 | `--max-divergence-bps` | `25` | 当 mark 价与盘口中价背离超过此值时跳过该轮（不动挂单） |
+| `--vol-pause-bps` | `0` | 波动率熔断：mark 在 `--vol-window` 轮内的极差达到此值（bps）即撤掉全部报价暂停，回落到一半以下才恢复。0 关闭。见 [13.3](#波动率熔断) |
+| `--vol-window` | `12` | 波动率熔断测量极差的窗口（最近 N 轮） |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
 
@@ -106,6 +108,17 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 - **早醒重报**：循环在 sleep 期间若发现 mark 已漂过 `--refresh-bps`，会提前进入下一轮，缩短暴露窗口而不增加闪撤（仅在本来就要重报时才早醒）。
 - **mark/mid 背离守卫**：mark 价与盘口中价背离超过 `--max-divergence-bps` 时，本轮不做任何动作（不撤不挂），避免在数据源打架时误动作。
 
+### 波动率熔断
+
+快速行情里被动做市最容易被"扫单"（逆向选择）。`--vol-pause-bps` 开启后，机器人跟踪 mark 在最近 `--vol-window` 轮内的极差（(max−min)/min，bps）：
+
+- 极差 **达到 `--vol-pause-bps`** → **熔断**：撤掉全部挂单、暂停报价（`⚡HALT`）。
+- 极差 **回落到阈值一半以下** → 恢复报价。
+
+采用滞回（hysteresis）：大幅波动必须先滚出窗口、极差降到一半以下才恢复，避免在阈值附近反复开关。熔断期间不报价 = 主动放弃这段 uptime，换取不被扫单——这是有意的取舍。`--vol-pause-bps 0`（默认）关闭。
+
+> 权衡：熔断会牺牲 SIP-5A 的 uptime 得分。阈值要结合 [13.4](#134-输出与遥测) 的遥测来定——熔断太频繁会拉低 uptime，太松则起不到保护。mark 价通常比盘口 touch 更"黏"，据此设阈值。
+
 ---
 
 ## 13.4 输出与遥测
@@ -113,7 +126,7 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 三种输出格式：
 
 - **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。
-- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`。
 - **Quiet（`--quiet`）**：只打印成交与增删挂单。
 
 退出时打印本次会话统计：
@@ -185,6 +198,7 @@ standx --dry-run maker run BTC-USD
 - [ ] 盘口穿过某侧挂单时,只撤违规一侧(would_cross)
 - [ ] `--output json` 每行都是合法 JSON,含 cycle_summary
 - [ ] touch 穿过报价时出现 FILL,pos 与 pnl 变化
+- [ ] `--vol-pause-bps` 设很小(如 2)时,波动中出现 `⚡HALT`、全部挂单被撤、平静后恢复
 - [ ] `Ctrl+C` 退出时打印统计并(live)清理挂单
 
 ### 参数校验

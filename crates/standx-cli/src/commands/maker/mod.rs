@@ -86,6 +86,8 @@ pub async fn handle_maker(
             max_position,
             skew_bps,
             max_divergence_bps,
+            vol_pause_bps,
+            vol_window,
             no_ws,
             live,
         } => {
@@ -102,6 +104,8 @@ pub async fn handle_maker(
                     max_position,
                     skew_bps,
                     max_divergence_bps,
+                    vol_pause_bps,
+                    vol_window,
                     no_ws,
                     live,
                     verbose,
@@ -124,6 +128,8 @@ struct MakerRunArgs {
     max_position: f64,
     skew_bps: f64,
     max_divergence_bps: f64,
+    vol_pause_bps: f64,
+    vol_window: u32,
     no_ws: bool,
     live: bool,
     verbose: bool,
@@ -275,6 +281,14 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 args.max_divergence_bps
             );
         }
+        if args.vol_pause_bps > 0.0 {
+            println!(
+                "│ vol breaker: halt at {}bps range / {} cycles (resume < {}bps)",
+                args.vol_pause_bps,
+                args.vol_window.max(1),
+                args.vol_pause_bps / 2.0
+            );
+        }
         println!("│ Ctrl+C to stop (cancels all resting orders on exit)");
         println!("└──────────────────────────────────────────────────────────┘");
     }
@@ -297,8 +311,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_cancels: u64 = 0;
     let mut total_holds: u64 = 0;
     let mut total_fills: u64 = 0;
+    let mut total_halted: u64 = 0;
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
     let mut stats = maker::MakerStats::default();
+    let mut breaker = maker::VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
 
@@ -323,10 +339,11 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut pending,
                 &mut sim_position,
                 &mut stats,
+                &mut breaker,
                 output_format,
             )
             .await?;
-            Ok::<_, anyhow::Error>((places, cancels, holds, fills, mark, src))
+            Ok::<_, anyhow::Error>((places, cancels, holds, fills, mark, src, breaker.halted()))
         };
         let cycle_result = tokio::select! {
             _ = signal::ctrl_c() => break MakerExit::CtrlC,
@@ -334,12 +351,13 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         };
 
         match cycle_result {
-            Ok((places, cancels, holds, fills, mark, src)) => {
+            Ok((places, cancels, holds, fills, mark, src, halted)) => {
                 consecutive_errors = 0;
                 total_places += places;
                 total_cancels += cancels;
                 total_holds += holds;
                 total_fills += fills;
+                total_halted += halted as u64;
                 last_mark = Some(mark);
                 if !args.no_ws && last_src != Some(src) {
                     match src {
@@ -424,6 +442,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             stats.avg_spread_capture_bps(),
             pnl_note
         );
+        if breaker.enabled() {
+            println!("   vol breaker: {} cycles halted", total_halted);
+        }
         if !args.live {
             println!(
                 "   paper sim: ending position {}",

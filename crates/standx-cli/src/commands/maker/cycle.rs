@@ -27,12 +27,18 @@ pub(super) async fn maker_cycle(
     pending: &mut Vec<PendingPlace>,
     sim_position: &mut f64,
     stats: &mut standx_sdk::maker::MakerStats,
+    breaker: &mut standx_sdk::maker::VolBreaker,
     output_format: OutputFormat,
 ) -> Result<(u64, u64, u64, u64)> {
     use standx_sdk::maker::{
         compute_desired_quotes, format_decimals, mark_mid_divergence_bps, paper_quote_filled,
         reconcile, skew_center, Action, RestingQuote,
     };
+
+    // 0. Feed the volatility breaker every cycle (even when a later guard
+    //    skips), so its window stays current. When tripped, quoting halts
+    //    below (all quotes pulled) until volatility subsides.
+    let halted = breaker.observe(mark);
 
     // 1. Sanity guard: when mark and the book mid disagree, at least one
     //    data source is wrong (stale feed, bad print, dislocated book).
@@ -165,8 +171,14 @@ pub(super) async fn maker_cycle(
         position = *sim_position;
     }
 
-    // 3. Decide.
-    let desired = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
+    // 3. Decide. When the volatility breaker is tripped, quote nothing —
+    //    an empty desired set makes reconcile cancel every resting quote
+    //    (pull all liquidity) and place none until volatility subsides.
+    let desired = if halted {
+        Vec::new()
+    } else {
+        compute_desired_quotes(cfg, mark, best_bid, best_ask, position)
+    };
     let actions = reconcile(
         cfg, mark, position, best_bid, best_ask, &desired, resting, cycle,
     );
@@ -306,6 +318,7 @@ pub(super) async fn maker_cycle(
         &actions,
         &fills,
         stats,
+        halted.then(|| breaker.vol_bps()),
         cfg,
     );
 
