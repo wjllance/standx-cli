@@ -1,0 +1,34 @@
+//! Command implementations
+//!
+//! One submodule per command domain; this file wires them together and
+//! re-exports the public handler surface consumed by `main.rs`.
+
+mod account;
+mod auth;
+mod block;
+mod config;
+mod dashboard;
+mod leverage;
+mod maker;
+mod margin;
+mod market;
+mod order;
+mod portfolio;
+mod stream;
+mod trade;
+mod util;
+
+pub use account::handle_account;
+pub use auth::handle_auth;
+pub use block::handle_block;
+pub use config::handle_config;
+pub use dashboard::handle_dashboard;
+pub use leverage::handle_leverage;
+pub use maker::handle_maker;
+pub use margin::handle_margin;
+pub use market::handle_market;
+pub use order::handle_order;
+pub use portfolio::{handle_portfolio, PortfolioCommand};
+pub use stream::handle_stream;
+pub use trade::handle_trade;
+pub use util::parse_time_string;
