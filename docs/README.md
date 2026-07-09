@@ -19,7 +19,9 @@ docs/
 ├── 08-streaming.md           # 实时数据流
 ├── 09-output-formats.md      # 输出格式
 ├── 10-special-features.md    # 特殊功能
-└── 11-troubleshooting.md     # 故障排除
+├── 11-troubleshooting.md     # 故障排除
+├── 12-version-checklist.md   # 版本发布检查清单
+└── 13-maker.md               # 做市机器人（Maker Bot）
 ```
 
 ---
@@ -39,6 +41,8 @@ docs/
 | [09-output-formats.md](09-output-formats.md) | 表格、JSON、CSV | 9 |
 | [10-special-features.md](10-special-features.md) | OpenClaw、Dry Run | 10 |
 | [11-troubleshooting.md](11-troubleshooting.md) | 常见问题解决 | 参考 |
+| [12-version-checklist.md](12-version-checklist.md) | 版本发布检查清单 | 参考 |
+| [13-maker.md](13-maker.md) | 做市机器人（SIP-5A、paper/live、遥测） | 进阶 |
 
 ---
 
@@ -55,8 +59,9 @@ docs/
 
 1. **新用户**: 按顺序阅读 01 → 02 → 03 → 04
 2. **开发者**: 重点关注 03, 05, 08, 09, 10
-3. **测试人员**: 每个文档末尾的「测试检查清单」
-4. **故障排查**: 直接查阅 11-troubleshooting.md
+3. **做市/量化**: 13-maker.md（依赖 02, 05, 08, 09）
+4. **测试人员**: 每个文档末尾的「测试检查清单」
+5. **故障排查**: 直接查阅 11-troubleshooting.md
 
 ---
 
