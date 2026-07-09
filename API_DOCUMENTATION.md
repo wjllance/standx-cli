@@ -37,6 +37,14 @@ Where `payload` is the request body (or empty string for GET requests).
 
 ## Public Endpoints
 
+### Health Check
+
+```http
+GET /api/health
+```
+
+Liveness probe; returns 200 when the API is up.
+
 ### Get Symbol Info
 
 ```http
@@ -88,6 +96,26 @@ Returns market data including funding rate.
 }
 ```
 
+### Get Symbol Price
+
+```http
+GET /api/query_symbol_price?symbol=BTC-USD
+```
+
+Returns the lightweight price ticker (mark / index / last). Used by the
+maker bot and `standx market ticker`.
+
+**Response:**
+```json
+{
+  "symbol": "BTC-USD",
+  "mark_price": "63127.37",
+  "index_price": "63126.67",
+  "last_price": "63115.80",
+  "time": "2026-02-24T08:06:48.645735Z"
+}
+```
+
 ### Get Order Book Depth
 
 ```http
@@ -135,14 +163,14 @@ Returns recent trades.
 ### Get Kline History
 
 ```http
-GET /api/kline/history?symbol=BTC-USD&resolution=1h&from=1704067200&to=1706659200
+GET /api/kline/history?symbol=BTC-USD&resolution=60&from=1704067200&to=1706659200
 ```
 
 Returns historical kline/candlestick data.
 
 **Parameters:**
 - `symbol`: Trading pair symbol
-- `resolution`: Time resolution (1m, 5m, 15m, 1h, 4h, 1d)
+- `resolution`: Minutes (`1`, `5`, `15`, `30`, `60`, `240`, `720`) or `1D` / `1W` / `1M`
 - `from`: Start timestamp (Unix seconds)
 - `to`: End timestamp (Unix seconds)
 
@@ -339,6 +367,109 @@ x-request-signature: <SIGNATURE>
 
 Cancels multiple orders.
 
+### Get Order History
+
+```http
+GET /api/query_orders?status=filled&symbol=BTC-USD&limit=50
+Authorization: Bearer <JWT>
+```
+
+Returns historical (filled) orders. Wrapped in `{ "result": [...] }`.
+
+**Response:**
+```json
+{
+  "result": [
+    {
+      "id": "12345",
+      "symbol": "BTC-USD",
+      "side": "Buy",
+      "type": "Limit",
+      "quantity": "0.1",
+      "filled_quantity": "0.1",
+      "price": "62000",
+      "status": "Filled",
+      "created_at": "2026-02-24T08:00:00Z",
+      "updated_at": "2026-02-24T08:01:00Z"
+    }
+  ]
+}
+```
+
+### Get User Trades
+
+```http
+GET /api/query_trades?symbol=BTC-USD&from=1704067200&to=1706659200&limit=100
+Authorization: Bearer <JWT>
+```
+
+Returns the caller's own trade (fill) history. Wrapped in `{ "result": [...] }`.
+
+### Get Position Config
+
+```http
+GET /api/query_position_config?symbol=BTC-USD
+Authorization: Bearer <JWT>
+```
+
+Returns per-symbol leverage and margin configuration.
+
+**Response:**
+```json
+{
+  "symbol": "BTC-USD",
+  "leverage": "10",
+  "max_leverage": "40",
+  "def_leverage": "10",
+  "margin_mode": "cross"
+}
+```
+
+### Change Leverage
+
+```http
+POST /api/change_leverage
+Authorization: Bearer <JWT>
+Content-Type: application/json
+
+{
+  "symbol": "BTC-USD",
+  "leverage": 20
+}
+```
+
+### Change Margin Mode
+
+```http
+POST /api/change_margin_mode
+Authorization: Bearer <JWT>
+Content-Type: application/json
+
+{
+  "symbol": "BTC-USD",
+  "margin_mode": "cross"
+}
+```
+
+### Transfer Margin
+
+```http
+POST /api/transfer_margin
+Authorization: Bearer <JWT>
+Content-Type: application/json
+
+{
+  "symbol": "BTC-USD",
+  "amount_in": "100.0"
+}
+```
+
+Adjusts isolated-position margin. `amount_in` is positive to add margin,
+negative to withdraw.
+
+> All authenticated `POST` endpoints require the full signing headers
+> (`x-request-*`) shown under [Create Order](#create-order).
+
 ## WebSocket API
 
 ### Connection
@@ -347,19 +478,25 @@ Connect to `wss://perps.standx.com/ws-stream/v1`
 
 ### Authentication
 
-Send authentication message immediately after connection:
+Send an authentication message immediately after connection. Public
+channels (`price`, `depth_book`, `public_trade`, `kline`) can be subscribed
+without auth; user channels (`order`, `position`, `balance`) require the
+token. The SDK lists the intended streams in the auth frame:
 
 ```json
 {
   "auth": {
-    "token": "eyJ..."
+    "token": "eyJ...",
+    "streams": [
+      { "channel": "price", "symbol": "BTC-USD" }
+    ]
   }
 }
 ```
 
 ### Subscription
 
-Subscribe to channels after successful authentication:
+Send a subscribe frame per channel (public channels need no prior auth):
 
 ```json
 {
