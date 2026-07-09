@@ -302,6 +302,11 @@ impl MakerStats {
         self.cash + self.last_position * mark
     }
 
+    /// The last observed position.
+    pub fn position(&self) -> f64 {
+        self.last_position
+    }
+
     /// Fraction of cycles (0–100) with quotes resting on both sides.
     pub fn uptime_pct(&self) -> f64 {
         if self.cycles == 0 {
@@ -390,6 +395,141 @@ impl VolBreaker {
 
     pub fn vol_bps(&self) -> f64 {
         self.last_vol_bps
+    }
+}
+
+/// A risk alert raised (or cleared) by [`AlertMonitor`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alert {
+    /// Machine-readable slug: `loss` | `inventory` | `uptime`.
+    pub kind: &'static str,
+    /// true = the condition just started breaching; false = it just recovered.
+    pub firing: bool,
+    /// Human-readable one-liner.
+    pub message: String,
+}
+
+/// Threshold-based risk alerting over the running [`MakerStats`]. Each
+/// condition is edge-triggered — it emits once when it starts breaching and
+/// once when it recovers — so a held breach doesn't spam every cycle. Delivery
+/// (stderr / webhook) is the caller's job; this type only decides.
+///
+/// Each threshold is independently opt-in (0 disables it).
+#[derive(Debug, Clone, Default)]
+pub struct AlertMonitor {
+    /// Alert when mark-to-market PnL <= -loss_limit (quote units). 0 = off.
+    loss_limit: f64,
+    /// Alert when |position| >= max_position * inventory_pct/100. 0 = off.
+    inventory_pct: f64,
+    /// Alert when two-sided uptime% < uptime_floor (after warmup). 0 = off.
+    uptime_floor: f64,
+    loss_on: bool,
+    inv_on: bool,
+    uptime_on: bool,
+}
+
+impl AlertMonitor {
+    /// Uptime is meaningless in the first few cycles; don't alert on it until
+    /// the session has run at least this long.
+    const UPTIME_WARMUP_CYCLES: u64 = 20;
+
+    pub fn new(loss_limit: f64, inventory_pct: f64, uptime_floor: f64) -> Self {
+        Self {
+            loss_limit,
+            inventory_pct,
+            uptime_floor,
+            ..Default::default()
+        }
+    }
+
+    /// Whether any threshold is configured.
+    pub fn enabled(&self) -> bool {
+        self.loss_limit > 0.0 || self.inventory_pct > 0.0 || self.uptime_floor > 0.0
+    }
+
+    /// Evaluate the current metrics and return only the alerts whose state
+    /// changed this cycle (fired or cleared).
+    pub fn evaluate(
+        &mut self,
+        stats: &MakerStats,
+        position: f64,
+        mark: f64,
+        max_position: f64,
+        cycle: u64,
+    ) -> Vec<Alert> {
+        let mut out = Vec::new();
+
+        // Loss limit: fire at -loss_limit, clear back above -loss_limit/2.
+        if self.loss_limit > 0.0 {
+            let pnl = stats.pnl(position, mark);
+            if !self.loss_on && pnl <= -self.loss_limit {
+                self.loss_on = true;
+                out.push(Alert {
+                    kind: "loss",
+                    firing: true,
+                    message: format!(
+                        "mark-to-market PnL {:+.2} breached loss limit -{:.2}",
+                        pnl, self.loss_limit
+                    ),
+                });
+            } else if self.loss_on && pnl > -self.loss_limit / 2.0 {
+                self.loss_on = false;
+                out.push(Alert {
+                    kind: "loss",
+                    firing: false,
+                    message: format!("PnL recovered to {:+.2}", pnl),
+                });
+            }
+        }
+
+        // Inventory: fire at pct of max_position, clear below 0.9x that.
+        if self.inventory_pct > 0.0 && max_position > 0.0 {
+            let threshold = max_position * self.inventory_pct / 100.0;
+            let abs_pos = position.abs();
+            if !self.inv_on && abs_pos >= threshold {
+                self.inv_on = true;
+                out.push(Alert {
+                    kind: "inventory",
+                    firing: true,
+                    message: format!(
+                        "position {:+.4} reached {:.0}% of max ({:.4})",
+                        position, self.inventory_pct, max_position
+                    ),
+                });
+            } else if self.inv_on && abs_pos < threshold * 0.9 {
+                self.inv_on = false;
+                out.push(Alert {
+                    kind: "inventory",
+                    firing: false,
+                    message: format!("position back to {:+.4}", position),
+                });
+            }
+        }
+
+        // Uptime: only after warmup; fire below floor, clear at/above it.
+        if self.uptime_floor > 0.0 && cycle >= Self::UPTIME_WARMUP_CYCLES {
+            let uptime = stats.uptime_pct();
+            if !self.uptime_on && uptime < self.uptime_floor {
+                self.uptime_on = true;
+                out.push(Alert {
+                    kind: "uptime",
+                    firing: true,
+                    message: format!(
+                        "two-sided uptime {:.0}% below floor {:.0}%",
+                        uptime, self.uptime_floor
+                    ),
+                });
+            } else if self.uptime_on && uptime >= self.uptime_floor {
+                self.uptime_on = false;
+                out.push(Alert {
+                    kind: "uptime",
+                    firing: false,
+                    message: format!("uptime recovered to {:.0}%", uptime),
+                });
+            }
+        }
+
+        out
     }
 }
 
@@ -1135,5 +1275,64 @@ mod tests {
         b.observe(100.25);
         let halted = b.observe(100.25); // window {100.5,100.25,100.25} range 25bps
         assert!(halted, "should stay halted in the hysteresis band");
+    }
+
+    // 28. Alert monitor: disabled emits nothing.
+    #[test]
+    fn alerts_disabled() {
+        let mut m = AlertMonitor::new(0.0, 0.0, 0.0);
+        assert!(!m.enabled());
+        let s = MakerStats::default();
+        assert!(m.evaluate(&s, 5.0, 100.0, 0.05, 100).is_empty());
+    }
+
+    // 29. Loss alert: edge-triggered fire then clear.
+    #[test]
+    fn alerts_loss_edge() {
+        let mut m = AlertMonitor::new(1.0, 0.0, 0.0); // loss limit 1.0
+        let mut s = MakerStats::default();
+        // Buy 1 @ 100 (cash -100), mark drops to 98 -> pnl = -100 + 1*98 = -2.
+        s.record_fill(OrderSide::Buy, 100.0, 1.0, 100.0);
+        let a = m.evaluate(&s, 1.0, 98.0, 0.05, 5);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].kind, "loss");
+        assert!(a[0].firing);
+        // Held breach -> no repeat.
+        assert!(m.evaluate(&s, 1.0, 98.0, 0.05, 6).is_empty());
+        // Recover above -limit/2 (pnl at mark 100 = 0) -> clear.
+        let a = m.evaluate(&s, 1.0, 100.0, 0.05, 7);
+        assert_eq!(a.len(), 1);
+        assert!(!a[0].firing);
+    }
+
+    // 30. Inventory alert fires at the configured pct of max.
+    #[test]
+    fn alerts_inventory_pct() {
+        let mut m = AlertMonitor::new(0.0, 80.0, 0.0); // 80% of max
+        let s = MakerStats::default();
+        // max 0.05 -> threshold 0.04. Position 0.03 -> no alert.
+        assert!(m.evaluate(&s, 0.03, 100.0, 0.05, 5).is_empty());
+        // 0.045 >= 0.04 -> fire.
+        let a = m.evaluate(&s, 0.045, 100.0, 0.05, 6);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].kind, "inventory");
+        assert!(a[0].firing);
+        // Short side symmetric: still on (held), no repeat.
+        assert!(m.evaluate(&s, 0.045, 100.0, 0.05, 7).is_empty());
+    }
+
+    // 31. Uptime alert waits for warmup.
+    #[test]
+    fn alerts_uptime_warmup() {
+        let mut m = AlertMonitor::new(0.0, 0.0, 50.0); // floor 50%
+        let mut s = MakerStats::default();
+        // One one-sided cycle -> uptime 0%, but before warmup: no alert.
+        s.end_cycle(0.0, 100.0, false, false);
+        assert!(m.evaluate(&s, 0.0, 100.0, 0.05, 5).is_empty());
+        // After warmup, still 0% < 50% -> fire.
+        let a = m.evaluate(&s, 0.0, 100.0, 0.05, 25);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].kind, "uptime");
+        assert!(a[0].firing);
     }
 }

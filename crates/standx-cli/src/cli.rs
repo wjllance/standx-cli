@@ -430,6 +430,22 @@ pub enum MakerCommands {
         /// Number of recent cycles the volatility breaker measures range over
         #[arg(long, default_value = "12")]
         vol_window: u32,
+        /// Risk alert: fire when mark-to-market PnL drops to -this (quote
+        /// units). 0 disables
+        #[arg(long, default_value = "0")]
+        alert_loss: f64,
+        /// Risk alert: fire when |position| reaches this percent of
+        /// --max-position. 0 disables
+        #[arg(long, default_value = "0")]
+        alert_inventory_pct: f64,
+        /// Risk alert: fire when two-sided uptime drops below this percent
+        /// (after warmup). 0 disables
+        #[arg(long, default_value = "0")]
+        alert_uptime: f64,
+        /// Also POST risk alerts as JSON to this URL (e.g. a Slack/Discord
+        /// incoming webhook). stderr always gets them regardless
+        #[arg(long)]
+        alert_webhook: Option<String>,
         /// Disable the WebSocket market feed and poll REST every cycle
         #[arg(long)]
         no_ws: bool,

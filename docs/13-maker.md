@@ -66,6 +66,10 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--max-divergence-bps` | `25` | 当 mark 价与盘口中价背离超过此值时跳过该轮（不动挂单） |
 | `--vol-pause-bps` | `0` | 波动率熔断：mark 在 `--vol-window` 轮内的极差达到此值（bps）即撤掉全部报价暂停，回落到一半以下才恢复。0 关闭。见 [13.3](#波动率熔断) |
 | `--vol-window` | `12` | 波动率熔断测量极差的窗口（最近 N 轮） |
+| `--alert-loss` | `0` | 风险告警：mark-to-market PnL 跌到 −此值（计价单位）时告警。0 关闭 |
+| `--alert-inventory-pct` | `0` | 风险告警：\|仓位\| 达到 `--max-position` 的此百分比时告警。0 关闭 |
+| `--alert-uptime` | `0` | 风险告警：双边 uptime 跌破此百分比时告警（过预热期后）。0 关闭 |
+| `--alert-webhook` | 无 | 除 stderr/JSON 外，把告警 POST 到此 URL（Slack/Discord incoming webhook 或自定义） |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
 
@@ -148,6 +152,24 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 
 > paper 用精确模拟成交计算；live 从周期间仓位差推断成交（按 mark 计价，是捕获的保守下界，直到接入 fills 频道）。**调参在 paper 里做**：观察 avg capture 与 PnL 的关系来调 `--spread-bps` / `--refresh-bps` / `--skew-bps`。
 
+### 风险告警
+
+遥测默认只**展示**指标；风险告警把它变成**主动通知**。三个阈值各自 opt-in（0 关闭）：
+
+- `--alert-loss <X>`：mark-to-market PnL 跌到 −X 时告警（回升到 −X/2 以上解除）。
+- `--alert-inventory-pct <P>`：\|仓位\| 达到 `--max-position` 的 P% 时告警（跌回 0.9×P% 以下解除）——趋势市里最先亮的灯。
+- `--alert-uptime <U>`：双边 uptime 跌破 U% 时告警（前 20 轮预热期不判）。
+
+告警是**边沿触发**的：进入异常态时响一次、恢复时响一次，不会每轮刷屏。输出到 stderr（`🚨 ALERT` / `✅ RESOLVED`）与 JSON（`action:"alert"`）；若设了 `--alert-webhook <url>`,还会 POST 一条带 `text` 字段的 JSON(直接适配 Slack/Discord incoming webhook),该 POST 是 fire-and-forget,慢/坏的端点不会拖住报价循环。
+
+```bash
+standx maker run BTC-USD \
+  --alert-loss 50 --alert-inventory-pct 80 --alert-uptime 90 \
+  --alert-webhook https://hooks.slack.com/services/XXX
+```
+
+> 注意:这些覆盖的是**金融风险**;基础设施类告警(feed 断线、连续错误 fail-safe、退出残留单)是内置的,始终开启。
+
 ---
 
 ## 13.5 Live（实盘）模式
@@ -199,6 +221,7 @@ standx --dry-run maker run BTC-USD
 - [ ] `--output json` 每行都是合法 JSON,含 cycle_summary
 - [ ] touch 穿过报价时出现 FILL,pos 与 pnl 变化
 - [ ] `--vol-pause-bps` 设很小(如 2)时,波动中出现 `⚡HALT`、全部挂单被撤、平静后恢复
+- [ ] `--alert-inventory-pct 50`(配小 `--max-position`)时,仓位过半出现 `🚨 ALERT`,只响一次;`--alert-webhook` 指向本地监听器能收到 POST
 - [ ] `Ctrl+C` 退出时打印统计并(live)清理挂单
 
 ### 参数校验

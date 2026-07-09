@@ -67,6 +67,65 @@ fn open_qty_adopts(open_qty: f64, placed_qty: f64) -> bool {
     open_qty > 0.0 && open_qty <= placed_qty * (1.0 + 1e-6)
 }
 
+/// Deliver a risk alert: to the console (stderr for humans, a JSON line in
+/// JSON mode) and, if configured, to a webhook. The webhook POST is spawned
+/// fire-and-forget so a slow or broken endpoint never stalls the trading loop.
+fn deliver_alert(
+    alert: &standx_sdk::maker::Alert,
+    symbol: &str,
+    output_format: OutputFormat,
+    http: Option<&reqwest::Client>,
+    webhook_url: &Option<String>,
+) {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let label = if alert.firing {
+        "🚨 ALERT"
+    } else {
+        "✅ RESOLVED"
+    };
+
+    match output_format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ts": ts, "symbol": symbol, "action": "alert",
+                    "kind": alert.kind, "firing": alert.firing,
+                    "message": alert.message,
+                })
+            );
+        }
+        _ => eprintln!("{} [{}] {} — {}", label, alert.kind, symbol, alert.message),
+    }
+
+    if let (Some(client), Some(url)) = (http, webhook_url.as_ref()) {
+        // `text` makes it render out-of-the-box in Slack/Discord webhooks;
+        // structured fields are there for custom consumers.
+        let body = serde_json::json!({
+            "text": format!("{} [{}] {} — {}", label, symbol, alert.kind, alert.message),
+            "ts": ts, "symbol": symbol, "kind": alert.kind,
+            "firing": alert.firing, "message": alert.message,
+        });
+        let client = client.clone();
+        let url = url.clone();
+        tokio::spawn(async move {
+            match client
+                .post(&url)
+                .json(&body)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(r) if !r.status().is_success() => {
+                    eprintln!("⚠️  alert webhook returned {}", r.status())
+                }
+                Err(e) => eprintln!("⚠️  alert webhook POST failed: {e}"),
+                _ => {}
+            }
+        });
+    }
+}
+
 /// Handle maker commands
 pub async fn handle_maker(
     command: MakerCommands,
@@ -88,6 +147,10 @@ pub async fn handle_maker(
             max_divergence_bps,
             vol_pause_bps,
             vol_window,
+            alert_loss,
+            alert_inventory_pct,
+            alert_uptime,
+            alert_webhook,
             no_ws,
             live,
         } => {
@@ -106,6 +169,10 @@ pub async fn handle_maker(
                     max_divergence_bps,
                     vol_pause_bps,
                     vol_window,
+                    alert_loss,
+                    alert_inventory_pct,
+                    alert_uptime,
+                    alert_webhook,
                     no_ws,
                     live,
                     verbose,
@@ -130,6 +197,10 @@ struct MakerRunArgs {
     max_divergence_bps: f64,
     vol_pause_bps: f64,
     vol_window: u32,
+    alert_loss: f64,
+    alert_inventory_pct: f64,
+    alert_uptime: f64,
+    alert_webhook: Option<String>,
     no_ws: bool,
     live: bool,
     verbose: bool,
@@ -289,6 +360,24 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 args.vol_pause_bps / 2.0
             );
         }
+        if args.alert_loss > 0.0 || args.alert_inventory_pct > 0.0 || args.alert_uptime > 0.0 {
+            let mut parts = Vec::new();
+            if args.alert_loss > 0.0 {
+                parts.push(format!("loss -{}", args.alert_loss));
+            }
+            if args.alert_inventory_pct > 0.0 {
+                parts.push(format!("inv {}%", args.alert_inventory_pct));
+            }
+            if args.alert_uptime > 0.0 {
+                parts.push(format!("uptime {}%", args.alert_uptime));
+            }
+            let sink = if args.alert_webhook.is_some() {
+                "stderr + webhook"
+            } else {
+                "stderr"
+            };
+            println!("│ risk alerts: {} → {}", parts.join(", "), sink);
+        }
         println!("│ Ctrl+C to stop (cancels all resting orders on exit)");
         println!("└──────────────────────────────────────────────────────────┘");
     }
@@ -315,6 +404,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
     let mut stats = maker::MakerStats::default();
     let mut breaker = maker::VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
+    let mut alerts =
+        maker::AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
+    // Reused HTTP client for webhook delivery (cheap to clone; Arc inside).
+    let alert_http = args.alert_webhook.as_ref().map(|_| reqwest::Client::new());
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
 
@@ -367,6 +460,21 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         ),
                     }
                     last_src = Some(src);
+                }
+                // Risk alerts: evaluate over the just-updated stats and
+                // deliver any state changes (stderr always; webhook if set).
+                if alerts.enabled() {
+                    let fired =
+                        alerts.evaluate(&stats, stats.position(), mark, cfg.max_position, cycle);
+                    for alert in fired {
+                        deliver_alert(
+                            &alert,
+                            &symbol,
+                            output_format,
+                            alert_http.as_ref(),
+                            &args.alert_webhook,
+                        );
+                    }
                 }
             }
             Err(e) => {
