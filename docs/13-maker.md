@@ -69,7 +69,8 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--alert-loss` | `0` | 风险告警：mark-to-market PnL 跌到 −此值（计价单位）时告警。0 关闭 |
 | `--alert-inventory-pct` | `0` | 风险告警：\|仓位\| 达到 `--max-position` 的此百分比时告警。0 关闭 |
 | `--alert-uptime` | `0` | 风险告警：双边 uptime 跌破此百分比时告警（过预热期后）。0 关闭 |
-| `--alert-webhook` | 无 | 除 stderr/JSON 外，把告警 POST 到此 URL（Slack/Discord incoming webhook 或自定义） |
+| `--alert-webhook` | 无 | 除 stderr/JSON 外，把告警 POST 到此 URL |
+| `--alert-webhook-format` | `slack` | webhook 报文格式：`slack` / `feishu` / `telegram` / `raw` |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
 
@@ -160,12 +161,26 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 - `--alert-inventory-pct <P>`：\|仓位\| 达到 `--max-position` 的 P% 时告警（跌回 0.9×P% 以下解除）——趋势市里最先亮的灯。
 - `--alert-uptime <U>`：双边 uptime 跌破 U% 时告警（前 20 轮预热期不判）。
 
-告警是**边沿触发**的：进入异常态时响一次、恢复时响一次，不会每轮刷屏。输出到 stderr（`🚨 ALERT` / `✅ RESOLVED`）与 JSON（`action:"alert"`）；若设了 `--alert-webhook <url>`,还会 POST 一条带 `text` 字段的 JSON(直接适配 Slack/Discord incoming webhook),该 POST 是 fire-and-forget,慢/坏的端点不会拖住报价循环。
+告警是**边沿触发**的：进入异常态时响一次、恢复时响一次，不会每轮刷屏。输出到 stderr（`🚨 ALERT` / `✅ RESOLVED`）与 JSON（`action:"alert"`）；若设了 `--alert-webhook <url>`，还会 POST 一条 JSON（fire-and-forget，慢/坏的端点不会拖住报价循环）。
+
+`--alert-webhook-format` 按目标平台组织报文:
+
+| 格式 | 报文 | 用法 |
+|------|------|------|
+| `slack`(默认) | `{"text":"..."}` | Slack incoming webhook |
+| `feishu` | `{"msg_type":"text","content":{"text":"..."}}` | 飞书/Lark 自定义机器人 |
+| `telegram` | `{"text":"..."}` | Telegram sendMessage,token 和 chat_id 放 URL 里:`https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>` |
+| `raw` | 完整结构化对象(text + ts/symbol/kind/firing/message) | 自定义消费端 |
 
 ```bash
-standx maker run BTC-USD \
-  --alert-loss 50 --alert-inventory-pct 80 --alert-uptime 90 \
-  --alert-webhook https://hooks.slack.com/services/XXX
+# 飞书
+standx maker run BTC-USD --alert-loss 50 --alert-inventory-pct 80 \
+  --alert-webhook <飞书机器人地址> --alert-webhook-format feishu
+
+# Telegram
+standx maker run BTC-USD --alert-inventory-pct 80 \
+  --alert-webhook "https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<ID>" \
+  --alert-webhook-format telegram
 ```
 
 > 注意:这些覆盖的是**金融风险**;基础设施类告警(feed 断线、连续错误 fail-safe、退出残留单)是内置的,始终开启。

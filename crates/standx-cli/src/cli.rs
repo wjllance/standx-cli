@@ -442,10 +442,13 @@ pub enum MakerCommands {
         /// (after warmup). 0 disables
         #[arg(long, default_value = "0")]
         alert_uptime: f64,
-        /// Also POST risk alerts as JSON to this URL (e.g. a Slack/Discord
-        /// incoming webhook). stderr always gets them regardless
+        /// Also POST risk alerts to this URL. stderr/JSON always get them
+        /// regardless. Payload shape is set by --alert-webhook-format
         #[arg(long)]
         alert_webhook: Option<String>,
+        /// Webhook payload format for the target chat platform
+        #[arg(long, value_enum, default_value = "slack")]
+        alert_webhook_format: AlertWebhookFormat,
         /// Disable the WebSocket market feed and poll REST every cycle
         #[arg(long)]
         no_ws: bool,
@@ -463,4 +466,19 @@ pub enum OutputFormat {
     Json,
     Csv,
     Quiet,
+}
+
+/// Payload shape for `--alert-webhook`, per target chat platform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum AlertWebhookFormat {
+    /// Slack incoming webhook: `{"text": "..."}`.
+    #[default]
+    Slack,
+    /// Feishu/Lark custom bot: `{"msg_type":"text","content":{"text":"..."}}`.
+    Feishu,
+    /// Telegram sendMessage: `{"text":"..."}` (put the bot token and
+    /// `chat_id` in the URL, e.g. `.../bot<TOKEN>/sendMessage?chat_id=<ID>`).
+    Telegram,
+    /// Generic: the full structured object (text + ts/symbol/kind/firing).
+    Raw,
 }

@@ -70,12 +70,42 @@ fn open_qty_adopts(open_qty: f64, placed_qty: f64) -> bool {
 /// Deliver a risk alert: to the console (stderr for humans, a JSON line in
 /// JSON mode) and, if configured, to a webhook. The webhook POST is spawned
 /// fire-and-forget so a slow or broken endpoint never stalls the trading loop.
+/// Shape the webhook body for the target chat platform. `text` is the ready
+/// one-line message; `alert` supplies the structured fields for `Raw`.
+fn webhook_payload(
+    format: AlertWebhookFormat,
+    text: &str,
+    ts: &str,
+    symbol: &str,
+    alert: &standx_sdk::maker::Alert,
+) -> serde_json::Value {
+    match format {
+        // Slack incoming webhook and Telegram sendMessage both read `text`
+        // (Telegram takes chat_id/token from the URL).
+        AlertWebhookFormat::Slack | AlertWebhookFormat::Telegram => {
+            serde_json::json!({ "text": text })
+        }
+        // Feishu/Lark custom bot.
+        AlertWebhookFormat::Feishu => serde_json::json!({
+            "msg_type": "text",
+            "content": { "text": text },
+        }),
+        // Generic consumers: full structured object.
+        AlertWebhookFormat::Raw => serde_json::json!({
+            "text": text, "ts": ts, "symbol": symbol,
+            "kind": alert.kind, "firing": alert.firing, "message": alert.message,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn deliver_alert(
     alert: &standx_sdk::maker::Alert,
     symbol: &str,
     output_format: OutputFormat,
     http: Option<&reqwest::Client>,
     webhook_url: &Option<String>,
+    webhook_format: AlertWebhookFormat,
 ) {
     let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let label = if alert.firing {
@@ -99,13 +129,8 @@ fn deliver_alert(
     }
 
     if let (Some(client), Some(url)) = (http, webhook_url.as_ref()) {
-        // `text` makes it render out-of-the-box in Slack/Discord webhooks;
-        // structured fields are there for custom consumers.
-        let body = serde_json::json!({
-            "text": format!("{} [{}] {} — {}", label, symbol, alert.kind, alert.message),
-            "ts": ts, "symbol": symbol, "kind": alert.kind,
-            "firing": alert.firing, "message": alert.message,
-        });
+        let text = format!("{} [{}] {} — {}", label, symbol, alert.kind, alert.message);
+        let body = webhook_payload(webhook_format, &text, &ts, symbol, alert);
         let client = client.clone();
         let url = url.clone();
         tokio::spawn(async move {
@@ -151,6 +176,7 @@ pub async fn handle_maker(
             alert_inventory_pct,
             alert_uptime,
             alert_webhook,
+            alert_webhook_format,
             no_ws,
             live,
         } => {
@@ -173,6 +199,7 @@ pub async fn handle_maker(
                     alert_inventory_pct,
                     alert_uptime,
                     alert_webhook,
+                    alert_webhook_format,
                     no_ws,
                     live,
                     verbose,
@@ -201,6 +228,7 @@ struct MakerRunArgs {
     alert_inventory_pct: f64,
     alert_uptime: f64,
     alert_webhook: Option<String>,
+    alert_webhook_format: AlertWebhookFormat,
     no_ws: bool,
     live: bool,
     verbose: bool,
@@ -372,9 +400,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 parts.push(format!("uptime {}%", args.alert_uptime));
             }
             let sink = if args.alert_webhook.is_some() {
-                "stderr + webhook"
+                format!("stderr + webhook ({:?})", args.alert_webhook_format).to_lowercase()
             } else {
-                "stderr"
+                "stderr".to_string()
             };
             println!("│ risk alerts: {} → {}", parts.join(", "), sink);
         }
@@ -473,6 +501,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                             output_format,
                             alert_http.as_ref(),
                             &args.alert_webhook,
+                            args.alert_webhook_format,
                         );
                     }
                 }
@@ -576,6 +605,35 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_payload_shapes() {
+        let alert = standx_sdk::maker::Alert {
+            kind: "loss",
+            firing: true,
+            message: "PnL -50 breached".into(),
+        };
+        let txt = "🚨 ALERT [BTC-USD] loss — PnL -50 breached";
+        let ts = "2026-07-09T00:00:00Z";
+
+        // Slack / Telegram: bare {"text": ...}
+        let slack = webhook_payload(AlertWebhookFormat::Slack, txt, ts, "BTC-USD", &alert);
+        assert_eq!(slack["text"], txt);
+        assert!(slack.get("msg_type").is_none());
+        let tg = webhook_payload(AlertWebhookFormat::Telegram, txt, ts, "BTC-USD", &alert);
+        assert_eq!(tg["text"], txt);
+
+        // Feishu: {"msg_type":"text","content":{"text":...}}
+        let feishu = webhook_payload(AlertWebhookFormat::Feishu, txt, ts, "BTC-USD", &alert);
+        assert_eq!(feishu["msg_type"], "text");
+        assert_eq!(feishu["content"]["text"], txt);
+
+        // Raw: structured fields present.
+        let raw = webhook_payload(AlertWebhookFormat::Raw, txt, ts, "BTC-USD", &alert);
+        assert_eq!(raw["kind"], "loss");
+        assert_eq!(raw["firing"], true);
+        assert_eq!(raw["symbol"], "BTC-USD");
+    }
 
     #[test]
     fn business_rejection_not_fail_safe() {

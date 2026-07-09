@@ -391,6 +391,7 @@ standx maker run BTC-USD \
   --alert-inventory-pct 80   # alert when |position| hits 80% of --max-position
   --alert-uptime 90          # alert when two-sided uptime drops below 90%
   --alert-webhook https://hooks.slack.com/services/XXX  # also POST alerts here
+  --alert-webhook-format slack   # slack | feishu | telegram | raw
 
 # Market data comes from a WebSocket feed (REST fallback when stale);
 # the loop also wakes early when mark has already drifted past
