@@ -422,6 +422,14 @@ pub enum MakerCommands {
         /// disagree and acting on them would be unsafe
         #[arg(long, default_value = "25")]
         max_divergence_bps: f64,
+        /// Volatility circuit breaker: halt quoting (pull all quotes) when the
+        /// mark's range over --vol-window cycles reaches this many bps; resume
+        /// once it falls below half that. 0 disables the breaker
+        #[arg(long, default_value = "0")]
+        vol_pause_bps: f64,
+        /// Number of recent cycles the volatility breaker measures range over
+        #[arg(long, default_value = "12")]
+        vol_window: u32,
         /// Disable the WebSocket market feed and poll REST every cycle
         #[arg(long)]
         no_ws: bool,

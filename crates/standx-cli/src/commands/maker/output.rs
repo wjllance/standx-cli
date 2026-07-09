@@ -16,6 +16,8 @@ pub(super) fn emit_maker_cycle(
     // Paper-mode simulated fills this cycle: (side, price, qty). Empty in live.
     fills: &[(OrderSide, f64, f64)],
     stats: &standx_sdk::maker::MakerStats,
+    // Some(vol_bps) when the volatility breaker halted quoting this cycle.
+    halt_vol_bps: Option<f64>,
     cfg: &standx_sdk::maker::MakerConfig,
 ) {
     use standx_sdk::maker::{format_decimals, Action};
@@ -100,6 +102,8 @@ pub(super) fn emit_maker_cycle(
                     "fills_total": stats.fills(),
                     "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
                     "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
+                    "halted": halt_vol_bps.is_some(),
+                    "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
                 })
             );
         }
@@ -140,11 +144,14 @@ pub(super) fn emit_maker_cycle(
         }
         _ => {
             let now = chrono::Local::now().format("%H:%M:%S");
-            let fill_note = if fills.is_empty() {
+            let mut fill_note = if fills.is_empty() {
                 String::new()
             } else {
                 format!(" fill={}", fills.len())
             };
+            if let Some(v) = halt_vol_bps {
+                fill_note.push_str(&format!(" ⚡HALT vol={:.1}bps", v));
+            }
             println!(
                 "[{}] #{} mark={} bid={} ask={} pos={} pnl={:.2} | hold={} place={} cancel={}{}",
                 now,

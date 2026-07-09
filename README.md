@@ -382,6 +382,8 @@ standx maker run BTC-USD \
   --skew-bps 5        # inventory skew: at full inventory, shift the quote
                       # center this many bps toward the reducing side
                       # (0 = off; live only, paper holds no position)
+  --vol-pause-bps 30  # volatility circuit breaker: pull all quotes when the
+                      # mark's range over --vol-window cycles hits this (0 = off)
 
 # Market data comes from a WebSocket feed (REST fallback when stale);
 # the loop also wakes early when mark has already drifted past
