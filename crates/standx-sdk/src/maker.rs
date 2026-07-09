@@ -390,7 +390,7 @@ mod tests {
         }
     }
 
-    fn find<'a>(quotes: &'a [DesiredQuote], side: OrderSide, level: u32) -> &'a DesiredQuote {
+    fn find(quotes: &[DesiredQuote], side: OrderSide, level: u32) -> &DesiredQuote {
         quotes
             .iter()
             .find(|q| q.side == side && q.level == level)
