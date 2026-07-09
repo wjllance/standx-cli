@@ -411,6 +411,14 @@ pub enum MakerCommands {
         /// Max absolute position; suppress the side that would exceed it
         #[arg(long, default_value = "0.05")]
         max_position: f64,
+        /// Sanity guard: skip the cycle (no places/cancels) when mark price
+        /// and book mid diverge by more than this (bps) — the data sources
+        /// disagree and acting on them would be unsafe
+        #[arg(long, default_value = "25")]
+        max_divergence_bps: f64,
+        /// Disable the WebSocket market feed and poll REST every cycle
+        #[arg(long)]
+        no_ws: bool,
         /// Place real orders (without this flag the bot runs in paper mode:
         /// full loop, prints intended actions, no orders placed)
         #[arg(long)]

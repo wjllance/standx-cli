@@ -1517,7 +1517,7 @@ struct PendingPlace {
 pub async fn handle_maker(
     command: MakerCommands,
     output_format: OutputFormat,
-    _verbose: bool,
+    verbose: bool,
 ) -> Result<()> {
     match command {
         MakerCommands::Run {
@@ -1530,6 +1530,8 @@ pub async fn handle_maker(
             refresh_bps,
             interval,
             max_position,
+            max_divergence_bps,
+            no_ws,
             live,
         } => {
             run_maker(
@@ -1543,7 +1545,10 @@ pub async fn handle_maker(
                     refresh_bps,
                     interval,
                     max_position,
+                    max_divergence_bps,
+                    no_ws,
                     live,
+                    verbose,
                 },
                 output_format,
             )
@@ -1561,7 +1566,127 @@ struct MakerRunArgs {
     refresh_bps: f64,
     interval: u64,
     max_position: f64,
+    max_divergence_bps: f64,
+    no_ws: bool,
     live: bool,
+    verbose: bool,
+}
+
+/// Latest market data from the WebSocket feed. Values are pre-parsed on
+/// receipt so cycle reads are lock-and-go.
+#[derive(Default)]
+struct FeedState {
+    mark: Option<f64>,
+    mark_at: Option<std::time::Instant>,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    book_at: Option<std::time::Instant>,
+}
+
+/// WS cache entries older than this fall back to REST for the cycle. REST
+/// polling refreshed data once per interval, so 5s keeps freshness at least
+/// as good as the old behavior while tolerating slow feed ticks.
+const WS_STALE_AFTER: Duration = Duration::from_secs(5);
+
+/// Spawn the resident market-feed task: one public WS connection carrying
+/// `price` + `depth_book`, written into a shared cache. The outer loop wraps
+/// the SDK's internal 5-attempt reconnect — when the stream ends (attempts
+/// exhausted or clean close), it rebuilds the connection from scratch, since
+/// subscriptions only take effect when registered before `connect()`.
+fn spawn_market_feed(
+    symbol: String,
+    verbose: bool,
+) -> (
+    Arc<RwLock<FeedState>>,
+    watch::Receiver<u64>,
+    tokio::task::JoinHandle<()>,
+) {
+    let state = Arc::new(RwLock::new(FeedState::default()));
+    let (tx, rx) = watch::channel(0u64);
+    let state_task = state.clone();
+
+    let handle = tokio::spawn(async move {
+        let mut seq = 0u64;
+        loop {
+            let ws = match StandXWebSocket::without_auth_with_verbose(verbose) {
+                Ok(ws) => ws,
+                Err(e) => {
+                    eprintln!("⚠️  market feed setup failed: {e}; retrying in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+            let _ = ws.subscribe("price", Some(&symbol)).await;
+            let _ = ws.subscribe("depth_book", Some(&symbol)).await;
+            let mut events = match ws.connect().await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    eprintln!("⚠️  market feed connect failed: {e}; retrying in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+            while let Some(msg) = events.recv().await {
+                let now = std::time::Instant::now();
+                match msg {
+                    WsMessage::Price(p) if p.symbol.eq_ignore_ascii_case(&symbol) => {
+                        if let Ok(mark) = p.mark_price.parse::<f64>() {
+                            let mut s = state_task.write().await;
+                            s.mark = Some(mark);
+                            s.mark_at = Some(now);
+                        }
+                    }
+                    WsMessage::Depth(d) if d.symbol.eq_ignore_ascii_case(&symbol) => {
+                        let mut s = state_task.write().await;
+                        s.best_bid = d.best_bid().and_then(|v| v.parse().ok());
+                        s.best_ask = d.best_ask().and_then(|v| v.parse().ok());
+                        s.book_at = Some(now);
+                    }
+                    _ => continue,
+                }
+                seq += 1;
+                let _ = tx.send(seq);
+            }
+            // Stream ended: SDK reconnects exhausted or server closed.
+            eprintln!("⚠️  market feed stream ended; rebuilding connection in 10s");
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    (state, rx, handle)
+}
+
+/// One market snapshot: WS cache when fresh, REST fallback otherwise
+/// (startup warm-up, feed outage, or --no-ws).
+async fn market_snapshot(
+    client: &StandXClient,
+    symbol: &str,
+    feed: Option<&Arc<RwLock<FeedState>>>,
+) -> Result<(f64, Option<f64>, Option<f64>, &'static str)> {
+    if let Some(feed) = feed {
+        let s = feed.read().await;
+        let fresh =
+            |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() < WS_STALE_AFTER);
+        if fresh(s.mark_at) && fresh(s.book_at) {
+            if let Some(mark) = s.mark {
+                return Ok((mark, s.best_bid, s.best_ask, "ws"));
+            }
+        }
+    }
+
+    let (price, depth) = tokio::join!(
+        client.get_symbol_price(symbol),
+        client.get_depth(symbol, Some(5))
+    );
+    let price = price?;
+    let depth = depth?;
+    let mark: f64 = price
+        .mark_price
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unparseable mark price: {}", price.mark_price))?;
+    let best_bid: Option<f64> = depth.best_bid().and_then(|s| s.parse().ok());
+    let best_ask: Option<f64> = depth.best_ask().and_then(|s| s.parse().ok());
+    Ok((mark, best_bid, best_ask, "rest"))
 }
 
 async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
@@ -1692,9 +1817,25 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             );
             println!("│ orders on this symbol will be cancelled as stale.");
         }
+        if args.no_ws {
+            println!("│ feed: REST polling (--no-ws)");
+        } else {
+            println!(
+                "│ feed: websocket (REST fallback) | divergence guard {}bps",
+                args.max_divergence_bps
+            );
+        }
         println!("│ Ctrl+C to stop (cancels all resting orders on exit)");
         println!("└──────────────────────────────────────────────────────────┘");
     }
+
+    // ---- Market feed (WS primary, REST fallback) ----
+    let (feed, mut updates, feed_handle) = if args.no_ws {
+        (None, None, None)
+    } else {
+        let (state, rx, handle) = spawn_market_feed(symbol.clone(), args.verbose);
+        (Some(state), Some(rx), Some(handle))
+    };
 
     // ---- Loop state ----
     let mut cycle: u64 = 0;
@@ -1705,32 +1846,54 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_places: u64 = 0;
     let mut total_cancels: u64 = 0;
     let mut total_holds: u64 = 0;
+    let mut last_mark: Option<f64> = None;
+    let mut last_src: Option<&'static str> = None;
 
-    let exit = loop {
+    let exit = 'main: loop {
         // Work phase raced against Ctrl+C so a slow API call can be
         // interrupted (mirrors run_watch_loop).
-        let work = maker_cycle(
-            &client,
-            &symbol,
-            &cfg,
-            args.live,
-            cycle,
-            &mut resting,
-            &mut adopted,
-            &mut pending,
-            output_format,
-        );
+        let work = async {
+            let (mark, best_bid, best_ask, src) =
+                market_snapshot(&client, &symbol, feed.as_ref()).await?;
+            let (places, cancels, holds) = maker_cycle(
+                &client,
+                &symbol,
+                &cfg,
+                args.live,
+                cycle,
+                mark,
+                best_bid,
+                best_ask,
+                args.max_divergence_bps,
+                &mut resting,
+                &mut adopted,
+                &mut pending,
+                output_format,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((places, cancels, holds, mark, src))
+        };
         let cycle_result = tokio::select! {
             _ = signal::ctrl_c() => break MakerExit::CtrlC,
             result = work => result,
         };
 
         match cycle_result {
-            Ok((places, cancels, holds)) => {
+            Ok((places, cancels, holds, mark, src)) => {
                 consecutive_errors = 0;
                 total_places += places;
                 total_cancels += cancels;
                 total_holds += holds;
+                last_mark = Some(mark);
+                if !args.no_ws && last_src != Some(src) {
+                    match src {
+                        "ws" => eprintln!("✅ market feed: websocket live"),
+                        _ => eprintln!(
+                            "⚠️  market feed: REST fallback (websocket warming up or stale)"
+                        ),
+                    }
+                    last_src = Some(src);
+                }
             }
             Err(e) => {
                 consecutive_errors += 1;
@@ -1743,13 +1906,51 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 
         cycle += 1;
 
-        tokio::select! {
-            _ = signal::ctrl_c() => break MakerExit::CtrlC,
-            _ = tokio::time::sleep(Duration::from_secs(args.interval)) => {}
+        // Sleep until the next cycle, but wake early when the cached mark
+        // has already drifted beyond refresh_bps — the quotes would be
+        // re-quoted anyway, so reacting now shrinks the pick-off window
+        // without adding flicker. min-gap of 1s bounds the API rate.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(args.interval);
+        let min_gap = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let update = async {
+                match updates.as_mut() {
+                    Some(rx) => rx.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = signal::ctrl_c() => break 'main MakerExit::CtrlC,
+                _ = tokio::time::sleep_until(deadline) => break,
+                ok = update => {
+                    if !ok {
+                        // Feed task gone: fall back to plain interval waits.
+                        updates = None;
+                        continue;
+                    }
+                    if tokio::time::Instant::now() < min_gap {
+                        continue;
+                    }
+                    let (Some(feed), Some(prev)) = (feed.as_ref(), last_mark) else {
+                        continue;
+                    };
+                    let drifted = {
+                        let s = feed.read().await;
+                        s.mark
+                            .is_some_and(|m| maker::bps_diff(m, prev) > cfg.refresh_bps)
+                    };
+                    if drifted {
+                        break; // early re-quote cycle
+                    }
+                }
+            }
         }
     };
 
     // ---- Cleanup on ALL exit paths ----
+    if let Some(handle) = feed_handle {
+        handle.abort();
+    }
     if output_format == OutputFormat::Table {
         println!(
             "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
@@ -1769,7 +1970,8 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     }
 }
 
-/// One reconcile cycle. Returns (places, cancels, holds) counts.
+/// One reconcile cycle over an already-acquired market snapshot.
+/// Returns (places, cancels, holds) counts.
 #[allow(clippy::too_many_arguments)]
 async fn maker_cycle(
     client: &StandXClient,
@@ -1777,28 +1979,52 @@ async fn maker_cycle(
     cfg: &standx_sdk::maker::MakerConfig,
     live: bool,
     cycle: u64,
+    mark: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    max_divergence_bps: f64,
     resting: &mut Vec<standx_sdk::maker::RestingQuote>,
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
     output_format: OutputFormat,
 ) -> Result<(u64, u64, u64)> {
     use standx_sdk::maker::{
-        compute_desired_quotes, format_decimals, reconcile, Action, RestingQuote,
+        compute_desired_quotes, format_decimals, mark_mid_divergence_bps, reconcile, Action,
+        RestingQuote,
     };
 
-    // 1. Market snapshot.
-    let (price, depth) = tokio::join!(
-        client.get_symbol_price(symbol),
-        client.get_depth(symbol, Some(5))
-    );
-    let price = price?;
-    let depth = depth?;
-    let mark: f64 = price
-        .mark_price
-        .parse()
-        .map_err(|_| anyhow::anyhow!("unparseable mark price: {}", price.mark_price))?;
-    let best_bid: Option<f64> = depth.best_bid().and_then(|s| s.parse().ok());
-    let best_ask: Option<f64> = depth.best_ask().and_then(|s| s.parse().ok());
+    // 1. Sanity guard: when mark and the book mid disagree, at least one
+    //    data source is wrong (stale feed, bad print, dislocated book).
+    //    Acting on it is unsafe in every direction, so do nothing this
+    //    cycle: resting quotes stay untouched. Not a fail-safe error.
+    if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+        let divergence = mark_mid_divergence_bps(mark, bid, ask);
+        if divergence > max_divergence_bps {
+            let live_str = if live { "live" } else { "paper" };
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "cycle": cycle, "mode": live_str, "symbol": symbol,
+                            "action": "skip", "reason": "mark_mid_divergence",
+                            "mark": format_decimals(mark, cfg.price_decimals),
+                            "divergence_bps": (divergence * 100.0).round() / 100.0,
+                            "max_divergence_bps": max_divergence_bps,
+                        })
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "⚠️  #{} mark/mid divergence {:.1}bps > {}bps — skipping cycle (no actions)",
+                        cycle, divergence, max_divergence_bps
+                    );
+                }
+            }
+            return Ok((0, 0, 0));
+        }
+    }
 
     if live && (best_bid.is_none() || best_ask.is_none()) {
         // Fail-safe: without a touch we cannot guarantee no-cross pricing.

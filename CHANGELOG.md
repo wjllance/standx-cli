@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Paper mode by default** (full loop, prints intended actions, no orders); `--live` implements real post-only quoting but is locked behind `STANDX_ENABLE_LIVE_MAKER=1` pending supervised production testing
   - Live safety rails: startup cancel-all, exchange open-orders as reconciliation truth, cancel-all-with-retry + verification on exit, fail-safe stop after 3 consecutive API errors
   - JSON-lines output for agents (`--output json` / `--openclaw`)
-  - Pure quoting/reconcile core in `standx_sdk::maker` with 15 unit tests
+  - Pure quoting/reconcile core in `standx_sdk::maker` with 16 unit tests
+  - WebSocket market feed (price + depth on one connection) with automatic REST fallback when the feed is warming up or stale; `--no-ws` forces REST polling
+  - Early re-quote: wakes before the interval elapses when the cached mark has already drifted past `--refresh-bps` (only fires when a re-quote would happen anyway — no added flicker; 1s min gap)
+  - mark/mid divergence guard (`--max-divergence-bps`, default 25): skips the cycle without touching resting quotes when mark price and book mid disagree
 - `TimeInForce::Alo` (post-only / add-liquidity-only), matching the backend enum; `standx order create --tif ALO` now supported
 - Block trade commands: `standx block list` / `standx block watch`
 
