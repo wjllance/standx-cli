@@ -185,6 +185,8 @@ standx maker run BTC-USD --alert-inventory-pct 80 \
 
 > 注意:这些覆盖的是**金融风险**;基础设施类告警(feed 断线、连续错误 fail-safe、退出残留单)是内置的,始终开启。
 
+**启动/停止通知**:只要设了 `--alert-webhook`,机器人还会在启动时推一条 🟢(含模式与关键参数)、退出时推一条 🔴(含停止原因——Ctrl+C 或 fail-safe——及本次会话汇总)。**不需要**配任何风险阈值即可生效;停止消息会等待投递完成再退出进程,确保送达。JSON 模式下同时输出 `action:"lifecycle"` 行。
+
 ---
 
 ## 13.5 Live（实盘）模式
