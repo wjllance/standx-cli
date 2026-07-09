@@ -1513,6 +1513,31 @@ struct PendingPlace {
     cycle: u64,
 }
 
+/// A business rejection from the venue: the exchange responded with a
+/// definite "no" (post-only would-cross, order not found, insufficient
+/// margin, …). These are expected during normal quoting and must NOT trip
+/// the fail-safe — that is reserved for transient failures (network, 5xx,
+/// rate limit) that signal we can no longer talk to the exchange, which
+/// keep their `retryable` flag and propagate as cycle errors.
+fn is_order_rejection(e: &StandxError) -> bool {
+    matches!(
+        e,
+        StandxError::Api {
+            retryable: false,
+            ..
+        }
+    )
+}
+
+/// Whether an open order's remaining `open_qty` plausibly belongs to a place
+/// we made for `placed_qty`. A partial fill leaves a positive remainder no
+/// larger than what we placed; anything bigger is somebody else's order.
+/// Tolerating the shrink is what keeps a partially-filled order adopted
+/// (and thus HELD) instead of cancelled as an unknown order.
+fn open_qty_adopts(open_qty: f64, placed_qty: f64) -> bool {
+    open_qty > 0.0 && open_qty <= placed_qty * (1.0 + 1e-6)
+}
+
 /// Handle maker commands
 pub async fn handle_maker(
     command: MakerCommands,
@@ -2064,11 +2089,13 @@ async fn maker_cycle(
                 let (level, ref_mark, placed_at_cycle) = match adopted.get(&o.id) {
                     Some(&meta) => meta,
                     None => {
-                        // Try to adopt from a recent place by (side, price, qty).
+                        // Try to adopt from a recent place by side + price,
+                        // tolerating a shrunk qty from a partial fill (see
+                        // open_qty_adopts).
                         let matched = pending.iter().position(|p| {
                             p.side == o.side
                                 && (p.price - price).abs() < tick / 2.0
-                                && (p.qty - qty).abs() < f64::EPSILON.max(qty * 1e-6)
+                                && open_qty_adopts(qty, p.qty)
                         });
                         let meta = match matched {
                             Some(idx) => {
@@ -2096,7 +2123,7 @@ async fn maker_cycle(
             })
             .collect();
         // Places older than 2 cycles never showed up as open orders —
-        // likely rejected (e.g. ALO would-cross) or instantly filled.
+        // likely rejected (e.g. ALO would-cross) or fully filled on arrival.
         pending.retain(|p| cycle.saturating_sub(p.cycle) <= 2);
         adopted.retain(|id, _| resting.iter().any(|r| r.order_id.as_deref() == Some(id)));
     } else {
@@ -2107,7 +2134,9 @@ async fn maker_cycle(
     let desired = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
     let actions = reconcile(cfg, mark, best_bid, best_ask, &desired, resting, cycle);
 
-    // 4. Execute.
+    // 4. Execute. Business rejections (post-only would-cross, order already
+    //    gone) are expected and logged inline; only transient failures
+    //    propagate as cycle errors toward the fail-safe.
     let mut places: u64 = 0;
     let mut cancels: u64 = 0;
     let mut holds: u64 = 0;
@@ -2117,22 +2146,45 @@ async fn maker_cycle(
                 order_id,
                 side,
                 level,
+                price,
                 ..
             } => {
-                cancels += 1;
                 if live {
                     if let Some(id) = order_id {
-                        client.cancel_order(symbol, id).await?;
-                        adopted.remove(id);
+                        match client.cancel_order(symbol, id).await {
+                            Ok(()) => {
+                                adopted.remove(id);
+                                cancels += 1;
+                            }
+                            Err(e) if is_order_rejection(&e) => {
+                                // Order already gone (filled or cancelled
+                                // out from under us) — that IS the goal.
+                                adopted.remove(id);
+                                cancels += 1;
+                                log_maker_event(
+                                    output_format,
+                                    symbol,
+                                    cycle,
+                                    "cancel_noop",
+                                    *side,
+                                    *level,
+                                    *price,
+                                    cfg.price_decimals,
+                                    "order already gone",
+                                );
+                            }
+                            // Transient (network / 5xx) → fail-safe path.
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                 } else {
                     resting.retain(|r| !(r.side == *side && r.level == *level));
+                    cancels += 1;
                 }
             }
             Action::Place(q) => {
-                places += 1;
                 if live {
-                    client
+                    match client
                         .create_order(CreateOrderParams {
                             symbol: symbol.to_string(),
                             side: q.side,
@@ -2147,15 +2199,36 @@ async fn maker_cycle(
                             sl_price: None,
                             tp_price: None,
                         })
-                        .await?;
-                    pending.push(PendingPlace {
-                        side: q.side,
-                        price: q.price,
-                        qty: q.qty,
-                        level: q.level,
-                        ref_mark: mark,
-                        cycle,
-                    });
+                        .await
+                    {
+                        Ok(_) => {
+                            pending.push(PendingPlace {
+                                side: q.side,
+                                price: q.price,
+                                qty: q.qty,
+                                level: q.level,
+                                ref_mark: mark,
+                                cycle,
+                            });
+                            places += 1;
+                        }
+                        Err(e) if is_order_rejection(&e) => {
+                            // Post-only would-cross etc. — expected in fast
+                            // markets. Re-quote next cycle, don't fail-safe.
+                            log_maker_event(
+                                output_format,
+                                symbol,
+                                cycle,
+                                "place_rejected",
+                                q.side,
+                                q.level,
+                                q.price,
+                                cfg.price_decimals,
+                                "post-only rejected",
+                            );
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
                 } else {
                     resting.push(RestingQuote {
                         order_id: None,
@@ -2166,6 +2239,7 @@ async fn maker_cycle(
                         ref_mark: mark,
                         placed_at_cycle: cycle,
                     });
+                    places += 1;
                 }
             }
             Action::Hold { .. } => holds += 1,
@@ -2415,9 +2489,90 @@ fn side_str(side: OrderSide) -> &'static str {
     }
 }
 
+/// Emit a one-off maker event (order rejection, no-op cancel) inline,
+/// respecting the output format. Only reached in live mode.
+#[allow(clippy::too_many_arguments)]
+fn log_maker_event(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    action: &str,
+    side: OrderSide,
+    level: u32,
+    price: f64,
+    price_decimals: u32,
+    detail: &str,
+) {
+    use standx_sdk::maker::format_decimals;
+    match output_format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "cycle": cycle, "mode": "live", "symbol": symbol,
+                    "action": action, "side": side, "level": level,
+                    "price": format_decimals(price, price_decimals),
+                    "detail": detail,
+                })
+            );
+        }
+        _ => {
+            eprintln!(
+                "    {} {} L{} @ {} — {}",
+                action,
+                side_str(side),
+                level,
+                format_decimals(price, price_decimals),
+                detail
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn business_rejection_not_fail_safe() {
+        // Post-only would-cross / order-not-found: exchange said no.
+        assert!(is_order_rejection(&StandxError::Api {
+            code: 400,
+            message: "post-only would cross".into(),
+            endpoint: None,
+            retryable: false,
+        }));
+        // 5xx from the venue: transient → counts toward fail-safe.
+        assert!(!is_order_rejection(&StandxError::Api {
+            code: 502,
+            message: "bad gateway".into(),
+            endpoint: None,
+            retryable: true,
+        }));
+        // Network layer: transient → counts toward fail-safe.
+        assert!(!is_order_rejection(&StandxError::Http {
+            code: 0,
+            message: "connection reset".into(),
+            retryable: Some(true),
+        }));
+    }
+
+    #[test]
+    fn partial_fill_stays_adopted() {
+        // Full remainder adopts.
+        assert!(open_qty_adopts(0.01, 0.01));
+        // Partial remainder (half filled) still adopts.
+        assert!(open_qty_adopts(0.005, 0.01));
+        // Tiny remainder adopts.
+        assert!(open_qty_adopts(0.0001, 0.01));
+        // Zero / fully filled does not adopt (no open order to match).
+        assert!(!open_qty_adopts(0.0, 0.01));
+        // Larger than placed is someone else's order.
+        assert!(!open_qty_adopts(0.02, 0.01));
+        // Float slop just under the placed qty is tolerated.
+        assert!(open_qty_adopts(0.01 + 1e-9, 0.01));
+    }
 
     #[test]
     fn test_parse_relative_time_hours() {

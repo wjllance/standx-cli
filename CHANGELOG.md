@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - WebSocket market feed (price + depth on one connection) with automatic REST fallback when the feed is warming up or stale; `--no-ws` forces REST polling
   - Early re-quote: wakes before the interval elapses when the cached mark has already drifted past `--refresh-bps` (only fires when a re-quote would happen anyway — no added flicker; 1s min gap)
   - mark/mid divergence guard (`--max-divergence-bps`, default 25): skips the cycle without touching resting quotes when mark price and book mid disagree
+  - Error classification: post-only (ALO) would-cross rejections and cancels of already-gone orders are treated as normal events (logged, re-quoted next cycle) instead of counting toward the 3-consecutive-error fail-safe — only transient failures (network, 5xx) trip it
+  - Partial-fill tolerance: a partially-filled resting order keeps its identity (adopted by side + price, qty ≤ placed) and holds its remainder instead of being cancelled as an unknown order
 - `TimeInForce::Alo` (post-only / add-liquidity-only), matching the backend enum; `standx order create --tif ALO` now supported
 - Block trade commands: `standx block list` / `standx block watch`
 
