@@ -67,17 +67,13 @@ fn open_qty_adopts(open_qty: f64, placed_qty: f64) -> bool {
     open_qty > 0.0 && open_qty <= placed_qty * (1.0 + 1e-6)
 }
 
-/// Deliver a risk alert: to the console (stderr for humans, a JSON line in
-/// JSON mode) and, if configured, to a webhook. The webhook POST is spawned
-/// fire-and-forget so a slow or broken endpoint never stalls the trading loop.
-/// Shape the webhook body for the target chat platform. `text` is the ready
-/// one-line message; `alert` supplies the structured fields for `Raw`.
-fn webhook_payload(
+/// Shape a webhook body for the target chat platform. `text` is the ready
+/// one-line message; `raw` is the full structured object used verbatim for
+/// the `Raw` format (it must itself carry a `text` field).
+fn webhook_body(
     format: AlertWebhookFormat,
     text: &str,
-    ts: &str,
-    symbol: &str,
-    alert: &standx_sdk::maker::Alert,
+    raw: &serde_json::Value,
 ) -> serde_json::Value {
     match format {
         // Slack incoming webhook and Telegram sendMessage both read `text`
@@ -90,11 +86,65 @@ fn webhook_payload(
             "msg_type": "text",
             "content": { "text": text },
         }),
-        // Generic consumers: full structured object.
-        AlertWebhookFormat::Raw => serde_json::json!({
+        // Generic consumers: the full structured object.
+        AlertWebhookFormat::Raw => raw.clone(),
+    }
+}
+
+/// POST a webhook body with a short timeout, logging failures. Awaitable so
+/// callers can fire-and-forget (`tokio::spawn`) or await delivery (shutdown).
+async fn post_webhook(client: reqwest::Client, url: String, body: serde_json::Value) {
+    match client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) if !r.status().is_success() => {
+            eprintln!("⚠️  maker webhook returned {}", r.status())
+        }
+        Err(e) => eprintln!("⚠️  maker webhook POST failed: {e}"),
+        _ => {}
+    }
+}
+
+/// Deliver a lifecycle notification (bot started / stopped) to the console
+/// (JSON mode only — the banner/summary already cover table mode) and, if
+/// configured, the webhook. `await_delivery` awaits the POST so the shutdown
+/// message lands before the process exits.
+#[allow(clippy::too_many_arguments)]
+async fn notify_lifecycle(
+    event: &str,
+    text: &str,
+    symbol: &str,
+    output_format: OutputFormat,
+    http: Option<&reqwest::Client>,
+    webhook_url: &Option<String>,
+    webhook_format: AlertWebhookFormat,
+    await_delivery: bool,
+) {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": ts, "symbol": symbol, "action": "lifecycle",
+                "event": event, "message": text,
+            })
+        );
+    }
+    if let (Some(client), Some(url)) = (http, webhook_url.as_ref()) {
+        let raw = serde_json::json!({
             "text": text, "ts": ts, "symbol": symbol,
-            "kind": alert.kind, "firing": alert.firing, "message": alert.message,
-        }),
+            "action": "lifecycle", "event": event,
+        });
+        let body = webhook_body(webhook_format, text, &raw);
+        if await_delivery {
+            post_webhook(client.clone(), url.clone(), body).await;
+        } else {
+            tokio::spawn(post_webhook(client.clone(), url.clone(), body));
+        }
     }
 }
 
@@ -130,24 +180,12 @@ fn deliver_alert(
 
     if let (Some(client), Some(url)) = (http, webhook_url.as_ref()) {
         let text = format!("{} [{}] {} — {}", label, symbol, alert.kind, alert.message);
-        let body = webhook_payload(webhook_format, &text, &ts, symbol, alert);
-        let client = client.clone();
-        let url = url.clone();
-        tokio::spawn(async move {
-            match client
-                .post(&url)
-                .json(&body)
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await
-            {
-                Ok(r) if !r.status().is_success() => {
-                    eprintln!("⚠️  alert webhook returned {}", r.status())
-                }
-                Err(e) => eprintln!("⚠️  alert webhook POST failed: {e}"),
-                _ => {}
-            }
+        let raw = serde_json::json!({
+            "text": text, "ts": ts, "symbol": symbol, "action": "alert",
+            "kind": alert.kind, "firing": alert.firing, "message": alert.message,
         });
+        let body = webhook_body(webhook_format, &text, &raw);
+        tokio::spawn(post_webhook(client.clone(), url.clone(), body));
     }
 }
 
@@ -410,6 +448,30 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         println!("└──────────────────────────────────────────────────────────┘");
     }
 
+    // Webhook client (also carries lifecycle + risk-alert messages).
+    let alert_http = args.alert_webhook.as_ref().map(|_| reqwest::Client::new());
+
+    // Notify start (fire-and-forget; the process keeps running).
+    notify_lifecycle(
+        "started",
+        &format!(
+            "🟢 maker started — {} {} | spread {}bps band {}bps size {} | {}",
+            mode,
+            symbol,
+            cfg.spread_bps,
+            cfg.band_bps,
+            cfg.size,
+            if args.no_ws { "REST" } else { "WS" }
+        ),
+        &symbol,
+        output_format,
+        alert_http.as_ref(),
+        &args.alert_webhook,
+        args.alert_webhook_format,
+        false,
+    )
+    .await;
+
     // ---- Market feed (WS primary, REST fallback) ----
     let (feed, mut updates, feed_handle) = if args.no_ws {
         (None, None, None)
@@ -434,8 +496,6 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut breaker = maker::VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut alerts =
         maker::AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
-    // Reused HTTP client for webhook delivery (cheap to clone; Arc inside).
-    let alert_http = args.alert_webhook.as_ref().map(|_| reqwest::Client::new());
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
 
@@ -593,6 +653,35 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         cancel_all_with_retry(&client, &symbol, 3).await?;
     }
 
+    // Notify stop on every exit path. Await delivery so the message lands
+    // before the process exits.
+    let reason = match &exit {
+        MakerExit::CtrlC => "Ctrl+C".to_string(),
+        MakerExit::FailSafe(e) => format!("fail-safe: {e}"),
+    };
+    let pnl_str = last_mark
+        .map(|m| format!("{:+.2}", stats.mark_to_market(m)))
+        .unwrap_or_else(|| "n/a".to_string());
+    notify_lifecycle(
+        "stopped",
+        &format!(
+            "🔴 maker stopped ({}) — {} | {} cycles, {} fills, uptime {:.0}%, PnL {}",
+            reason,
+            symbol,
+            cycle,
+            total_fills,
+            stats.uptime_pct(),
+            pnl_str
+        ),
+        &symbol,
+        output_format,
+        alert_http.as_ref(),
+        &args.alert_webhook,
+        args.alert_webhook_format,
+        true,
+    )
+    .await;
+
     match exit {
         MakerExit::CtrlC => Ok(()),
         MakerExit::FailSafe(e) => Err(anyhow::anyhow!(
@@ -607,29 +696,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn webhook_payload_shapes() {
-        let alert = standx_sdk::maker::Alert {
-            kind: "loss",
-            firing: true,
-            message: "PnL -50 breached".into(),
-        };
+    fn webhook_body_shapes() {
         let txt = "🚨 ALERT [BTC-USD] loss — PnL -50 breached";
-        let ts = "2026-07-09T00:00:00Z";
+        // Structured object a caller would build for the Raw format.
+        let raw_in = serde_json::json!({
+            "text": txt, "symbol": "BTC-USD", "kind": "loss", "firing": true,
+        });
 
         // Slack / Telegram: bare {"text": ...}
-        let slack = webhook_payload(AlertWebhookFormat::Slack, txt, ts, "BTC-USD", &alert);
+        let slack = webhook_body(AlertWebhookFormat::Slack, txt, &raw_in);
         assert_eq!(slack["text"], txt);
         assert!(slack.get("msg_type").is_none());
-        let tg = webhook_payload(AlertWebhookFormat::Telegram, txt, ts, "BTC-USD", &alert);
+        let tg = webhook_body(AlertWebhookFormat::Telegram, txt, &raw_in);
         assert_eq!(tg["text"], txt);
+        assert!(tg.get("kind").is_none()); // not the structured object
 
         // Feishu: {"msg_type":"text","content":{"text":...}}
-        let feishu = webhook_payload(AlertWebhookFormat::Feishu, txt, ts, "BTC-USD", &alert);
+        let feishu = webhook_body(AlertWebhookFormat::Feishu, txt, &raw_in);
         assert_eq!(feishu["msg_type"], "text");
         assert_eq!(feishu["content"]["text"], txt);
 
-        // Raw: structured fields present.
-        let raw = webhook_payload(AlertWebhookFormat::Raw, txt, ts, "BTC-USD", &alert);
+        // Raw: the structured object verbatim.
+        let raw = webhook_body(AlertWebhookFormat::Raw, txt, &raw_in);
         assert_eq!(raw["kind"], "loss");
         assert_eq!(raw["firing"], true);
         assert_eq!(raw["symbol"], "BTC-USD");
