@@ -368,6 +368,12 @@ standx maker run BTC-USD \
   --levels 2          # quote levels per side
   --max-position 0.05 # suppress the side that would exceed this
 
+# Market data comes from a WebSocket feed (REST fallback when stale);
+# the loop also wakes early when mark has already drifted past
+# --refresh-bps, shrinking the reaction window without adding flicker.
+# --no-ws forces plain REST polling; --max-divergence-bps (default 25)
+# skips a cycle when mark price and the book mid disagree.
+
 # Machine-readable JSON lines (one object per action)
 standx maker run BTC-USD --output json
 

@@ -158,6 +158,15 @@ pub fn bps_diff(a: f64, b: f64) -> f64 {
     ((a - b) / b).abs() * 10_000.0
 }
 
+/// Divergence between mark price and the book mid, in bps of mark.
+///
+/// A large value means the two data sources disagree (stale feed, bad print,
+/// or a dislocated book) — quotes anchored to mark would sit nonsensically
+/// relative to the book, so callers should skip acting on such a snapshot.
+pub fn mark_mid_divergence_bps(mark: f64, best_bid: f64, best_ask: f64) -> f64 {
+    bps_diff((best_bid + best_ask) / 2.0, mark)
+}
+
 /// Compute the desired quote set for the current market snapshot.
 ///
 /// Applies, in order: the spread/level ladder, the band clamp, the no-cross
@@ -631,5 +640,18 @@ mod tests {
         assert_eq!(ceil_to_decimals(100.10, 2), 100.10);
         assert_eq!(format_decimals(99.9, 2), "99.90");
         assert_eq!(format_decimals(0.0123, 4), "0.0123");
+    }
+
+    // 15. Mark/mid divergence guard helper.
+    #[test]
+    fn mark_mid_divergence() {
+        // mid = 100.0 == mark -> no divergence
+        assert_eq!(mark_mid_divergence_bps(100.0, 99.9, 100.1), 0.0);
+        // mid = 100.25 vs mark 100.0 -> 25 bps
+        assert!((mark_mid_divergence_bps(100.0, 100.2, 100.3) - 25.0).abs() < 1e-9);
+        // symmetric below
+        assert!((mark_mid_divergence_bps(100.0, 99.7, 99.8) - 25.0).abs() < 1e-9);
+        // degenerate mark = 0 -> 0.0, no blowup
+        assert_eq!(mark_mid_divergence_bps(0.0, 99.9, 100.1), 0.0);
     }
 }
