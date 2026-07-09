@@ -80,7 +80,7 @@ class StandxCli < Formula
 
   test do
     assert_match "standx #{version}", shell_output("#{bin}/standx --version")
-    assert_match "A CLI tool for StandX perpetual DEX", shell_output("#{bin}/standx --help")
+    assert_match "Usage: standx", shell_output("#{bin}/standx --help")
   end
 end
 ```
