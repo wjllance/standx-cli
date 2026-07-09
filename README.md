@@ -385,6 +385,13 @@ standx maker run BTC-USD \
   --vol-pause-bps 30  # volatility circuit breaker: pull all quotes when the
                       # mark's range over --vol-window cycles hits this (0 = off)
 
+# Risk alerts (edge-triggered; stderr/JSON always, webhook optional):
+standx maker run BTC-USD \
+  --alert-loss 50            # alert when mark-to-market PnL <= -50
+  --alert-inventory-pct 80   # alert when |position| hits 80% of --max-position
+  --alert-uptime 90          # alert when two-sided uptime drops below 90%
+  --alert-webhook https://hooks.slack.com/services/XXX  # also POST alerts here
+
 # Market data comes from a WebSocket feed (REST fallback when stale);
 # the loop also wakes early when mark has already drifted past
 # --refresh-bps, shrinking the reaction window without adding flicker.

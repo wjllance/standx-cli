@@ -24,6 +24,9 @@ clap = { version = "4.5", features = ["derive", "env", "cargo"] }
 tokio.workspace = true
 futures.workspace = true
 
+# HTTP (risk-alert webhook delivery)
+reqwest.workspace = true
+
 # Serialization
 serde.workspace = true
 serde_json.workspace = true
