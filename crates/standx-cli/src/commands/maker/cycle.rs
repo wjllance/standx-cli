@@ -26,6 +26,7 @@ pub(super) async fn maker_cycle(
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
     sim_position: &mut f64,
+    stats: &mut standx_sdk::maker::MakerStats,
     output_format: OutputFormat,
 ) -> Result<(u64, u64, u64, u64)> {
     use standx_sdk::maker::{
@@ -155,6 +156,7 @@ pub(super) async fn maker_cycle(
                     OrderSide::Buy => q.qty,
                     OrderSide::Sell => -q.qty,
                 };
+                stats.record_fill(q.side, q.price, q.qty, mark);
                 fills.push((q.side, q.price, q.qty));
             } else {
                 i += 1;
@@ -285,7 +287,13 @@ pub(super) async fn maker_cycle(
         }
     }
 
-    // 5. Emit.
+    // 5. Telemetry: fold this cycle into the running stats (live infers a
+    //    fill from any position delta; paper already recorded exact fills).
+    let two_sided = resting.iter().any(|r| r.side == OrderSide::Buy)
+        && resting.iter().any(|r| r.side == OrderSide::Sell);
+    stats.end_cycle(position, mark, two_sided, live);
+
+    // 6. Emit.
     emit_maker_cycle(
         output_format,
         live,
@@ -297,6 +305,7 @@ pub(super) async fn maker_cycle(
         position,
         &actions,
         &fills,
+        stats,
         cfg,
     );
 

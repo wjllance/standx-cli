@@ -379,6 +379,11 @@ standx maker run BTC-USD \
 # --no-ws forces plain REST polling; --max-divergence-bps (default 25)
 # skips a cycle when mark price and the book mid disagree.
 
+# Each cycle reports running telemetry — mark-to-market PnL, favorable
+# spread capture (bps/fill), two-sided uptime %, fills, and max inventory —
+# and a stats block on exit, so tuning spread/refresh/skew is a measured
+# loop rather than guesswork.
+
 # Machine-readable JSON lines (one object per action)
 standx maker run BTC-USD --output json
 

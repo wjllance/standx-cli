@@ -298,6 +298,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_holds: u64 = 0;
     let mut total_fills: u64 = 0;
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
+    let mut stats = maker::MakerStats::default();
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
 
@@ -321,6 +322,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut adopted,
                 &mut pending,
                 &mut sim_position,
+                &mut stats,
                 output_format,
             )
             .await?;
@@ -410,10 +412,21 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
             cycle, total_places, total_cancels, total_holds
         );
+        let pnl_note = match last_mark {
+            Some(m) => format!(" | PnL {:+.2} (mark-to-market)", stats.mark_to_market(m)),
+            None => String::new(),
+        };
+        println!(
+            "   {} fills | uptime {:.0}% | max pos {} | avg capture {:.1}bps{}",
+            total_fills,
+            stats.uptime_pct(),
+            maker::format_decimals(stats.max_abs_position, cfg.qty_decimals),
+            stats.avg_spread_capture_bps(),
+            pnl_note
+        );
         if !args.live {
             println!(
-                "   paper sim: {} fills, ending position {}",
-                total_fills,
+                "   paper sim: ending position {}",
                 maker::format_decimals(sim_position, cfg.qty_decimals)
             );
         }

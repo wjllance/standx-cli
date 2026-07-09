@@ -15,9 +15,12 @@ pub(super) fn emit_maker_cycle(
     actions: &[standx_sdk::maker::Action],
     // Paper-mode simulated fills this cycle: (side, price, qty). Empty in live.
     fills: &[(OrderSide, f64, f64)],
+    stats: &standx_sdk::maker::MakerStats,
     cfg: &standx_sdk::maker::MakerConfig,
 ) {
     use standx_sdk::maker::{format_decimals, Action};
+
+    let pnl = stats.pnl(position, mark);
 
     let mode = if live { "live" } else { "paper" };
     let counts = actions.iter().fold((0, 0, 0), |mut acc, a| {
@@ -93,6 +96,10 @@ pub(super) fn emit_maker_cycle(
                     "position": position,
                     "holds": holds, "places": places, "cancels": cancels,
                     "fills": fills.len(),
+                    "pnl": (pnl * 1e6).round() / 1e6,
+                    "fills_total": stats.fills(),
+                    "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
+                    "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
                 })
             );
         }
@@ -139,7 +146,7 @@ pub(super) fn emit_maker_cycle(
                 format!(" fill={}", fills.len())
             };
             println!(
-                "[{}] #{} mark={} bid={} ask={} pos={} | hold={} place={} cancel={}{}",
+                "[{}] #{} mark={} bid={} ask={} pos={} pnl={:.2} | hold={} place={} cancel={}{}",
                 now,
                 cycle,
                 format_decimals(mark, cfg.price_decimals),
@@ -150,6 +157,7 @@ pub(super) fn emit_maker_cycle(
                     .map(|a| format_decimals(a, cfg.price_decimals))
                     .unwrap_or_else(|| "-".into()),
                 format_decimals(position, cfg.qty_decimals),
+                pnl,
                 holds,
                 places,
                 cancels,

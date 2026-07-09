@@ -212,6 +212,113 @@ pub fn paper_quote_filled(
     }
 }
 
+/// Running telemetry for a maker session: fills, mark-to-market PnL, spread
+/// capture, two-sided uptime, and inventory extent.
+///
+/// PnL is mark-to-market via a signed cash accumulator: a buy of `q@p` does
+/// `cash -= p*q`, a sell `cash += p*q`, and equity is `cash + position*mark`.
+/// This credits captured spread (fills away from mark) and inventory drift in
+/// one number. Spread capture is the favorable distance of each fill from the
+/// mark at fill time, in bps (positive = earned edge).
+#[derive(Debug, Clone, Default)]
+pub struct MakerStats {
+    pub cycles: u64,
+    pub two_sided_cycles: u64,
+    pub buy_fills: u64,
+    pub sell_fills: u64,
+    /// Total filled base quantity (both sides).
+    pub filled_qty: f64,
+    /// Signed quote cash flow from fills (see struct docs).
+    pub cash: f64,
+    spread_bps_sum: f64,
+    spread_bps_n: u64,
+    pub max_abs_position: f64,
+    /// Last observed position, for inferring live fills from position deltas.
+    last_position: f64,
+}
+
+impl MakerStats {
+    /// Record an executed fill at `price` against `mark` at fill time.
+    pub fn record_fill(&mut self, side: OrderSide, price: f64, qty: f64, mark: f64) {
+        self.filled_qty += qty;
+        match side {
+            OrderSide::Buy => {
+                self.buy_fills += 1;
+                self.cash -= price * qty;
+            }
+            OrderSide::Sell => {
+                self.sell_fills += 1;
+                self.cash += price * qty;
+            }
+        }
+        // Favorable distance from mark: a buy earns when below mark, a sell
+        // when above.
+        if mark > 0.0 {
+            let capture = match side {
+                OrderSide::Buy => (mark - price) / mark,
+                OrderSide::Sell => (price - mark) / mark,
+            } * 10_000.0;
+            self.spread_bps_sum += capture;
+            self.spread_bps_n += 1;
+        }
+    }
+
+    /// Close out a cycle: infer a live fill from any position delta (priced at
+    /// mark, since the exact fill price isn't known without the fills channel),
+    /// then update uptime and inventory extent. `two_sided` is whether both a
+    /// bid and an ask were resting this cycle.
+    pub fn end_cycle(&mut self, position: f64, mark: f64, two_sided: bool, live: bool) {
+        if live {
+            let delta = position - self.last_position;
+            if delta.abs() > f64::EPSILON {
+                let side = if delta > 0.0 {
+                    OrderSide::Buy
+                } else {
+                    OrderSide::Sell
+                };
+                self.record_fill(side, mark, delta.abs(), mark);
+            }
+        }
+        self.last_position = position;
+        self.max_abs_position = self.max_abs_position.max(position.abs());
+        self.cycles += 1;
+        if two_sided {
+            self.two_sided_cycles += 1;
+        }
+    }
+
+    /// Total fills across both sides.
+    pub fn fills(&self) -> u64 {
+        self.buy_fills + self.sell_fills
+    }
+
+    /// Mark-to-market equity: realized cash plus inventory valued at `mark`.
+    pub fn pnl(&self, position: f64, mark: f64) -> f64 {
+        self.cash + position * mark
+    }
+
+    /// Mark-to-market equity using the last observed position.
+    pub fn mark_to_market(&self, mark: f64) -> f64 {
+        self.cash + self.last_position * mark
+    }
+
+    /// Fraction of cycles (0–100) with quotes resting on both sides.
+    pub fn uptime_pct(&self) -> f64 {
+        if self.cycles == 0 {
+            return 0.0;
+        }
+        self.two_sided_cycles as f64 / self.cycles as f64 * 100.0
+    }
+
+    /// Average favorable spread capture per fill, in bps (0 with no fills).
+    pub fn avg_spread_capture_bps(&self) -> f64 {
+        if self.spread_bps_n == 0 {
+            return 0.0;
+        }
+        self.spread_bps_sum / self.spread_bps_n as f64
+    }
+}
+
 /// Compute the desired quote set for the current market snapshot.
 ///
 /// Applies, in order: the inventory-skewed spread/level ladder, the band clamp,
@@ -761,6 +868,47 @@ mod tests {
         // Absent book side never fills.
         assert!(!paper_quote_filled(OrderSide::Buy, 99.90, None, None));
         assert!(!paper_quote_filled(OrderSide::Sell, 100.10, None, None));
+    }
+
+    // 24. Stats: spread capture, mark-to-market PnL, uptime.
+    #[test]
+    fn stats_pnl_and_capture() {
+        let mut s = MakerStats::default();
+        // Buy 1 @ 99.90 (mark 100) then sell 1 @ 100.10 (mark 100): a round
+        // trip capturing 10 + 10 bps, net cash +0.20, flat position.
+        s.record_fill(OrderSide::Buy, 99.90, 1.0, 100.0);
+        s.record_fill(OrderSide::Sell, 100.10, 1.0, 100.0);
+        assert_eq!(s.fills(), 2);
+        assert!((s.filled_qty - 2.0).abs() < 1e-9);
+        assert!((s.cash - 0.20).abs() < 1e-9);
+        // Flat position -> PnL is just the captured cash.
+        assert!((s.pnl(0.0, 100.0) - 0.20).abs() < 1e-9);
+        // Each leg captured 10 bps -> avg 10.
+        assert!((s.avg_spread_capture_bps() - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stats_unrealized_inventory() {
+        let mut s = MakerStats::default();
+        // Buy 2 @ 100 (no edge), then mark rises to 101: unrealized +2.
+        s.record_fill(OrderSide::Buy, 100.0, 2.0, 100.0);
+        assert!((s.pnl(2.0, 101.0) - 2.0).abs() < 1e-9);
+        assert!((s.pnl(2.0, 100.0)).abs() < 1e-9); // flat at entry mark
+    }
+
+    #[test]
+    fn stats_uptime_and_live_inference() {
+        let mut s = MakerStats::default();
+        s.end_cycle(0.0, 100.0, true, false); // two-sided
+        s.end_cycle(0.0, 100.0, false, false); // one-sided
+        assert_eq!(s.cycles, 2);
+        assert!((s.uptime_pct() - 50.0).abs() < 1e-9);
+        // Live: a position jump 0 -> 0.01 infers one buy fill at mark.
+        let mut l = MakerStats::default();
+        l.end_cycle(0.01, 100.0, true, true);
+        assert_eq!(l.fills(), 1);
+        assert_eq!(l.buy_fills, 1);
+        assert!((l.max_abs_position - 0.01).abs() < 1e-9);
     }
 
     // 16. skew_center helper: directional, zero cases.
