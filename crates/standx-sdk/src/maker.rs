@@ -36,6 +36,10 @@ pub struct MakerConfig {
     /// Max absolute position; the side that would grow it further is
     /// suppressed once exceeded.
     pub max_position: f64,
+    /// Inventory skew: at full inventory (`|position| == max_position`), the
+    /// quote center is shifted this many bps away from mark to favor the
+    /// reducing side. 0 disables skew (quotes stay centered on mark).
+    pub skew_bps: f64,
     /// Price precision (decimal places) from `SymbolInfo.price_tick_decimals`.
     pub price_decimals: u32,
     /// Quantity precision (decimal places) from `SymbolInfo.qty_tick_decimals`.
@@ -70,15 +74,18 @@ pub struct RestingQuote {
     pub level: u32,
     pub price: f64,
     pub qty: f64,
-    /// Mark price when this quote was placed — the anti-flicker anchor.
-    pub ref_mark: f64,
+    /// The quote center (`skew_center(mark, position)`) when this quote was
+    /// placed — the anti-flicker anchor. Equals the mark at placement when
+    /// skew is off; re-quoting keys off drift of the current center from this.
+    pub ref_center: f64,
     pub placed_at_cycle: u64,
 }
 
 /// Why a resting quote is being cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelReason {
-    /// Mark drifted more than `refresh_bps` from the quote's `ref_mark`.
+    /// The quote center drifted more than `refresh_bps` from the quote's
+    /// `ref_center` — driven by mark movement and/or inventory skew.
     MarkMovedBeyondRefresh,
     /// The resting price left the eligibility band (earns nothing there).
     OutsideBand,
@@ -119,7 +126,8 @@ pub enum Action {
         level: u32,
         price: f64,
         age_cycles: u64,
-        /// Current drift from the quote's ref_mark, in bps (for display).
+        /// Current drift of the quote center from the quote's ref_center, in
+        /// bps (for display).
         drift_bps: f64,
     },
 }
@@ -167,13 +175,31 @@ pub fn mark_mid_divergence_bps(mark: f64, best_bid: f64, best_ask: f64) -> f64 {
     bps_diff((best_bid + best_ask) / 2.0, mark)
 }
 
+/// Inventory-skewed quote center.
+///
+/// The quote ladder is built around this instead of mark. Holding a long
+/// position (`position > 0`) shifts the center DOWN, which moves the reducing
+/// side (sell) nearer the true mark (more likely to fill) and the growing side
+/// (buy) further away (less likely to fill) — turning `max_position` from a
+/// hard brake into gradual mean reversion. Short positions shift it up. The
+/// shift scales linearly with inventory and saturates at `skew_bps` when
+/// `|position| >= max_position`. Returns mark unchanged when skew is off or
+/// `max_position` is non-positive.
+pub fn skew_center(cfg: &MakerConfig, mark: f64, position: f64) -> f64 {
+    if cfg.max_position <= 0.0 {
+        return mark;
+    }
+    let inv_ratio = (position / cfg.max_position).clamp(-1.0, 1.0);
+    mark * (1.0 - cfg.skew_bps * inv_ratio / 1e4)
+}
+
 /// Compute the desired quote set for the current market snapshot.
 ///
-/// Applies, in order: the spread/level ladder, the band clamp, the no-cross
-/// clamp, directional tick rounding (with band re-entry), the min-qty filter,
-/// and max-position side suppression. Quotes that fail a guard are dropped;
-/// duplicate prices after clamping/rounding are collapsed (outer level wins
-/// nothing — the inner level is kept).
+/// Applies, in order: the inventory-skewed spread/level ladder, the band clamp,
+/// the no-cross clamp, directional tick rounding (with band re-entry), the
+/// min-qty filter, and max-position side suppression. Quotes that fail a guard
+/// are dropped; duplicate prices after clamping/rounding are collapsed (outer
+/// level wins nothing — the inner level is kept).
 pub fn compute_desired_quotes(
     cfg: &MakerConfig,
     mark: f64,
@@ -192,8 +218,13 @@ pub fn compute_desired_quotes(
     }
 
     let tick = cfg.price_tick();
+    // Band eligibility is defined around the TRUE mark, not the skewed center.
     let band_lo = mark * (1.0 - cfg.band_bps / 1e4);
     let band_hi = mark * (1.0 + cfg.band_bps / 1e4);
+
+    // Ladder is centered on the inventory-skewed price; the band/no-cross
+    // guards below still reference the true mark and touch.
+    let center = skew_center(cfg, mark, position);
 
     let suppress_buy = position >= cfg.max_position;
     let suppress_sell = position <= -cfg.max_position;
@@ -206,8 +237,8 @@ pub fn compute_desired_quotes(
         for level in 0..cfg.levels {
             let offset_bps = cfg.spread_bps + level as f64 * cfg.level_step_bps;
             let mut price = match side {
-                OrderSide::Buy => mark * (1.0 - offset_bps / 1e4),
-                OrderSide::Sell => mark * (1.0 + offset_bps / 1e4),
+                OrderSide::Buy => center * (1.0 - offset_bps / 1e4),
+                OrderSide::Sell => center * (1.0 + offset_bps / 1e4),
             };
 
             // Band clamp: quoting outside the band earns nothing, so clamp
@@ -276,23 +307,31 @@ pub fn compute_desired_quotes(
 /// | 2 | no desired quote at (side, level)                | Cancel (Stale)                |
 /// | 3 | price outside current band                       | Cancel (OutsideBand)          |
 /// | 4 | price crosses current touch                      | Cancel (WouldCross)           |
-/// | 5 | mark drifted > refresh_bps from ref_mark         | Cancel (MarkMovedBeyondRefresh) |
+/// | 5 | quote center drifted > refresh_bps from ref_center | Cancel (MarkMovedBeyondRefresh) |
 /// | 6 | otherwise                                        | Hold (anti-flicker)           |
 ///
-/// Every desired quote without a surviving resting counterpart yields a
-/// `Place`. The returned Vec orders all Cancels before all Places so the
-/// executor frees margin before re-placing; Holds come last.
+/// The center (row 5) is `skew_center(mark, position)`, so this single rule
+/// re-quotes on both mark movement and inventory skew; with skew off it is the
+/// bare mark, identical to prior behavior. Every desired quote without a
+/// surviving resting counterpart yields a `Place`. The returned Vec orders all
+/// Cancels before all Places so the executor frees margin before re-placing;
+/// Holds come last.
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile(
     cfg: &MakerConfig,
     mark: f64,
+    position: f64,
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     desired: &[DesiredQuote],
     resting: &[RestingQuote],
     cycle: u64,
 ) -> Vec<Action> {
+    // Band/no-cross reference the true mark and touch; the anti-flicker anchor
+    // uses the inventory-skewed center.
     let band_lo = mark * (1.0 - cfg.band_bps / 1e4);
     let band_hi = mark * (1.0 + cfg.band_bps / 1e4);
+    let center = skew_center(cfg, mark, position);
 
     let desired_has = |side: OrderSide, level: u32| -> bool {
         desired.iter().any(|d| d.side == side && d.level == level)
@@ -318,7 +357,7 @@ pub fn reconcile(
             OrderSide::Sell => best_bid.map(|b| r.price <= b).unwrap_or(false),
         } {
             Some(CancelReason::WouldCross)
-        } else if bps_diff(mark, r.ref_mark) > cfg.refresh_bps {
+        } else if bps_diff(center, r.ref_center) > cfg.refresh_bps {
             Some(CancelReason::MarkMovedBeyondRefresh)
         } else {
             None
@@ -339,7 +378,7 @@ pub fn reconcile(
                     level: r.level,
                     price: r.price,
                     age_cycles: cycle.saturating_sub(r.placed_at_cycle),
-                    drift_bps: bps_diff(mark, r.ref_mark),
+                    drift_bps: bps_diff(center, r.ref_center),
                 });
             }
         }
@@ -372,20 +411,21 @@ mod tests {
             levels: 1,
             size: 0.01,
             max_position: 0.05,
+            skew_bps: 0.0,
             price_decimals: 2,
             qty_decimals: 4,
             min_order_qty: 0.001,
         }
     }
 
-    fn resting(side: OrderSide, level: u32, price: f64, ref_mark: f64) -> RestingQuote {
+    fn resting(side: OrderSide, level: u32, price: f64, ref_center: f64) -> RestingQuote {
         RestingQuote {
             order_id: Some("1".into()),
             side,
             level,
             price,
             qty: 0.01,
-            ref_mark,
+            ref_center,
             placed_at_cycle: 0,
         }
     }
@@ -499,7 +539,7 @@ mod tests {
             resting(OrderSide::Buy, 0, 99.90, 100.0),
             resting(OrderSide::Sell, 0, 100.10, 100.0),
         ];
-        let actions = reconcile(&c, mark, None, None, &desired, &rest, 7);
+        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 7);
         assert!(
             actions.iter().all(|a| matches!(a, Action::Hold { .. })),
             "{actions:?}"
@@ -517,7 +557,7 @@ mod tests {
         let mark = 100.05; // 5 bps > refresh 3
         let desired = compute_desired_quotes(&c, mark, None, None, 0.0);
         let rest = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
-        let actions = reconcile(&c, mark, None, None, &desired, &rest, 1);
+        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
         // Expect: cancel(buy, mark_moved), then places for buy+sell.
         assert!(matches!(
             actions[0],
@@ -543,7 +583,7 @@ mod tests {
         let mark = 100.30;
         let desired = compute_desired_quotes(&c, mark, None, None, 0.0);
         let rest = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
-        let actions = reconcile(&c, mark, None, None, &desired, &rest, 1);
+        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
         assert!(
             matches!(
                 actions[0],
@@ -564,7 +604,16 @@ mod tests {
         let desired = compute_desired_quotes(&c, mark, Some(100.12), Some(100.14), 0.0);
         // Resting sell at 100.10 now BELOW best bid 100.12 -> crossed.
         let rest = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
-        let actions = reconcile(&c, mark, Some(100.12), Some(100.14), &desired, &rest, 1);
+        let actions = reconcile(
+            &c,
+            mark,
+            0.0,
+            Some(100.12),
+            Some(100.14),
+            &desired,
+            &rest,
+            1,
+        );
         assert!(
             matches!(
                 actions[0],
@@ -587,7 +636,7 @@ mod tests {
             resting(OrderSide::Buy, 0, 99.90, 100.0),
             resting(OrderSide::Buy, 1, 99.88, 100.0), // stale level
         ];
-        let actions = reconcile(&c, mark, None, None, &desired, &rest, 1);
+        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
         let stale: Vec<_> = actions
             .iter()
             .filter(|a| {
@@ -653,5 +702,115 @@ mod tests {
         assert!((mark_mid_divergence_bps(100.0, 99.7, 99.8) - 25.0).abs() < 1e-9);
         // degenerate mark = 0 -> 0.0, no blowup
         assert_eq!(mark_mid_divergence_bps(0.0, 99.9, 100.1), 0.0);
+    }
+
+    // 16. skew_center helper: directional, zero cases.
+    #[test]
+    fn skew_center_directional() {
+        let mut c = cfg();
+        c.skew_bps = 10.0;
+        // flat position -> center = mark
+        assert_eq!(skew_center(&c, 100.0, 0.0), 100.0);
+        // long (ratio +0.5) -> center down 99.95
+        assert!((skew_center(&c, 100.0, 0.025) - 99.95).abs() < 1e-9);
+        // short (ratio -0.5) -> center up 100.05
+        assert!((skew_center(&c, 100.0, -0.025) - 100.05).abs() < 1e-9);
+        // skew off -> center = mark regardless of position
+        let c0 = cfg();
+        assert_eq!(skew_center(&c0, 100.0, 0.05), 100.0);
+    }
+
+    // 17. Long inventory shifts the whole ladder down; reducing side (sell)
+    // moves nearer mark, growing side (buy) further.
+    #[test]
+    fn skew_long_shifts_center_down() {
+        let mut c = cfg();
+        c.skew_bps = 10.0;
+        // half-max long -> center 99.95; buy = 99.85, sell = 100.05
+        let q = compute_desired_quotes(&c, 100.0, None, None, 0.025);
+        assert_eq!(find(&q, OrderSide::Buy, 0).price, 99.85);
+        assert_eq!(find(&q, OrderSide::Sell, 0).price, 100.05);
+        // both below the no-skew baseline (99.90 / 100.10)
+        assert!(find(&q, OrderSide::Buy, 0).price < 99.90);
+        assert!(find(&q, OrderSide::Sell, 0).price < 100.10);
+    }
+
+    // 18. Short inventory shifts up; reducing side (buy) nearer mark.
+    #[test]
+    fn skew_short_shifts_center_up() {
+        let mut c = cfg();
+        c.skew_bps = 10.0;
+        // half-max short -> center 100.05; buy = 99.94, sell = 100.16
+        let q = compute_desired_quotes(&c, 100.0, None, None, -0.025);
+        assert_eq!(find(&q, OrderSide::Buy, 0).price, 99.94);
+        assert_eq!(find(&q, OrderSide::Sell, 0).price, 100.16);
+        // buy moved nearer mark than the no-skew baseline 99.90
+        assert!(find(&q, OrderSide::Buy, 0).price > 99.90);
+    }
+
+    // 19. skew_bps = 0 is a no-op regardless of position.
+    #[test]
+    fn skew_zero_is_noop() {
+        let c = cfg(); // skew_bps = 0
+        let base = compute_desired_quotes(&c, 100.0, None, None, 0.0);
+        let with_pos = compute_desired_quotes(&c, 100.0, None, None, 0.025);
+        assert_eq!(base, with_pos);
+    }
+
+    // 20. Inventory ratio saturates at ±1 past max_position.
+    #[test]
+    fn skew_clamps_at_full_inventory() {
+        let mut c = cfg();
+        c.skew_bps = 10.0;
+        // 2x max short: growing side (sell) suppressed, only buy remains;
+        // ratio clamps to -1 -> center 100.10 -> buy 99.99 (NOT the ratio=-2
+        // value 100.09).
+        let q = compute_desired_quotes(&c, 100.0, None, None, -0.10);
+        assert!(q.iter().all(|d| d.side == OrderSide::Buy));
+        assert_eq!(find(&q, OrderSide::Buy, 0).price, 99.99);
+    }
+
+    // 21. Large skew still respects the band and no-cross guards.
+    #[test]
+    fn skew_still_respects_band_and_no_cross() {
+        let mut c = cfg();
+        c.skew_bps = 100.0; // would push the sell far below mark
+        let (bid, ask) = (99.90, 100.00);
+        // full long: buy suppressed; sell pulled down hard but held above the
+        // band floor and one tick above the bid.
+        let q = compute_desired_quotes(&c, 100.0, Some(bid), Some(ask), 0.05);
+        let sell = find(&q, OrderSide::Sell, 0).price;
+        assert!(sell >= 99.80 - 1e-9, "sell {sell} below band floor");
+        assert!(sell > bid, "sell {sell} crosses bid {bid}");
+    }
+
+    // 22. Inventory skew alone (mark unchanged) triggers a re-quote once the
+    // center drifts past refresh_bps; stays held within it.
+    #[test]
+    fn reconcile_skew_requote() {
+        let mut c = cfg();
+        c.skew_bps = 10.0;
+        let mark = 100.0;
+        // Resting sell placed when flat (ref_center = 100.0).
+        // Long 0.025 -> center 99.95, drift 5bps > refresh 3 -> re-quote.
+        let pos = 0.025;
+        let desired = compute_desired_quotes(&c, mark, None, None, pos);
+        let rest = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
+        let actions = reconcile(&c, mark, pos, None, None, &desired, &rest, 1);
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Cancel {
+                reason: CancelReason::MarkMovedBeyondRefresh,
+                ..
+            }
+        )));
+
+        // Smaller long 0.01 -> center 99.98, drift 2bps < refresh -> hold.
+        let pos2 = 0.01;
+        let desired2 = compute_desired_quotes(&c, mark, None, None, pos2);
+        let rest2 = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
+        let actions2 = reconcile(&c, mark, pos2, None, None, &desired2, &rest2, 1);
+        assert!(actions2.iter().any(|a| matches!(a, Action::Hold { .. })));
+        assert!(!actions2.iter().any(|a| matches!(a, Action::Cancel { .. })));
     }
 }

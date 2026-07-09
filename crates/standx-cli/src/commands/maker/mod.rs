@@ -38,7 +38,7 @@ struct PendingPlace {
     price: f64,
     qty: f64,
     level: u32,
-    ref_mark: f64,
+    ref_center: f64,
     cycle: u64,
 }
 
@@ -84,6 +84,7 @@ pub async fn handle_maker(
             refresh_bps,
             interval,
             max_position,
+            skew_bps,
             max_divergence_bps,
             no_ws,
             live,
@@ -99,6 +100,7 @@ pub async fn handle_maker(
                     refresh_bps,
                     interval,
                     max_position,
+                    skew_bps,
                     max_divergence_bps,
                     no_ws,
                     live,
@@ -120,6 +122,7 @@ struct MakerRunArgs {
     refresh_bps: f64,
     interval: u64,
     max_position: f64,
+    skew_bps: f64,
     max_divergence_bps: f64,
     no_ws: bool,
     live: bool,
@@ -165,6 +168,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         levels: args.levels.max(1),
         size: args.size,
         max_position: args.max_position,
+        skew_bps: args.skew_bps,
         price_decimals: info.price_tick_decimals,
         qty_decimals: info.qty_tick_decimals,
         min_order_qty,
@@ -172,6 +176,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 
     if cfg.spread_bps <= 0.0 {
         return Err(anyhow::anyhow!("--spread-bps must be > 0"));
+    }
+    if cfg.skew_bps < 0.0 {
+        return Err(anyhow::anyhow!("--skew-bps must be >= 0"));
     }
     if cfg.band_bps <= cfg.spread_bps {
         return Err(anyhow::anyhow!(
@@ -240,6 +247,12 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             "│ size {} | max-position {} | interval {}s",
             cfg.size, cfg.max_position, args.interval
         );
+        if cfg.skew_bps > 0.0 {
+            println!(
+                "│ inventory skew {}bps (live only; paper holds no position)",
+                cfg.skew_bps
+            );
+        }
         println!(
             "│ ticks: price {}dp, qty {}dp | min qty {}",
             cfg.price_decimals, cfg.qty_decimals, cfg.min_order_qty

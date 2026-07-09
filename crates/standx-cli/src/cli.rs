@@ -411,6 +411,12 @@ pub enum MakerCommands {
         /// Max absolute position; suppress the side that would exceed it
         #[arg(long, default_value = "0.05")]
         max_position: f64,
+        /// Inventory skew: at full inventory, shift the quote center this many
+        /// bps away from mark to favor the reducing side (0 disables). Only
+        /// takes effect in live mode; paper holds no position. Suggested
+        /// starting point: roughly your --spread-bps
+        #[arg(long, default_value = "0")]
+        skew_bps: f64,
         /// Sanity guard: skip the cycle (no places/cancels) when mark price
         /// and book mid diverge by more than this (bps) — the data sources
         /// disagree and acting on them would be unsafe

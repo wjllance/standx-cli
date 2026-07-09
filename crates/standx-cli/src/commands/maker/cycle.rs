@@ -27,8 +27,8 @@ pub(super) async fn maker_cycle(
     output_format: OutputFormat,
 ) -> Result<(u64, u64, u64)> {
     use standx_sdk::maker::{
-        compute_desired_quotes, format_decimals, mark_mid_divergence_bps, reconcile, Action,
-        RestingQuote,
+        compute_desired_quotes, format_decimals, mark_mid_divergence_bps, reconcile, skew_center,
+        Action, RestingQuote,
     };
 
     // 1. Sanity guard: when mark and the book mid disagree, at least one
@@ -99,7 +99,7 @@ pub(super) async fn maker_cycle(
             .map(|o| {
                 let price: f64 = o.price.parse().unwrap_or(0.0);
                 let qty: f64 = o.qty.parse().unwrap_or(0.0);
-                let (level, ref_mark, placed_at_cycle) = match adopted.get(&o.id) {
+                let (level, ref_center, placed_at_cycle) = match adopted.get(&o.id) {
                     Some(&meta) => meta,
                     None => {
                         // Try to adopt from a recent place by side + price,
@@ -113,7 +113,7 @@ pub(super) async fn maker_cycle(
                         let meta = match matched {
                             Some(idx) => {
                                 let p = pending.remove(idx);
-                                (p.level, p.ref_mark, p.cycle)
+                                (p.level, p.ref_center, p.cycle)
                             }
                             // Unknown order (manual or unmatched): sentinel
                             // level so reconcile cancels it as stale — the
@@ -130,7 +130,7 @@ pub(super) async fn maker_cycle(
                     level,
                     price,
                     qty,
-                    ref_mark,
+                    ref_center,
                     placed_at_cycle,
                 }
             })
@@ -145,7 +145,13 @@ pub(super) async fn maker_cycle(
 
     // 3. Decide.
     let desired = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
-    let actions = reconcile(cfg, mark, best_bid, best_ask, &desired, resting, cycle);
+    let actions = reconcile(
+        cfg, mark, position, best_bid, best_ask, &desired, resting, cycle,
+    );
+
+    // The quote center these places are built around — the anti-flicker
+    // anchor stored on each placed quote (equals mark when skew is off).
+    let ref_center = skew_center(cfg, mark, position);
 
     // 4. Execute. Business rejections (post-only would-cross, order already
     //    gone) are expected and logged inline; only transient failures
@@ -220,7 +226,7 @@ pub(super) async fn maker_cycle(
                                 price: q.price,
                                 qty: q.qty,
                                 level: q.level,
-                                ref_mark: mark,
+                                ref_center,
                                 cycle,
                             });
                             places += 1;
@@ -249,7 +255,7 @@ pub(super) async fn maker_cycle(
                         level: q.level,
                         price: q.price,
                         qty: q.qty,
-                        ref_mark: mark,
+                        ref_center,
                         placed_at_cycle: cycle,
                     });
                     places += 1;
