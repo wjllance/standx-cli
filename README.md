@@ -357,7 +357,9 @@ re-quotes when mark price drifts past a threshold — no flicker-cancelling.
 
 ```bash
 # Paper mode (default): runs the full loop, prints intended actions,
-# places NO orders. Safe to run without credentials.
+# places NO orders. Safe to run without credentials. Fills are simulated
+# (a quote crossed by the touch), so position and inventory skew are
+# observable without going live.
 standx maker run BTC-USD --size 0.001 --interval 3
 
 # Tune the strategy

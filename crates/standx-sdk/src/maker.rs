@@ -193,6 +193,25 @@ pub fn skew_center(cfg: &MakerConfig, mark: f64, position: f64) -> f64 {
     mark * (1.0 - cfg.skew_bps * inv_ratio / 1e4)
 }
 
+/// Paper-mode fill model: whether a resting quote would be filled by the
+/// current touch. A resting bid fills when offers reach down to it
+/// (`best_ask <= price`); a resting ask fills when bids reach up to it
+/// (`best_bid >= price`). Returns false when the relevant book side is absent.
+///
+/// This is a discrete-time "crossed → filled" proxy used only to simulate
+/// inventory in paper mode; a real venue matches on the trade stream.
+pub fn paper_quote_filled(
+    side: OrderSide,
+    price: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+) -> bool {
+    match side {
+        OrderSide::Buy => best_ask.is_some_and(|a| a <= price),
+        OrderSide::Sell => best_bid.is_some_and(|b| b >= price),
+    }
+}
+
 /// Compute the desired quote set for the current market snapshot.
 ///
 /// Applies, in order: the inventory-skewed spread/level ladder, the band clamp,
@@ -702,6 +721,46 @@ mod tests {
         assert!((mark_mid_divergence_bps(100.0, 99.7, 99.8) - 25.0).abs() < 1e-9);
         // degenerate mark = 0 -> 0.0, no blowup
         assert_eq!(mark_mid_divergence_bps(0.0, 99.9, 100.1), 0.0);
+    }
+
+    // 23. Paper fill model: crossed touch fills, otherwise not.
+    #[test]
+    fn paper_fills_on_crossed_touch() {
+        // Resting buy at 99.90: fills once offers reach down to it.
+        assert!(!paper_quote_filled(
+            OrderSide::Buy,
+            99.90,
+            Some(99.80),
+            Some(99.95)
+        ));
+        assert!(paper_quote_filled(
+            OrderSide::Buy,
+            99.90,
+            Some(99.80),
+            Some(99.90)
+        ));
+        assert!(paper_quote_filled(
+            OrderSide::Buy,
+            99.90,
+            Some(99.80),
+            Some(99.85)
+        ));
+        // Resting sell at 100.10: fills once bids reach up to it.
+        assert!(!paper_quote_filled(
+            OrderSide::Sell,
+            100.10,
+            Some(100.05),
+            Some(100.2)
+        ));
+        assert!(paper_quote_filled(
+            OrderSide::Sell,
+            100.10,
+            Some(100.10),
+            Some(100.2)
+        ));
+        // Absent book side never fills.
+        assert!(!paper_quote_filled(OrderSide::Buy, 99.90, None, None));
+        assert!(!paper_quote_filled(OrderSide::Sell, 100.10, None, None));
     }
 
     // 16. skew_center helper: directional, zero cases.

@@ -13,6 +13,8 @@ pub(super) fn emit_maker_cycle(
     best_ask: Option<f64>,
     position: f64,
     actions: &[standx_sdk::maker::Action],
+    // Paper-mode simulated fills this cycle: (side, price, qty). Empty in live.
+    fills: &[(OrderSide, f64, f64)],
     cfg: &standx_sdk::maker::MakerConfig,
 ) {
     use standx_sdk::maker::{format_decimals, Action};
@@ -31,6 +33,17 @@ pub(super) fn emit_maker_cycle(
     match output_format {
         OutputFormat::Json => {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            for (side, price, qty) in fills {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                        "action": "fill", "side": side,
+                        "price": format_decimals(*price, cfg.price_decimals),
+                        "qty": format_decimals(*qty, cfg.qty_decimals),
+                    })
+                );
+            }
             for a in actions {
                 let obj = match a {
                     Action::Place(q) => serde_json::json!({
@@ -79,10 +92,19 @@ pub(super) fn emit_maker_cycle(
                     "best_bid": best_bid, "best_ask": best_ask,
                     "position": position,
                     "holds": holds, "places": places, "cancels": cancels,
+                    "fills": fills.len(),
                 })
             );
         }
         OutputFormat::Quiet => {
+            for (side, price, qty) in fills {
+                println!(
+                    "fill {} @ {} x {}",
+                    side_str(*side),
+                    format_decimals(*price, cfg.price_decimals),
+                    format_decimals(*qty, cfg.qty_decimals)
+                );
+            }
             // Only mutations and their reasons.
             for a in actions {
                 match a {
@@ -111,8 +133,13 @@ pub(super) fn emit_maker_cycle(
         }
         _ => {
             let now = chrono::Local::now().format("%H:%M:%S");
+            let fill_note = if fills.is_empty() {
+                String::new()
+            } else {
+                format!(" fill={}", fills.len())
+            };
             println!(
-                "[{}] #{} mark={} bid={} ask={} pos={} | hold={} place={} cancel={}",
+                "[{}] #{} mark={} bid={} ask={} pos={} | hold={} place={} cancel={}{}",
                 now,
                 cycle,
                 format_decimals(mark, cfg.price_decimals),
@@ -122,11 +149,20 @@ pub(super) fn emit_maker_cycle(
                 best_ask
                     .map(|a| format_decimals(a, cfg.price_decimals))
                     .unwrap_or_else(|| "-".into()),
-                position,
+                format_decimals(position, cfg.qty_decimals),
                 holds,
                 places,
-                cancels
+                cancels,
+                fill_note
             );
+            for (side, price, qty) in fills {
+                println!(
+                    "    FILL   {} @ {} x {}",
+                    side_str(*side),
+                    format_decimals(*price, cfg.price_decimals),
+                    format_decimals(*qty, cfg.qty_decimals)
+                );
+            }
             for a in actions {
                 match a {
                     Action::Place(q) => println!(
