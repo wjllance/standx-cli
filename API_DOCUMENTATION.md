@@ -287,7 +287,7 @@ Creates a new order.
 - `order_type`: `limit` or `market`
 - `qty`: Order quantity
 - `price`: Order price (required for limit orders)
-- `time_in_force`: `GTC`, `IOC`, or `FOK`
+- `time_in_force`: `GTC`, `ALO`, or `IOC` (`ALO` = add-liquidity-only / post-only)
 - `reduce_only`: Close position only
 - `sl_price`: Stop-loss price (optional)
 - `tp_price`: Take-profit price (optional)
@@ -487,8 +487,8 @@ Order updates (authenticated).
 
 ### Time in Force
 - `GTC` - Good Till Cancel
+- `ALO` - Add Liquidity Only (post-only; rejects if it would cross)
 - `IOC` - Immediate or Cancel
-- `FOK` - Fill or Kill
 
 ### Order Status
 - `New` - New order
