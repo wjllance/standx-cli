@@ -367,6 +367,9 @@ standx maker run BTC-USD \
   --refresh-bps 3     # anti-flicker: re-quote only after this much drift
   --levels 2          # quote levels per side
   --max-position 0.05 # suppress the side that would exceed this
+  --skew-bps 5        # inventory skew: at full inventory, shift the quote
+                      # center this many bps toward the reducing side
+                      # (0 = off; live only, paper holds no position)
 
 # Market data comes from a WebSocket feed (REST fallback when stale);
 # the loop also wakes early when mark has already drifted past
