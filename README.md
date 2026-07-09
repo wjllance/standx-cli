@@ -348,6 +348,16 @@ standx stream balance    # Balance updates
 standx stream fills      # Fill updates
 ```
 
+### Block Trades
+
+```bash
+# List block trades (optionally filter by symbol / status)
+standx block list --symbol BTC-USD --status completed
+
+# Watch block trades (polling)
+standx block watch --interval 10
+```
+
 ### Maker Bot (SIP-5A Community Maker Yield)
 
 A simple two-sided quoting loop optimized for
@@ -396,8 +406,13 @@ standx maker run BTC-USD --live
 In live mode the bot manages **all** orders on the quoted symbol (it starts
 with a cancel-all and cancels unknown orders as stale), cancels everything on
 exit (with retries and verification), and stops quoting after 3 consecutive
-API errors (fail-safe). Paper mode does not simulate fills, so position
-stays 0.
+API errors (fail-safe). Paper mode simulates fills when the touch crosses a
+quote, so position, inventory skew, and PnL telemetry are observable without
+going live.
+
+See **[docs/13-maker.md](docs/13-maker.md)** for the full guide — every flag,
+the anti-flicker decision table, inventory skew, telemetry, and live safety
+rails.
 
 ---
 
@@ -459,9 +474,11 @@ await exec("standx order create ...")
 **Goal**: Seamless experience across all AI Agents
 
 - [x] Comprehensive testing framework
+- [x] Reusable `standx-sdk` crate (REST/WS/signing, presentation-free) — see [workspace layout](#project-structure)
+- [x] Maker bot (SIP-5A): anti-flicker quoting, inventory skew, paper fill simulation, and PnL/uptime telemetry — see [docs/13-maker.md](docs/13-maker.md)
 - [ ] Portfolio PnL analysis
 - [ ] Python SDK - `pip install standx-agent`
-- [ ] Strategy templates (Grid, DCA, TWAP)
+- [ ] More strategy templates (Grid, DCA, TWAP)
 - [ ] Webhook callbacks
 - [ ] MCP support (optional enhancement)
 
@@ -484,6 +501,27 @@ await exec("standx order create ...")
 | Hummingbot | 🔴 Complex | 🔴 Complex | 🔴 High |
 | CCXT | 🟡 Wrapper needed | 🟡 Wrapper needed | 🟡 Medium |
 | Hyperliquid SDK | 🟡 Integration needed | 🟡 Integration needed | 🟡 Medium |
+
+---
+
+## 🏗️ Project Structure
+
+A Cargo workspace of two crates:
+
+```
+standx-cli/
+├── crates/standx-sdk/    # lib: REST client, WebSocket streams, models,
+│                         #      Ed25519 signing, maker strategy core.
+│                         #      Reusable by any Rust agent/bot; zero
+│                         #      presentation deps (tables behind a feature).
+└── crates/standx-cli/    # bin `standx`: commands, output formatting,
+                          #      config, telemetry. Depends on standx-sdk.
+```
+
+The `standx` binary, install scripts, and Homebrew formula are unchanged by
+the split. Strategy logic (quoting, reconcile, skew, stats) lives in
+`standx_sdk::maker` as pure, unit-tested functions — no I/O — so it can be
+embedded or tested without a network.
 
 ---
 

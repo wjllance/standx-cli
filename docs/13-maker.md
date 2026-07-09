@@ -1,0 +1,224 @@
+# 13 - 做市机器人（Maker Bot）
+
+本文档介绍 `standx maker` —— 面向 [SIP-5A 社区做市收益](https://docs.standx.com/sip/sip-5a-community-maker-yield)的双边报价机器人。
+
+SIP-5A 按**在线时长（uptime）**、**报价贴近 mark 价（须在合格带内）**和**深度**奖励做市商，并惩罚闪撤（flicker-cancel）与短命报价。因此本机器人的核心是 **anti-flicker 循环**：只要报价还在合格带内就一直挂着，仅当 mark 价相对下单时漂移超过阈值才重新报价。
+
+---
+
+## 前置条件
+
+- **Paper（模拟）模式**：无需认证，只读公共行情，不下任何真实单。默认即此模式。
+- **Live（实盘）模式**：需要 JWT + Ed25519 私钥（参考 [02-authentication.md](02-authentication.md)），且当前锁定在环境变量 `STANDX_ENABLE_LIVE_MAKER=1` 之后（见 [13.5](#135-live-实盘模式)）。
+
+---
+
+## 13.1 快速开始
+
+```bash
+# Paper 模式（默认）：跑完整循环、打印将要执行的动作，但不下真实单。
+# 成交会被模拟（touch 穿过报价即视为成交），所以仓位与库存 skew 可观测。
+standx maker run BTC-USD --size 0.001 --interval 3
+```
+
+**预期输出（表格模式）：**
+```
+┌──────────────────────────────────────────────────────────┐
+│ standx maker — PAPER mode on BTC-USD
+│ spread 5bps | band 20bps | refresh 3bps | 1 level(s)
+│ size 0.001 | max-position 0.05 | interval 3s
+│ ticks: price 2dp, qty 4dp | min qty 0.0001
+│ paper mode: no real orders; fills are simulated when the
+│ touch crosses a quote, so position & skew move. --live for real.
+│ feed: websocket (REST fallback) | divergence guard 25bps
+│ Ctrl+C to stop (cancels all resting orders on exit)
+└──────────────────────────────────────────────────────────┘
+[12:00:00] #0 mark=62000.00 bid=61999.00 ask=62001.00 pos=0.0000 pnl=0.00 | hold=0 place=2 cancel=0
+    PLACE  buy  L0 @ 61969.00 x 0.0010
+    PLACE  sell L0 @ 62031.00 x 0.0010
+[12:00:03] #1 mark=62001.00 bid=62000.00 ask=62002.00 pos=0.0000 pnl=0.00 | hold=2 place=0 cancel=0
+    HOLD   buy  L0 @ 61969.00 (age 1 cycles, drift 0.2bps)
+    HOLD   sell L0 @ 62031.00 (age 1 cycles, drift 0.2bps)
+```
+
+按 `Ctrl+C` 退出，机器人会撤掉所有挂单并打印本次会话的统计。
+
+---
+
+## 13.2 策略参数
+
+```bash
+standx maker run <SYMBOL> [OPTIONS]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `<SYMBOL>` | — | 交易对，如 `BTC-USD`（必填） |
+| `--spread-bps` | `5` | 距 mark 价的半价差（bps）：L0 买 = mark×(1−spread)，卖 = mark×(1+spread) |
+| `--band-bps` | `20` | 合格带守卫：绝不报到 mark ± band 之外（须 > spread） |
+| `--size` | `0.01` | 每侧每档数量（取整后须 ≥ 交易对最小下单量） |
+| `--levels` | `1` | 每侧报价档数 |
+| `--level-step-bps` | `2` | 档间距（bps，`--levels > 1` 时生效） |
+| `--refresh-bps` | `3` | anti-flicker：报价中心相对下单时漂移超过此值才重报 |
+| `-i, --interval` | `5` | 循环间隔（秒） |
+| `--max-position` | `0.05` | 最大绝对持仓；会把继续加仓的一侧压制掉 |
+| `--skew-bps` | `0` | 库存 skew：满仓时把报价中心向减仓侧偏移的最大幅度（bps），0 关闭。见 [13.3](#库存-skew) |
+| `--max-divergence-bps` | `25` | 当 mark 价与盘口中价背离超过此值时跳过该轮（不动挂单） |
+| `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
+| `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
+
+启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`。
+
+---
+
+## 13.3 工作原理
+
+### Anti-flicker reconcile
+
+每一轮，机器人对比"期望报价"与"当前挂单"，按以下决策表逐条处理每个挂单（顺序即优先级）：
+
+| # | 条件 | 动作 |
+|---|------|------|
+| 1 | 该侧被 max-position 压制 | 撤单（side_suppressed） |
+| 2 | 该 (side, level) 已无期望报价 | 撤单（stale） |
+| 3 | 挂单价出了当前合格带 | 撤单（outside_band） |
+| 4 | 挂单价穿过当前 touch | 撤单（would_cross） |
+| 5 | 报价中心相对下单时漂移 > refresh-bps | 撤单（mark_moved） |
+| 6 | 以上都不满足 | **保持（HOLD）** |
+
+保持是关键：只要还在带内、未穿价、漂移未超阈值，就不动它 —— 这正是 SIP-5A 奖励的 uptime。
+
+### 库存 skew
+
+被动做市有天然逆向选择：买单只在下跌时成交、卖单只在上涨时成交，库存会往亏损方向累积。`--skew-bps` 把报价中心按当前仓位偏移：
+
+```
+center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
+```
+
+持多头时中心下移 → 减仓侧（卖）更贴近 mark（更易成交）、加仓侧（买）更远（更难成交）；持空头相反。这把 `max-position` 从"急刹车"变成"渐进回中"。anti-flicker 的锚点也是这个中心，所以同一条重报规则同时响应 mark 漂移与库存 skew。
+
+> **注意**：paper 模式下 skew 只有在模拟成交累积出仓位后才生效；`--skew-bps 0`（默认）时行为与不带 skew 完全一致。
+
+### 行情来源与守卫
+
+- **WebSocket feed**：价格与深度走同一条公共连接；缓存超过 5 秒未更新时自动回退到 REST（覆盖预热、断线、`--no-ws`）。
+- **早醒重报**：循环在 sleep 期间若发现 mark 已漂过 `--refresh-bps`，会提前进入下一轮，缩短暴露窗口而不增加闪撤（仅在本来就要重报时才早醒）。
+- **mark/mid 背离守卫**：mark 价与盘口中价背离超过 `--max-divergence-bps` 时，本轮不做任何动作（不撤不挂），避免在数据源打架时误动作。
+
+---
+
+## 13.4 输出与遥测
+
+三种输出格式：
+
+- **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`。
+- **Quiet（`--quiet`）**：只打印成交与增删挂单。
+
+退出时打印本次会话统计：
+
+```
+👋 Stopping maker (ran 120 cycles: 40 places, 38 cancels, 210 holds)
+   6 fills | uptime 92% | max pos 0.0030 | avg capture 1.7bps | PnL +0.42 (mark-to-market)
+   paper sim: ending position 0.0010
+```
+
+**遥测指标含义**：
+
+| 指标 | 含义 |
+|------|------|
+| PnL（mark-to-market） | 已实现现金 + 持仓按 mark 计价，一个数同时体现点差捕获与库存盈亏 |
+| avg capture (bps) | 每笔成交在赚钱方向上离 mark 的平均距离 —— 做市 edge |
+| uptime % | 同时挂着买卖单的周期占比 —— SIP-5A 真正奖励的东西 |
+| fills / max pos | 成交笔数、会话内最大绝对持仓 |
+
+> paper 用精确模拟成交计算；live 从周期间仓位差推断成交（按 mark 计价，是捕获的保守下界，直到接入 fills 频道）。**调参在 paper 里做**：观察 avg capture 与 PnL 的关系来调 `--spread-bps` / `--refresh-bps` / `--skew-bps`。
+
+---
+
+## 13.5 Live（实盘）模式
+
+> ⚠️ **风险提示**：live 模式会下真实的 post-only（ALO）订单。它已实现但**尚未经过生产环境的监督测试**，因此锁定在环境变量之后。
+
+```bash
+export STANDX_ENABLE_LIVE_MAKER=1        # 解锁（自行承担风险）
+standx maker run BTC-USD --size 0.0001 --max-position 0.001 --live
+```
+
+live 模式的安全栏：
+
+- **启动即 cancel-all**：从干净的盘口开始，避免上一轮残留干扰对账。
+- **机器人接管该交易对的全部挂单**：手动挂的单会被当作 stale 撤掉。
+- **拒单容错**：post-only 穿价拒单、撤已成交单等属正常事件（记录后下轮重报），不计入 fail-safe；只有网络/5xx 等瞬时故障才计数。
+- **部分成交容忍**:部分成交的挂单保留剩余部分继续挂,不会被误撤。
+- **fail-safe 停机**:连续 3 次瞬时错误即停机并清理。
+- **退出必清理**:所有退出路径都会 cancel-all(3 次重试 + 校验),有残留会大字告警并给出手动撤单命令。
+
+---
+
+## 13.6 使用示例
+
+```bash
+# 多档报价(每侧 3 档,档间距 1bps)
+standx maker run BTC-USD --levels 3 --level-step-bps 1 --size 0.001
+
+# 开启库存 skew,并用 JSON 输出喂给 agent / 日志管道
+standx maker run ETH-USD --skew-bps 5 --output json
+
+# 强制 REST 轮询(不用 WebSocket)
+standx maker run BTC-USD --no-ws --interval 5
+
+# 全局 --dry-run:只打印说明,不进入循环
+standx --dry-run maker run BTC-USD
+```
+
+---
+
+## 13.7 测试检查清单
+
+### Paper 模式(零风险,只读公共 API)
+
+- [ ] `standx maker run BTC-USD --size 0.001 --interval 3` 首轮两侧各下一单
+- [ ] 平静期出现 HOLD,age 递增
+- [ ] mark 漂过 refresh-bps 时出现 CANCEL(mark_moved)+PLACE
+- [ ] 盘口穿过某侧挂单时,只撤违规一侧(would_cross)
+- [ ] `--output json` 每行都是合法 JSON,含 cycle_summary
+- [ ] touch 穿过报价时出现 FILL,pos 与 pnl 变化
+- [ ] `Ctrl+C` 退出时打印统计并(live)清理挂单
+
+### 参数校验
+
+- [ ] `--band-bps` ≤ `--spread-bps` 时报错
+- [ ] `--size` 小于最小下单量时报错
+- [ ] `--skew-bps` 为负时报错
+- [ ] 未知交易对时报错并列出可用交易对
+
+### Live 模式(需 `STANDX_ENABLE_LIVE_MAKER=1` + 认证)
+
+- [ ] 不设环境变量时 `--live` 报 "live mode not yet enabled"
+- [ ] 解锁后小额观测:ALO 拒单行为、启动 cancel-all、退出清理
+
+---
+
+## 13.8 常见问题
+
+### Q: paper 模式为什么 PnL / skew 一直是 0?
+
+paper 只有在模拟成交累积出仓位后才有非零仓位与 skew。若市场平静、touch 从未穿过你的报价,就不会有成交。用更紧的 `--spread-bps` 或更长运行时间即可观察到。
+
+### Q: `--live` 报 "live mode not yet enabled"?
+
+live 模式当前锁定,需要 `export STANDX_ENABLE_LIVE_MAKER=1` 解锁,并确保已 `standx auth login`(含私钥)。
+
+### Q: 如何选择 `--spread-bps` / `--refresh-bps` / `--skew-bps`?
+
+在 paper 里跑,观察退出统计的 **avg capture(点差捕获)** 与 **PnL**:capture 为正说明在赚点差,PnL 为负说明库存风险压过了点差 —— 此时应收紧仓位或调大 skew。
+
+---
+
+## 下一步
+
+- 认证配置:[02-authentication.md](02-authentication.md)
+- 输出格式:[09-output-formats.md](09-output-formats.md)
+- 下单/撤单基础:[05-orders.md](05-orders.md)
