@@ -136,7 +136,6 @@ cargo build --release
 ## 📚 相关文档
 
 - [CHANGELOG.md](../CHANGELOG.md)
-- [RELEASE_NOTES_v0.6.0.md](../RELEASE_NOTES_v0.6.0.md)
 - [Semantic Versioning](https://semver.org/)
 
 ---

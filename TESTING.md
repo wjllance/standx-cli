@@ -368,9 +368,8 @@ cargo test test_cli_version -- --nocapture
 
 ## 相关文档
 
-- [发布说明](RELEASE_NOTES_v0.5.0.md)
 - [CHANGELOG](CHANGELOG.md)
-- [开发计划](DEVELOPMENT_PLAN.md)
+- [使用文档](docs/README.md)
 
 ---
 
