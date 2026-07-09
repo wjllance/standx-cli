@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// One reconcile cycle over an already-acquired market snapshot.
-/// Returns (places, cancels, holds) counts.
+/// Returns (places, cancels, holds, fills) counts. `sim_position` carries the
+/// paper-mode simulated inventory across cycles (unused in live).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn maker_cycle(
     client: &StandXClient,
@@ -24,11 +25,12 @@ pub(super) async fn maker_cycle(
     resting: &mut Vec<standx_sdk::maker::RestingQuote>,
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
+    sim_position: &mut f64,
     output_format: OutputFormat,
-) -> Result<(u64, u64, u64)> {
+) -> Result<(u64, u64, u64, u64)> {
     use standx_sdk::maker::{
-        compute_desired_quotes, format_decimals, mark_mid_divergence_bps, reconcile, skew_center,
-        Action, RestingQuote,
+        compute_desired_quotes, format_decimals, mark_mid_divergence_bps, paper_quote_filled,
+        reconcile, skew_center, Action, RestingQuote,
     };
 
     // 1. Sanity guard: when mark and the book mid disagree, at least one
@@ -60,19 +62,20 @@ pub(super) async fn maker_cycle(
                     );
                 }
             }
-            return Ok((0, 0, 0));
+            return Ok((0, 0, 0, 0));
         }
     }
 
     if live && (best_bid.is_none() || best_ask.is_none()) {
         // Fail-safe: without a touch we cannot guarantee no-cross pricing.
         eprintln!("⚠️  empty order book on {}; skipping this cycle", symbol);
-        return Ok((0, 0, 0));
+        return Ok((0, 0, 0, 0));
     }
 
     // 2. Rebuild resting + position from the exchange (live) or keep the
     //    simulated book (paper).
     let position: f64;
+    let mut fills: Vec<(OrderSide, f64, f64)> = Vec::new(); // paper sim only
     if live {
         let (orders, positions) = tokio::join!(
             client.get_open_orders(Some(symbol)),
@@ -140,7 +143,24 @@ pub(super) async fn maker_cycle(
         pending.retain(|p| cycle.saturating_sub(p.cycle) <= 2);
         adopted.retain(|id, _| resting.iter().any(|r| r.order_id.as_deref() == Some(id)));
     } else {
-        position = 0.0; // fills are not simulated in paper mode
+        // Paper mode: simulate fills against the touch so inventory (and thus
+        // skew) is observable without going live. A crossed resting quote is
+        // taken off the book and its signed qty folded into the position; the
+        // reconcile below then re-quotes the vacated level.
+        let mut i = 0;
+        while i < resting.len() {
+            if paper_quote_filled(resting[i].side, resting[i].price, best_bid, best_ask) {
+                let q = resting.remove(i);
+                *sim_position += match q.side {
+                    OrderSide::Buy => q.qty,
+                    OrderSide::Sell => -q.qty,
+                };
+                fills.push((q.side, q.price, q.qty));
+            } else {
+                i += 1;
+            }
+        }
+        position = *sim_position;
     }
 
     // 3. Decide.
@@ -276,10 +296,11 @@ pub(super) async fn maker_cycle(
         best_ask,
         position,
         &actions,
+        &fills,
         cfg,
     );
 
-    Ok((places, cancels, holds))
+    Ok((places, cancels, holds, fills.len() as u64))
 }
 
 /// Cancel-all with retries; verifies the book is actually clean afterwards.

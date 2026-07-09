@@ -258,8 +258,8 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             cfg.price_decimals, cfg.qty_decimals, cfg.min_order_qty
         );
         if !args.live {
-            println!("│ paper mode: no orders are placed; fills are NOT simulated");
-            println!("│ (position stays 0). Add --live for real quoting.");
+            println!("│ paper mode: no real orders; fills are simulated when the");
+            println!("│ touch crosses a quote, so position & skew move. --live for real.");
         } else {
             println!(
                 "│ ⚠️  LIVE: the bot manages ALL orders on {} — manual",
@@ -296,6 +296,8 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_places: u64 = 0;
     let mut total_cancels: u64 = 0;
     let mut total_holds: u64 = 0;
+    let mut total_fills: u64 = 0;
+    let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
 
@@ -305,7 +307,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         let work = async {
             let (mark, best_bid, best_ask, src) =
                 market_snapshot(&client, &symbol, feed.as_ref()).await?;
-            let (places, cancels, holds) = maker_cycle(
+            let (places, cancels, holds, fills) = maker_cycle(
                 &client,
                 &symbol,
                 &cfg,
@@ -318,10 +320,11 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut resting,
                 &mut adopted,
                 &mut pending,
+                &mut sim_position,
                 output_format,
             )
             .await?;
-            Ok::<_, anyhow::Error>((places, cancels, holds, mark, src))
+            Ok::<_, anyhow::Error>((places, cancels, holds, fills, mark, src))
         };
         let cycle_result = tokio::select! {
             _ = signal::ctrl_c() => break MakerExit::CtrlC,
@@ -329,11 +332,12 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         };
 
         match cycle_result {
-            Ok((places, cancels, holds, mark, src)) => {
+            Ok((places, cancels, holds, fills, mark, src)) => {
                 consecutive_errors = 0;
                 total_places += places;
                 total_cancels += cancels;
                 total_holds += holds;
+                total_fills += fills;
                 last_mark = Some(mark);
                 if !args.no_ws && last_src != Some(src) {
                     match src {
@@ -406,6 +410,13 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
             cycle, total_places, total_cancels, total_holds
         );
+        if !args.live {
+            println!(
+                "   paper sim: {} fills, ending position {}",
+                total_fills,
+                maker::format_decimals(sim_position, cfg.qty_decimals)
+            );
+        }
     }
     if args.live {
         cancel_all_with_retry(&client, &symbol, 3).await?;
