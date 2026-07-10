@@ -5,7 +5,7 @@ use standx_sdk::client::StandXClient;
 use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide};
 use standx_sdk::order_response::OrderResponse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::signal;
@@ -588,6 +588,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
     let mut adopted: HashMap<String, (u32, f64, u64)> = HashMap::new(); // id -> (level, ref_mark, cycle)
     let mut pending: Vec<PendingPlace> = Vec::new();
+    let mut maker_order_ids: HashSet<u64> = HashSet::new();
+    let mut seen_fill_ids: HashSet<u64> = HashSet::new();
+    let session_started_at = chrono::Utc::now().timestamp();
     let mut consecutive_errors: u32 = 0;
     let mut total_places: u64 = 0;
     let mut total_cancels: u64 = 0;
@@ -643,6 +646,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut resting,
                 &mut adopted,
                 &mut pending,
+                &mut maker_order_ids,
+                &mut seen_fill_ids,
+                session_started_at,
                 &mut sim_position,
                 &mut stats,
                 &mut breaker,

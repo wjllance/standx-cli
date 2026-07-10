@@ -233,7 +233,7 @@ pub struct MakerStats {
     spread_bps_sum: f64,
     spread_bps_n: u64,
     pub max_abs_position: f64,
-    /// Last observed position, for inferring live fills from position deltas.
+    /// Last observed position, used for mark-to-market and inventory telemetry.
     last_position: f64,
 }
 
@@ -263,22 +263,9 @@ impl MakerStats {
         }
     }
 
-    /// Close out a cycle: infer a live fill from any position delta (priced at
-    /// mark, since the exact fill price isn't known without the fills channel),
-    /// then update uptime and inventory extent. `two_sided` is whether both a
-    /// bid and an ask were resting this cycle.
-    pub fn end_cycle(&mut self, position: f64, mark: f64, two_sided: bool, live: bool) {
-        if live {
-            let delta = position - self.last_position;
-            if delta.abs() > f64::EPSILON {
-                let side = if delta > 0.0 {
-                    OrderSide::Buy
-                } else {
-                    OrderSide::Sell
-                };
-                self.record_fill(side, mark, delta.abs(), mark);
-            }
-        }
+    /// Close out a cycle after the caller has recorded exact venue fills.
+    /// `two_sided` is whether both a bid and an ask were resting this cycle.
+    pub fn end_cycle(&mut self, position: f64, two_sided: bool) {
         self.last_position = position;
         self.max_abs_position = self.max_abs_position.max(position.abs());
         self.cycles += 1;
@@ -1155,15 +1142,16 @@ mod tests {
     #[test]
     fn stats_uptime_and_live_inference() {
         let mut s = MakerStats::default();
-        s.end_cycle(0.0, 100.0, true, false); // two-sided
-        s.end_cycle(0.0, 100.0, false, false); // one-sided
+        s.end_cycle(0.0, true); // two-sided
+        s.end_cycle(0.0, false); // one-sided
         assert_eq!(s.cycles, 2);
         assert!((s.uptime_pct() - 50.0).abs() < 1e-9);
-        // Live: a position jump 0 -> 0.01 infers one buy fill at mark.
+        // Position movement alone must not fabricate a live fill: exact
+        // maker fills are supplied by the venue ledger.
         let mut l = MakerStats::default();
-        l.end_cycle(0.01, 100.0, true, true);
-        assert_eq!(l.fills(), 1);
-        assert_eq!(l.buy_fills, 1);
+        l.end_cycle(0.01, true);
+        assert_eq!(l.fills(), 0);
+        assert_eq!(l.buy_fills, 0);
         assert!((l.max_abs_position - 0.01).abs() < 1e-9);
     }
 
@@ -1422,7 +1410,7 @@ mod tests {
         let mut m = AlertMonitor::new(0.0, 0.0, 50.0); // floor 50%
         let mut s = MakerStats::default();
         // One one-sided cycle -> uptime 0%, but before warmup: no alert.
-        s.end_cycle(0.0, 100.0, false, false);
+        s.end_cycle(0.0, false);
         assert!(m.evaluate(&s, 0.0, 100.0, 0.05, 5).is_empty());
         // After warmup, still 0% < 50% -> fire.
         let a = m.evaluate(&s, 0.0, 100.0, 0.05, 25);

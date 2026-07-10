@@ -151,7 +151,7 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 | uptime % | 同时挂着买卖单的周期占比 —— SIP-5A 真正奖励的东西 |
 | fills / max pos | 成交笔数、会话内最大绝对持仓 |
 
-> paper 用精确模拟成交计算；live 从周期间仓位差推断成交（按 mark 计价，是捕获的保守下界，直到接入 fills 频道）。**调参在 paper 里做**：观察 avg capture 与 PnL 的关系来调 `--spread-bps` / `--refresh-bps` / `--skew-bps`。
+> paper 用精确模拟成交计算；live 从认证成交历史读取本次会话内、已关联到 `sxmk-` maker 订单的成交，并按成交 ID 去重。不会把手工/API 订单或单纯仓位变化当作 maker 成交。当前 mark-to-market 仍基于成交现金流与仓位估值；费用币种和交易所已实现盈亏会单列核对。**调参在 paper 里做**：观察 avg capture 与 PnL 的关系来调 `--spread-bps` / `--refresh-bps` / `--skew-bps`。
 
 ### 风险告警
 
