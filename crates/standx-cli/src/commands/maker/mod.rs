@@ -123,16 +123,22 @@ fn position_for_symbol(positions: &[Position], symbol: &str) -> Result<f64> {
             let qty = position.qty.parse::<f64>().map_err(|_| {
                 anyhow::anyhow!("position on {symbol} has invalid qty '{}'", position.qty)
             })?;
-            if !qty.is_finite() || qty < 0.0 {
+            if !qty.is_finite() {
                 return Err(anyhow::anyhow!(
-                    "position on {symbol} has invalid non-finite/negative qty"
+                    "position on {symbol} has invalid non-finite qty"
                 ));
             }
-            Ok(total
-                + match position.side {
-                    Some(OrderSide::Sell) => -qty,
-                    _ => qty,
-                })
+            // Venue responses have used both unsigned quantities with an
+            // explicit side and signed quantities with that same side. Treat
+            // side as authoritative whenever it is present so a short such
+            // as `side=sell, qty=-0.13` remains a short rather than failing
+            // reconciliation (or being double-negated).
+            let signed_qty = match position.side {
+                Some(OrderSide::Sell) => -qty.abs(),
+                Some(OrderSide::Buy) => qty.abs(),
+                None => qty,
+            };
+            Ok(total + signed_qty)
         })
 }
 
@@ -1586,6 +1592,23 @@ mod tests {
         assert!(starting_position_within_limit(0.800_05, 0.8, 3));
         assert!(!starting_position_within_limit(0.800_6, 0.8, 3));
         assert!(starting_position_within_limit(-0.8, 0.8, 3));
+    }
+
+    #[test]
+    fn position_uses_side_to_normalize_signed_and_unsigned_quantities() {
+        assert_eq!(
+            position_for_symbol(&[test_position("buy", "0.13")], "XAG-USD").unwrap(),
+            0.13
+        );
+        assert_eq!(
+            position_for_symbol(&[test_position("sell", "0.13")], "XAG-USD").unwrap(),
+            -0.13
+        );
+        assert_eq!(
+            position_for_symbol(&[test_position("sell", "-0.13")], "XAG-USD").unwrap(),
+            -0.13
+        );
+        assert!(position_for_symbol(&[test_position("sell", "NaN")], "XAG-USD").is_err());
     }
 
     #[test]
