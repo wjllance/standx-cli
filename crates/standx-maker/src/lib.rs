@@ -1787,6 +1787,44 @@ mod tests {
         assert_eq!(halted_plan.inventory_exit, None);
     }
 
+    #[test]
+    fn cycle_plan_reserves_delayed_places_and_caps_directional_exposure() {
+        let mut c = cfg();
+        c.levels = 2;
+        c.max_position = 0.015;
+        let pending_slots = [(OrderSide::Buy, 0)];
+        let plan = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 4,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.9),
+                    best_ask: Some(100.1),
+                },
+                // The pending 0.01 buy already reserves more than the 0.005
+                // remaining long-inventory budget.
+                position: 0.01,
+                resting: &[],
+                pending_slots: &pending_slots,
+                active_exit_enabled: false,
+                inventory_exit_pct: 0.0,
+                inventory_exit_qty: 0.0,
+            },
+            false,
+        );
+
+        let buy_places = plan
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Place(quote) if quote.side == OrderSide::Buy => Some(quote),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(buy_places.is_empty());
+    }
+
     // 28. Alert monitor: disabled emits nothing.
     #[test]
     fn alerts_disabled() {
