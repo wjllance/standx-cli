@@ -38,6 +38,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Utilities
 dirs = "6.0"
+uuid = { version = "1.7", features = ["v4"] }
 
 # Output formatting
 tabled = "0.18"
