@@ -7,8 +7,8 @@ use crate::cli::*;
 use anyhow::Result;
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
-use standx_sdk::models::{OrderSide, OrderType, TimeInForce};
-use std::collections::HashMap;
+use standx_sdk::models::{OrderSide, OrderType, TimeInForce, Trade};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -29,6 +29,9 @@ pub(super) async fn maker_cycle(
     resting: &mut Vec<standx_sdk::maker::RestingQuote>,
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
+    maker_order_ids: &mut HashSet<u64>,
+    seen_fill_ids: &mut HashSet<u64>,
+    session_started_at: i64,
     sim_position: &mut f64,
     stats: &mut standx_sdk::maker::MakerStats,
     breaker: &mut standx_sdk::maker::VolBreaker,
@@ -89,12 +92,52 @@ pub(super) async fn maker_cycle(
     let position: f64;
     let mut fills: Vec<(OrderSide, f64, f64)> = Vec::new(); // paper sim only
     if live {
-        let (orders, positions) = tokio::join!(
+        let now = chrono::Utc::now().timestamp();
+        let (orders, positions, filled_orders, trades) = tokio::join!(
             client.get_open_orders(Some(symbol)),
-            client.get_positions(Some(symbol))
+            client.get_positions(Some(symbol)),
+            client.get_order_history(Some(symbol), Some(100)),
+            client.get_user_trades(symbol, session_started_at, now, Some(500)),
         );
         let orders = orders?;
         let positions = positions?;
+        let filled_orders = filled_orders?;
+        let trades = trades?;
+
+        // Open maker orders identify partial fills; historical maker orders
+        // identify a quote that fully filled between two polling cycles.
+        for order in orders.iter().chain(filled_orders.iter()) {
+            if is_maker_order(order) {
+                let order_id = order.id.parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "maker-owned order has non-integer exchange ID '{}'",
+                        order.id
+                    )
+                })?;
+                maker_order_ids.insert(order_id);
+            }
+        }
+
+        for trade in trades {
+            let Some(order_id) = trade.order_id else {
+                continue;
+            };
+            if !maker_order_ids.contains(&order_id) {
+                continue;
+            }
+            if trade.id == 0 {
+                return Err(anyhow::anyhow!(
+                    "maker fill for order {} has no stable trade ID",
+                    order_id
+                ));
+            }
+            if !seen_fill_ids.insert(trade.id) {
+                continue;
+            }
+            let (side, price, qty) = maker_trade_fill(&trade)?;
+            stats.record_fill(side, price, qty, mark);
+            fills.push((side, price, qty));
+        }
 
         position = positions
             .iter()
@@ -358,7 +401,7 @@ pub(super) async fn maker_cycle(
     //    fill from any position delta; paper already recorded exact fills).
     let two_sided = resting.iter().any(|r| r.side == OrderSide::Buy)
         && resting.iter().any(|r| r.side == OrderSide::Sell);
-    stats.end_cycle(position, mark, two_sided, live);
+    stats.end_cycle(position, two_sided);
 
     // 6. Emit.
     emit_maker_cycle(
@@ -378,6 +421,39 @@ pub(super) async fn maker_cycle(
     );
 
     Ok((places, cancels, holds, fills.len() as u64))
+}
+
+/// Decode a venue fill strictly enough for accounting. A maker fill with
+/// missing side, price, or quantity is not silently guessed from position.
+fn maker_trade_fill(trade: &Trade) -> Result<(OrderSide, f64, f64)> {
+    let side = match trade.side.as_deref() {
+        Some(side) if side.eq_ignore_ascii_case("buy") => OrderSide::Buy,
+        Some(side) if side.eq_ignore_ascii_case("sell") => OrderSide::Sell,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "maker trade {} is missing a valid side",
+                trade.id
+            ));
+        }
+    };
+    let price = trade.price.parse::<f64>().map_err(|_| {
+        anyhow::anyhow!(
+            "maker trade {} has invalid price '{}'",
+            trade.id,
+            trade.price
+        )
+    })?;
+    let qty = trade
+        .qty
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("maker trade {} has invalid qty '{}'", trade.id, trade.qty))?;
+    if !price.is_finite() || price <= 0.0 || !qty.is_finite() || qty <= 0.0 {
+        return Err(anyhow::anyhow!(
+            "maker trade {} has non-positive price/qty",
+            trade.id
+        ));
+    }
+    Ok((side, price, qty))
 }
 
 /// Cancel maker-owned orders with retries, preserving manual/API orders.
@@ -455,5 +531,43 @@ pub(super) async fn cancel_maker_orders_with_retry(
                 e
             )),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trade(side: Option<&str>, price: &str, qty: &str) -> Trade {
+        Trade {
+            id: 42,
+            time: "2026-07-10T00:00:00Z".to_string(),
+            price: price.to_string(),
+            qty: qty.to_string(),
+            side: side.map(str::to_string),
+            is_buyer_taker: false,
+            fee_asset: None,
+            fee_qty: None,
+            pnl: None,
+            order_id: Some(7),
+            symbol: Some("BTC-USD".to_string()),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn maker_trade_fill_requires_complete_venue_fields() {
+        assert_eq!(
+            maker_trade_fill(&trade(Some("buy"), "99.5", "0.02")).unwrap(),
+            (OrderSide::Buy, 99.5, 0.02)
+        );
+        assert!(maker_trade_fill(&trade(None, "99.5", "0.02"))
+            .unwrap_err()
+            .to_string()
+            .contains("valid side"));
+        assert!(maker_trade_fill(&trade(Some("sell"), "bad", "0.02"))
+            .unwrap_err()
+            .to_string()
+            .contains("invalid price"));
     }
 }

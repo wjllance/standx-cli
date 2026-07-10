@@ -413,12 +413,14 @@ standx maker run BTC-USD --output json
 standx maker run BTC-USD --live
 ```
 
-In live mode the bot manages **all** orders on the quoted symbol (it starts
-with a cancel-all and cancels unknown orders as stale), cancels everything on
-exit (with retries and verification), and stops quoting after 3 consecutive
-API errors (fail-safe). Paper mode simulates fills when the touch crosses a
-quote, so position, inventory skew, and PnL telemetry are observable without
-going live.
+In live mode the bot manages only orders tagged with its `sxmk-` client-order
+ID prefix: manual/API orders are preserved. It cleans up maker-owned orders on
+exit (with retries and verification), stops quoting after 3 consecutive API
+errors, and fails closed if the asynchronous order-response stream disconnects.
+Live fill telemetry is sourced from authenticated, maker-order-correlated trade
+history rather than inferred from position changes. Paper mode simulates fills
+when the touch crosses a quote, so position, inventory skew, and PnL telemetry
+are observable without going live.
 
 See **[docs/13-maker.md](docs/13-maker.md)** for the full guide — every flag,
 the anti-flicker decision table, inventory skew, telemetry, and live safety
