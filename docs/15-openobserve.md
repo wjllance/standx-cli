@@ -113,7 +113,28 @@ ORDER BY events DESC;
 分析时以 `event_id` 去重；外部预置仓位不属于 maker-correlated fill ledger，不能把
 对应会话的 maker PnL 当成账户真实盈亏。
 
-## 5. 安全边界
+同一查询也可以从终端只读执行：
+
+```bash
+python3 scripts/openobserve_query.py --hours 24
+```
+
+## 5. 创建或刷新 maker Dashboard
+
+创建原生 `StandX Maker Overview` Dashboard；如果同名 Dashboard 已存在，则更新它：
+
+```bash
+set -a
+source deploy/openobserve/.env
+set +a
+python3 scripts/openobserve_dashboard.py
+```
+
+Dashboard 默认选择最新 maker run，包含 `Overview` 和 `Runs & Events` 两个页签。
+PnL 面板展示 maker session 自身的 PnL；reduce-only exit 演练所用的外部预置库存，
+通过 Inventory 和 Events 面板单独判断。
+
+## 6. 安全边界
 
 - OpenObserve 仅监听 `127.0.0.1:5080`，不要直接暴露公网。
 - `deploy/openobserve/.env` 使用独立密码，不复用交易所凭证。

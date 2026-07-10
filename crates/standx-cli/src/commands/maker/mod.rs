@@ -9,7 +9,6 @@ use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide};
 use standx_sdk::order_response::OrderResponse;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::signal;
 
@@ -35,8 +34,36 @@ const MAKER_CL_ORD_ID_PREFIX: &str = "sxmk-";
 /// Why the maker loop stopped.
 enum MakerExit {
     CtrlC,
-    /// Too many consecutive API errors — fail safe, not open.
-    FailSafe(String),
+    /// The asynchronous order-response stream cannot confirm live orders.
+    OrderResponse(String),
+    /// Three consecutive transient maker-cycle failures.
+    ConsecutiveErrors(String),
+}
+
+impl MakerExit {
+    fn lifecycle_reason(&self) -> String {
+        match self {
+            Self::CtrlC => "Ctrl+C".to_string(),
+            Self::OrderResponse(error) => {
+                format!("fail-safe: order-response stream unavailable: {error}")
+            }
+            Self::ConsecutiveErrors(error) => {
+                format!("fail-safe: 3 consecutive maker cycle errors: {error}")
+            }
+        }
+    }
+
+    fn terminal_error(&self) -> Option<String> {
+        match self {
+            Self::CtrlC => None,
+            Self::OrderResponse(error) => Some(format!(
+                "maker stopped immediately (fail-safe): order-response stream unavailable: {error}"
+            )),
+            Self::ConsecutiveErrors(error) => Some(format!(
+                "maker stopped after 3 consecutive maker cycle errors (fail-safe): {error}"
+            )),
+        }
+    }
 }
 
 /// Pending place awaiting order-id adoption in live mode. The HTTP request is
@@ -525,7 +552,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 // Aborting drops the local WebSocket halves; set health first
                 // so the maker exits through its existing fail-safe path even
                 // if the runtime delays observing the socket close.
-                health_for_fault.store(false, Ordering::Release);
+                health_for_fault.mark_unhealthy(format!(
+                    "controlled fault injection closed the order-response stream after {after}s"
+                ));
                 abort.abort();
             });
             eprintln!(
@@ -669,14 +698,16 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut last_src: Option<&'static str> = None;
 
     let exit = 'main: loop {
-        if args.live
-            && !order_response_health
+        if args.live {
+            if let Some(health) = order_response_health
                 .as_ref()
-                .is_some_and(|health| health.load(Ordering::Acquire))
-        {
-            break MakerExit::FailSafe(
-                "order-response stream is unhealthy; refusing further live orders".to_string(),
-            );
+                .filter(|health| !health.is_healthy())
+            {
+                let detail = health.failure_reason().unwrap_or_else(|| {
+                    "order-response stream became unhealthy without a recorded reason".to_string()
+                });
+                break MakerExit::OrderResponse(format!("{detail}; refusing further live orders"));
+            }
         }
         if let Some(receiver) = order_responses.as_mut() {
             if let Err(error) = apply_order_responses(
@@ -687,7 +718,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 cycle,
                 cfg.price_decimals,
             ) {
-                break MakerExit::FailSafe(error.to_string());
+                break MakerExit::OrderResponse(error.to_string());
             }
         }
 
@@ -719,7 +750,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut stats,
                 &mut breaker,
                 output_format,
-                order_response_health.as_deref(),
+                order_response_health.as_ref(),
             )
             .await?;
             Ok::<_, anyhow::Error>((places, cancels, holds, fills, mark, src, breaker.halted()))
@@ -768,7 +799,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 consecutive_errors += 1;
                 eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
                 if consecutive_errors >= 3 {
-                    break MakerExit::FailSafe(e.to_string());
+                    break MakerExit::ConsecutiveErrors(e.to_string());
                 }
             }
         }
@@ -862,10 +893,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 
     // Notify stop on every exit path. Await delivery so the message lands
     // before the process exits.
-    let reason = match &exit {
-        MakerExit::CtrlC => "Ctrl+C".to_string(),
-        MakerExit::FailSafe(e) => format!("fail-safe: {e}"),
-    };
+    let reason = exit.lifecycle_reason();
     let pnl_str = last_mark
         .map(|m| format!("{:+.2}", stats.mark_to_market(m)))
         .unwrap_or_else(|| "n/a".to_string());
@@ -900,12 +928,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         ));
     }
 
-    match exit {
-        MakerExit::CtrlC => Ok(()),
-        MakerExit::FailSafe(e) => Err(anyhow::anyhow!(
-            "maker stopped after 3 consecutive errors (fail-safe): {}",
-            e
-        )),
+    match exit.terminal_error() {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(()),
     }
 }
 
@@ -913,6 +938,29 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
+
+    #[test]
+    fn order_response_exit_message_does_not_claim_three_errors() {
+        let exit = MakerExit::OrderResponse(
+            "order-response WebSocket closed: code=1008 reason=\"maintenance\"".to_string(),
+        );
+
+        let lifecycle = exit.lifecycle_reason();
+        let terminal = exit.terminal_error().unwrap();
+        assert!(lifecycle.contains("code=1008"), "{lifecycle}");
+        assert!(terminal.contains("stopped immediately"), "{terminal}");
+        assert!(!terminal.contains("3 consecutive"), "{terminal}");
+    }
+
+    #[test]
+    fn consecutive_cycle_exit_message_names_three_errors() {
+        let exit = MakerExit::ConsecutiveErrors("network timeout".to_string());
+
+        let lifecycle = exit.lifecycle_reason();
+        let terminal = exit.terminal_error().unwrap();
+        assert!(lifecycle.contains("3 consecutive maker cycle errors"));
+        assert!(terminal.contains("3 consecutive maker cycle errors"));
+    }
 
     struct EnvGuard {
         key: &'static str,

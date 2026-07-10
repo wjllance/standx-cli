@@ -6,7 +6,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -37,8 +37,47 @@ pub struct OrderResponseStream {
     session_id: String,
 }
 
-/// Shared liveness flag for an authenticated order-response connection.
-pub type OrderResponseHealth = Arc<AtomicBool>;
+/// Shared liveness state for an authenticated order-response connection.
+///
+/// The failure reason is written before `healthy` flips to false, so callers
+/// that observe an unhealthy stream can include the close code/reason or the
+/// underlying WebSocket error in their fail-safe log.
+#[derive(Debug, Clone)]
+pub struct OrderResponseHealth {
+    healthy: Arc<AtomicBool>,
+    failure_reason: Arc<Mutex<Option<String>>>,
+}
+
+impl Default for OrderResponseHealth {
+    fn default() -> Self {
+        Self {
+            healthy: Arc::new(AtomicBool::new(true)),
+            failure_reason: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl OrderResponseHealth {
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
+    pub fn failure_reason(&self) -> Option<String> {
+        self.failure_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
+    }
+
+    /// Mark the response stream unusable. This is public so the supervised
+    /// controlled-disconnect hook can exercise the same production fail-safe.
+    pub fn mark_unhealthy(&self, reason: impl Into<String>) {
+        if let Ok(mut failure_reason) = self.failure_reason.lock() {
+            *failure_reason = Some(reason.into());
+        }
+        self.healthy.store(false, Ordering::Release);
+    }
+}
 
 impl OrderResponseStream {
     /// Construct a production stream from the currently-loaded credentials.
@@ -131,8 +170,8 @@ impl OrderResponseStream {
         }
 
         let (tx, rx) = mpsc::channel(256);
-        let healthy = Arc::new(AtomicBool::new(true));
-        let task_health = Arc::clone(&healthy);
+        let health = OrderResponseHealth::default();
+        let task_health = health.clone();
         let handle = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
@@ -144,18 +183,41 @@ impl OrderResponseStream {
                         }
                     }
                     Ok(Message::Ping(payload)) => {
-                        if write.send(Message::Pong(payload)).await.is_err() {
-                            break;
+                        if let Err(error) = write.send(Message::Pong(payload)).await {
+                            task_health.mark_unhealthy(format!(
+                                "failed to send order-response pong: {error}"
+                            ));
+                            return;
                         }
                     }
-                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(Message::Close(frame)) => {
+                        let reason = frame.map_or_else(
+                            || "order-response WebSocket closed without a close frame".to_string(),
+                            |frame| {
+                                format!(
+                                    "order-response WebSocket closed: code={} reason={:?}",
+                                    u16::from(frame.code),
+                                    frame.reason
+                                )
+                            },
+                        );
+                        task_health.mark_unhealthy(reason);
+                        return;
+                    }
+                    Err(error) => {
+                        task_health
+                            .mark_unhealthy(format!("order-response WebSocket error: {error}"));
+                        return;
+                    }
                     _ => {}
                 }
             }
-            task_health.store(false, Ordering::Release);
+            task_health.mark_unhealthy(
+                "order-response WebSocket ended without a close frame or reported error",
+            );
         });
 
-        Ok((rx, healthy, handle))
+        Ok((rx, health, handle))
     }
 }
 
@@ -172,6 +234,7 @@ fn auth_request(session_id: &str, token: &str, request_id: &str) -> serde_json::
 mod tests {
     use super::*;
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 
     #[test]
     fn auth_request_uses_stable_session_and_unique_request() {
@@ -247,16 +310,72 @@ mod tests {
 
         let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
         let (_responses, health, handle) = stream.connect().await.unwrap();
-        assert!(health.load(Ordering::Acquire));
+        assert!(health.is_healthy());
         server.await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while health.load(Ordering::Acquire) {
+            while health.is_healthy() {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .expect("connection close should mark the response stream unhealthy");
         handle.await.unwrap();
+        assert!(health
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("order-response WebSocket")));
+    }
+
+    #[tokio::test]
+    async fn authenticated_close_preserves_code_and_reason() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "maintenance".into(),
+                })))
+                .await
+                .unwrap();
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
+        let (_responses, health, handle) = stream.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while health.is_healthy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close frame should mark the response stream unhealthy");
+        handle.await.unwrap();
+        server.await.unwrap();
+
+        let reason = health.failure_reason().unwrap();
+        assert!(reason.contains("code=1008"), "{reason}");
+        assert!(reason.contains("maintenance"), "{reason}");
     }
 
     #[tokio::test]

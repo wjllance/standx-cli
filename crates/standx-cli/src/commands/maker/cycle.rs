@@ -9,9 +9,19 @@ use standx_maker::{self as maker, MakerConfig, MakerStats, RestingQuote, VolBrea
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
+use standx_sdk::order_response::OrderResponseHealth;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<String> {
+    match health {
+        Some(health) if health.is_healthy() => None,
+        Some(health) => Some(health.failure_reason().unwrap_or_else(|| {
+            "order-response stream became unhealthy without a recorded reason".to_string()
+        })),
+        None => Some("order-response health state is unavailable".to_string()),
+    }
+}
 
 /// One reconcile cycle over an already-acquired market snapshot.
 /// Returns (places, cancels, holds, fills) counts. `sim_position` carries the
@@ -40,7 +50,7 @@ pub(super) async fn maker_cycle(
     stats: &mut MakerStats,
     breaker: &mut VolBreaker,
     output_format: OutputFormat,
-    order_response_health: Option<&AtomicBool>,
+    order_response_health: Option<&OrderResponseHealth>,
 ) -> Result<(u64, u64, u64, u64)> {
     use maker::{
         format_decimals, paper_quote_filled, Action, CycleInput, CycleSkip, MarketSnapshot,
@@ -358,10 +368,8 @@ pub(super) async fn maker_cycle(
             }
             Action::Place(q) => {
                 if live {
-                    if !order_response_health.is_some_and(|health| health.load(Ordering::Acquire)) {
-                        return Err(anyhow::anyhow!(
-                            "order-response stream is unhealthy; refusing live placement"
-                        ));
+                    if let Some(reason) = unhealthy_order_response(order_response_health) {
+                        return Err(anyhow::anyhow!("{reason}; refusing live placement"));
                     }
                     let cl_ord_id = format!("{}{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
                     match client
@@ -434,10 +442,8 @@ pub(super) async fn maker_cycle(
         // The next cycle must observe an empty maker book before the single
         // exit request can be submitted.
         if resting.is_empty() && pending.is_empty() {
-            if !order_response_health.is_some_and(|health| health.load(Ordering::Acquire)) {
-                return Err(anyhow::anyhow!(
-                    "order-response stream is unhealthy; refusing inventory exit"
-                ));
+            if let Some(reason) = unhealthy_order_response(order_response_health) {
+                return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
             }
             let cl_ord_id = format!("{}exit-{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
             client
