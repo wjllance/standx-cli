@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::signal;
 
+mod config;
 mod cycle;
 mod feed;
 mod output;
@@ -272,6 +273,7 @@ pub async fn handle_maker(
     match command {
         MakerCommands::Run {
             symbol,
+            maker_config,
             spread_bps,
             band_bps,
             size,
@@ -294,29 +296,30 @@ pub async fn handle_maker(
             no_ws,
             live,
         } => {
+            let file = config::load(maker_config.as_deref())?;
             run_maker(
                 symbol,
                 MakerRunArgs {
-                    spread_bps,
-                    band_bps,
-                    size,
-                    levels,
-                    level_step_bps,
-                    refresh_bps,
-                    interval,
-                    max_position,
-                    skew_bps,
-                    inventory_exit_pct,
-                    inventory_exit_qty,
-                    max_divergence_bps,
-                    vol_pause_bps,
-                    vol_window,
-                    alert_loss,
-                    alert_inventory_pct,
-                    alert_uptime,
+                    spread_bps: choose(spread_bps, file.spread_bps, 5.0),
+                    band_bps: choose(band_bps, file.band_bps, 20.0),
+                    size: choose(size, file.size, 0.01),
+                    levels: choose(levels, file.levels, 1),
+                    level_step_bps: choose(level_step_bps, file.level_step_bps, 2.0),
+                    refresh_bps: choose(refresh_bps, file.refresh_bps, 3.0),
+                    interval: choose(interval, file.interval, 5),
+                    max_position: choose(max_position, file.max_position, 0.05),
+                    skew_bps: choose(skew_bps, file.skew_bps, 0.0),
+                    inventory_exit_pct: choose(inventory_exit_pct, file.inventory_exit_pct, 0.0),
+                    inventory_exit_qty: choose(inventory_exit_qty, file.inventory_exit_qty, 0.0),
+                    max_divergence_bps: choose(max_divergence_bps, file.max_divergence_bps, 25.0),
+                    vol_pause_bps: choose(vol_pause_bps, file.vol_pause_bps, 0.0),
+                    vol_window: choose(vol_window, file.vol_window, 12),
+                    alert_loss: choose(alert_loss, file.alert_loss, 0.0),
+                    alert_inventory_pct: choose(alert_inventory_pct, file.alert_inventory_pct, 0.0),
+                    alert_uptime: choose(alert_uptime, file.alert_uptime, 0.0),
                     alert_webhook,
                     alert_webhook_format,
-                    no_ws,
+                    no_ws: no_ws || file.no_ws.unwrap_or(false),
                     live,
                     verbose,
                 },
@@ -325,6 +328,10 @@ pub async fn handle_maker(
             .await
         }
     }
+}
+
+fn choose<T: Copy>(cli: Option<T>, file: Option<T>, default: T) -> T {
+    cli.or(file).unwrap_or(default)
 }
 
 struct MakerRunArgs {
@@ -978,6 +985,13 @@ mod tests {
         assert!(pending_covers_slot(&pending, OrderSide::Buy, 0));
         assert!(!pending_covers_slot(&pending, OrderSide::Buy, 1));
         assert!(!pending_covers_slot(&pending, OrderSide::Sell, 0));
+    }
+
+    #[test]
+    fn cli_value_overrides_maker_file_then_default() {
+        assert_eq!(choose(Some(3_u32), Some(2), 1), 3);
+        assert_eq!(choose(None, Some(2_u32), 1), 2);
+        assert_eq!(choose(None::<u32>, None, 1), 1);
     }
 
     #[test]
