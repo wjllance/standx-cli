@@ -62,23 +62,26 @@ async fn main() {
     }
 
     // Track command start
-    let command_name = format!("{:?}", cli.command);
+    // Keep telemetry useful without serializing command fields. Several
+    // commands carry credentials or webhook URLs, so a Debug representation
+    // must never be written to the local telemetry log.
+    let command_name = command_name(&cli.command);
     let args: Vec<String> = std::env::args().collect();
-    telemetry.track_command_start(&command_name, &args);
+    telemetry.track_command_start(command_name, &args);
 
     // Handle dry run mode
     if cli.dry_run {
         let output = cli.output;
         match handle_dry_run(&cli.command, output).await {
             Ok(_) => {
-                telemetry.track_command_complete(&command_name, true, None);
+                telemetry.track_command_complete(command_name, true, None);
                 std::process::exit(0);
             }
             Err(e) => {
                 let boxed_error: Box<dyn std::error::Error> = Box::new(e);
                 print_error(&boxed_error, output);
                 telemetry.track_command_complete(
-                    &command_name,
+                    command_name,
                     false,
                     Some(&boxed_error.to_string()),
                 );
@@ -99,13 +102,32 @@ async fn main() {
     // Execute command and handle errors
     match execute_command(cli.command, output, cli.verbose).await {
         Ok(_) => {
-            telemetry.track_command_complete(&command_name, true, None);
+            telemetry.track_command_complete(command_name, true, None);
         }
         Err(e) => {
             print_error(&e, output);
-            telemetry.track_command_complete(&command_name, false, Some(&e.to_string()));
+            telemetry.track_command_complete(command_name, false, Some(&e.to_string()));
             std::process::exit(1);
         }
+    }
+}
+
+/// Stable, non-sensitive telemetry label for the top-level command.
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Config { .. } => "config",
+        Commands::Auth { .. } => "auth",
+        Commands::Market { .. } => "market",
+        Commands::Account { .. } => "account",
+        Commands::Order { .. } => "order",
+        Commands::Trade { .. } => "trade",
+        Commands::Leverage { .. } => "leverage",
+        Commands::Margin { .. } => "margin",
+        Commands::Stream { .. } => "stream",
+        Commands::Dashboard { .. } => "dashboard",
+        Commands::Portfolio { .. } => "portfolio",
+        Commands::Block { .. } => "block",
+        Commands::Maker { .. } => "maker",
     }
 }
 

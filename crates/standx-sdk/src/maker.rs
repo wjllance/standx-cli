@@ -548,7 +548,11 @@ pub fn compute_desired_quotes(
     position: f64,
 ) -> Vec<DesiredQuote> {
     let mut out = Vec::new();
-    if mark <= 0.0 {
+    if !mark.is_finite()
+        || mark <= 0.0
+        || best_bid.is_some_and(|price| !price.is_finite() || price <= 0.0)
+        || best_ask.is_some_and(|price| !price.is_finite() || price <= 0.0)
+    {
         return out;
     }
 
@@ -576,29 +580,34 @@ pub fn compute_desired_quotes(
         let mut last_price: Option<f64> = None;
         for level in 0..cfg.levels {
             let offset_bps = cfg.spread_bps + level as f64 * cfg.level_step_bps;
-            let mut price = match side {
+            let raw_price = match side {
                 OrderSide::Buy => center * (1.0 - offset_bps / 1e4),
                 OrderSide::Sell => center * (1.0 + offset_bps / 1e4),
             };
 
-            // Band clamp: quoting outside the band earns nothing, so clamp
-            // back to the edge (still eligible).
-            price = price.clamp(band_lo, band_hi);
-
-            // No-cross clamp: without relying solely on ALO rejection, never
-            // price through the touch. One tick of safety margin.
-            match side {
-                OrderSide::Buy => {
-                    if let Some(ask) = best_ask {
-                        price = price.min(ask - tick);
-                    }
-                }
-                OrderSide::Sell => {
-                    if let Some(bid) = best_bid {
-                        price = price.max(bid + tick);
-                    }
-                }
+            // Intersect the eligibility band with the post-only no-cross
+            // interval. If no tick can satisfy both, omit this side instead of
+            // emitting a quote outside the band or relying on ALO rejection.
+            let (price_lo, price_hi) = match side {
+                OrderSide::Buy => (
+                    band_lo,
+                    best_ask.map_or(band_hi, |ask| band_hi.min(ask - tick)),
+                ),
+                OrderSide::Sell => (
+                    best_bid.map_or(band_lo, |bid| band_lo.max(bid + tick)),
+                    band_hi,
+                ),
+            };
+            let price_tolerance = tick * 1e-6;
+            if !raw_price.is_finite()
+                || !price_lo.is_finite()
+                || !price_hi.is_finite()
+                || price_lo > price_hi + price_tolerance
+            {
+                continue;
             }
+
+            let mut price = raw_price.clamp(price_lo, price_hi);
 
             // Directional tick rounding: away from mark, so rounding never
             // pushes us through the touch.
@@ -607,15 +616,22 @@ pub fn compute_desired_quotes(
                 OrderSide::Sell => ceil_to_decimals(price, cfg.price_decimals),
             };
 
-            // Rounding may have pushed the price just outside the band —
-            // nudge one tick back toward mark.
-            if price < band_lo {
-                price = floor_to_decimals(price + tick, cfg.price_decimals);
-            } else if price > band_hi {
-                price = ceil_to_decimals(price - tick, cfg.price_decimals);
+            // Directional rounding can leave the feasible interval when the
+            // band boundary is not tick-aligned. Snap back to the nearest
+            // valid tick, then re-check every constraint.
+            if price < price_lo {
+                price = ceil_to_decimals(price_lo, cfg.price_decimals);
+            } else if price > price_hi {
+                price = floor_to_decimals(price_hi, cfg.price_decimals);
             }
 
-            if price <= 0.0 {
+            if !price.is_finite()
+                || price <= 0.0
+                || price < price_lo - price_tolerance
+                || price > price_hi + price_tolerance
+                || best_ask.is_some_and(|ask| side == OrderSide::Buy && price >= ask)
+                || best_bid.is_some_and(|bid| side == OrderSide::Sell && price <= bid)
+            {
                 continue;
             }
 
@@ -832,6 +848,7 @@ mod tests {
         // Best ask (99.85) sits BELOW our raw buy (99.90): buy must clamp
         // down to ask - tick.
         let quotes = compute_desired_quotes(&cfg(), 100.0, Some(99.83), Some(99.85), 0.0);
+        assert_eq!(quotes.len(), 2, "{quotes:?}");
         let buy = find(&quotes, OrderSide::Buy, 0);
         let sell = find(&quotes, OrderSide::Sell, 0);
         // buy clamped to ask - tick = 99.84
@@ -843,6 +860,22 @@ mod tests {
         let quotes = compute_desired_quotes(&cfg(), 100.0, Some(100.15), Some(100.20), 0.0);
         let sell = find(&quotes, OrderSide::Sell, 0);
         assert_eq!(sell.price, 100.16);
+    }
+
+    #[test]
+    fn drops_side_when_band_and_no_cross_have_no_feasible_tick() {
+        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(99.78), Some(99.79), 0.0);
+        assert!(quotes.iter().all(|quote| quote.side == OrderSide::Sell));
+
+        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(100.21), Some(100.22), 0.0);
+        assert!(quotes.iter().all(|quote| quote.side == OrderSide::Buy));
+    }
+
+    #[test]
+    fn invalid_market_values_produce_no_quotes() {
+        assert!(compute_desired_quotes(&cfg(), f64::NAN, None, None, 0.0).is_empty());
+        assert!(compute_desired_quotes(&cfg(), 100.0, Some(f64::INFINITY), None, 0.0).is_empty());
+        assert!(compute_desired_quotes(&cfg(), 100.0, None, Some(0.0), 0.0).is_empty());
     }
 
     // 6. Size below min_order_qty -> no quotes at all.
@@ -1200,6 +1233,7 @@ mod tests {
         // full long: buy suppressed; sell pulled down hard but held above the
         // band floor and one tick above the bid.
         let q = compute_desired_quotes(&c, 100.0, Some(bid), Some(ask), 0.05);
+        assert_eq!(q.len(), 1, "{q:?}");
         let sell = find(&q, OrderSide::Sell, 0).price;
         assert!(sell >= 99.80 - 1e-9, "sell {sell} below band floor");
         assert!(sell > bid, "sell {sell} crosses bid {bid}");
