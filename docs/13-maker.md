@@ -78,6 +78,39 @@ standx maker run <SYMBOL> [OPTIONS]
 
 启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`；主动退出必须同时设置百分比与数量。
 
+### 专用配置文件
+
+默认会读取 `~/.config/standx/maker.toml`（macOS 为 `~/Library/Application Support/standx/maker.toml`）；也可用 `--maker-config <PATH>` 指定文件。文件只保存非敏感策略参数，命令行显式参数优先于文件，文件未设置的字段继续使用内置默认值。
+
+```toml
+# maker.toml — 不放 JWT、私钥、--live 或 webhook URL
+spread_bps = 8.0
+band_bps = 30.0
+size = 0.001
+levels = 2
+level_step_bps = 2.0
+refresh_bps = 4.0
+interval = 5
+max_position = 0.01
+skew_bps = 6.0
+max_divergence_bps = 25.0
+vol_pause_bps = 40.0
+vol_window = 12
+alert_inventory_pct = 80.0
+no_ws = false
+```
+
+```bash
+# 文件值生效
+standx maker run BTC-USD
+
+# 本次运行覆盖文件中的 size
+standx maker run BTC-USD --size 0.002
+
+# 使用另一套策略文件
+standx maker run ETH-USD --maker-config ./configs/eth-maker.toml
+```
+
 ---
 
 ## 13.3 工作原理

@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "standx")]
@@ -386,70 +387,74 @@ pub enum MakerCommands {
     Run {
         /// Symbol to quote (e.g., BTC-USD)
         symbol: String,
+        /// Maker strategy TOML file. If omitted, loads maker.toml from the
+        /// StandX config directory when it exists.
+        #[arg(long)]
+        maker_config: Option<PathBuf>,
         /// Half-spread from mark price in basis points
-        #[arg(long, default_value = "5")]
-        spread_bps: f64,
+        #[arg(long)]
+        spread_bps: Option<f64>,
         /// Eligibility band guard in bps: never quote outside mark ± band
-        #[arg(long, default_value = "20")]
-        band_bps: f64,
+        #[arg(long)]
+        band_bps: Option<f64>,
         /// Per-side, per-level order quantity
-        #[arg(long, default_value = "0.01")]
-        size: f64,
+        #[arg(long)]
+        size: Option<f64>,
         /// Number of quote levels per side
-        #[arg(long, default_value = "1")]
-        levels: u32,
+        #[arg(long)]
+        levels: Option<u32>,
         /// Spacing between levels in bps (when levels > 1)
-        #[arg(long, default_value = "2")]
-        level_step_bps: f64,
+        #[arg(long)]
+        level_step_bps: Option<f64>,
         /// Anti-flicker: re-quote only when mark moved more than this (bps)
         /// since the order was placed
-        #[arg(long, default_value = "3")]
-        refresh_bps: f64,
+        #[arg(long)]
+        refresh_bps: Option<f64>,
         /// Loop interval in seconds
-        #[arg(short, long, default_value = "5")]
-        interval: u64,
+        #[arg(short, long)]
+        interval: Option<u64>,
         /// Max absolute position; suppress the side that would exceed it
-        #[arg(long, default_value = "0.05")]
-        max_position: f64,
+        #[arg(long)]
+        max_position: Option<f64>,
         /// Inventory skew: at full inventory, shift the quote center this many
         /// bps away from mark to favor the reducing side (0 disables). Only
         /// takes effect in live mode; paper holds no position. Suggested
         /// starting point: roughly your --spread-bps
-        #[arg(long, default_value = "0")]
-        skew_bps: f64,
+        #[arg(long)]
+        skew_bps: Option<f64>,
         /// Actively exit inventory once |position| reaches this percent of
         /// --max-position. 0 disables; requires --inventory-exit-qty.
-        #[arg(long, default_value = "0")]
-        inventory_exit_pct: f64,
+        #[arg(long)]
+        inventory_exit_pct: Option<f64>,
         /// Maximum base quantity for one reduce-only inventory exit. 0
         /// disables; requires --inventory-exit-pct.
-        #[arg(long, default_value = "0")]
-        inventory_exit_qty: f64,
+        #[arg(long)]
+        inventory_exit_qty: Option<f64>,
         /// Sanity guard: skip the cycle (no places/cancels) when mark price
         /// and book mid diverge by more than this (bps) — the data sources
         /// disagree and acting on them would be unsafe
-        #[arg(long, default_value = "25")]
-        max_divergence_bps: f64,
+        #[arg(long)]
+        max_divergence_bps: Option<f64>,
         /// Volatility circuit breaker: halt quoting (pull all quotes) when the
         /// mark's range over --vol-window cycles reaches this many bps; resume
         /// once it falls below half that. 0 disables the breaker
-        #[arg(long, default_value = "0")]
-        vol_pause_bps: f64,
+        #[arg(long)]
+        vol_pause_bps: Option<f64>,
         /// Number of recent cycles the volatility breaker measures range over
-        #[arg(long, default_value = "12")]
-        vol_window: u32,
+        #[arg(long)]
+        vol_window: Option<u32>,
         /// Risk alert: fire when mark-to-market PnL drops to -this (quote
         /// units). 0 disables
-        #[arg(long, default_value = "0")]
-        alert_loss: f64,
+        #[arg(long)]
+        alert_loss: Option<f64>,
         /// Risk alert: fire when |position| reaches this percent of
         /// --max-position. 0 disables
-        #[arg(long, default_value = "0")]
-        alert_inventory_pct: f64,
+        #[arg(long)]
+        alert_inventory_pct: Option<f64>,
         /// Risk alert: fire when two-sided uptime drops below this percent
         /// (after warmup). 0 disables
-        #[arg(long, default_value = "0")]
-        alert_uptime: f64,
+        #[arg(long)]
+        alert_uptime: Option<f64>,
         /// Also POST risk alerts to this URL. stderr/JSON always get them
         /// regardless. Payload shape is set by --alert-webhook-format
         #[arg(long)]
