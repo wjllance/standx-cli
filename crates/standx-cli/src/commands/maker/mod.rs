@@ -509,7 +509,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         // Clean only leftover orders owned by this maker. Manual/API orders
         // are not part of the strategy's reconciliation state and must never
         // be adopted or cancelled as stale.
-        cancel_maker_orders_with_retry(&client, &symbol, 3).await?;
+        cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await?;
 
         let stream = OrderResponseStream::new(
             order_session_id
@@ -853,7 +853,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     // Do not return early on cleanup failure: operators need the stopped
     // lifecycle alert most when residual maker orders may still be live.
     let cleanup_error = if args.live {
-        cancel_maker_orders_with_retry(&client, &symbol, 3)
+        cancel_maker_orders_with_retry(&client, &symbol, 3, output_format)
             .await
             .err()
     } else {
@@ -1197,7 +1197,7 @@ mod tests {
             .await;
 
         let client = StandXClient::with_base_url(server.url()).unwrap();
-        cancel_maker_orders_with_retry(&client, "BTC-USD", 3)
+        cancel_maker_orders_with_retry(&client, "BTC-USD", 3, OutputFormat::Quiet)
             .await
             .unwrap();
 

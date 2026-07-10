@@ -535,6 +535,7 @@ pub(super) async fn cancel_maker_orders_with_retry(
     client: &StandXClient,
     symbol: &str,
     attempts: u32,
+    output_format: OutputFormat,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=attempts {
@@ -578,7 +579,20 @@ pub(super) async fn cancel_maker_orders_with_retry(
     // untouched and must not turn a clean maker shutdown into an error.
     match client.get_open_orders(Some(symbol)).await {
         Ok(orders) if orders.iter().all(|order| !is_maker_order(order)) => {
-            println!("✅ All maker-owned {} orders cancelled", symbol);
+            if output_format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "symbol": symbol,
+                        "action": "maker_cleanup",
+                        "event": "complete",
+                        "remaining_maker_orders": 0,
+                    })
+                );
+            } else {
+                println!("✅ All maker-owned {} orders cancelled", symbol);
+            }
             Ok(())
         }
         Ok(orders) => {

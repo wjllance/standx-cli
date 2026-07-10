@@ -426,6 +426,9 @@ See **[docs/13-maker.md](docs/13-maker.md)** for the full guide — every flag,
 the anti-flicker decision table, inventory skew, telemetry, and live safety
 rails.
 
+For local structured log collection and SQL analysis, see
+**[docs/15-openobserve.md](docs/15-openobserve.md)**.
+
 ---
 
 ## 💡 Use Cases

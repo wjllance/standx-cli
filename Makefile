@@ -2,16 +2,31 @@ CARGO ?= cargo
 SYMBOL ?= BTC-USD
 MAKER_CONFIG ?= examples/maker.toml
 MAKER_ARGS ?=
+OPENOBSERVE_ENV ?= deploy/openobserve/.env
+OPENOBSERVE_COMPOSE ?= deploy/openobserve/compose.yaml
 
-.PHONY: help maker
+.PHONY: help maker openobserve-up openobserve-down openobserve-logs
 
 help:
 	@printf '%s\n' \
 		'make maker                         Start the paper maker for BTC-USD' \
 		'make maker SYMBOL=ETH-USD          Select a symbol' \
 		'make maker MAKER_CONFIG=path.toml  Select a strategy config file' \
-		'make maker MAKER_ARGS="--interval 3"  Pass additional maker arguments'
+		'make maker MAKER_ARGS="--interval 3"  Pass additional maker arguments' \
+		'make openobserve-up                Start local OpenObserve' \
+		'make openobserve-down              Stop local OpenObserve' \
+		'make openobserve-logs              Follow OpenObserve service logs'
 
 # Paper mode is deliberate: this target never adds --live.
 maker:
 	$(CARGO) run -p standx-cli -- maker run $(SYMBOL) --maker-config $(MAKER_CONFIG) $(MAKER_ARGS)
+
+openobserve-up:
+	@test -f $(OPENOBSERVE_ENV) || { printf 'copy deploy/openobserve/.env.example to %s and set a password\n' $(OPENOBSERVE_ENV); exit 1; }
+	docker compose --env-file $(OPENOBSERVE_ENV) -f $(OPENOBSERVE_COMPOSE) up -d
+
+openobserve-down:
+	docker compose --env-file $(OPENOBSERVE_ENV) -f $(OPENOBSERVE_COMPOSE) down
+
+openobserve-logs:
+	docker compose --env-file $(OPENOBSERVE_ENV) -f $(OPENOBSERVE_COMPOSE) logs -f openobserve

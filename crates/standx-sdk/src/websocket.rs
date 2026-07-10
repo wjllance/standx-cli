@@ -272,7 +272,10 @@ async fn connect_and_run(
             }
         });
         if verbose {
-            eprintln!("[WebSocket Debug] Sending auth: {}", auth_msg);
+            eprintln!(
+                "[WebSocket Debug] Sending authentication for {} stream(s)",
+                subs.len()
+            );
         }
         write
             .send(Message::Text(auth_msg.to_string().into()))

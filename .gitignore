@@ -13,3 +13,5 @@ config.local.toml
 *.log
 *.tmp
 /tmp
+/var/standx/
+/deploy/openobserve/data/
