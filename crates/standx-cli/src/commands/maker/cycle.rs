@@ -94,6 +94,7 @@ pub(super) async fn maker_cycle(
     //    simulated book (paper).
     let position: f64;
     let mut fills: Vec<(OrderSide, f64, f64)> = Vec::new(); // paper sim only
+    let mut exit_fill_observed = false;
     if live {
         let now = chrono::Utc::now().timestamp();
         let (orders, positions, filled_orders, trades) = tokio::join!(
@@ -109,6 +110,7 @@ pub(super) async fn maker_cycle(
 
         // Open maker orders identify partial fills; historical maker orders
         // identify a quote that fully filled between two polling cycles.
+        let mut exit_order_ids = HashSet::new();
         for order in orders.iter().chain(filled_orders.iter()) {
             if is_maker_order(order) {
                 let order_id = order.id.parse::<u64>().map_err(|_| {
@@ -118,6 +120,13 @@ pub(super) async fn maker_cycle(
                     )
                 })?;
                 maker_order_ids.insert(order_id);
+                if order
+                    .cl_ord_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("sxmk-exit-"))
+                {
+                    exit_order_ids.insert(order_id);
+                }
             }
         }
 
@@ -140,6 +149,7 @@ pub(super) async fn maker_cycle(
             let (side, price, qty) = maker_trade_fill(&trade)?;
             stats.record_fill(side, price, qty, mark);
             fills.push((side, price, qty));
+            exit_fill_observed |= exit_order_ids.contains(&order_id);
         }
 
         position = positions
@@ -237,7 +247,7 @@ pub(super) async fn maker_cycle(
     // 3. Decide. When the volatility breaker is tripped, quote nothing —
     //    an empty desired set makes reconcile cancel every resting quote
     //    (pull all liquidity) and place none until volatility subsides.
-    let inventory_exit = if live {
+    let raw_inventory_exit = if live {
         standx_sdk::maker::inventory_exit_plan(
             position,
             cfg.max_position,
@@ -247,14 +257,22 @@ pub(super) async fn maker_cycle(
     } else {
         None
     };
-    if inventory_exit.is_none() {
+    if exit_fill_observed {
         *inventory_exit_pending = false;
     }
-    if inventory_exit.is_some() && *inventory_exit_pending {
+    if raw_inventory_exit.is_none() {
+        *inventory_exit_pending = false;
+    }
+    if raw_inventory_exit.is_some() && *inventory_exit_pending {
         return Err(anyhow::anyhow!(
             "inventory exit is still awaiting venue confirmation; refusing to submit another"
         ));
     }
+
+    // Volatility halt pulls liquidity but deliberately does not send the
+    // opt-in market exit: de-risking at a taker price during the most
+    // dislocated interval requires a separate explicit emergency policy.
+    let inventory_exit = if halted { None } else { raw_inventory_exit };
 
     let desired = if halted || inventory_exit.is_some() {
         Vec::new()
@@ -460,8 +478,8 @@ pub(super) async fn maker_cycle(
         }
     }
 
-    // 5. Telemetry: fold this cycle into the running stats (live infers a
-    //    fill from any position delta; paper already recorded exact fills).
+    // 5. Telemetry uses exact ledger fills in live mode and simulated fills
+    // in paper mode; never infer a fill from a position delta.
     let two_sided = resting.iter().any(|r| r.side == OrderSide::Buy)
         && resting.iter().any(|r| r.side == OrderSide::Sell);
     stats.end_cycle(position, two_sided);
