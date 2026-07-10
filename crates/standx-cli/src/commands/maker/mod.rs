@@ -778,9 +778,15 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     if let Some(handle) = order_response_handle {
         handle.abort();
     }
-    if args.live {
-        cancel_maker_orders_with_retry(&client, &symbol, 3).await?;
-    }
+    // Do not return early on cleanup failure: operators need the stopped
+    // lifecycle alert most when residual maker orders may still be live.
+    let cleanup_error = if args.live {
+        cancel_maker_orders_with_retry(&client, &symbol, 3)
+            .await
+            .err()
+    } else {
+        None
+    };
 
     // Notify stop on every exit path. Await delivery so the message lands
     // before the process exits.
@@ -791,16 +797,20 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let pnl_str = last_mark
         .map(|m| format!("{:+.2}", stats.mark_to_market(m)))
         .unwrap_or_else(|| "n/a".to_string());
+    let cleanup_note = cleanup_error.as_ref().map_or_else(String::new, |error| {
+        format!(" | ⚠️ cleanup failed: {error}")
+    });
     notify_lifecycle(
         "stopped",
         &format!(
-            "🔴 maker stopped ({}) — {} | {} cycles, {} fills, uptime {:.0}%, PnL {}",
+            "🔴 maker stopped ({}) — {} | {} cycles, {} fills, uptime {:.0}%, PnL {}{}",
             reason,
             symbol,
             cycle,
             total_fills,
             stats.uptime_pct(),
-            pnl_str
+            pnl_str,
+            cleanup_note,
         ),
         &symbol,
         output_format,
@@ -810,6 +820,13 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         true,
     )
     .await;
+
+    if let Some(error) = cleanup_error {
+        return Err(anyhow::anyhow!(
+            "maker stopped but maker-owned order cleanup failed: {}",
+            error
+        ));
+    }
 
     match exit {
         MakerExit::CtrlC => Ok(()),
