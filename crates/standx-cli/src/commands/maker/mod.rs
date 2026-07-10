@@ -281,6 +281,8 @@ pub async fn handle_maker(
             interval,
             max_position,
             skew_bps,
+            inventory_exit_pct,
+            inventory_exit_qty,
             max_divergence_bps,
             vol_pause_bps,
             vol_window,
@@ -304,6 +306,8 @@ pub async fn handle_maker(
                     interval,
                     max_position,
                     skew_bps,
+                    inventory_exit_pct,
+                    inventory_exit_qty,
                     max_divergence_bps,
                     vol_pause_bps,
                     vol_window,
@@ -333,6 +337,8 @@ struct MakerRunArgs {
     interval: u64,
     max_position: f64,
     skew_bps: f64,
+    inventory_exit_pct: f64,
+    inventory_exit_qty: f64,
     max_divergence_bps: f64,
     vol_pause_bps: f64,
     vol_window: u32,
@@ -401,6 +407,16 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     }
     if cfg.skew_bps < 0.0 {
         return Err(anyhow::anyhow!("--skew-bps must be >= 0"));
+    }
+    if !(0.0..=100.0).contains(&args.inventory_exit_pct) || args.inventory_exit_qty < 0.0 {
+        return Err(anyhow::anyhow!(
+            "--inventory-exit-pct must be 0..=100 and --inventory-exit-qty must be >= 0"
+        ));
+    }
+    if (args.inventory_exit_pct > 0.0) != (args.inventory_exit_qty > 0.0) {
+        return Err(anyhow::anyhow!(
+            "active inventory exit requires both --inventory-exit-pct and --inventory-exit-qty"
+        ));
     }
     if cfg.band_bps <= cfg.spread_bps {
         return Err(anyhow::anyhow!(
@@ -499,6 +515,12 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 cfg.skew_bps
             );
         }
+        if args.inventory_exit_pct > 0.0 {
+            println!(
+                "│ active exit: {}% of max, reduce-only chunks of {} (live only)",
+                args.inventory_exit_pct, args.inventory_exit_qty
+            );
+        }
         println!(
             "│ ticks: price {}dp, qty {}dp | min qty {}",
             cfg.price_decimals, cfg.qty_decimals, cfg.min_order_qty
@@ -588,6 +610,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
     let mut adopted: HashMap<String, (u32, f64, u64)> = HashMap::new(); // id -> (level, ref_mark, cycle)
     let mut pending: Vec<PendingPlace> = Vec::new();
+    let mut inventory_exit_pending = false;
     let mut maker_order_ids: HashSet<u64> = HashSet::new();
     let mut seen_fill_ids: HashSet<u64> = HashSet::new();
     let session_started_at = chrono::Utc::now().timestamp();
@@ -643,9 +666,12 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 best_bid,
                 best_ask,
                 args.max_divergence_bps,
+                args.inventory_exit_pct,
+                args.inventory_exit_qty,
                 &mut resting,
                 &mut adopted,
                 &mut pending,
+                &mut inventory_exit_pending,
                 &mut maker_order_ids,
                 &mut seen_fill_ids,
                 session_started_at,

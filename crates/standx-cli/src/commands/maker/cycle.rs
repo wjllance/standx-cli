@@ -26,9 +26,12 @@ pub(super) async fn maker_cycle(
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     max_divergence_bps: f64,
+    inventory_exit_pct: f64,
+    inventory_exit_qty: f64,
     resting: &mut Vec<standx_sdk::maker::RestingQuote>,
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
+    inventory_exit_pending: &mut bool,
     maker_order_ids: &mut HashSet<u64>,
     seen_fill_ids: &mut HashSet<u64>,
     session_started_at: i64,
@@ -234,7 +237,26 @@ pub(super) async fn maker_cycle(
     // 3. Decide. When the volatility breaker is tripped, quote nothing —
     //    an empty desired set makes reconcile cancel every resting quote
     //    (pull all liquidity) and place none until volatility subsides.
-    let desired = if halted {
+    let inventory_exit = if live {
+        standx_sdk::maker::inventory_exit_plan(
+            position,
+            cfg.max_position,
+            inventory_exit_pct,
+            inventory_exit_qty,
+        )
+    } else {
+        None
+    };
+    if inventory_exit.is_none() {
+        *inventory_exit_pending = false;
+    }
+    if inventory_exit.is_some() && *inventory_exit_pending {
+        return Err(anyhow::anyhow!(
+            "inventory exit is still awaiting venue confirmation; refusing to submit another"
+        ));
+    }
+
+    let desired = if halted || inventory_exit.is_some() {
         Vec::new()
     } else {
         let raw = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
@@ -394,6 +416,47 @@ pub(super) async fn maker_cycle(
                 }
             }
             Action::Hold { .. } => holds += 1,
+        }
+    }
+
+    if let Some(exit) = inventory_exit {
+        // Do not race a reduce-only market order against quote cancellations.
+        // The next cycle must observe an empty maker book before the single
+        // exit request can be submitted.
+        if resting.is_empty() && pending.is_empty() {
+            if !order_response_health.is_some_and(|health| health.load(Ordering::Acquire)) {
+                return Err(anyhow::anyhow!(
+                    "order-response stream is unhealthy; refusing inventory exit"
+                ));
+            }
+            let cl_ord_id = format!("{}exit-{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
+            client
+                .create_order(CreateOrderParams {
+                    symbol: symbol.to_string(),
+                    cl_ord_id: Some(cl_ord_id),
+                    side: exit.side,
+                    order_type: OrderType::Market,
+                    quantity: format_decimals(exit.qty, cfg.qty_decimals),
+                    price: None,
+                    time_in_force: None,
+                    reduce_only: true,
+                    stop_price: None,
+                    sl_price: None,
+                    tp_price: None,
+                })
+                .await?;
+            *inventory_exit_pending = true;
+            log_maker_event(
+                output_format,
+                symbol,
+                cycle,
+                "inventory_exit_submitted",
+                exit.side,
+                0,
+                mark,
+                cfg.price_decimals,
+                "reduce-only market order submitted after maker book cleared",
+            );
         }
     }
 

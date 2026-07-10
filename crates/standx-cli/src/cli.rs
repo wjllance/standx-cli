@@ -417,6 +417,14 @@ pub enum MakerCommands {
         /// starting point: roughly your --spread-bps
         #[arg(long, default_value = "0")]
         skew_bps: f64,
+        /// Actively exit inventory once |position| reaches this percent of
+        /// --max-position. 0 disables; requires --inventory-exit-qty.
+        #[arg(long, default_value = "0")]
+        inventory_exit_pct: f64,
+        /// Maximum base quantity for one reduce-only inventory exit. 0
+        /// disables; requires --inventory-exit-pct.
+        #[arg(long, default_value = "0")]
+        inventory_exit_qty: f64,
         /// Sanity guard: skip the cycle (no places/cancels) when mark price
         /// and book mid diverge by more than this (bps) — the data sources
         /// disagree and acting on them would be unsafe
