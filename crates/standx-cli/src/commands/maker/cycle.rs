@@ -34,8 +34,8 @@ pub(super) async fn maker_cycle(
     output_format: OutputFormat,
 ) -> Result<(u64, u64, u64, u64)> {
     use standx_sdk::maker::{
-        compute_desired_quotes, format_decimals, mark_mid_divergence_bps, paper_quote_filled,
-        reconcile, skew_center, Action, RestingQuote,
+        cap_desired_exposure, compute_desired_quotes, format_decimals, mark_mid_divergence_bps,
+        paper_quote_filled, reconcile, skew_center, Action, RestingQuote,
     };
 
     // 0. Feed the volatility breaker every cycle (even when a later guard
@@ -192,7 +192,12 @@ pub(super) async fn maker_cycle(
     let desired = if halted {
         Vec::new()
     } else {
-        compute_desired_quotes(cfg, mark, best_bid, best_ask, position)
+        let raw = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
+        let pending_slots = pending
+            .iter()
+            .map(|place| (place.side, place.level))
+            .collect::<Vec<_>>();
+        cap_desired_exposure(cfg, position, &raw, &pending_slots)
     };
     let actions = reconcile(
         cfg, mark, position, best_bid, best_ask, &desired, resting, cycle,
