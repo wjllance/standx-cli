@@ -637,6 +637,48 @@ pub fn compute_desired_quotes(
     out
 }
 
+/// Limit a desired ladder so that all quotes on either side filling cannot
+/// push the account beyond `max_position`.
+///
+/// Position-only suppression is insufficient for a multi-level ladder: while
+/// the current position may be inside the cap, several resting bids (or asks)
+/// can all fill before the next reconciliation cycle. This guard budgets each
+/// directional ladder independently. `reserved_slots` are considered first;
+/// callers use them for submitted-but-not-yet-visible orders, so transport
+/// delay cannot make a later level lose its exposure reservation.
+pub fn cap_desired_exposure(
+    cfg: &MakerConfig,
+    position: f64,
+    desired: &[DesiredQuote],
+    reserved_slots: &[(OrderSide, u32)],
+) -> Vec<DesiredQuote> {
+    let mut buy_budget = (cfg.max_position - position).max(0.0);
+    let mut sell_budget = (cfg.max_position + position).max(0.0);
+    let mut candidates = desired.to_vec();
+    // Stable ordering keeps the configured inner-to-outer ladder order while
+    // moving only submitted-but-not-yet-visible slots to the front.
+    candidates.sort_by_key(|quote| !reserved_slots.contains(&(quote.side, quote.level)));
+
+    candidates
+        .into_iter()
+        .filter(|quote| {
+            let budget = match quote.side {
+                OrderSide::Buy => &mut buy_budget,
+                OrderSide::Sell => &mut sell_budget,
+            };
+            // Retain only full, tick-aligned orders. Shrinking a level would
+            // create a quantity not represented by the strategy's config and
+            // could fall below the venue's minimum order size.
+            if quote.qty <= *budget + f64::EPSILON {
+                *budget = (*budget - quote.qty).max(0.0);
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
 /// Diff desired vs resting quotes, applying the anti-flicker hold rule.
 ///
 /// Decision table per resting quote (checked in order):
@@ -1176,6 +1218,59 @@ mod tests {
         let base = compute_desired_quotes(&c, 100.0, None, None, 0.0);
         let with_pos = compute_desired_quotes(&c, 100.0, None, None, 0.025);
         assert_eq!(base, with_pos);
+    }
+
+    #[test]
+    fn exposure_cap_limits_all_same_side_fills() {
+        let mut c = cfg();
+        c.levels = 3;
+        c.size = 0.02;
+        c.max_position = 0.05;
+        let raw = compute_desired_quotes(&c, 100.0, None, None, 0.03);
+        let capped = cap_desired_exposure(&c, 0.03, &raw, &[]);
+
+        // At +0.03, only one additional 0.02 buy can be exposed. All three
+        // sells remain safe: even if they all fill, the position is -0.03.
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|quote| quote.side == OrderSide::Buy)
+                .count(),
+            1
+        );
+        assert_eq!(
+            capped
+                .iter()
+                .filter(|quote| quote.side == OrderSide::Sell)
+                .count(),
+            3
+        );
+        let buy_qty: f64 = capped
+            .iter()
+            .filter(|quote| quote.side == OrderSide::Buy)
+            .map(|quote| quote.qty)
+            .sum();
+        assert!(0.03 + buy_qty <= c.max_position + 1e-9);
+    }
+
+    #[test]
+    fn exposure_cap_reserves_pending_slot_before_new_levels() {
+        let mut c = cfg();
+        c.levels = 3;
+        c.size = 0.02;
+        c.max_position = 0.05;
+        let raw = compute_desired_quotes(&c, 100.0, None, None, 0.03);
+        let capped = cap_desired_exposure(&c, 0.03, &raw, &[(OrderSide::Buy, 2)]);
+
+        // The in-flight outer bid gets the only 0.02 buy budget. A later
+        // reconcile cannot place level 0 in addition while level 2 is still
+        // awaiting exchange visibility.
+        assert!(capped
+            .iter()
+            .any(|quote| quote.side == OrderSide::Buy && quote.level == 2));
+        assert!(!capped
+            .iter()
+            .any(|quote| quote.side == OrderSide::Buy && quote.level == 0));
     }
 
     // 20. Inventory ratio saturates at ±1 past max_position.
