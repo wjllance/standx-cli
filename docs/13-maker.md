@@ -69,7 +69,7 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--level-step-bps` | `2` | 档间距（bps，`--levels > 1` 时生效） |
 | `--refresh-bps` | `3` | anti-flicker：报价中心相对下单时漂移超过此值才重报 |
 | `-i, --interval` | `5` | 循环间隔（秒） |
-| `--max-position` | `0.05` | 最大绝对持仓；会把继续加仓的一侧压制掉 |
+| `--max-position` | `0.05` | 最大绝对持仓；会把继续加仓的一侧压制掉；live 启动仓位超过该值时拒绝启动 |
 | `--skew-bps` | `0` | 库存 skew：满仓时把报价中心向减仓侧偏移的最大幅度（bps），0 关闭。见 [13.3](#库存-skew) |
 | `--inventory-exit-pct` | `0` | 主动减仓触发线：仓位达到 `--max-position` 的此百分比时启动退出流程；需同时设置 `--inventory-exit-qty`，0 关闭 |
 | `--inventory-exit-qty` | `0` | 单次 reduce-only 主动退出的最大数量；先确认 maker 空簿再下市价单，提交后未确认会 fail-safe，0 关闭 |
@@ -182,7 +182,9 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 三种输出格式：
 
 - **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。Live 模式还会打印 `ACCOUNT balance= equity= available= upnl=`，数据来自该轮交易所账户快照；这里的账户 `upnl` 与机器人本次会话的 `pnl` 是两个不同口径。
-- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`starting_position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live fill 还包含 `trade_id`、`order_id`、`trade_ts` 与 `origin=current_run`。
+
+live 启动时会先清理旧 `sxmk-` 订单并同步账本。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。之后若交易所仓位无法由本 run 的 maker fills 解释，复查一次仍不一致就立即 fail-safe 清理退出。
 - **Quiet（`--quiet`）**：只打印成交与增删挂单。
 
 退出时打印本次会话统计：

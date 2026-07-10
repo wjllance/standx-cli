@@ -4,6 +4,7 @@ use crate::auth::{Credentials, StandXSigner};
 use crate::client::StandXClient;
 use crate::error::{Error, Result};
 use crate::models::{Balance, Order, Position};
+use chrono::{SecondsFormat, TimeZone, Utc};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 
@@ -16,6 +17,38 @@ struct ApiListResponse<T> {
     #[serde(rename = "page_size")]
     _page_size: Option<i32>,
     result: Vec<T>,
+}
+
+fn trade_history_query(
+    symbol: &str,
+    from: i64,
+    to: i64,
+    limit: Option<u32>,
+) -> Result<Vec<(&'static str, String)>> {
+    if from > to {
+        return Err(Error::Validation {
+            field: "from".to_string(),
+            message: "trade history start must not be after end".to_string(),
+        });
+    }
+    let format = |field: &str, value: i64| {
+        Utc.timestamp_opt(value, 0)
+            .single()
+            .map(|time| time.to_rfc3339_opts(SecondsFormat::Secs, true))
+            .ok_or_else(|| Error::Validation {
+                field: field.to_string(),
+                message: format!("invalid Unix timestamp: {value}"),
+            })
+    };
+    let mut query = vec![
+        ("symbol", symbol.to_string()),
+        ("start", format("from", from)?),
+        ("end", format("to", to)?),
+    ];
+    if let Some(limit) = limit {
+        query.push(("limit", limit.to_string()));
+    }
+    Ok(query)
 }
 
 /// Account-related API methods
@@ -206,14 +239,7 @@ impl StandXClient {
         let url = format!("{}/api/query_trades", self.base_url);
         let headers = self.auth_headers()?;
 
-        let mut query: Vec<(&str, String)> = vec![
-            ("symbol", symbol.to_string()),
-            ("from", from.to_string()),
-            ("to", to.to_string()),
-        ];
-        if let Some(l) = limit {
-            query.push(("limit", l.to_string()));
-        }
+        let query = trade_history_query(symbol, from, to, limit)?;
 
         let response = self
             .client
@@ -382,6 +408,28 @@ impl StandXClient {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod trade_history_tests {
+    use super::*;
+
+    #[test]
+    fn trade_history_query_uses_iso_start_and_end() {
+        let query = trade_history_query("XAG-USD", 1_783_696_499, 1_783_696_560, Some(500))
+            .expect("valid query");
+        assert_eq!(query[0], ("symbol", "XAG-USD".to_string()));
+        assert_eq!(query[1], ("start", "2026-07-10T15:14:59Z".to_string()));
+        assert_eq!(query[2], ("end", "2026-07-10T15:16:00Z".to_string()));
+        assert_eq!(query[3], ("limit", "500".to_string()));
+        assert!(query.iter().all(|(key, _)| *key != "from" && *key != "to"));
+    }
+
+    #[test]
+    fn trade_history_query_rejects_reversed_range() {
+        let error = trade_history_query("XAG-USD", 20, 10, None).unwrap_err();
+        assert!(matches!(error, Error::Validation { field, .. } if field == "from"));
     }
 }
 

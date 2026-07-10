@@ -13,11 +13,11 @@ pub(super) fn emit_maker_cycle(
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     position: f64,
+    starting_position: f64,
     // Real venue account snapshot. Present only in live mode.
     account: Option<&Balance>,
     actions: &[Action],
-    // Paper-mode simulated fills this cycle: (side, price, qty). Empty in live.
-    fills: &[(OrderSide, f64, f64)],
+    fills: &[MakerFill],
     stats: &MakerStats,
     // Some(vol_bps) when the volatility breaker halted quoting this cycle.
     halt_vol_bps: Option<f64>,
@@ -41,14 +41,18 @@ pub(super) fn emit_maker_cycle(
     match output_format {
         OutputFormat::Json => {
             let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-            for (side, price, qty) in fills {
+            for fill in fills {
                 println!(
                     "{}",
                     serde_json::json!({
                         "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
-                        "action": "fill", "side": side,
-                        "price": format_decimals(*price, cfg.price_decimals),
-                        "qty": format_decimals(*qty, cfg.qty_decimals),
+                        "action": "fill", "side": fill.side,
+                        "price": format_decimals(fill.price, cfg.price_decimals),
+                        "qty": format_decimals(fill.qty, cfg.qty_decimals),
+                        "trade_id": fill.trade_id,
+                        "order_id": fill.order_id,
+                        "trade_ts": fill.trade_ts,
+                        "origin": fill.origin,
                     })
                 );
             }
@@ -99,6 +103,7 @@ pub(super) fn emit_maker_cycle(
                     "mark": format_decimals(mark, cfg.price_decimals),
                     "best_bid": best_bid, "best_ask": best_ask,
                     "position": position,
+                    "starting_position": starting_position,
                     "account": account.map(account_json),
                     "holds": holds, "places": places, "cancels": cancels,
                     "fills": fills.len(),
@@ -112,12 +117,12 @@ pub(super) fn emit_maker_cycle(
             );
         }
         OutputFormat::Quiet => {
-            for (side, price, qty) in fills {
+            for fill in fills {
                 println!(
                     "fill {} @ {} x {}",
-                    side_str(*side),
-                    format_decimals(*price, cfg.price_decimals),
-                    format_decimals(*qty, cfg.qty_decimals)
+                    side_str(fill.side),
+                    format_decimals(fill.price, cfg.price_decimals),
+                    format_decimals(fill.qty, cfg.qty_decimals)
                 );
             }
             // Only mutations and their reasons.
@@ -183,12 +188,12 @@ pub(super) fn emit_maker_cycle(
                     format_account_amount(&account.upnl),
                 );
             }
-            for (side, price, qty) in fills {
+            for fill in fills {
                 println!(
                     "    FILL   {} @ {} x {}",
-                    side_str(*side),
-                    format_decimals(*price, cfg.price_decimals),
-                    format_decimals(*qty, cfg.qty_decimals)
+                    side_str(fill.side),
+                    format_decimals(fill.price, cfg.price_decimals),
+                    format_decimals(fill.qty, cfg.qty_decimals)
                 );
             }
             for a in actions {

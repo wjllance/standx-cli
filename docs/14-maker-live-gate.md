@@ -17,7 +17,9 @@ maker by itself.
 
 - Paper mode completes a recorded multi-hour session without panic or invariant failure.
 - Order-response authentication succeeds; a forced disconnect produces fail-safe shutdown and maker-order cleanup.
-- Fill ledger records only `sxmk-` correlated venue fills and does not duplicate trade IDs.
+- Fill ledger records only venue fills whose client-order ID carries the current run tag, enforces the session time boundary, and does not duplicate trade IDs. Historical `sxmk-` trades are ledger-sync evidence, not current-run fills.
+- Existing inventory at or below `max_position` is adopted at the startup mark with maker-session PnL zeroed; inventory above the limit rejects startup after maker-order cleanup.
+- A venue position change that cannot be explained by current-run fills is rechecked once, then immediately triggers fail-safe cleanup and shutdown.
 - Inventory-exit configuration remains disabled unless a supervised test has approved its exact threshold and chunk; the recorded XAG-USD test approves only `max_position=0.8`, trigger `25%`, and chunk `0.2`.
 
 ## Supervised canary

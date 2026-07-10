@@ -339,13 +339,15 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
         panel(
             "standx_key_events",
             "table",
-            "Fail-safe, Cleanup, Exit and Fill Events",
-            "Operational event timeline for the selected run.",
+            "Ledger, Fail-safe, Cleanup, Exit and Fill Events",
+            "Operational and session-ledger event timeline for the selected run.",
             query(
                 stream,
                 f'''SELECT _timestamp, action, event, side, price, qty, reason, message
 FROM "{stream}" WHERE {selected}
-  AND action IN ('fill', 'cancel', 'alert', 'maker_cleanup', 'inventory_exit', 'order_response_reconnect', 'lifecycle')
+  AND action IN ('fill', 'cancel', 'alert', 'maker_cleanup', 'inventory_exit',
+                 'order_response_reconnect', 'position_reconciliation',
+                 'ledger_sync', 'inventory_adopted', 'startup_rejected', 'lifecycle')
 ORDER BY _timestamp DESC LIMIT 200''',
                 [axis("_timestamp", "Time"), axis("action", "Action"), axis("event", "Event"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
                 [axis("price", "Price"), axis("qty", "Qty")],
