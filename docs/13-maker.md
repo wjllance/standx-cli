@@ -63,6 +63,8 @@ standx maker run <SYMBOL> [OPTIONS]
 | `-i, --interval` | `5` | 循环间隔（秒） |
 | `--max-position` | `0.05` | 最大绝对持仓；会把继续加仓的一侧压制掉 |
 | `--skew-bps` | `0` | 库存 skew：满仓时把报价中心向减仓侧偏移的最大幅度（bps），0 关闭。见 [13.3](#库存-skew) |
+| `--inventory-exit-pct` | `0` | 主动减仓触发线：仓位达到 `--max-position` 的此百分比时启动退出流程；需同时设置 `--inventory-exit-qty`，0 关闭 |
+| `--inventory-exit-qty` | `0` | 单次 reduce-only 主动退出的最大数量；先确认 maker 空簿再下市价单，提交后未确认会 fail-safe，0 关闭 |
 | `--max-divergence-bps` | `25` | 当 mark 价与盘口中价背离超过此值时跳过该轮（不动挂单） |
 | `--vol-pause-bps` | `0` | 波动率熔断：mark 在 `--vol-window` 轮内的极差达到此值（bps）即撤掉全部报价暂停，回落到一半以下才恢复。0 关闭。见 [13.3](#波动率熔断) |
 | `--vol-window` | `12` | 波动率熔断测量极差的窗口（最近 N 轮） |
@@ -74,7 +76,7 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
 
-启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`。
+启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`；主动退出必须同时设置百分比与数量。
 
 ---
 
@@ -106,6 +108,10 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 持多头时中心下移 → 减仓侧（卖）更贴近 mark（更易成交）、加仓侧（买）更远（更难成交）；持空头相反。这把 `max-position` 从"急刹车"变成"渐进回中"。anti-flicker 的锚点也是这个中心，所以同一条重报规则同时响应 mark 漂移与库存 skew。
 
 > **注意**：paper 模式下 skew 只有在模拟成交累积出仓位后才生效；`--skew-bps 0`（默认）时行为与不带 skew 完全一致。
+
+### 主动库存退出
+
+`--inventory-exit-pct 80 --inventory-exit-qty 0.01` 表示仓位达到上限的 80% 后，先撤销 maker 自有报价；在下一轮确认 maker 空簿且没有待确认下单时，再提交一笔最大 `0.01` 的 reduce-only 市价单。多头只卖出、空头只买入，数量不会超过当前仓位。该功能只在 live 模式生效，默认关闭；退出请求提交后若交易所状态未及时确认，策略会 fail-safe，而不会重复追单。
 
 ### 行情来源与守卫
 
