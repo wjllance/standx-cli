@@ -19,6 +19,7 @@ const DEFAULT_BASE_URL: &str = "https://perps.standx.com";
 pub struct StandXClient {
     client: Client,
     base_url: String,
+    session_id: Option<String>,
 }
 
 impl StandXClient {
@@ -32,6 +33,7 @@ impl StandXClient {
         Ok(Self {
             client,
             base_url: DEFAULT_BASE_URL.to_string(),
+            session_id: None,
         })
     }
 
@@ -42,12 +44,27 @@ impl StandXClient {
             .connect_timeout(Duration::from_secs(10))
             .build()?;
 
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            session_id: None,
+        })
     }
 
     /// Get the base URL
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// Attach a stable order-response session ID to signed order requests.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Current order-response session ID, if configured.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Build authenticated headers with optional request signing
@@ -77,6 +94,16 @@ impl StandXClient {
         );
 
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+        if let Some(session_id) = &self.session_id {
+            headers.insert(
+                "x-session-id",
+                HeaderValue::from_str(session_id).map_err(|e| Error::Validation {
+                    field: "session_id".to_string(),
+                    message: e.to_string(),
+                })?,
+            );
+        }
 
         // Add request signature if private key is available
         if !creds.private_key.is_empty() {
@@ -412,6 +439,14 @@ impl Default for StandXClient {
 mod tests {
     use super::*;
     use mockito::Server;
+
+    #[test]
+    fn session_id_builder_is_stable() {
+        let client = StandXClient::with_base_url("https://example.invalid".to_string())
+            .unwrap()
+            .with_session_id("maker-session");
+        assert_eq!(client.session_id(), Some("maker-session"));
+    }
 
     #[tokio::test]
     async fn test_get_symbol_info() {

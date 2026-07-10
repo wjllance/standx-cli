@@ -115,11 +115,21 @@ pub(super) async fn maker_cycle(
                         // Try to adopt from a recent place by side + price,
                         // tolerating a shrunk qty from a partial fill (see
                         // open_qty_adopts).
-                        let matched = pending.iter().position(|p| {
-                            p.side == o.side
-                                && (p.price - price).abs() < tick / 2.0
-                                && open_qty_adopts(qty, p.qty)
-                        });
+                        let matched = o
+                            .cl_ord_id
+                            .as_ref()
+                            .and_then(|cl_ord_id| {
+                                pending.iter().position(|p| p.cl_ord_id == *cl_ord_id)
+                            })
+                            .or_else(|| {
+                                // Backward-compatible fallback for orders
+                                // created before client IDs were enabled.
+                                pending.iter().position(|p| {
+                                    p.side == o.side
+                                        && (p.price - price).abs() < tick / 2.0
+                                        && open_qty_adopts(qty, p.qty)
+                                })
+                            });
                         let meta = match matched {
                             Some(idx) => {
                                 let p = pending.remove(idx);
@@ -237,10 +247,11 @@ pub(super) async fn maker_cycle(
             }
             Action::Place(q) => {
                 if live {
+                    let cl_ord_id = format!("sxmk-{}", uuid::Uuid::new_v4());
                     match client
                         .create_order(CreateOrderParams {
                             symbol: symbol.to_string(),
-                            cl_ord_id: None,
+                            cl_ord_id: Some(cl_ord_id.clone()),
                             side: q.side,
                             order_type: OrderType::Limit,
                             quantity: format_decimals(q.qty, cfg.qty_decimals),
@@ -255,8 +266,10 @@ pub(super) async fn maker_cycle(
                         })
                         .await
                     {
-                        Ok(_) => {
+                        Ok(submission) => {
                             pending.push(PendingPlace {
+                                request_id: submission.id,
+                                cl_ord_id,
                                 side: q.side,
                                 price: q.price,
                                 qty: q.qty,
