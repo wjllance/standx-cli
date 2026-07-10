@@ -120,6 +120,40 @@ disconnect remains a separate failure mode. No manual orders were present in
 this canary, so preservation of foreign orders continues to rely on the local
 mock proof above.
 
+## Supervised production active inventory-exit test — XAG-USD
+
+- Operator authorization: explicit approval to market-buy `0.2 XAG` and run a
+  reduce-only inventory-exit test.
+- Pre-check: production `XAG-USD` open orders `[]`; production position `[]`.
+- Seed position: market buy `0.2 XAG`, order
+  `8679b60a-c3cb-47aa-b45f-e1381cb0982f`, filled by the venue before the maker
+  was started.
+- Exact test tuple: `max_position=0.8`, `inventory_exit_pct=25`, and
+  `inventory_exit_qty=0.2`; the trigger is therefore `0.2 XAG`.
+- Saved operational profile: [`../../examples/maker-xag-100u.toml`](../../examples/maker-xag-100u.toml).
+- Exit: on cycle 0 the maker cleared its book and submitted a `reduce_only`
+  market sell. Venue history confirms `sxmk-exit-22b6d12a-349b-4c2f-8429-15a5502cb2f5`,
+  `0.200 XAG`, fully filled at `59.48`.
+- Cleanup: a controlled order-response disconnect then stopped the process;
+  it reported all maker-owned `XAG-USD` orders cancelled.
+- Post-check: production open orders `[]`; production position `[]`.
+
+Artifacts:
+
+- [`logs/maker-xag-inventory-exit-entry-20260710.log`](logs/maker-xag-inventory-exit-entry-20260710.log)
+  (`SHA-256 35c521c1ba3a5aea974041a78fb66bd52c2cb955342990fd268ca2c78d7dab76`)
+- [`logs/maker-xag-inventory-exit-live-20260710.log`](logs/maker-xag-inventory-exit-live-20260710.log)
+  (`SHA-256 331dfa2e0fcfb4fccc35ee02e595e28a9ee5bc8236a3b5f019cd7b2d0e9d0992`)
+- [`logs/maker-xag-inventory-exit-post-check-20260710.log`](logs/maker-xag-inventory-exit-post-check-20260710.log)
+  (`SHA-256 b63378ddacc91e2529ef8ed74c6154c64df1eb6782eacd7ad463e6b166e51805`)
+
+Result: **PASS for the exact active-exit tuple above.** This does not approve a
+different threshold or chunk without another supervised test. The maker's
+reported `PnL +11.89` during this run is not realized PnL: the seed entry was
+an external/manual order and is deliberately absent from the maker-correlated
+fill ledger. Do not run the maker against pre-existing manual inventory or use
+its PnL/`alert_loss` as a safety measure for such inventory.
+
 ## Engineering checks
 
 | Check | Result | Evidence |

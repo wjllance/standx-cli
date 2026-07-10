@@ -1,0 +1,40 @@
+# Conservative XAG-USD maker profile for a 100 DUSD account.
+#
+# Run with:
+#   standx --output json maker run XAG-USD \
+#     --maker-config examples/maker-xag-100u.toml --live --yes
+#
+# Set isolated 2x leverage separately. This config caps max directional
+# inventory at 0.8 XAG (about 48 DUSD around a 59.6 mark) and uses only one
+# 0.2 XAG quote per side.
+#
+# Active exit was production-tested only for this exact tuple:
+# max_position=0.8, inventory_exit_pct=25, inventory_exit_qty=0.2.
+# Do not run against manual/pre-existing XAG inventory: maker PnL and
+# alert_loss track maker-correlated fills, not external cost basis.
+
+# Quote geometry
+spread_bps = 7.0
+band_bps = 9.0
+size = 0.2
+levels = 1
+level_step_bps = 0.0
+refresh_bps = 2.0
+interval = 3
+
+# Inventory and market-data guards
+max_position = 0.8
+skew_bps = 8.0
+max_divergence_bps = 6.0
+vol_pause_bps = 30.0
+vol_window = 20
+
+# Alerts and supervised active inventory exit
+alert_loss = 3.0
+alert_inventory_pct = 70.0
+alert_uptime = 60.0
+inventory_exit_pct = 25.0
+inventory_exit_qty = 0.2
+
+# Use the WebSocket market feed, with REST fallback handled by the CLI.
+no_ws = false
