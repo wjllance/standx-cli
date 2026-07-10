@@ -4,6 +4,7 @@ use standx_sdk::auth::Credentials;
 use standx_sdk::client::StandXClient;
 use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::OrderSide;
+use standx_sdk::order_response::OrderResponse;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::signal;
@@ -30,16 +31,59 @@ enum MakerExit {
     FailSafe(String),
 }
 
-/// Pending place awaiting order-id adoption (live mode): create_order only
-/// returns a request id, so new open orders are matched back to recent
-/// places by (side, price, qty) on the next cycle.
+/// Pending place awaiting order-id adoption in live mode. The HTTP request is
+/// correlated to its asynchronous response by request ID, then to the visible
+/// open order by client order ID. Side, price, and quantity remain only as a
+/// compatibility fallback for orders submitted before client IDs were added.
 struct PendingPlace {
+    request_id: String,
+    cl_ord_id: String,
     side: OrderSide,
     price: f64,
     qty: f64,
     level: u32,
     ref_center: f64,
     cycle: u64,
+}
+
+fn apply_order_responses(
+    receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
+    pending: &mut Vec<PendingPlace>,
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    price_decimals: u32,
+) {
+    while let Ok(response) = receiver.try_recv() {
+        let Some(request_id) = response.request_id.as_deref() else {
+            continue;
+        };
+        let Some(index) = pending
+            .iter()
+            .position(|place| place.request_id == request_id)
+        else {
+            // Authentication acknowledgements and cancellation responses do
+            // not correspond to a pending maker place.
+            continue;
+        };
+
+        if response.accepted() {
+            continue;
+        }
+
+        let rejected = pending.remove(index);
+        output::log_maker_event(
+            output_format,
+            symbol,
+            cycle,
+            "place_rejected_async",
+            rejected.side,
+            rejected.level,
+            rejected.price,
+            price_decimals,
+            &response.message,
+        );
+    }
 }
 
 /// A business rejection from the venue: the exchange responded with a
@@ -274,8 +318,13 @@ struct MakerRunArgs {
 
 async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
     use standx_sdk::maker::{self, MakerConfig, RestingQuote};
+    use standx_sdk::order_response::OrderResponseStream;
 
-    let client = StandXClient::new()?;
+    let order_session_id = args.live.then(|| uuid::Uuid::new_v4().to_string());
+    let client = match order_session_id.as_deref() {
+        Some(session_id) => StandXClient::new()?.with_session_id(session_id),
+        None => StandXClient::new()?,
+    };
 
     // ---- Startup: symbol metadata + invariants (fail fast) ----
     let infos = client.get_symbol_info().await?;
@@ -354,6 +403,8 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     }
 
     // ---- Live gating & clean start ----
+    let mut order_responses = None;
+    let mut order_response_handle = None;
     if args.live {
         if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
             return Err(anyhow::anyhow!(
@@ -372,6 +423,14 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 "Live mode requires a private key for order signing. Run 'standx auth login' with --private-key."
             ));
         }
+        let stream = OrderResponseStream::new(
+            order_session_id
+                .as_deref()
+                .expect("live maker must have an order session"),
+        )?;
+        let (responses, handle) = stream.connect().await?;
+        order_responses = Some(responses);
+        order_response_handle = Some(handle);
         // Start from a clean book so reconciliation isn't confused by
         // leftovers from a previous run. The bot owns ALL orders on this
         // symbol while running.
@@ -500,6 +559,17 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut last_src: Option<&'static str> = None;
 
     let exit = 'main: loop {
+        if let Some(receiver) = order_responses.as_mut() {
+            apply_order_responses(
+                receiver,
+                &mut pending,
+                output_format,
+                &symbol,
+                cycle,
+                cfg.price_decimals,
+            );
+        }
+
         // Work phase raced against Ctrl+C so a slow API call can be
         // interrupted (mirrors run_watch_loop).
         let work = async {
@@ -652,6 +722,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     if args.live {
         cancel_all_with_retry(&client, &symbol, 3).await?;
     }
+    if let Some(handle) = order_response_handle {
+        handle.abort();
+    }
 
     // Notify stop on every exit path. Await delivery so the message lands
     // before the process exits.
@@ -761,5 +834,73 @@ mod tests {
         assert!(!open_qty_adopts(0.02, 0.01));
         // Float slop just under the placed qty is tolerated.
         assert!(open_qty_adopts(0.01 + 1e-9, 0.01));
+    }
+
+    #[test]
+    fn async_rejection_removes_only_matching_pending_place() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let pending_place = |request_id: &str| PendingPlace {
+            request_id: request_id.to_string(),
+            cl_ord_id: format!("client-{request_id}"),
+            side: OrderSide::Buy,
+            price: 100.0,
+            qty: 0.01,
+            level: 0,
+            ref_center: 100.0,
+            cycle: 1,
+        };
+        let mut pending = vec![pending_place("request-1"), pending_place("request-2")];
+        sender
+            .try_send(OrderResponse {
+                code: 400,
+                message: "alo order rejected".to_string(),
+                request_id: Some("request-1".to_string()),
+            })
+            .unwrap();
+
+        apply_order_responses(
+            &mut receiver,
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            2,
+            2,
+        );
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, "request-2");
+    }
+
+    #[test]
+    fn async_acceptance_keeps_pending_until_exchange_order_is_visible() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let mut pending = vec![PendingPlace {
+            request_id: "request-1".to_string(),
+            cl_ord_id: "client-1".to_string(),
+            side: OrderSide::Sell,
+            price: 101.0,
+            qty: 0.01,
+            level: 0,
+            ref_center: 100.0,
+            cycle: 1,
+        }];
+        sender
+            .try_send(OrderResponse {
+                code: 0,
+                message: "accepted".to_string(),
+                request_id: Some("request-1".to_string()),
+            })
+            .unwrap();
+
+        apply_order_responses(
+            &mut receiver,
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            2,
+            2,
+        );
+
+        assert_eq!(pending.len(), 1);
     }
 }

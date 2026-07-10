@@ -42,6 +42,7 @@ pub mod client;
 pub mod error;
 pub mod maker;
 pub mod models;
+pub mod order_response;
 pub mod websocket;
 
 pub use error::{Error, Result};
