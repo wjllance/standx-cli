@@ -82,6 +82,8 @@ standx maker run <SYMBOL> [OPTIONS]
 
 默认会读取 `~/.config/standx/maker.toml`（macOS 为 `~/Library/Application Support/standx/maker.toml`）；也可用 `--maker-config <PATH>` 指定文件。文件只保存非敏感策略参数，命令行显式参数优先于文件，文件未设置的字段继续使用内置默认值。
 
+完整可复制模板见 [`examples/maker.toml`](../examples/maker.toml)。
+
 ```toml
 # maker.toml — 不放 JWT、私钥、--live 或 webhook URL
 spread_bps = 8.0

@@ -1,0 +1,33 @@
+# StandX maker strategy example
+#
+# Copy to ~/.config/standx/maker.toml, or pass with:
+#   standx maker run BTC-USD --maker-config ./examples/maker.toml
+#
+# This file deliberately contains no JWT, private key, --live switch, or
+# webhook URL. Those remain explicit command-line/environment choices.
+
+# Quote geometry
+spread_bps = 8.0
+band_bps = 30.0
+size = 0.001
+levels = 2
+level_step_bps = 2.0
+refresh_bps = 4.0
+interval = 5
+
+# Inventory and safety guards
+max_position = 0.01
+skew_bps = 6.0
+max_divergence_bps = 25.0
+vol_pause_bps = 40.0
+vol_window = 12
+
+# Alerts and optional active inventory exit (0 disables)
+alert_loss = 0.0
+alert_inventory_pct = 80.0
+alert_uptime = 0.0
+inventory_exit_pct = 0.0
+inventory_exit_qty = 0.0
+
+# Use REST market polling instead of the WebSocket feed (normally false)
+no_ws = false
