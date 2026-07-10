@@ -31,3 +31,7 @@ Only a release owner may enable the environment variable after the preceding
 evidence is reviewed. The first canary does not grant permanent approval: any
 strategy, venue API, credential, or risk-control change re-locks the gate and
 requires a new canary record.
+
+## Execution records
+
+- [2026-07-10 maker paper long run and controlled disconnect](evidence/maker-live-gate-2026-07-10.md)

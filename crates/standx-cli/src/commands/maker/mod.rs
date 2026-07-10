@@ -881,6 +881,29 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mockito::{Matcher, Server};
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
 
     #[test]
     fn webhook_body_shapes() {
@@ -1083,5 +1106,72 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn controlled_disconnect_fails_closed_then_cleans_only_maker_orders() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        drop(sender);
+        let mut pending = Vec::new();
+
+        let error = apply_order_responses(
+            &mut receiver,
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            7,
+            2,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disconnected"));
+        eprintln!("controlled disconnect -> fail-safe: {error}");
+
+        let _jwt = EnvGuard::set("STANDX_JWT", "controlled-test-jwt");
+        let mut server = Server::new_async().await;
+        let open_before = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"code":0,"message":"ok","result":[
+                    {"id":"42","cl_ord_id":"sxmk-controlled-buy","symbol":"BTC-USD","side":"buy","order_type":"limit","qty":"0.001","fill_qty":"0","price":"63000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"},
+                    {"id":"99","cl_ord_id":"manual-order","symbol":"BTC-USD","side":"sell","order_type":"limit","qty":"0.001","fill_qty":"0","price":"65000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}
+                ]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let cancel = server
+            .mock("POST", "/api/cancel_orders")
+            .match_body(Matcher::Json(serde_json::json!({ "order_id_list": [42] })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"code":0,"message":"accepted"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let open_after = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"code":0,"message":"ok","result":[
+                    {"id":"99","cl_ord_id":"manual-order","symbol":"BTC-USD","side":"sell","order_type":"limit","qty":"0.001","fill_qty":"0","price":"65000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}
+                ]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        cancel_maker_orders_with_retry(&client, "BTC-USD", 3)
+            .await
+            .unwrap();
+
+        open_before.assert_async().await;
+        cancel.assert_async().await;
+        open_after.assert_async().await;
     }
 }
