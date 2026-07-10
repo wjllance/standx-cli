@@ -831,6 +831,74 @@ pub fn reconcile(
     actions
 }
 
+/// One deterministic market/position observation for offline strategy replay.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReplaySnapshot {
+    pub mark: f64,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub position: f64,
+}
+
+/// Decisions generated for one replay observation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayCycle {
+    pub cycle: u64,
+    pub actions: Vec<Action>,
+}
+
+/// Replay quote/reconcile decisions without network, credentials, or order I/O.
+///
+/// This simulator deliberately does not invent fills. Callers provide the
+/// observed position at every step, which makes it suitable for validating
+/// risk guards against recorded market/position sequences before canary use.
+pub fn replay_actions(cfg: &MakerConfig, snapshots: &[ReplaySnapshot]) -> Vec<ReplayCycle> {
+    let mut resting = Vec::<RestingQuote>::new();
+    let mut cycles = Vec::with_capacity(snapshots.len());
+
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        let cycle = index as u64;
+        let raw = compute_desired_quotes(
+            cfg,
+            snapshot.mark,
+            snapshot.best_bid,
+            snapshot.best_ask,
+            snapshot.position,
+        );
+        let desired = cap_desired_exposure(cfg, snapshot.position, &raw, &[]);
+        let actions = reconcile(
+            cfg,
+            snapshot.mark,
+            snapshot.position,
+            snapshot.best_bid,
+            snapshot.best_ask,
+            &desired,
+            &resting,
+            cycle,
+        );
+
+        for action in &actions {
+            match action {
+                Action::Cancel { side, level, .. } => {
+                    resting.retain(|quote| !(quote.side == *side && quote.level == *level));
+                }
+                Action::Place(quote) => resting.push(RestingQuote {
+                    order_id: None,
+                    side: quote.side,
+                    level: quote.level,
+                    price: quote.price,
+                    qty: quote.qty,
+                    ref_center: skew_center(cfg, snapshot.mark, snapshot.position),
+                    placed_at_cycle: cycle,
+                }),
+                Action::Hold { .. } => {}
+            }
+        }
+        cycles.push(ReplayCycle { cycle, actions });
+    }
+    cycles
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +958,44 @@ mod tests {
         assert_eq!(inventory_exit_plan(0.039, 0.05, 80.0, 0.01), None);
         assert_eq!(inventory_exit_plan(0.05, 0.05, 0.0, 0.01), None);
         assert_eq!(inventory_exit_plan(0.05, 0.05, 101.0, 0.01), None);
+    }
+
+    #[test]
+    fn replay_requotes_on_touch_move_without_creating_crossed_quote() {
+        let snapshots = [
+            ReplaySnapshot {
+                mark: 100.0,
+                best_bid: Some(99.99),
+                best_ask: Some(100.01),
+                position: 0.0,
+            },
+            ReplaySnapshot {
+                mark: 100.0,
+                best_bid: Some(99.88),
+                best_ask: Some(99.90),
+                position: 0.0,
+            },
+        ];
+        let replay = replay_actions(&cfg(), &snapshots);
+        assert!(replay[0]
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(_))));
+        assert!(replay[1].actions.iter().any(|action| matches!(
+            action,
+            Action::Cancel {
+                reason: CancelReason::WouldCross,
+                ..
+            }
+        )));
+        for action in &replay[1].actions {
+            if let Action::Place(quote) = action {
+                match quote.side {
+                    OrderSide::Buy => assert!(quote.price < snapshots[1].best_ask.unwrap()),
+                    OrderSide::Sell => assert!(quote.price > snapshots[1].best_bid.unwrap()),
+                }
+            }
+        }
     }
 
     // 1. Basic two-sided quoting.
