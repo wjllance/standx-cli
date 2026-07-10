@@ -36,5 +36,10 @@ alert_uptime = 60.0
 inventory_exit_pct = 25.0
 inventory_exit_qty = 0.2
 
+# Bounded safe recovery for the authenticated order-response stream. Quoting
+# resumes only after maker cleanup and account/trade reconciliation succeed.
+order_response_reconnect_attempts = 3
+order_response_reconnect_backoff = 2
+
 # Use the WebSocket market feed, with REST fallback handled by the CLI.
 no_ws = false

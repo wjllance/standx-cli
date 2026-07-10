@@ -345,7 +345,7 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
                 stream,
                 f'''SELECT _timestamp, action, event, side, price, qty, reason, message
 FROM "{stream}" WHERE {selected}
-  AND action IN ('fill', 'cancel', 'alert', 'maker_cleanup', 'inventory_exit', 'lifecycle')
+  AND action IN ('fill', 'cancel', 'alert', 'maker_cleanup', 'inventory_exit', 'order_response_reconnect', 'lifecycle')
 ORDER BY _timestamp DESC LIMIT 200''',
                 [axis("_timestamp", "Time"), axis("action", "Action"), axis("event", "Event"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
                 [axis("price", "Price"), axis("qty", "Qty")],

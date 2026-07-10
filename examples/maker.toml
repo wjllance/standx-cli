@@ -29,5 +29,11 @@ alert_uptime = 70.0
 inventory_exit_pct = 0.0
 inventory_exit_qty = 0.0
 
+# Order-response recovery: each attempt cancels/verifies maker orders, opens a
+# new authenticated session, then reconciles orders, position, and fills.
+# Set attempts to 0 to retain immediate fail-safe shutdown on disconnect.
+order_response_reconnect_attempts = 3
+order_response_reconnect_backoff = 2
+
 # Use REST market polling instead of the WebSocket feed (normally false)
 no_ws = false

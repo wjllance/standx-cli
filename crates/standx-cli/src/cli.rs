@@ -469,6 +469,15 @@ pub enum MakerCommands {
         /// full loop, prints intended actions, no orders placed)
         #[arg(long)]
         live: bool,
+        /// Maximum authenticated order-response reconnect attempts across one
+        /// live maker run. Each attempt first cleans maker orders and must
+        /// reconcile an empty maker book before quoting resumes. 0 disables.
+        #[arg(long)]
+        order_response_reconnect_attempts: Option<u32>,
+        /// Base delay in seconds between order-response reconnect attempts.
+        /// Later attempts use bounded exponential backoff.
+        #[arg(long)]
+        order_response_reconnect_backoff: Option<u64>,
         /// Supervised fault injection: close the local order-response stream
         /// after this many seconds. Hidden because it is only for live-gate
         /// validation and is limited by the maker command to 60 seconds.

@@ -6,8 +6,8 @@ use standx_maker::{
 use standx_sdk::auth::Credentials;
 use standx_sdk::client::StandXClient;
 use standx_sdk::error::Error as StandxError;
-use standx_sdk::models::{Order, OrderSide};
-use standx_sdk::order_response::OrderResponse;
+use standx_sdk::models::{Order, OrderSide, Position, Trade};
+use standx_sdk::order_response::{OrderResponse, OrderResponseHealth, OrderResponseStream};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::signal;
@@ -325,6 +325,8 @@ pub async fn handle_maker(
             alert_webhook_format,
             no_ws,
             live,
+            order_response_reconnect_attempts,
+            order_response_reconnect_backoff,
             controlled_disconnect_after,
         } => {
             let file = config::load(maker_config.as_deref())?;
@@ -352,6 +354,16 @@ pub async fn handle_maker(
                     alert_webhook_format,
                     no_ws: no_ws || file.no_ws.unwrap_or(false),
                     live,
+                    order_response_reconnect_attempts: choose(
+                        order_response_reconnect_attempts,
+                        file.order_response_reconnect_attempts,
+                        3,
+                    ),
+                    order_response_reconnect_backoff: choose(
+                        order_response_reconnect_backoff,
+                        file.order_response_reconnect_backoff,
+                        2,
+                    ),
                     controlled_disconnect_after,
                     verbose,
                 },
@@ -388,13 +400,287 @@ struct MakerRunArgs {
     alert_webhook_format: AlertWebhookFormat,
     no_ws: bool,
     live: bool,
+    order_response_reconnect_attempts: u32,
+    order_response_reconnect_backoff: u64,
     controlled_disconnect_after: Option<u64>,
     verbose: bool,
 }
 
-async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
-    use standx_sdk::order_response::OrderResponseStream;
+#[derive(Debug, PartialEq)]
+struct ReconnectSnapshot {
+    position: f64,
+    maker_filled_orders: usize,
+    maker_trades: usize,
+}
 
+struct ReconnectedOrderResponse {
+    client: StandXClient,
+    responses: tokio::sync::mpsc::Receiver<OrderResponse>,
+    health: OrderResponseHealth,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+fn emit_order_response_reconnect(
+    output_format: OutputFormat,
+    symbol: &str,
+    event: &str,
+    attempt: u32,
+    max_attempts: u32,
+    message: &str,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "action": "order_response_reconnect",
+                "event": event,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!(
+            "⚠️  order-response reconnect {event} ({attempt}/{max_attempts}) on {symbol}: {message}"
+        );
+    }
+}
+
+fn order_response_reconnect_available(failure: &str, attempts_used: u32, max: u32) -> bool {
+    !failure.starts_with("controlled fault injection") && attempts_used < max
+}
+
+fn validate_reconnect_snapshot(
+    symbol: &str,
+    open_orders: &[Order],
+    positions: &[Position],
+    filled_orders: &[Order],
+    trades: &[Trade],
+) -> Result<ReconnectSnapshot> {
+    let residual_ids = open_orders
+        .iter()
+        .filter(|order| is_maker_order(order))
+        .map(|order| order.id.as_str())
+        .collect::<Vec<_>>();
+    if !residual_ids.is_empty() {
+        return Err(anyhow::anyhow!(
+            "maker orders appeared after cleanup on {symbol}: [{}]",
+            residual_ids.join(", ")
+        ));
+    }
+
+    let mut position = 0.0;
+    for item in positions
+        .iter()
+        .filter(|position| position.symbol.eq_ignore_ascii_case(symbol))
+    {
+        let qty = item.qty.parse::<f64>().map_err(|_| {
+            anyhow::anyhow!(
+                "reconnect reconciliation found invalid position qty '{}' on {symbol}",
+                item.qty
+            )
+        })?;
+        if !qty.is_finite() {
+            return Err(anyhow::anyhow!(
+                "reconnect reconciliation found non-finite position qty on {symbol}"
+            ));
+        }
+        position += match item.side {
+            Some(OrderSide::Sell) => -qty,
+            _ => qty,
+        };
+    }
+
+    let maker_filled_order_ids = filled_orders
+        .iter()
+        .filter(|order| is_maker_order(order))
+        .map(|order| {
+            order.id.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "reconnect reconciliation found non-integer maker order ID '{}'",
+                    order.id
+                )
+            })
+        })
+        .collect::<Result<HashSet<_>>>()?;
+    let maker_trades = trades
+        .iter()
+        .filter(|trade| {
+            trade
+                .order_id
+                .is_some_and(|order_id| maker_filled_order_ids.contains(&order_id))
+        })
+        .map(|trade| {
+            if trade.id == 0 {
+                Err(anyhow::anyhow!(
+                    "reconnect reconciliation found maker trade without a stable trade ID"
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .collect::<Result<Vec<_>>>()?
+        .len();
+
+    Ok(ReconnectSnapshot {
+        position,
+        maker_filled_orders: maker_filled_order_ids.len(),
+        maker_trades,
+    })
+}
+
+async fn query_reconnect_snapshot(
+    client: &StandXClient,
+    symbol: &str,
+    session_started_at: i64,
+) -> Result<ReconnectSnapshot> {
+    let now = chrono::Utc::now().timestamp();
+    let (open_orders, positions, filled_orders, trades) = tokio::join!(
+        client.get_open_orders(Some(symbol)),
+        client.get_positions(Some(symbol)),
+        client.get_order_history(Some(symbol), Some(100)),
+        client.get_user_trades(symbol, session_started_at, now, Some(500)),
+    );
+    validate_reconnect_snapshot(
+        symbol,
+        &open_orders?,
+        &positions?,
+        &filled_orders?,
+        &trades?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_order_response(
+    cleanup_client: StandXClient,
+    symbol: &str,
+    session_started_at: i64,
+    output_format: OutputFormat,
+    attempts_used: u32,
+    max_attempts: u32,
+    base_backoff: Duration,
+    original_failure: &str,
+) -> Result<(ReconnectedOrderResponse, u32)> {
+    let mut cleanup_client = cleanup_client;
+    let first_attempt = attempts_used.saturating_add(1);
+    let mut last_error = None;
+
+    for attempt in first_attempt..=max_attempts {
+        emit_order_response_reconnect(
+            output_format,
+            symbol,
+            "starting",
+            attempt,
+            max_attempts,
+            original_failure,
+        );
+
+        if let Err(error) =
+            cancel_maker_orders_with_retry(&cleanup_client, symbol, 3, output_format).await
+        {
+            last_error = Some(anyhow::anyhow!("pre-reconnect cleanup failed: {error}"));
+        } else {
+            // Give just-submitted HTTP orders time to become visible, then
+            // require a second authoritative snapshot after authentication.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let candidate_client = StandXClient::new()?.with_session_id(&session_id);
+            let stream = OrderResponseStream::new(&session_id)?;
+            match tokio::time::timeout(Duration::from_secs(15), stream.connect()).await {
+                Ok(Ok((responses, health, handle))) => {
+                    match query_reconnect_snapshot(&candidate_client, symbol, session_started_at)
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            if !health.is_healthy() {
+                                let reason = health.failure_reason().unwrap_or_else(|| {
+                                    "new order-response session became unhealthy during reconciliation without a recorded reason".to_string()
+                                });
+                                handle.abort();
+                                cleanup_client = candidate_client;
+                                last_error = Some(anyhow::anyhow!(
+                                    "new order-response session failed during reconciliation: {reason}"
+                                ));
+                            } else {
+                                let message = format!(
+                                    "authenticated new session {}; maker book empty; position={:+.8}; maker filled orders={}; maker trades={}",
+                                    session_id,
+                                    snapshot.position,
+                                    snapshot.maker_filled_orders,
+                                    snapshot.maker_trades,
+                                );
+                                emit_order_response_reconnect(
+                                    output_format,
+                                    symbol,
+                                    "complete",
+                                    attempt,
+                                    max_attempts,
+                                    &message,
+                                );
+                                return Ok((
+                                    ReconnectedOrderResponse {
+                                        client: candidate_client,
+                                        responses,
+                                        health,
+                                        handle,
+                                    },
+                                    attempt,
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            handle.abort();
+                            cleanup_client = candidate_client;
+                            last_error =
+                                Some(anyhow::anyhow!("post-auth reconciliation failed: {error}"));
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    cleanup_client = candidate_client;
+                    last_error = Some(anyhow::anyhow!(
+                        "order-response authentication failed: {error}"
+                    ));
+                }
+                Err(_) => {
+                    cleanup_client = candidate_client;
+                    last_error = Some(anyhow::anyhow!(
+                        "order-response reconnect timed out after 15 seconds"
+                    ));
+                }
+            }
+        }
+
+        let error_text = last_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unknown reconnect failure".to_string());
+        emit_order_response_reconnect(
+            output_format,
+            symbol,
+            "attempt_failed",
+            attempt,
+            max_attempts,
+            &error_text,
+        );
+        if attempt < max_attempts {
+            let local_attempt = attempt.saturating_sub(first_attempt).min(4);
+            let multiplier = 1_u32 << local_attempt;
+            tokio::time::sleep(base_backoff.saturating_mul(multiplier)).await;
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "safe order-response reconnect exhausted: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no attempts available".to_string())
+    ))
+}
+
+async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
     let order_session_id = args.live.then(|| uuid::Uuid::new_v4().to_string());
 
     if let Some(after) = args.controlled_disconnect_after {
@@ -409,7 +695,19 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             ));
         }
     }
-    let client = match order_session_id.as_deref() {
+    if args.order_response_reconnect_attempts > 10 {
+        return Err(anyhow::anyhow!(
+            "--order-response-reconnect-attempts must be between 0 and 10"
+        ));
+    }
+    if args.order_response_reconnect_attempts > 0
+        && !(1..=60).contains(&args.order_response_reconnect_backoff)
+    {
+        return Err(anyhow::anyhow!(
+            "--order-response-reconnect-backoff must be between 1 and 60 seconds when reconnect is enabled"
+        ));
+    }
+    let mut client = match order_session_id.as_deref() {
         Some(session_id) => StandXClient::new()?.with_session_id(session_id),
         None => StandXClient::new()?,
     };
@@ -603,6 +901,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 MAKER_CL_ORD_ID_PREFIX, symbol
             );
             println!("│ manual/API orders are preserved and ignored.");
+            println!(
+                "│ order-response recovery: {} attempt(s), {}s base backoff",
+                args.order_response_reconnect_attempts, args.order_response_reconnect_backoff
+            );
         }
         if args.no_ws {
             println!("│ feed: REST polling (--no-ws)");
@@ -649,13 +951,18 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     notify_lifecycle(
         "started",
         &format!(
-            "🟢 maker started — {} {} | spread {}bps band {}bps size {} | {}",
+            "🟢 maker started — {} {} | spread {}bps band {}bps size {} | {} | order-response reconnects {}",
             mode,
             symbol,
             cfg.spread_bps,
             cfg.band_bps,
             cfg.size,
-            if args.no_ws { "REST" } else { "WS" }
+            if args.no_ws { "REST" } else { "WS" },
+            if args.live {
+                args.order_response_reconnect_attempts
+            } else {
+                0
+            }
         ),
         &symbol,
         output_format,
@@ -696,6 +1003,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
+    let mut order_response_reconnect_attempts_used = 0_u32;
 
     let exit = 'main: loop {
         if args.live {
@@ -706,7 +1014,64 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 let detail = health.failure_reason().unwrap_or_else(|| {
                     "order-response stream became unhealthy without a recorded reason".to_string()
                 });
-                break MakerExit::OrderResponse(format!("{detail}; refusing further live orders"));
+                let controlled_fault = detail.starts_with("controlled fault injection");
+                let reconnect_available = order_response_reconnect_available(
+                    &detail,
+                    order_response_reconnect_attempts_used,
+                    args.order_response_reconnect_attempts,
+                );
+                if reconnect_available {
+                    if let Some(handle) = order_response_handle.take() {
+                        handle.abort();
+                    }
+                    order_responses.take();
+                    match reconnect_order_response(
+                        client.clone(),
+                        &symbol,
+                        session_started_at,
+                        output_format,
+                        order_response_reconnect_attempts_used,
+                        args.order_response_reconnect_attempts,
+                        Duration::from_secs(args.order_response_reconnect_backoff),
+                        &detail,
+                    )
+                    .await
+                    {
+                        Ok((reconnected, attempts_used)) => {
+                            client = reconnected.client;
+                            order_responses = Some(reconnected.responses);
+                            order_response_health = Some(reconnected.health);
+                            order_response_handle = Some(reconnected.handle);
+                            order_response_reconnect_attempts_used = attempts_used;
+                            // Cleanup verified an empty maker book. The next
+                            // cycle rebuilds exchange state before it may place.
+                            resting.clear();
+                            adopted.clear();
+                            pending.clear();
+                            consecutive_errors = 0;
+                            continue;
+                        }
+                        Err(error) => {
+                            break MakerExit::OrderResponse(format!(
+                                "{detail}; safe reconnect failed: {error}; refusing further live orders"
+                            ));
+                        }
+                    }
+                }
+                let reconnect_note = if controlled_fault {
+                    "controlled fault injection requires fail-safe shutdown".to_string()
+                } else if args.order_response_reconnect_attempts == 0 {
+                    "safe reconnect is disabled".to_string()
+                } else {
+                    format!(
+                        "safe reconnect budget exhausted ({}/{})",
+                        order_response_reconnect_attempts_used,
+                        args.order_response_reconnect_attempts
+                    )
+                };
+                break MakerExit::OrderResponse(format!(
+                    "{detail}; {reconnect_note}; refusing further live orders"
+                ));
             }
         }
         if let Some(receiver) = order_responses.as_mut() {
@@ -718,6 +1083,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 cycle,
                 cfg.price_decimals,
             ) {
+                if let Some(health) = order_response_health.as_ref() {
+                    health.mark_unhealthy(error.to_string());
+                    continue;
+                }
                 break MakerExit::OrderResponse(error.to_string());
             }
         }
@@ -962,6 +1331,30 @@ mod tests {
         assert!(terminal.contains("3 consecutive maker cycle errors"));
     }
 
+    #[test]
+    fn reconnect_policy_is_bounded_and_preserves_controlled_fail_safe() {
+        assert!(order_response_reconnect_available(
+            "order-response WebSocket error: reset",
+            0,
+            3
+        ));
+        assert!(!order_response_reconnect_available(
+            "order-response WebSocket error: reset",
+            3,
+            3
+        ));
+        assert!(!order_response_reconnect_available(
+            "controlled fault injection closed the order-response stream after 15s",
+            0,
+            3
+        ));
+        assert!(!order_response_reconnect_available(
+            "order-response WebSocket error: reset",
+            0,
+            0
+        ));
+    }
+
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
@@ -982,6 +1375,112 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    fn test_order(id: &str, cl_ord_id: Option<&str>) -> Order {
+        Order {
+            id: id.to_string(),
+            cl_ord_id: cl_ord_id.map(str::to_string),
+            symbol: "XAG-USD".to_string(),
+            side: OrderSide::Buy,
+            order_type: standx_sdk::models::OrderType::Limit,
+            qty: "0.2".to_string(),
+            fill_qty: "0".to_string(),
+            price: "59.40".to_string(),
+            status: standx_sdk::models::OrderStatus::New,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        }
+    }
+
+    fn test_position(side: &str, qty: &str) -> Position {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "symbol": "XAG-USD",
+            "side": side,
+            "qty": qty,
+            "entry_price": "59.40",
+            "entry_value": "11.88",
+            "holding_margin": "1",
+            "initial_margin": "1",
+            "leverage": "1",
+            "mark_price": "59.40",
+            "margin_asset": "USDT",
+            "margin_mode": "cross",
+            "position_value": "11.88",
+            "realized_pnl": "0",
+            "required_margin": "1",
+            "status": "open",
+            "upnl": "0",
+            "time": "now",
+            "created_at": "now",
+            "updated_at": "now",
+            "user": "test"
+        }))
+        .unwrap()
+    }
+
+    fn test_trade(id: u64, order_id: u64) -> Trade {
+        Trade {
+            id,
+            time: "now".to_string(),
+            price: "59.40".to_string(),
+            qty: "0.2".to_string(),
+            side: Some("buy".to_string()),
+            is_buyer_taker: false,
+            fee_asset: None,
+            fee_qty: None,
+            pnl: None,
+            order_id: Some(order_id),
+            symbol: Some("XAG-USD".to_string()),
+            value: None,
+        }
+    }
+
+    #[test]
+    fn reconnect_snapshot_requires_empty_maker_book_and_valid_ledger() {
+        let manual = test_order("99", Some("manual-order"));
+        let filled = test_order("42", Some("sxmk-filled"));
+        let snapshot = validate_reconnect_snapshot(
+            "XAG-USD",
+            &[manual],
+            &[test_position("sell", "0.2")],
+            &[filled],
+            &[test_trade(7, 42)],
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.position, -0.2);
+        assert_eq!(snapshot.maker_filled_orders, 1);
+        assert_eq!(snapshot.maker_trades, 1);
+    }
+
+    #[test]
+    fn reconnect_snapshot_rejects_residual_maker_order() {
+        let error = validate_reconnect_snapshot(
+            "XAG-USD",
+            &[test_order("42", Some("sxmk-still-open"))],
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("appeared after cleanup"));
+    }
+
+    #[test]
+    fn reconnect_snapshot_rejects_unstable_maker_trade_id() {
+        let error = validate_reconnect_snapshot(
+            "XAG-USD",
+            &[],
+            &[],
+            &[test_order("42", Some("sxmk-filled"))],
+            &[test_trade(0, 42)],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stable trade ID"));
     }
 
     #[test]
@@ -1054,23 +1553,9 @@ mod tests {
 
     #[test]
     fn maker_order_ownership_uses_reserved_client_id_prefix() {
-        let order = |cl_ord_id: Option<&str>| Order {
-            id: "123".to_string(),
-            cl_ord_id: cl_ord_id.map(str::to_string),
-            symbol: "BTC-USD".to_string(),
-            side: OrderSide::Buy,
-            order_type: standx_sdk::models::OrderType::Limit,
-            qty: "0.01".to_string(),
-            fill_qty: "0".to_string(),
-            price: "100".to_string(),
-            status: standx_sdk::models::OrderStatus::New,
-            created_at: "now".to_string(),
-            updated_at: "now".to_string(),
-        };
-
-        assert!(is_maker_order(&order(Some("sxmk-7f2b"))));
-        assert!(!is_maker_order(&order(Some("manual-7f2b"))));
-        assert!(!is_maker_order(&order(None)));
+        assert!(is_maker_order(&test_order("123", Some("sxmk-7f2b"))));
+        assert!(!is_maker_order(&test_order("123", Some("manual-7f2b"))));
+        assert!(!is_maker_order(&test_order("123", None)));
     }
 
     #[test]

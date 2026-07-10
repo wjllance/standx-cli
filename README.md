@@ -416,7 +416,10 @@ standx maker run BTC-USD --live
 In live mode the bot manages only orders tagged with its `sxmk-` client-order
 ID prefix: manual/API orders are preserved. It cleans up maker-owned orders on
 exit (with retries and verification), stops quoting after 3 consecutive API
-errors, and fails closed if the asynchronous order-response stream disconnects.
+errors, and safely pauses on an asynchronous order-response disconnect. It
+then cleans and verifies the maker book, authenticates a new response session,
+and reconciles orders, position, and fills before quoting can resume; a disabled
+or exhausted reconnect budget still fails closed.
 Live fill telemetry is sourced from authenticated, maker-order-correlated trade
 history rather than inferred from position changes. Paper mode simulates fills
 when the touch crosses a quote, so position, inventory skew, and PnL telemetry

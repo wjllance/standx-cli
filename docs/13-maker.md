@@ -83,6 +83,8 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--alert-webhook-format` | `slack` | webhook 报文格式：`slack` / `feishu` / `telegram` / `raw` |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
+| `--order-response-reconnect-attempts` | `3` | 单次 maker run 内订单回报流的安全重连总预算；每次先清理、换 session 并对账，`0` 禁用 |
+| `--order-response-reconnect-backoff` | `2` | 安全重连基础退避秒数，后续失败按上限递增 |
 
 启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`；主动退出必须同时设置百分比与数量。
 
@@ -253,9 +255,12 @@ live 模式的安全栏：
 - **机器人接管该交易对的全部挂单**：手动挂的单会被当作 stale 撤掉。
 - **拒单容错**：post-only 穿价拒单、撤已成交单等属正常事件（记录后下轮重报），不计入 fail-safe；只有网络/5xx 等瞬时故障才计数。
 - **部分成交容忍**:部分成交的挂单保留剩余部分继续挂,不会被误撤。
-- **fail-safe 停机**：订单回报 WebSocket 断开或报错时立即停机，并记录 close code、
-  close reason 或底层 WebSocket 错误；其他瞬时 cycle 错误连续 3 次后停机。两种路径
-  都会进入 maker 自有订单清理。
+- **订单回报安全重连**：WebSocket 断开或报错后立即停止新下单，记录 close code、
+  close reason 或底层错误，清理并验证 maker 空簿；随后使用新 session 认证，并重新
+  查询挂单、仓位、已成交订单及会话成交。只有全部对账通过才恢复报价。
+- **fail-safe 停机**：安全重连关闭、预算耗尽、清理/对账失败，或连续 3 次其他瞬时
+  cycle 错误时停机并再次清理。`--controlled-disconnect-after` 仍强制走停机演练，
+  不会因重连而变成持续实盘。
 - **退出必清理**:所有退出路径都会 cancel-all(3 次重试 + 校验),有残留会大字告警并给出手动撤单命令。
 
 ---
