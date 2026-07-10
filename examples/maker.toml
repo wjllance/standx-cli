@@ -23,11 +23,11 @@ vol_pause_bps = 40.0
 vol_window = 12
 
 # Alerts and optional active inventory exit (0 disables)
-alert_loss = 50.0 
-alert_inventory_pct = 60.0
+alert_loss = 50.0
+alert_inventory_pct = 80.0
 alert_uptime = 70.0
-inventory_exit_pct = 75.0
-inventory_exit_qty = 0.002
+inventory_exit_pct = 0.0
+inventory_exit_qty = 0.0
 
 # Use REST market polling instead of the WebSocket feed (normally false)
 no_ws = false

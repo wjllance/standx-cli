@@ -434,6 +434,147 @@ impl VolBreaker {
     }
 }
 
+/// Market data required to make one maker decision.
+///
+/// This intentionally contains only plain values so it can be recorded and
+/// replayed without a client, websocket, or clock.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketSnapshot {
+    pub mark: f64,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+}
+
+/// Why the strategy refused to make a decision for a market snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CycleSkip {
+    /// Mark and book mid disagree enough that either source may be stale.
+    MarkMidDivergence { divergence_bps: f64 },
+    /// A live maker cannot safely enforce post-only pricing without both sides.
+    MissingTouch,
+}
+
+/// Result of the checks that must run before any account or order I/O.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CyclePreflight {
+    /// The volatility breaker state after observing this mark.
+    pub halted: bool,
+    /// Present when the caller must skip the whole cycle.
+    pub skip: Option<CycleSkip>,
+}
+
+/// Observe volatility and validate a snapshot before account/order I/O.
+///
+/// A skipped cycle deliberately leaves resting quotes untouched. This mirrors
+/// the existing fail-safe behavior: bad market data must not trigger a blind
+/// cancel-and-replace sequence.
+pub fn preflight_cycle(
+    breaker: &mut VolBreaker,
+    market: MarketSnapshot,
+    max_divergence_bps: f64,
+    require_full_touch: bool,
+) -> CyclePreflight {
+    let halted = breaker.observe(market.mark);
+    if let (Some(best_bid), Some(best_ask)) = (market.best_bid, market.best_ask) {
+        let divergence_bps = mark_mid_divergence_bps(market.mark, best_bid, best_ask);
+        if divergence_bps > max_divergence_bps {
+            return CyclePreflight {
+                halted,
+                skip: Some(CycleSkip::MarkMidDivergence { divergence_bps }),
+            };
+        }
+    }
+    if require_full_touch && (market.best_bid.is_none() || market.best_ask.is_none()) {
+        return CyclePreflight {
+            halted,
+            skip: Some(CycleSkip::MissingTouch),
+        };
+    }
+    CyclePreflight { halted, skip: None }
+}
+
+/// Inputs owned by the strategy for one post-account-sync decision.
+#[derive(Debug, Clone, Copy)]
+pub struct CycleInput<'a> {
+    pub cycle: u64,
+    pub market: MarketSnapshot,
+    pub position: f64,
+    pub resting: &'a [RestingQuote],
+    /// Submitted orders that have not become visible in the venue order book.
+    pub pending_slots: &'a [(OrderSide, u32)],
+    pub active_exit_enabled: bool,
+    pub inventory_exit_pct: f64,
+    pub inventory_exit_qty: f64,
+}
+
+/// A deterministic plan for the executor to apply after a successful preflight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CyclePlan {
+    /// The configured exit request before volatility policy is applied.
+    /// Callers use this to track venue confirmation and avoid duplicate exits.
+    pub requested_inventory_exit: Option<InventoryExit>,
+    /// The active exit to submit this cycle. A volatility halt always suppresses it.
+    pub inventory_exit: Option<InventoryExit>,
+    /// Cancels, places, and holds in executor-safe order.
+    pub actions: Vec<Action>,
+    /// Anchor used for any newly submitted quote.
+    pub ref_center: f64,
+}
+
+/// Build a deterministic quote/exit plan after the caller has synchronized
+/// position and resting orders with the venue.
+///
+/// The caller owns transport state (pending HTTP submissions and exit
+/// acknowledgements) and must run [`preflight_cycle`] first. This function
+/// deliberately cannot perform I/O.
+pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> CyclePlan {
+    let requested_inventory_exit = input
+        .active_exit_enabled
+        .then(|| {
+            inventory_exit_plan(
+                input.position,
+                cfg.max_position,
+                input.inventory_exit_pct,
+                input.inventory_exit_qty,
+            )
+        })
+        .flatten();
+
+    // During a volatility halt, pull resting liquidity but never send an
+    // opt-in taker exit: emergency execution needs a separate explicit policy.
+    let inventory_exit = (!halted)
+        .then_some(requested_inventory_exit.clone())
+        .flatten();
+    let desired = if halted || inventory_exit.is_some() {
+        Vec::new()
+    } else {
+        let raw = compute_desired_quotes(
+            cfg,
+            input.market.mark,
+            input.market.best_bid,
+            input.market.best_ask,
+            input.position,
+        );
+        cap_desired_exposure(cfg, input.position, &raw, input.pending_slots)
+    };
+
+    CyclePlan {
+        requested_inventory_exit,
+        inventory_exit,
+        actions: reconcile(
+            cfg,
+            input.market.mark,
+            input.position,
+            input.market.best_bid,
+            input.market.best_ask,
+            &desired,
+            input.resting,
+            input.cycle,
+        ),
+        ref_center: skew_center(cfg, input.market.mark, input.position),
+    }
+}
+
 /// A risk alert raised (or cleared) by [`AlertMonitor`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Alert {
@@ -1568,6 +1709,120 @@ mod tests {
         b.observe(100.25);
         let halted = b.observe(100.25); // window {100.5,100.25,100.25} range 25bps
         assert!(halted, "should stay halted in the hysteresis band");
+    }
+
+    #[test]
+    fn preflight_skips_divergent_or_incomplete_live_books() {
+        let mut breaker = VolBreaker::new(3, 0.0);
+        let divergent = preflight_cycle(
+            &mut breaker,
+            MarketSnapshot {
+                mark: 100.0,
+                best_bid: Some(90.0),
+                best_ask: Some(90.1),
+            },
+            10.0,
+            true,
+        );
+        assert!(matches!(
+            divergent.skip,
+            Some(CycleSkip::MarkMidDivergence { divergence_bps }) if divergence_bps > 10.0
+        ));
+
+        let incomplete = preflight_cycle(
+            &mut breaker,
+            MarketSnapshot {
+                mark: 100.0,
+                best_bid: Some(99.9),
+                best_ask: None,
+            },
+            10.0,
+            true,
+        );
+        assert_eq!(incomplete.skip, Some(CycleSkip::MissingTouch));
+    }
+
+    #[test]
+    fn cycle_plan_pulls_quotes_for_exit_and_suppresses_exit_during_vol_halt() {
+        let c = cfg();
+        let resting = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
+        let input = CycleInput {
+            cycle: 1,
+            market: MarketSnapshot {
+                mark: 100.0,
+                best_bid: Some(99.8),
+                best_ask: Some(100.2),
+            },
+            position: c.max_position,
+            resting: &resting,
+            pending_slots: &[],
+            active_exit_enabled: true,
+            inventory_exit_pct: 80.0,
+            inventory_exit_qty: 0.01,
+        };
+
+        let exit_plan = plan_cycle(&c, input, false);
+        assert_eq!(
+            exit_plan.requested_inventory_exit,
+            Some(InventoryExit {
+                side: OrderSide::Sell,
+                qty: 0.01,
+            })
+        );
+        assert_eq!(exit_plan.inventory_exit, exit_plan.requested_inventory_exit);
+        assert!(exit_plan
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Cancel { .. })));
+        assert!(!exit_plan
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(_))));
+
+        let halted_plan = plan_cycle(&c, input, true);
+        assert_eq!(
+            halted_plan.requested_inventory_exit,
+            exit_plan.requested_inventory_exit
+        );
+        assert_eq!(halted_plan.inventory_exit, None);
+    }
+
+    #[test]
+    fn cycle_plan_reserves_delayed_places_and_caps_directional_exposure() {
+        let mut c = cfg();
+        c.levels = 2;
+        c.max_position = 0.015;
+        let pending_slots = [(OrderSide::Buy, 0)];
+        let plan = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 4,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.9),
+                    best_ask: Some(100.1),
+                },
+                // The pending 0.01 buy already reserves more than the 0.005
+                // remaining long-inventory budget.
+                position: 0.01,
+                resting: &[],
+                pending_slots: &pending_slots,
+                active_exit_enabled: false,
+                inventory_exit_pct: 0.0,
+                inventory_exit_qty: 0.0,
+            },
+            false,
+        );
+
+        let buy_places = plan
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Place(quote) if quote.side == OrderSide::Buy => Some(quote),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(buy_places.is_empty());
     }
 
     // 28. Alert monitor: disabled emits nothing.
