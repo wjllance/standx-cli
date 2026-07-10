@@ -1,5 +1,8 @@
 use crate::cli::*;
 use anyhow::Result;
+use standx_maker::{
+    self as maker, Alert, AlertMonitor, MakerConfig, MakerStats, RestingQuote, VolBreaker,
+};
 use standx_sdk::auth::Credentials;
 use standx_sdk::client::StandXClient;
 use standx_sdk::error::Error as StandxError;
@@ -225,7 +228,7 @@ async fn notify_lifecycle(
 
 #[allow(clippy::too_many_arguments)]
 fn deliver_alert(
-    alert: &standx_sdk::maker::Alert,
+    alert: &Alert,
     symbol: &str,
     output_format: OutputFormat,
     http: Option<&reqwest::Client>,
@@ -360,7 +363,6 @@ struct MakerRunArgs {
 }
 
 async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
-    use standx_sdk::maker::{self, MakerConfig, RestingQuote};
     use standx_sdk::order_response::OrderResponseStream;
 
     let order_session_id = args.live.then(|| uuid::Uuid::new_v4().to_string());
@@ -628,10 +630,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_fills: u64 = 0;
     let mut total_halted: u64 = 0;
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
-    let mut stats = maker::MakerStats::default();
-    let mut breaker = maker::VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
+    let mut stats = MakerStats::default();
+    let mut breaker = VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut alerts =
-        maker::AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
+        AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
 

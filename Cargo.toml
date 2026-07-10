@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/standx-sdk", "crates/standx-cli"]
+members = ["crates/standx-sdk", "crates/standx-maker", "crates/standx-cli"]
 
 [workspace.package]
 edition = "2021"
