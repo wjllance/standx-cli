@@ -102,7 +102,9 @@ pub(super) async fn market_snapshot(
             |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() < WS_STALE_AFTER);
         if fresh(s.mark_at) && fresh(s.book_at) {
             if let Some(mark) = s.mark {
-                return Ok((mark, s.best_bid, s.best_ask, "ws"));
+                if let Ok(snapshot) = validated_snapshot(mark, s.best_bid, s.best_ask, "ws") {
+                    return Ok(snapshot);
+                }
             }
         }
     }
@@ -119,5 +121,49 @@ pub(super) async fn market_snapshot(
         .map_err(|_| anyhow::anyhow!("unparseable mark price: {}", price.mark_price))?;
     let best_bid: Option<f64> = depth.best_bid().and_then(|s| s.parse().ok());
     let best_ask: Option<f64> = depth.best_ask().and_then(|s| s.parse().ok());
-    Ok((mark, best_bid, best_ask, "rest"))
+    validated_snapshot(mark, best_bid, best_ask, "rest")
+}
+
+fn validated_snapshot(
+    mark: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    source: &'static str,
+) -> Result<(f64, Option<f64>, Option<f64>, &'static str)> {
+    if !mark.is_finite() || mark <= 0.0 {
+        return Err(anyhow::anyhow!("invalid mark price from {source}: {mark}"));
+    }
+    if best_bid.is_some_and(|price| !price.is_finite() || price <= 0.0) {
+        return Err(anyhow::anyhow!("invalid best bid from {source}"));
+    }
+    if best_ask.is_some_and(|price| !price.is_finite() || price <= 0.0) {
+        return Err(anyhow::anyhow!("invalid best ask from {source}"));
+    }
+    if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+        if bid >= ask {
+            return Err(anyhow::anyhow!(
+                "crossed order book from {source}: bid {bid} >= ask {ask}"
+            ));
+        }
+    }
+
+    Ok((mark, best_bid, best_ask, source))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_validation_accepts_valid_and_one_sided_books() {
+        assert!(validated_snapshot(100.0, Some(99.9), Some(100.1), "test").is_ok());
+        assert!(validated_snapshot(100.0, Some(99.9), None, "test").is_ok());
+    }
+
+    #[test]
+    fn snapshot_validation_rejects_non_finite_and_crossed_books() {
+        assert!(validated_snapshot(f64::NAN, Some(99.9), Some(100.1), "test").is_err());
+        assert!(validated_snapshot(100.0, Some(f64::INFINITY), Some(100.1), "test").is_err());
+        assert!(validated_snapshot(100.0, Some(100.1), Some(100.1), "test").is_err());
+    }
 }

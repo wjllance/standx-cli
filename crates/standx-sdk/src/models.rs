@@ -176,12 +176,26 @@ pub struct OrderBook {
 impl OrderBook {
     /// Get best bid price
     pub fn best_bid(&self) -> Option<&str> {
-        self.bids.first().map(|b| b[0].as_str())
+        self.bids
+            .iter()
+            .filter_map(|level| {
+                let price = level[0].parse::<f64>().ok()?;
+                (price.is_finite() && price > 0.0).then_some((price, level[0].as_str()))
+            })
+            .max_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, price)| price)
     }
 
     /// Get best ask price
     pub fn best_ask(&self) -> Option<&str> {
-        self.asks.first().map(|a| a[0].as_str())
+        self.asks
+            .iter()
+            .filter_map(|level| {
+                let price = level[0].parse::<f64>().ok()?;
+                (price.is_finite() && price > 0.0).then_some((price, level[0].as_str()))
+            })
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, price)| price)
     }
 
     /// Get spread between best bid and ask
@@ -919,22 +933,23 @@ mod tests {
     #[test]
     fn test_order_book_sorting() {
         // Server might return unsorted data
-        let _book = OrderBook {
+        let book = OrderBook {
             symbol: "BTC-USD".to_string(),
             bids: vec![
                 ["67900".to_string(), "2.0".to_string()],
+                ["not-a-price".to_string(), "9.0".to_string()],
                 ["68000".to_string(), "1.0".to_string()],
             ],
             asks: vec![
                 ["68200".to_string(), "1.0".to_string()],
+                ["NaN".to_string(), "9.0".to_string()],
                 ["68100".to_string(), "0.5".to_string()],
             ],
             timestamp: "2026-01-01T00:00:00Z".to_string(),
         };
 
-        // Client should sort: bids descending, asks ascending
-        // Note: This test documents expected behavior
-        // In actual implementation, sorting would happen in the client
+        assert_eq!(book.best_bid(), Some("68000"));
+        assert_eq!(book.best_ask(), Some("68100"));
     }
 
     #[test]
