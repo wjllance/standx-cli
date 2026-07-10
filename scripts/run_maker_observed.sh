@@ -43,12 +43,17 @@ stdout_log="$log_dir/$run_id.ndjson"
 stderr_log="$log_dir/$run_id.stderr.log"
 pipe_dir=""
 child_pid=""
+uploader_pid=""
 
 mkdir -p "$log_dir"
 pipe_dir="$(mktemp -d "$log_dir/.pipes.XXXXXX")"
 mkfifo "$pipe_dir/stdout" "$pipe_dir/stderr"
 
 cleanup() {
+  if [[ -n "$uploader_pid" ]] && kill -0 "$uploader_pid" 2>/dev/null; then
+    kill -TERM "$uploader_pid" 2>/dev/null || true
+    wait "$uploader_pid" 2>/dev/null || true
+  fi
   [[ -n "$pipe_dir" && -d "$pipe_dir" ]] && rm -rf "$pipe_dir"
 }
 
@@ -63,10 +68,40 @@ trap cleanup EXIT
 trap 'forward_signal INT' INT
 trap 'forward_signal TERM' TERM
 
+: >"$stdout_log"
+: >"$stderr_log"
+
 tee "$stdout_log" <"$pipe_dir/stdout" &
 stdout_tee_pid=$!
 tee "$stderr_log" <"$pipe_dir/stderr" >&2 &
 stderr_tee_pid=$!
+
+git_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || true)"
+config_hash=""
+if [[ -n "$config_file" && -f "$config_file" ]]; then
+  config_hash="$(shasum -a 256 "$config_file" | awk '{print $1}')"
+fi
+
+if [[ "${OPENOBSERVE_AUTO_UPLOAD:-0}" == "1" ]]; then
+  if [[ -z "${OPENOBSERVE_USER:-}" || -z "${OPENOBSERVE_PASSWORD:-}" ]]; then
+    printf 'OpenObserve live upload skipped: credentials are not exported\n' >&2
+  else
+    upload_args=(
+      "$script_dir/openobserve_ingest.py" "$stdout_log"
+      --run-id "$run_id"
+      --incremental
+      --follow
+      --preflight
+      --poll-interval "${OPENOBSERVE_UPLOAD_INTERVAL:-2}"
+    )
+    [[ -n "$git_sha" ]] && upload_args+=(--git-sha "$git_sha")
+    [[ -n "$config_hash" ]] && upload_args+=(--config-hash "$config_hash")
+    python3 "${upload_args[@]}" >&2 &
+    uploader_pid=$!
+    printf 'OpenObserve live uploader starting: run_id=%s interval=%ss\n' \
+      "$run_id" "${OPENOBSERVE_UPLOAD_INTERVAL:-2}" >&2
+  fi
+fi
 
 "${args[@]}" >"$pipe_dir/stdout" 2>"$pipe_dir/stderr" &
 child_pid=$!
@@ -75,23 +110,28 @@ child_status=$?
 wait "$stdout_tee_pid" || true
 wait "$stderr_tee_pid" || true
 
-git_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || true)"
-config_hash=""
-if [[ -n "$config_file" && -f "$config_file" ]]; then
-  config_hash="$(shasum -a 256 "$config_file" | awk '{print $1}')"
-fi
-
 printf 'maker run_id=%s exit=%s stdout=%s stderr=%s\n' \
   "$run_id" "$child_status" "$stdout_log" "$stderr_log" >&2
 
-if [[ "${OPENOBSERVE_AUTO_UPLOAD:-0}" == "1" ]]; then
-  if [[ -z "${OPENOBSERVE_USER:-}" || -z "${OPENOBSERVE_PASSWORD:-}" ]]; then
-    printf 'OpenObserve upload skipped: credentials are not exported\n' >&2
-  else
-    upload_args=("$script_dir/openobserve_ingest.py" "$stdout_log" --run-id "$run_id")
-    [[ -n "$git_sha" ]] && upload_args+=(--git-sha "$git_sha")
-    [[ -n "$config_hash" ]] && upload_args+=(--config-hash "$config_hash")
-    python3 "${upload_args[@]}" || printf 'OpenObserve upload failed; raw logs are intact\n' >&2
+if [[ -n "$uploader_pid" ]]; then
+  uploader_status=0
+  if kill -0 "$uploader_pid" 2>/dev/null; then
+    kill -TERM "$uploader_pid" 2>/dev/null || true
+  fi
+  wait "$uploader_pid" || uploader_status=$?
+  uploader_pid=""
+  if ((uploader_status != 0)); then
+    printf 'OpenObserve live uploader exited with status %s; attempting final catch-up\n' \
+      "$uploader_status" >&2
+    final_upload_args=(
+      "$script_dir/openobserve_ingest.py" "$stdout_log"
+      --run-id "$run_id"
+      --incremental
+    )
+    [[ -n "$git_sha" ]] && final_upload_args+=(--git-sha "$git_sha")
+    [[ -n "$config_hash" ]] && final_upload_args+=(--config-hash "$config_hash")
+    python3 "${final_upload_args[@]}" >&2 || \
+      printf 'OpenObserve final upload failed; raw logs are intact\n' >&2
   fi
 fi
 

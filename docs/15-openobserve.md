@@ -1,8 +1,9 @@
 # OpenObserve maker 日志
 
 这是面向单机、小规模 maker 的最小日志方案。maker 的 stdout 先完整写入本地
-NDJSON，stderr 单独保存；maker 退出后再批量上传 OpenObserve。远端不可用时，
-原始日志仍保留，上传错误不会改变 maker 的退出状态，也不会进入报价循环。
+NDJSON，stderr 单独保存；启用自动上传后，运行期间按 checkpoint 增量上传，退出时
+再做一次最终补传。远端不可用时，原始日志仍保留，上传错误不会改变 maker 的退出
+状态，也不会进入报价循环。
 
 ## 1. 启动本地 OpenObserve
 
@@ -30,6 +31,9 @@ make openobserve-down
 set -a
 source deploy/openobserve/.env
 set +a
+export OPENOBSERVE_AUTO_UPLOAD=1
+# 可选，默认每 2 秒上传一次新增事件
+export OPENOBSERVE_UPLOAD_INTERVAL=2
 ```
 
 纸面示例：
@@ -46,7 +50,20 @@ scripts/run_maker_observed.sh \
 2. 将 stdout 写入 `var/standx/<run_id>.ndjson`。
 3. 将 stderr 写入 `var/standx/<run_id>.stderr.log`，同时保留终端显示。
 4. 转发 Ctrl+C/TERM 给 maker，并等待 lifecycle/cleanup 日志写完。
-5. maker 退出后，若 `OPENOBSERVE_AUTO_UPLOAD=1`，上传完整 NDJSON。
+5. 若 `OPENOBSERVE_AUTO_UPLOAD=1`，启动时验证 OpenObserve 连接，运行期间持续增量上传。
+6. maker 退出后等待 lifecycle/cleanup 落盘，再做最终补传。
+
+终端看到以下信息表示启动检查和实时上传正常：
+
+```text
+OpenObserve live uploader starting: run_id=... interval=2s
+OpenObserve preflight ok: org=default stream=standx_maker
+OpenObserve live upload: run_id=... uploaded=... checkpoint=...
+```
+
+上传失败只会输出 warning；checkpoint 不前移，网络恢复后自动补传，本地 maker 不停机。
+Dashboard 页面需要选择包含当前时间的范围，并把自动刷新设为 `5s`（或手动点击刷新），
+即可在 maker 运行期间看到新增周期、成交和告警。
 
 实盘仍需显式 `--live --yes`，采集脚本不会自行开启实盘，也不会读取或上传
 `STANDX_JWT`、`STANDX_PRIVATE_KEY`。OpenObserve 密码通过环境变量传入，不出现在
@@ -77,6 +94,11 @@ python3 scripts/openobserve_ingest.py \
 - `source_file`
 - `_timestamp`
 - `git_sha`、`config_hash`（包装器可获取时）
+
+实时模式使用稳定的 `run_id + 行号` 生成 `event_id`，文件增长不会改变已经上传事件的
+身份，正常反复扫描不会重复发送。若 HTTP 已写入但响应丢失，at-least-once 重试仍可能
+产生相同 `event_id` 的重复行，分析查询应继续使用 `count(DISTINCT event_id)`。手工导入
+已结束的不可变日志仍保持原有的文件哈希 checkpoint 语义。
 
 JWT、private key、token、password、authorization、webhook 等字段在上传前会递归
 替换为 `[REDACTED]`。原始本地文件不被修改。
