@@ -64,6 +64,55 @@ pub struct DesiredQuote {
     pub qty: f64,
 }
 
+/// A deliberate inventory-reducing order. Execution is kept outside this pure
+/// strategy module so callers can first cancel conflicting maker quotes and
+/// enforce venue-specific reduce-only semantics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InventoryExit {
+    /// Opposite the current position: sell a long, buy a short.
+    pub side: OrderSide,
+    /// Never exceeds the current absolute position or the configured chunk.
+    pub qty: f64,
+}
+
+/// Decide whether inventory has reached an explicit active-exit threshold.
+///
+/// A zero threshold or chunk disables active exit. The threshold is expressed
+/// as a percentage of `max_position`; values over 100 are invalid/disabled so
+/// a typo cannot create a surprising late exit. The result is only a plan —
+/// callers must cancel stale quotes and submit a reduce-only order separately.
+pub fn inventory_exit_plan(
+    position: f64,
+    max_position: f64,
+    trigger_pct: f64,
+    chunk_qty: f64,
+) -> Option<InventoryExit> {
+    if !position.is_finite()
+        || !max_position.is_finite()
+        || !trigger_pct.is_finite()
+        || !chunk_qty.is_finite()
+        || max_position <= 0.0
+        || trigger_pct <= 0.0
+        || trigger_pct > 100.0
+        || chunk_qty <= 0.0
+    {
+        return None;
+    }
+
+    let abs_position = position.abs();
+    if abs_position + f64::EPSILON < max_position * trigger_pct / 100.0 {
+        return None;
+    }
+    Some(InventoryExit {
+        side: if position > 0.0 {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        },
+        qty: abs_position.min(chunk_qty),
+    })
+}
+
 /// A quote currently resting (a real order in live mode, simulated in paper
 /// mode).
 #[derive(Debug, Clone)]
@@ -820,6 +869,27 @@ mod tests {
             .iter()
             .find(|q| q.side == side && q.level == level)
             .expect("quote missing")
+    }
+
+    #[test]
+    fn inventory_exit_plan_is_explicit_capped_and_reducing() {
+        assert_eq!(
+            inventory_exit_plan(0.04, 0.05, 80.0, 0.015),
+            Some(InventoryExit {
+                side: OrderSide::Sell,
+                qty: 0.015,
+            })
+        );
+        assert_eq!(
+            inventory_exit_plan(-0.05, 0.05, 80.0, 0.10),
+            Some(InventoryExit {
+                side: OrderSide::Buy,
+                qty: 0.05,
+            })
+        );
+        assert_eq!(inventory_exit_plan(0.039, 0.05, 80.0, 0.01), None);
+        assert_eq!(inventory_exit_plan(0.05, 0.05, 0.0, 0.01), None);
+        assert_eq!(inventory_exit_plan(0.05, 0.05, 101.0, 0.01), None);
     }
 
     // 1. Basic two-sided quoting.
