@@ -1,5 +1,8 @@
 use super::output::{emit_maker_cycle, log_maker_event};
-use super::{is_order_rejection, open_qty_adopts, PendingPlace};
+use super::{
+    is_maker_order, is_order_rejection, open_qty_adopts, pending_covers_slot, PendingPlace,
+    MAKER_CL_ORD_ID_PREFIX,
+};
 use crate::cli::*;
 use anyhow::Result;
 use standx_sdk::client::order::CreateOrderParams;
@@ -106,6 +109,7 @@ pub(super) async fn maker_cycle(
         let tick = cfg.price_tick();
         *resting = orders
             .into_iter()
+            .filter(is_maker_order)
             .map(|o| {
                 let price: f64 = o.price.parse().unwrap_or(0.0);
                 let qty: f64 = o.qty.parse().unwrap_or(0.0);
@@ -135,9 +139,10 @@ pub(super) async fn maker_cycle(
                                 let p = pending.remove(idx);
                                 (p.level, p.ref_center, p.cycle)
                             }
-                            // Unknown order (manual or unmatched): sentinel
-                            // level so reconcile cancels it as stale — the
-                            // bot owns all orders on this symbol.
+                            // An older maker order without in-memory state:
+                            // sentinel level makes reconciliation replace it.
+                            // Manual orders were filtered above and cannot
+                            // enter the strategy state.
                             None => (u32::MAX, mark, cycle),
                         };
                         adopted.insert(o.id.clone(), meta);
@@ -192,6 +197,30 @@ pub(super) async fn maker_cycle(
     let actions = reconcile(
         cfg, mark, position, best_bid, best_ask, &desired, resting, cycle,
     );
+    // The pure reconciler intentionally knows nothing about transport state.
+    // Remove desired placements whose slots are still reserved by an HTTP
+    // submission before both execution and telemetry, so output never claims
+    // a duplicate place occurred.
+    let actions: Vec<Action> = actions
+        .into_iter()
+        .filter(|action| match action {
+            Action::Place(q) if live && pending_covers_slot(pending, q.side, q.level) => {
+                log_maker_event(
+                    output_format,
+                    symbol,
+                    cycle,
+                    "place_pending",
+                    q.side,
+                    q.level,
+                    q.price,
+                    cfg.price_decimals,
+                    "awaiting asynchronous order confirmation",
+                );
+                false
+            }
+            _ => true,
+        })
+        .collect();
 
     // The quote center these places are built around — the anti-flicker
     // anchor stored on each placed quote (equals mark when skew is off).
@@ -247,7 +276,7 @@ pub(super) async fn maker_cycle(
             }
             Action::Place(q) => {
                 if live {
-                    let cl_ord_id = format!("sxmk-{}", uuid::Uuid::new_v4());
+                    let cl_ord_id = format!("{}{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
                     match client
                         .create_order(CreateOrderParams {
                             symbol: symbol.to_string(),
@@ -339,25 +368,43 @@ pub(super) async fn maker_cycle(
     Ok((places, cancels, holds, fills.len() as u64))
 }
 
-/// Cancel-all with retries; verifies the book is actually clean afterwards.
-pub(super) async fn cancel_all_with_retry(
+/// Cancel maker-owned orders with retries, preserving manual/API orders.
+pub(super) async fn cancel_maker_orders_with_retry(
     client: &StandXClient,
     symbol: &str,
     attempts: u32,
 ) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=attempts {
-        match client.cancel_all_orders(symbol).await {
+        let result = async {
+            let orders = client.get_open_orders(Some(symbol)).await?;
+            let order_ids = orders
+                .iter()
+                .filter(|order| is_maker_order(order))
+                .map(|order| {
+                    order.id.parse::<i64>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "maker-owned order has non-integer exchange ID '{}'",
+                            order.id
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            client.cancel_orders(&order_ids).await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match result {
             Ok(()) => {
                 last_err = None;
                 break;
             }
             Err(e) => {
                 eprintln!(
-                    "⚠️  cancel-all attempt {}/{} failed: {}",
+                    "⚠️  maker-order cancellation attempt {}/{} failed: {}",
                     attempt, attempts, e
                 );
-                last_err = Some(e.into());
+                last_err = Some(e);
                 if attempt < attempts {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                 }
@@ -365,16 +412,21 @@ pub(super) async fn cancel_all_with_retry(
         }
     }
 
-    // Verify: a failed cancel leaves live orders unattended.
+    // Verify only maker-owned orders. Foreign orders are intentionally left
+    // untouched and must not turn a clean maker shutdown into an error.
     match client.get_open_orders(Some(symbol)).await {
-        Ok(orders) if orders.is_empty() => {
-            println!("✅ All {} orders cancelled", symbol);
+        Ok(orders) if orders.iter().all(|order| !is_maker_order(order)) => {
+            println!("✅ All maker-owned {} orders cancelled", symbol);
             Ok(())
         }
         Ok(orders) => {
-            let ids: Vec<_> = orders.iter().map(|o| o.id.as_str()).collect();
+            let ids: Vec<_> = orders
+                .iter()
+                .filter(|order| is_maker_order(order))
+                .map(|order| order.id.as_str())
+                .collect();
             Err(anyhow::anyhow!(
-                "⚠️  RESIDUAL ORDERS on {} after cancel-all: [{}] — cancel manually with 'standx order cancel-all {}'",
+                "⚠️  RESIDUAL MAKER ORDERS on {} after cancellation: [{}] — inspect or cancel manually with 'standx order cancel-all {}'",
                 symbol,
                 ids.join(", "),
                 symbol
@@ -382,12 +434,12 @@ pub(super) async fn cancel_all_with_retry(
         }
         Err(e) => match last_err {
             Some(cancel_err) => Err(anyhow::anyhow!(
-                "cancel-all failed ({}) and verification failed ({}) — check open orders manually",
+                "maker-order cancellation failed ({}) and verification failed ({}) — check open orders manually",
                 cancel_err,
                 e
             )),
             None => Err(anyhow::anyhow!(
-                "cancel-all succeeded but verification failed ({}) — check open orders manually",
+                "maker-order cancellation succeeded but verification failed ({}) — check open orders manually",
                 e
             )),
         },
