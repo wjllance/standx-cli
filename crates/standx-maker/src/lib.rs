@@ -15,7 +15,7 @@
 //! ad-hoc f64 math on the API's string values); if symbols with more than ~8
 //! price decimals ever list, revisit with a decimal type.
 
-use crate::models::OrderSide;
+use standx_sdk::models::OrderSide;
 
 /// Static per-run configuration (CLI args + symbol metadata).
 #[derive(Debug, Clone)]

@@ -1,4 +1,5 @@
 use super::*;
+use standx_maker::{self as maker, Action, MakerConfig, MakerStats};
 use standx_sdk::models::OrderSide;
 
 /// Per-cycle output: one human line + indented actions, or JSON lines.
@@ -12,15 +13,15 @@ pub(super) fn emit_maker_cycle(
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     position: f64,
-    actions: &[standx_sdk::maker::Action],
+    actions: &[Action],
     // Paper-mode simulated fills this cycle: (side, price, qty). Empty in live.
     fills: &[(OrderSide, f64, f64)],
-    stats: &standx_sdk::maker::MakerStats,
+    stats: &MakerStats,
     // Some(vol_bps) when the volatility breaker halted quoting this cycle.
     halt_vol_bps: Option<f64>,
-    cfg: &standx_sdk::maker::MakerConfig,
+    cfg: &MakerConfig,
 ) {
-    use standx_sdk::maker::{format_decimals, Action};
+    use maker::format_decimals;
 
     let pnl = stats.pnl(position, mark);
 
@@ -241,7 +242,7 @@ pub(super) fn log_maker_event(
     price_decimals: u32,
     detail: &str,
 ) {
-    use standx_sdk::maker::format_decimals;
+    use maker::format_decimals;
     match output_format {
         OutputFormat::Json => {
             println!(

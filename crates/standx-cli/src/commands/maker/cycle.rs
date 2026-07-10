@@ -5,6 +5,7 @@ use super::{
 };
 use crate::cli::*;
 use anyhow::Result;
+use standx_maker::{self as maker, MakerConfig, MakerStats, RestingQuote, VolBreaker};
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{OrderSide, OrderType, TimeInForce, Trade};
@@ -19,7 +20,7 @@ use std::time::Duration;
 pub(super) async fn maker_cycle(
     client: &StandXClient,
     symbol: &str,
-    cfg: &standx_sdk::maker::MakerConfig,
+    cfg: &MakerConfig,
     live: bool,
     cycle: u64,
     mark: f64,
@@ -28,7 +29,7 @@ pub(super) async fn maker_cycle(
     max_divergence_bps: f64,
     inventory_exit_pct: f64,
     inventory_exit_qty: f64,
-    resting: &mut Vec<standx_sdk::maker::RestingQuote>,
+    resting: &mut Vec<RestingQuote>,
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
     inventory_exit_pending: &mut bool,
@@ -36,12 +37,12 @@ pub(super) async fn maker_cycle(
     seen_fill_ids: &mut HashSet<u64>,
     session_started_at: i64,
     sim_position: &mut f64,
-    stats: &mut standx_sdk::maker::MakerStats,
-    breaker: &mut standx_sdk::maker::VolBreaker,
+    stats: &mut MakerStats,
+    breaker: &mut VolBreaker,
     output_format: OutputFormat,
     order_response_health: Option<&AtomicBool>,
 ) -> Result<(u64, u64, u64, u64)> {
-    use standx_sdk::maker::{
+    use maker::{
         cap_desired_exposure, compute_desired_quotes, format_decimals, mark_mid_divergence_bps,
         paper_quote_filled, reconcile, skew_center, Action, RestingQuote,
     };
@@ -248,7 +249,7 @@ pub(super) async fn maker_cycle(
     //    an empty desired set makes reconcile cancel every resting quote
     //    (pull all liquidity) and place none until volatility subsides.
     let raw_inventory_exit = if live {
-        standx_sdk::maker::inventory_exit_plan(
+        maker::inventory_exit_plan(
             position,
             cfg.max_position,
             inventory_exit_pct,

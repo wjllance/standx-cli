@@ -1861,6 +1861,7 @@ dependencies = [
  "rpassword",
  "serde",
  "serde_json",
+ "standx-maker",
  "standx-sdk",
  "tabled",
  "tempfile",
@@ -1870,6 +1871,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "standx-maker"
+version = "0.1.0"
+dependencies = [
+ "standx-sdk",
 ]
 
 [[package]]

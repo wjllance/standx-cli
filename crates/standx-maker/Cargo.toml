@@ -1,0 +1,12 @@
+[package]
+name = "standx-maker"
+version = "0.1.0"
+description = "Deterministic market-making strategy and risk engine for StandX"
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+standx-sdk = { path = "../standx-sdk", version = "0.1.0" }
