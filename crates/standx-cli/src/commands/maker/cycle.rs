@@ -240,6 +240,7 @@ pub(super) async fn maker_cycle(
                     match client
                         .create_order(CreateOrderParams {
                             symbol: symbol.to_string(),
+                            cl_ord_id: None,
                             side: q.side,
                             order_type: OrderType::Limit,
                             quantity: format_decimals(q.qty, cfg.qty_decimals),

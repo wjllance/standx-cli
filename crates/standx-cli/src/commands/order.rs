@@ -45,6 +45,7 @@ pub async fn handle_order(command: OrderCommands) -> Result<()> {
 
             let params = CreateOrderParams {
                 symbol,
+                cl_ord_id: None,
                 side,
                 order_type,
                 quantity: qty,

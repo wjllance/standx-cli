@@ -425,6 +425,8 @@ pub struct OrderRequest {
 pub struct Order {
     #[serde(deserialize_with = "string_or_number_to_string")]
     pub id: String,
+    #[serde(default)]
+    pub cl_ord_id: Option<String>,
     pub symbol: String,
     #[serde(deserialize_with = "deserialize_order_side")]
     pub side: OrderSide,

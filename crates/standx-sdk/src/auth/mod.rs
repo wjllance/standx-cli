@@ -12,7 +12,6 @@ pub use credentials::Credentials;
 pub struct StandXSigner {
     signing_key: SigningKey,
     verifying_key: VerifyingKey,
-    request_id: String,
 }
 
 /// Request signature headers
@@ -41,18 +40,11 @@ impl StandXSigner {
         })?);
 
         let verifying_key = signing_key.verifying_key();
-        let request_id = hex::encode(verifying_key.as_bytes());
 
         Ok(Self {
             signing_key,
             verifying_key,
-            request_id,
         })
-    }
-
-    /// Get the request ID (hex-encoded public key)
-    pub fn request_id(&self) -> &str {
-        &self.request_id
     }
 
     /// Get the public key in hex format
@@ -60,20 +52,34 @@ impl StandXSigner {
         hex::encode(self.verifying_key.as_bytes())
     }
 
-    /// Sign a request
-    pub fn sign_request(&self, timestamp: u64, payload: &str) -> RequestSignature {
+    /// Sign a request with a caller-provided request ID.
+    ///
+    /// This is useful for deterministic tests and for protocols that need to
+    /// correlate an externally-created UUID with an asynchronous response.
+    pub fn sign_request_with_id(
+        &self,
+        request_id: &str,
+        timestamp: u64,
+        payload: &str,
+    ) -> RequestSignature {
         let version = "v1";
-        let message = format!("{},{},{},{}", version, self.request_id, timestamp, payload);
+        let message = format!("{version},{request_id},{timestamp},{payload}");
 
         let signature = self.signing_key.sign(message.as_bytes());
 
         RequestSignature {
             version: version.to_string(),
-            request_id: self.request_id.clone(),
+            request_id: request_id.to_string(),
             timestamp,
             signature: STANDARD.encode(signature.to_bytes()),
             pubkey: self.pubkey_hex(),
         }
+    }
+
+    /// Sign a request with a fresh UUID request ID.
+    pub fn sign_request(&self, timestamp: u64, payload: &str) -> RequestSignature {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.sign_request_with_id(&request_id, timestamp, payload)
     }
 
     /// Sign a request with the current timestamp
@@ -96,7 +102,6 @@ mod tests {
 
         let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
 
-        assert!(!signer.request_id().is_empty());
         assert!(!signer.pubkey_hex().is_empty());
     }
 
@@ -115,7 +120,7 @@ mod tests {
         assert_eq!(sig.timestamp, 1700000000000);
         assert!(!sig.signature.is_empty());
         assert!(!sig.pubkey.is_empty());
-        assert_eq!(sig.request_id, signer.request_id());
+        assert!(uuid::Uuid::parse_str(&sig.request_id).is_ok());
     }
 
     #[test]
@@ -181,9 +186,10 @@ mod tests {
         let payload = r#"{"symbol":"BTC-USD","side":"buy"}"#;
         let timestamp = 1700000000000u64;
 
-        // Sign same payload twice
-        let sig1 = signer.sign_request(timestamp, payload);
-        let sig2 = signer.sign_request(timestamp, payload);
+        // Sign the same request twice with a fixed correlation ID.
+        let request_id = "6f071beb-1b81-4c68-a8bf-66f1589c2146";
+        let sig1 = signer.sign_request_with_id(request_id, timestamp, payload);
+        let sig2 = signer.sign_request_with_id(request_id, timestamp, payload);
 
         // Same signer should produce same request_id and pubkey
         assert_eq!(sig1.request_id, sig2.request_id);
@@ -191,5 +197,19 @@ mod tests {
 
         // Ed25519 is deterministic, so signatures should be identical
         assert_eq!(sig1.signature, sig2.signature);
+    }
+
+    #[test]
+    fn test_sign_request_uses_unique_uuid() {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let private_key_base58 = bs58::encode(signing_key.to_bytes()).into_string();
+        let signer = StandXSigner::from_base58(&private_key_base58).unwrap();
+
+        let sig1 = signer.sign_request(1700000000000, "{}");
+        let sig2 = signer.sign_request(1700000000000, "{}");
+
+        assert_ne!(sig1.request_id, sig2.request_id);
+        assert!(uuid::Uuid::parse_str(&sig1.request_id).is_ok());
+        assert!(uuid::Uuid::parse_str(&sig2.request_id).is_ok());
     }
 }

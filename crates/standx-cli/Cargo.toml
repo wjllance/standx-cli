@@ -50,7 +50,7 @@ chrono.workspace = true
 dirs.workspace = true
 rpassword = "7.3"
 regex = "1.10"
-uuid = { version = "1.7", features = ["v4"] }
+uuid.workspace = true
 
 [dev-dependencies]
 tokio-test = "0.4"
