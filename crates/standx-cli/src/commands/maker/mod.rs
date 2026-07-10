@@ -6,6 +6,7 @@ use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide};
 use standx_sdk::order_response::OrderResponse;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::signal;
 
@@ -73,8 +74,17 @@ fn apply_order_responses(
     symbol: &str,
     cycle: u64,
     price_decimals: u32,
-) {
-    while let Ok(response) = receiver.try_recv() {
+) -> Result<()> {
+    loop {
+        let response = match receiver.try_recv() {
+            Ok(response) => response,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return Err(anyhow::anyhow!(
+                    "order-response stream disconnected; refusing further live orders"
+                ));
+            }
+        };
         let Some(request_id) = response.request_id.as_deref() else {
             continue;
         };
@@ -424,6 +434,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 
     // ---- Live gating & clean start ----
     let mut order_responses = None;
+    let mut order_response_health = None;
     let mut order_response_handle = None;
     if args.live {
         if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
@@ -464,8 +475,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 .as_deref()
                 .expect("live maker must have an order session"),
         )?;
-        let (responses, handle) = stream.connect().await?;
+        let (responses, health, handle) = stream.connect().await?;
         order_responses = Some(responses);
+        order_response_health = Some(health);
         order_response_handle = Some(handle);
     }
 
@@ -591,15 +603,26 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut last_src: Option<&'static str> = None;
 
     let exit = 'main: loop {
+        if args.live
+            && !order_response_health
+                .as_ref()
+                .is_some_and(|health| health.load(Ordering::Acquire))
+        {
+            break MakerExit::FailSafe(
+                "order-response stream is unhealthy; refusing further live orders".to_string(),
+            );
+        }
         if let Some(receiver) = order_responses.as_mut() {
-            apply_order_responses(
+            if let Err(error) = apply_order_responses(
                 receiver,
                 &mut pending,
                 output_format,
                 &symbol,
                 cycle,
                 cfg.price_decimals,
-            );
+            ) {
+                break MakerExit::FailSafe(error.to_string());
+            }
         }
 
         // Work phase raced against Ctrl+C so a slow API call can be
@@ -624,6 +647,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut stats,
                 &mut breaker,
                 output_format,
+                order_response_health.as_deref(),
             )
             .await?;
             Ok::<_, anyhow::Error>((places, cancels, holds, fills, mark, src, breaker.halted()))
@@ -936,7 +960,8 @@ mod tests {
             "BTC-USD",
             2,
             2,
-        );
+        )
+        .unwrap();
 
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request_id, "request-2");
@@ -970,8 +995,28 @@ mod tests {
             "BTC-USD",
             2,
             2,
-        );
+        )
+        .unwrap();
 
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn disconnected_order_response_stream_is_fail_closed() {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        drop(sender);
+        let mut pending = Vec::new();
+
+        let error = apply_order_responses(
+            &mut receiver,
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("disconnected"));
     }
 }
