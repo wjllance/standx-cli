@@ -123,22 +123,7 @@ impl Telemetry {
     /// Track command execution start
     pub fn track_command_start(&mut self, command: &str, args: &[String]) {
         self.command_start = Some(Instant::now());
-
-        // Sanitize args - remove sensitive data
-        let sanitized_args: Vec<String> = args
-            .iter()
-            .map(|arg| {
-                // Hide potential sensitive values after certain flags
-                if arg.starts_with("--private-key")
-                    || arg.starts_with("--token")
-                    || arg.starts_with("-p")
-                {
-                    format!("{}=***", arg.split('=').next().unwrap_or(arg))
-                } else {
-                    arg.clone()
-                }
-            })
-            .collect();
+        let sanitized_args = sanitize_args(args);
 
         self.track_event(
             EventType::CommandStarted,
@@ -227,6 +212,41 @@ impl Telemetry {
     }
 }
 
+/// Redact secrets from CLI argv while preserving the flag names needed for
+/// aggregate usage analysis. Handles both `--flag value` and `--flag=value`.
+fn sanitize_args(args: &[String]) -> Vec<String> {
+    const SENSITIVE_FLAGS: &[&str] = &["--private-key", "--token", "--alert-webhook", "-p"];
+
+    let mut sanitized = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+
+    for arg in args {
+        if redact_next {
+            sanitized.push("***".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        if SENSITIVE_FLAGS.contains(&arg.as_str()) {
+            sanitized.push(arg.clone());
+            redact_next = true;
+            continue;
+        }
+
+        if let Some(flag) = SENSITIVE_FLAGS
+            .iter()
+            .find(|flag| arg.starts_with(&format!("{}=", flag)))
+        {
+            sanitized.push(format!("{}=***", flag));
+            continue;
+        }
+
+        sanitized.push(arg.clone());
+    }
+
+    sanitized
+}
+
 impl Drop for Telemetry {
     fn drop(&mut self) {
         // Ensure any pending events are written
@@ -263,5 +283,50 @@ mod tests {
         let _telemetry = Telemetry::new();
         // Note: This might fail if user has env var set
         // In real tests, use a temp directory
+    }
+
+    #[test]
+    fn sanitize_args_redacts_separate_sensitive_values() {
+        let args = vec![
+            "standx".to_string(),
+            "maker".to_string(),
+            "run".to_string(),
+            "BTC-USD".to_string(),
+            "--alert-webhook".to_string(),
+            "https://api.telegram.org/bot-secret/sendMessage".to_string(),
+            "--token".to_string(),
+            "jwt-secret".to_string(),
+        ];
+
+        let sanitized = sanitize_args(&args);
+        assert_eq!(sanitized[4], "--alert-webhook");
+        assert_eq!(sanitized[5], "***");
+        assert_eq!(sanitized[6], "--token");
+        assert_eq!(sanitized[7], "***");
+        assert!(!sanitized.join(" ").contains("secret"));
+    }
+
+    #[test]
+    fn sanitize_args_redacts_equals_form_and_preserves_other_args() {
+        let args = vec![
+            "standx".to_string(),
+            "auth".to_string(),
+            "login".to_string(),
+            "--private-key=private-secret".to_string(),
+            "--alert-webhook=https://hooks.example/secret".to_string(),
+            "--output=json".to_string(),
+        ];
+
+        assert_eq!(
+            sanitize_args(&args),
+            vec![
+                "standx",
+                "auth",
+                "login",
+                "--private-key=***",
+                "--alert-webhook=***",
+                "--output=json",
+            ]
+        );
     }
 }
