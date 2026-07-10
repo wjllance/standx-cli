@@ -179,8 +179,8 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 
 三种输出格式：
 
-- **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。
-- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`。
+- **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。Live 模式还会打印 `ACCOUNT balance= equity= available= upnl=`，数据来自该轮交易所账户快照；这里的账户 `upnl` 与机器人本次会话的 `pnl` 是两个不同口径。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。
 - **Quiet（`--quiet`）**：只打印成交与增删挂单。
 
 退出时打印本次会话统计：

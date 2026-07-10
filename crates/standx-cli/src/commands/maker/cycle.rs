@@ -8,7 +8,7 @@ use anyhow::Result;
 use standx_maker::{self as maker, MakerConfig, MakerStats, RestingQuote, VolBreaker};
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
-use standx_sdk::models::{OrderSide, OrderType, TimeInForce, Trade};
+use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -92,20 +92,23 @@ pub(super) async fn maker_cycle(
     // 2. Rebuild resting + position from the exchange (live) or keep the
     //    simulated book (paper).
     let position: f64;
+    let mut account_balance: Option<Balance> = None;
     let mut fills: Vec<(OrderSide, f64, f64)> = Vec::new(); // paper sim only
     let mut exit_fill_observed = false;
     if live {
         let now = chrono::Utc::now().timestamp();
-        let (orders, positions, filled_orders, trades) = tokio::join!(
+        let (orders, positions, filled_orders, trades, balance) = tokio::join!(
             client.get_open_orders(Some(symbol)),
             client.get_positions(Some(symbol)),
             client.get_order_history(Some(symbol), Some(100)),
             client.get_user_trades(symbol, session_started_at, now, Some(500)),
+            client.get_balance(),
         );
         let orders = orders?;
         let positions = positions?;
         let filled_orders = filled_orders?;
         let trades = trades?;
+        account_balance = Some(balance?);
 
         // Open maker orders identify partial fills; historical maker orders
         // identify a quote that fully filled between two polling cycles.
@@ -483,6 +486,7 @@ pub(super) async fn maker_cycle(
         best_bid,
         best_ask,
         position,
+        account_balance.as_ref(),
         &actions,
         &fills,
         stats,
