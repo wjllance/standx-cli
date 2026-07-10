@@ -111,7 +111,7 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 
 ### 主动库存退出
 
-`--inventory-exit-pct 80 --inventory-exit-qty 0.01` 表示仓位达到上限的 80% 后，先撤销 maker 自有报价；在下一轮确认 maker 空簿且没有待确认下单时，再提交一笔最大 `0.01` 的 reduce-only 市价单。多头只卖出、空头只买入，数量不会超过当前仓位。该功能只在 live 模式生效，默认关闭；退出请求提交后若交易所状态未及时确认，策略会 fail-safe，而不会重复追单。
+`--inventory-exit-pct 80 --inventory-exit-qty 0.01` 表示仓位达到上限的 80% 后，先撤销 maker 自有报价；在下一轮确认 maker 空簿且没有待确认下单时，再提交一笔最大 `0.01` 的 reduce-only 市价单。多头只卖出、空头只买入，数量不会超过当前仓位。该功能只在 live 模式生效，默认关闭。波动熔断期间只撤单、不发送主动市价退出；每笔退出必须由 `sxmk-exit-` 关联成交进入账本后才能允许下一笔 chunk，未确认时策略 fail-safe，不会重复追单。
 
 ### 行情来源与守卫
 
