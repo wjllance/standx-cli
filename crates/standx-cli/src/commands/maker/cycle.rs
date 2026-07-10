@@ -43,22 +43,20 @@ pub(super) async fn maker_cycle(
     order_response_health: Option<&AtomicBool>,
 ) -> Result<(u64, u64, u64, u64)> {
     use maker::{
-        cap_desired_exposure, compute_desired_quotes, format_decimals, mark_mid_divergence_bps,
-        paper_quote_filled, reconcile, skew_center, Action, RestingQuote,
+        format_decimals, paper_quote_filled, Action, CycleInput, CycleSkip, MarketSnapshot,
     };
 
-    // 0. Feed the volatility breaker every cycle (even when a later guard
-    //    skips), so its window stays current. When tripped, quoting halts
-    //    below (all quotes pulled) until volatility subsides.
-    let halted = breaker.observe(mark);
-
-    // 1. Sanity guard: when mark and the book mid disagree, at least one
-    //    data source is wrong (stale feed, bad print, dislocated book).
-    //    Acting on it is unsafe in every direction, so do nothing this
-    //    cycle: resting quotes stay untouched. Not a fail-safe error.
-    if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-        let divergence = mark_mid_divergence_bps(mark, bid, ask);
-        if divergence > max_divergence_bps {
+    // 0. Run all market-only guards before any account/order I/O. The pure
+    // planner owns breaker observation and data-consistency policy; this
+    // adapter only renders the resulting skip decision.
+    let market = MarketSnapshot {
+        mark,
+        best_bid,
+        best_ask,
+    };
+    let preflight = maker::preflight_cycle(breaker, market, max_divergence_bps, live);
+    let halted = match preflight.skip {
+        Some(CycleSkip::MarkMidDivergence { divergence_bps }) => {
             let live_str = if live { "live" } else { "paper" };
             match output_format {
                 OutputFormat::Json => {
@@ -69,7 +67,7 @@ pub(super) async fn maker_cycle(
                             "cycle": cycle, "mode": live_str, "symbol": symbol,
                             "action": "skip", "reason": "mark_mid_divergence",
                             "mark": format_decimals(mark, cfg.price_decimals),
-                            "divergence_bps": (divergence * 100.0).round() / 100.0,
+                            "divergence_bps": (divergence_bps * 100.0).round() / 100.0,
                             "max_divergence_bps": max_divergence_bps,
                         })
                     );
@@ -77,19 +75,19 @@ pub(super) async fn maker_cycle(
                 _ => {
                     eprintln!(
                         "⚠️  #{} mark/mid divergence {:.1}bps > {}bps — skipping cycle (no actions)",
-                        cycle, divergence, max_divergence_bps
+                        cycle, divergence_bps, max_divergence_bps
                     );
                 }
             }
             return Ok((0, 0, 0, 0));
         }
-    }
-
-    if live && (best_bid.is_none() || best_ask.is_none()) {
-        // Fail-safe: without a touch we cannot guarantee no-cross pricing.
-        eprintln!("⚠️  empty order book on {}; skipping this cycle", symbol);
-        return Ok((0, 0, 0, 0));
-    }
+        Some(CycleSkip::MissingTouch) => {
+            // Fail-safe: without a touch we cannot guarantee no-cross pricing.
+            eprintln!("⚠️  empty order book on {}; skipping this cycle", symbol);
+            return Ok((0, 0, 0, 0));
+        }
+        None => preflight.halted,
+    };
 
     // 2. Rebuild resting + position from the exchange (live) or keep the
     //    simulated book (paper).
@@ -245,19 +243,26 @@ pub(super) async fn maker_cycle(
         position = *sim_position;
     }
 
-    // 3. Decide. When the volatility breaker is tripped, quote nothing —
-    //    an empty desired set makes reconcile cancel every resting quote
-    //    (pull all liquidity) and place none until volatility subsides.
-    let raw_inventory_exit = if live {
-        maker::inventory_exit_plan(
+    // 3. Build the pure quote/exit plan from the synchronized state.
+    let pending_slots = pending
+        .iter()
+        .map(|place| (place.side, place.level))
+        .collect::<Vec<_>>();
+    let plan = maker::plan_cycle(
+        cfg,
+        CycleInput {
+            cycle,
+            market,
             position,
-            cfg.max_position,
+            resting,
+            pending_slots: &pending_slots,
+            active_exit_enabled: live,
             inventory_exit_pct,
             inventory_exit_qty,
-        )
-    } else {
-        None
-    };
+        },
+        halted,
+    );
+    let raw_inventory_exit = plan.requested_inventory_exit;
     if exit_fill_observed {
         *inventory_exit_pending = false;
     }
@@ -270,29 +275,13 @@ pub(super) async fn maker_cycle(
         ));
     }
 
-    // Volatility halt pulls liquidity but deliberately does not send the
-    // opt-in market exit: de-risking at a taker price during the most
-    // dislocated interval requires a separate explicit emergency policy.
-    let inventory_exit = if halted { None } else { raw_inventory_exit };
-
-    let desired = if halted || inventory_exit.is_some() {
-        Vec::new()
-    } else {
-        let raw = compute_desired_quotes(cfg, mark, best_bid, best_ask, position);
-        let pending_slots = pending
-            .iter()
-            .map(|place| (place.side, place.level))
-            .collect::<Vec<_>>();
-        cap_desired_exposure(cfg, position, &raw, &pending_slots)
-    };
-    let actions = reconcile(
-        cfg, mark, position, best_bid, best_ask, &desired, resting, cycle,
-    );
+    let inventory_exit = plan.inventory_exit;
     // The pure reconciler intentionally knows nothing about transport state.
     // Remove desired placements whose slots are still reserved by an HTTP
     // submission before both execution and telemetry, so output never claims
     // a duplicate place occurred.
-    let actions: Vec<Action> = actions
+    let actions: Vec<Action> = plan
+        .actions
         .into_iter()
         .filter(|action| match action {
             Action::Place(q) if live && pending_covers_slot(pending, q.side, q.level) => {
@@ -313,9 +302,8 @@ pub(super) async fn maker_cycle(
         })
         .collect();
 
-    // The quote center these places are built around — the anti-flicker
-    // anchor stored on each placed quote (equals mark when skew is off).
-    let ref_center = skew_center(cfg, mark, position);
+    // The pure planner provides the anti-flicker anchor for new placements.
+    let ref_center = plan.ref_center;
 
     // 4. Execute. Business rejections (post-only would-cross, order already
     //    gone) are expected and logged inline; only transient failures
