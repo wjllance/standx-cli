@@ -1,8 +1,10 @@
 # Maker live gate
 
-`STANDX_ENABLE_LIVE_MAKER=1` is an intentional lock, not an operational
-toggle. It must remain unset until every gate below has evidence attached to
-the release/change record.
+`STANDX_ENABLE_LIVE_MAKER=1` is an intentional release-owner gate, not an
+automatic start command. It was unlocked on 2026-07-10 after the paper run,
+engineering checks, and supervised production canary were recorded below.
+The flag only permits a future `--live` invocation; it does not start the
+maker by itself.
 
 ## Required engineering evidence
 
@@ -28,10 +30,10 @@ the release/change record.
 ## Unlock decision
 
 Only a release owner may enable the environment variable after the preceding
-evidence is reviewed. The first canary does not grant permanent approval: any
-strategy, venue API, credential, or risk-control change re-locks the gate and
-requires a new canary record.
+evidence is reviewed. The explicit unlock approval was recorded on
+2026-07-10. Any strategy, venue API, credential, or risk-control change
+re-locks the gate and requires a new canary record.
 
 ## Execution records
 
-- [2026-07-10 maker paper long run and controlled disconnect](evidence/maker-live-gate-2026-07-10.md)
+- [2026-07-10 maker paper long run, controlled disconnect, and supervised production canary](evidence/maker-live-gate-2026-07-10.md)

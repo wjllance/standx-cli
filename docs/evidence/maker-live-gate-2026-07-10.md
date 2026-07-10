@@ -2,12 +2,17 @@
 
 ## Decision
 
-**PAPER EVIDENCE RECORDED — LIVE GATE REMAINS LOCKED.**
+**PAPER EVIDENCE AND SUPERVISED PRODUCTION CANARY RECORDED — LIVE GATE UNLOCKED BY EXPLICIT RELEASE-OWNER APPROVAL.**
 
 This record separates repeatable local evidence from production venue
-evidence. Passing the controlled disconnect harness does not prove production
-order-response authentication, production cancellation, or a supervised live
-canary.
+evidence. The supervised canary below proves production authentication,
+real-order placement, fail-safe shutdown, and maker-only cleanup for an empty
+manual-order scope. The gate is now unlocked, but no continuous maker process
+was started by this approval.
+
+- Unlock approval: explicit user instruction received on `2026-07-10`.
+- Persistent flag: `STANDX_ENABLE_LIVE_MAKER=1` added to the operator's
+  `~/.zshrc`; this only permits a future `--live` invocation.
 
 ## Scope and build identity
 
@@ -73,8 +78,47 @@ Evidence:
 - [`logs/maker-controlled-disconnect-ws-20260710.log`](logs/maker-controlled-disconnect-ws-20260710.log)
 - [`logs/maker-controlled-disconnect-cleanup-20260710.log`](logs/maker-controlled-disconnect-cleanup-20260710.log)
 
-Result: **PASS (local controlled harness only).** Production authentication and
-cleanup evidence remains open.
+Result: **PASS (local controlled harness only).** Production evidence is
+recorded separately in the supervised canary section below.
+
+## Supervised production canary — BTC-USD
+
+- Operator authorization: explicit approval in the task to run a production
+  controlled disconnect and maker cleanup exercise without continuous live
+  making.
+- Credentials: loaded from `STANDX_JWT` and `STANDX_PRIVATE_KEY`; values were
+  not logged. `STANDX_ENABLE_LIVE_MAKER=1` was scoped to the canary process only.
+- Pre-check: production `BTC-USD` open orders `[]`; production position `[]`.
+- Parameters: one level, size `0.001`, max position `0.001`, interval `5s`,
+  `--controlled-disconnect-after 15`; no inventory exit and no webhook.
+- Window: started `2026-07-10T09:34:17Z`; fail-safe stopped at
+  `2026-07-10T09:34:37Z` after three cycles.
+- Real orders: two initial maker placements (buy/sell), zero fills, zero
+  position change.
+- Fault: the authenticated production order-response stream was intentionally
+  closed by the CLI's supervised fault-injection hook after 15 seconds.
+- Fail-safe: `order-response stream is unhealthy; refusing further live orders`.
+- Cleanup: venue query after shutdown returned `[]` maker orders; the process
+  emitted `All maker-owned BTC-USD orders cancelled`.
+- Post-check: production orders `[]`, production position `[]`.
+
+Artifacts:
+
+- [`logs/maker-production-controlled-disconnect-20260710.log`](logs/maker-production-controlled-disconnect-20260710.log)
+  (`SHA-256 53bc8d8fef112e351d8e5fa890edbfed76087e34e3f990f1cb046306e9e4633e`)
+- [`logs/maker-production-post-check-20260710.log`](logs/maker-production-post-check-20260710.log)
+  (`SHA-256 2fa9fe3f3ea80a96ee9f1dfebe1da33aeb89a25707c4b150e2a91afefa0e6363`)
+
+The outer zsh wrapper attempted to assign the reserved `status` variable after
+the maker process exited; that wrapper-reporting error did not interrupt the
+canary. The maker log contains the stopped lifecycle record and the post-check
+completed successfully.
+
+Result: **PASS for the supervised production canary.** The fault was injected
+locally after production stream authentication; a venue/network-originated
+disconnect remains a separate failure mode. No manual orders were present in
+this canary, so preservation of foreign orders continues to rely on the local
+mock proof above.
 
 ## Engineering checks
 
@@ -90,13 +134,16 @@ runtime commit.
 
 ## Remaining gate items
 
-- Authenticate to the real production order-response stream under a named,
-  supervised operator and retain the non-secret evidence.
-- Force a production disconnect only under the documented canary procedure,
-  verify maker-order cleanup against the venue, and retain order IDs/timestamps.
-- Complete the supervised minimum-size live canary and release-owner review.
+- Have the release owner review and sign off the production canary evidence.
+- If foreign/manual orders must be protected during the first live session,
+  repeat the canary with a deliberately identified non-maker order under the
+  venue's emergency-cancel procedure.
+- Keep the venue/network-originated disconnect scenario as a follow-up if the
+  venue can provide a safe server-side fault trigger.
 
 For a future paper run, capture stdout/stderr without a signal-sensitive pipe
 so that the long-run's own `lifecycle: stopped` line is retained.
 
-Until those items are reviewed, `STANDX_ENABLE_LIVE_MAKER` must remain unset.
+The gate is unlocked, but every live session remains subject to the supervised
+canary procedure, emergency cancel readiness, and immediate re-lock on any
+strategy, venue API, credential, or risk-control change.

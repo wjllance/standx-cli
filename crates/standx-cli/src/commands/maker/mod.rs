@@ -298,6 +298,7 @@ pub async fn handle_maker(
             alert_webhook_format,
             no_ws,
             live,
+            controlled_disconnect_after,
         } => {
             let file = config::load(maker_config.as_deref())?;
             run_maker(
@@ -324,6 +325,7 @@ pub async fn handle_maker(
                     alert_webhook_format,
                     no_ws: no_ws || file.no_ws.unwrap_or(false),
                     live,
+                    controlled_disconnect_after,
                     verbose,
                 },
                 output_format,
@@ -359,6 +361,7 @@ struct MakerRunArgs {
     alert_webhook_format: AlertWebhookFormat,
     no_ws: bool,
     live: bool,
+    controlled_disconnect_after: Option<u64>,
     verbose: bool,
 }
 
@@ -366,6 +369,19 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     use standx_sdk::order_response::OrderResponseStream;
 
     let order_session_id = args.live.then(|| uuid::Uuid::new_v4().to_string());
+
+    if let Some(after) = args.controlled_disconnect_after {
+        if !args.live {
+            return Err(anyhow::anyhow!(
+                "--controlled-disconnect-after requires --live"
+            ));
+        }
+        if after == 0 || after > 60 {
+            return Err(anyhow::anyhow!(
+                "--controlled-disconnect-after must be between 1 and 60 seconds"
+            ));
+        }
+    }
     let client = match order_session_id.as_deref() {
         Some(session_id) => StandXClient::new()?.with_session_id(session_id),
         None => StandXClient::new()?,
@@ -501,6 +517,21 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 .expect("live maker must have an order session"),
         )?;
         let (responses, health, handle) = stream.connect().await?;
+        if let Some(after) = args.controlled_disconnect_after {
+            let health_for_fault = health.clone();
+            let abort = handle.abort_handle();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(after)).await;
+                // Aborting drops the local WebSocket halves; set health first
+                // so the maker exits through its existing fail-safe path even
+                // if the runtime delays observing the socket close.
+                health_for_fault.store(false, Ordering::Release);
+                abort.abort();
+            });
+            eprintln!(
+                "⚠️ controlled fault injection armed: closing order-response stream after {after}s"
+            );
+        }
         order_responses = Some(responses);
         order_response_health = Some(health);
         order_response_handle = Some(handle);

@@ -469,6 +469,11 @@ pub enum MakerCommands {
         /// full loop, prints intended actions, no orders placed)
         #[arg(long)]
         live: bool,
+        /// Supervised fault injection: close the local order-response stream
+        /// after this many seconds. Hidden because it is only for live-gate
+        /// validation and is limited by the maker command to 60 seconds.
+        #[arg(long, hide = true)]
+        controlled_disconnect_after: Option<u64>,
     },
 }
 
