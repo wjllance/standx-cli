@@ -60,4 +60,16 @@ mod tests {
         assert_eq!(config.no_ws, Some(true));
         assert_eq!(config.size, None);
     }
+
+    #[test]
+    fn example_keeps_active_inventory_exit_disabled() {
+        let config: MakerFileConfig = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker.toml"
+        )))
+        .unwrap();
+
+        assert_eq!(config.inventory_exit_pct, Some(0.0));
+        assert_eq!(config.inventory_exit_qty, Some(0.0));
+    }
 }
