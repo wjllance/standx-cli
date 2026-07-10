@@ -4,6 +4,11 @@ use crate::auth::Credentials;
 use crate::error::{Error, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -31,6 +36,9 @@ pub struct OrderResponseStream {
     token: String,
     session_id: String,
 }
+
+/// Shared liveness flag for an authenticated order-response connection.
+pub type OrderResponseHealth = Arc<AtomicBool>;
 
 impl OrderResponseStream {
     /// Construct a production stream from the currently-loaded credentials.
@@ -68,16 +76,63 @@ impl OrderResponseStream {
         &self.session_id
     }
 
-    /// Connect, authenticate, and return parsed asynchronous order responses.
+    /// Connect, wait for a successful authentication acknowledgement, and
+    /// return parsed asynchronous order responses plus a shared liveness flag.
     pub async fn connect(
         &self,
-    ) -> Result<(mpsc::Receiver<OrderResponse>, tokio::task::JoinHandle<()>)> {
+    ) -> Result<(
+        mpsc::Receiver<OrderResponse>,
+        OrderResponseHealth,
+        tokio::task::JoinHandle<()>,
+    )> {
         let (stream, _) = connect_async(&self.url).await?;
         let (mut write, mut read) = stream.split();
-        let auth = auth_request(&self.session_id, &self.token);
+        let auth_request_id = uuid::Uuid::new_v4().to_string();
+        let auth = auth_request(&self.session_id, &self.token, &auth_request_id);
         write.send(Message::Text(auth.to_string().into())).await?;
 
+        let auth_response = loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), read.next())
+                .await
+                .map_err(|_| Error::WebSocket {
+                    message: "timed out waiting for order-response authentication".to_string(),
+                })?
+                .ok_or_else(|| Error::WebSocket {
+                    message: "order-response stream closed before authentication".to_string(),
+                })??;
+            match message {
+                Message::Text(text) => {
+                    let response = serde_json::from_str::<OrderResponse>(&text)?;
+                    if response.request_id.as_deref() != Some(auth_request_id.as_str()) {
+                        return Err(Error::WebSocket {
+                            message: "received an unexpected response before authentication"
+                                .to_string(),
+                        });
+                    }
+                    break response;
+                }
+                Message::Ping(payload) => write.send(Message::Pong(payload)).await?,
+                Message::Close(_) => {
+                    return Err(Error::WebSocket {
+                        message: "order-response stream closed before authentication".to_string(),
+                    });
+                }
+                _ => {}
+            }
+        };
+        if !auth_response.accepted() {
+            return Err(Error::AuthRequired {
+                message: format!(
+                    "order-response authentication rejected: {}",
+                    auth_response.message
+                ),
+                resolution: "Run 'standx auth login' and retry".to_string(),
+            });
+        }
+
         let (tx, rx) = mpsc::channel(256);
+        let healthy = Arc::new(AtomicBool::new(true));
+        let task_health = Arc::clone(&healthy);
         let handle = tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
@@ -97,16 +152,17 @@ impl OrderResponseStream {
                     _ => {}
                 }
             }
+            task_health.store(false, Ordering::Release);
         });
 
-        Ok((rx, handle))
+        Ok((rx, healthy, handle))
     }
 }
 
-fn auth_request(session_id: &str, token: &str) -> serde_json::Value {
+fn auth_request(session_id: &str, token: &str, request_id: &str) -> serde_json::Value {
     serde_json::json!({
         "session_id": session_id,
-        "request_id": uuid::Uuid::new_v4().to_string(),
+        "request_id": request_id,
         "method": "auth:login",
         "params": serde_json::json!({ "token": token }).to_string(),
     })
@@ -115,14 +171,16 @@ fn auth_request(session_id: &str, token: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::accept_async;
 
     #[test]
     fn auth_request_uses_stable_session_and_unique_request() {
-        let first = auth_request("maker-session", "jwt");
-        let second = auth_request("maker-session", "jwt");
+        let first = auth_request("maker-session", "jwt", "request-1");
+        let second = auth_request("maker-session", "jwt", "request-2");
 
         assert_eq!(first["session_id"], "maker-session");
         assert_eq!(first["method"], "auth:login");
+        assert_eq!(first["request_id"], "request-1");
         assert_ne!(first["request_id"], second["request_id"]);
         assert!(first["params"].as_str().unwrap().contains("jwt"));
     }
@@ -154,5 +212,85 @@ mod tests {
             "maker-session",
         );
         assert_eq!(stream.session_id(), "maker-session");
+    }
+
+    #[tokio::test]
+    async fn authenticated_connection_becomes_unhealthy_after_server_close() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            // Drop the socket: the client must flip the liveness flag rather
+            // than continuing to place orders on a dead response stream.
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
+        let (_responses, health, handle) = stream.connect().await.unwrap();
+        assert!(health.load(Ordering::Acquire));
+        server.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while health.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection close should mark the response stream unhealthy");
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authentication_rejection_prevents_connection_start() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 401,
+                        "message": "invalid token",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "bad-jwt", "maker-session");
+        let error = stream.connect().await.unwrap_err();
+        assert!(matches!(error, Error::AuthRequired { .. }));
+        server.await.unwrap();
     }
 }

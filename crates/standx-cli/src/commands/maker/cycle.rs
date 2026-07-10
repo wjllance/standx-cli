@@ -9,6 +9,7 @@ use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{OrderSide, OrderType, TimeInForce};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// One reconcile cycle over an already-acquired market snapshot.
@@ -32,6 +33,7 @@ pub(super) async fn maker_cycle(
     stats: &mut standx_sdk::maker::MakerStats,
     breaker: &mut standx_sdk::maker::VolBreaker,
     output_format: OutputFormat,
+    order_response_health: Option<&AtomicBool>,
 ) -> Result<(u64, u64, u64, u64)> {
     use standx_sdk::maker::{
         cap_desired_exposure, compute_desired_quotes, format_decimals, mark_mid_divergence_bps,
@@ -281,6 +283,11 @@ pub(super) async fn maker_cycle(
             }
             Action::Place(q) => {
                 if live {
+                    if !order_response_health.is_some_and(|health| health.load(Ordering::Acquire)) {
+                        return Err(anyhow::anyhow!(
+                            "order-response stream is unhealthy; refusing live placement"
+                        ));
+                    }
                     let cl_ord_id = format!("{}{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
                     match client
                         .create_order(CreateOrderParams {
