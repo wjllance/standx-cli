@@ -287,6 +287,18 @@ pub struct MakerStats {
 }
 
 impl MakerStats {
+    /// Start a maker session while adopting an existing venue position.
+    /// Session PnL is zero at `baseline_mark`; venue/account PnL retains its
+    /// historical cost basis and is reported separately by the CLI.
+    pub fn with_inventory_baseline(position: f64, baseline_mark: f64) -> Self {
+        Self {
+            cash: -position * baseline_mark,
+            max_abs_position: position.abs(),
+            last_position: position,
+            ..Self::default()
+        }
+    }
+
     /// Record an executed fill at `price` against `mark` at fill time.
     pub fn record_fill(&mut self, side: OrderSide, price: f64, qty: f64, mark: f64) {
         self.filled_qty += qty;
@@ -1487,6 +1499,24 @@ mod tests {
         s.record_fill(OrderSide::Buy, 100.0, 2.0, 100.0);
         assert!((s.pnl(2.0, 101.0) - 2.0).abs() < 1e-9);
         assert!((s.pnl(2.0, 100.0)).abs() < 1e-9); // flat at entry mark
+    }
+
+    #[test]
+    fn stats_adopted_inventory_starts_at_zero_for_long_and_short() {
+        let long = MakerStats::with_inventory_baseline(0.13, 59.72);
+        let short = MakerStats::with_inventory_baseline(-0.13, 59.72);
+        assert!(long.pnl(0.13, 59.72).abs() < 1e-9);
+        assert!(short.pnl(-0.13, 59.72).abs() < 1e-9);
+        assert!((long.pnl(0.13, 60.72) - 0.13).abs() < 1e-9);
+        assert!((short.pnl(-0.13, 60.72) + 0.13).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stats_adopted_inventory_and_new_fill_share_session_basis() {
+        let mut stats = MakerStats::with_inventory_baseline(-0.2, 60.0);
+        stats.record_fill(OrderSide::Buy, 59.5, 0.2, 59.5);
+        assert!((stats.pnl(0.0, 59.5) - 0.1).abs() < 1e-9);
+        assert_eq!(stats.fills(), 1);
     }
 
     #[test]

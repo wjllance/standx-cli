@@ -10,8 +10,9 @@
 #
 # Active exit was production-tested only for this exact tuple:
 # max_position=0.8, inventory_exit_pct=25, inventory_exit_qty=0.2.
-# Do not run against manual/pre-existing XAG inventory: maker PnL and
-# alert_loss track maker-correlated fills, not external cost basis.
+# Pre-existing XAG inventory up to max_position is adopted automatically at
+# the startup mark, so maker-session PnL starts at zero. Larger inventory is
+# rejected after maker-order cleanup. Account upnl keeps the venue cost basis.
 
 # Quote geometry
 spread_bps = 7.0

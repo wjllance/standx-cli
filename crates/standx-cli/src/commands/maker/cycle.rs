@@ -1,7 +1,7 @@
 use super::output::{emit_maker_cycle, log_maker_event};
 use super::{
-    is_maker_order, is_order_rejection, open_qty_adopts, pending_covers_slot, PendingPlace,
-    MAKER_CL_ORD_ID_PREFIX,
+    is_current_run_order, is_maker_order, is_order_rejection, open_qty_adopts, pending_covers_slot,
+    position_for_symbol, MakerFill, PendingPlace,
 };
 use crate::cli::*;
 use anyhow::Result;
@@ -11,7 +11,114 @@ use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::OrderResponseHealth;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::time::Duration;
+
+#[derive(Debug)]
+pub(super) struct PositionReconciliationError {
+    pub(super) expected: f64,
+    pub(super) observed: f64,
+}
+
+impl fmt::Display for PositionReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "expected position {:+.8}, venue reported {:+.8}",
+            self.expected, self.observed
+        )
+    }
+}
+
+impl std::error::Error for PositionReconciliationError {}
+
+fn quote_client_order_id(
+    run_order_prefix: &str,
+    cycle: u64,
+    side: OrderSide,
+    level: u32,
+) -> String {
+    let side_code = match side {
+        OrderSide::Buy => 'b',
+        OrderSide::Sell => 's',
+    };
+    format!(
+        "{run_order_prefix}q{:08x}{side_code}{level:x}",
+        cycle as u32
+    )
+}
+
+fn exit_client_order_id(run_order_prefix: &str, cycle: u64) -> String {
+    format!("{run_order_prefix}x{:08x}", cycle as u32)
+}
+
+fn trade_is_in_session(trade: &Trade, session_started_at: i64, now: i64) -> Result<bool> {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&trade.time).map_err(|_| {
+        anyhow::anyhow!(
+            "maker trade {} has invalid RFC3339 timestamp '{}'",
+            trade.id,
+            trade.time
+        )
+    })?;
+    let timestamp = timestamp.timestamp();
+    Ok(timestamp >= session_started_at && timestamp <= now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_current_run_fills(
+    trades: Vec<Trade>,
+    maker_order_ids: &HashSet<u64>,
+    exit_order_ids: &HashSet<u64>,
+    seen_fill_ids: &mut HashSet<u64>,
+    session_started_at: i64,
+    now: i64,
+    mark: f64,
+    stats: &mut MakerStats,
+    fills: &mut Vec<MakerFill>,
+    expected_position: &mut f64,
+) -> Result<bool> {
+    let mut exit_fill_observed = false;
+    for trade in trades {
+        let Some(order_id) = trade.order_id else {
+            continue;
+        };
+        if !maker_order_ids.contains(&order_id) {
+            continue;
+        }
+        if trade.id == 0 {
+            return Err(anyhow::anyhow!(
+                "maker fill for order {} has no stable trade ID",
+                order_id
+            ));
+        }
+        if !trade_is_in_session(&trade, session_started_at, now)? {
+            return Err(anyhow::anyhow!(
+                "current-run maker trade {} falls outside the session time boundary",
+                trade.id
+            ));
+        }
+        if !seen_fill_ids.insert(trade.id) {
+            continue;
+        }
+        let (side, price, qty) = maker_trade_fill(&trade)?;
+        stats.record_fill(side, price, qty, mark);
+        *expected_position += match side {
+            OrderSide::Buy => qty,
+            OrderSide::Sell => -qty,
+        };
+        fills.push(MakerFill {
+            side,
+            price,
+            qty,
+            trade_id: Some(trade.id),
+            order_id: Some(order_id),
+            trade_ts: Some(trade.time),
+            origin: "current_run",
+        });
+        exit_fill_observed |= exit_order_ids.contains(&order_id);
+    }
+    Ok(exit_fill_observed)
+}
 
 fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<String> {
     match health {
@@ -46,6 +153,9 @@ pub(super) async fn maker_cycle(
     maker_order_ids: &mut HashSet<u64>,
     seen_fill_ids: &mut HashSet<u64>,
     session_started_at: i64,
+    run_order_prefix: &str,
+    starting_position: f64,
+    expected_position: &mut f64,
     sim_position: &mut f64,
     stats: &mut MakerStats,
     breaker: &mut VolBreaker,
@@ -103,19 +213,17 @@ pub(super) async fn maker_cycle(
     //    simulated book (paper).
     let position: f64;
     let mut account_balance: Option<Balance> = None;
-    let mut fills: Vec<(OrderSide, f64, f64)> = Vec::new(); // paper sim only
+    let mut fills: Vec<MakerFill> = Vec::new();
     let mut exit_fill_observed = false;
     if live {
         let now = chrono::Utc::now().timestamp();
-        let (orders, positions, filled_orders, trades, balance) = tokio::join!(
+        let (orders, filled_orders, trades, balance) = tokio::join!(
             client.get_open_orders(Some(symbol)),
-            client.get_positions(Some(symbol)),
             client.get_order_history(Some(symbol), Some(100)),
             client.get_user_trades(symbol, session_started_at, now, Some(500)),
             client.get_balance(),
         );
-        let orders = orders?;
-        let positions = positions?;
+        let mut orders = orders?;
         let filled_orders = filled_orders?;
         let trades = trades?;
         account_balance = Some(balance?);
@@ -124,10 +232,10 @@ pub(super) async fn maker_cycle(
         // identify a quote that fully filled between two polling cycles.
         let mut exit_order_ids = HashSet::new();
         for order in orders.iter().chain(filled_orders.iter()) {
-            if is_maker_order(order) {
+            if is_current_run_order(order, run_order_prefix) {
                 let order_id = order.id.parse::<u64>().map_err(|_| {
                     anyhow::anyhow!(
-                        "maker-owned order has non-integer exchange ID '{}'",
+                        "current-run maker order has non-integer exchange ID '{}'",
                         order.id
                     )
                 })?;
@@ -135,51 +243,104 @@ pub(super) async fn maker_cycle(
                 if order
                     .cl_ord_id
                     .as_deref()
-                    .is_some_and(|id| id.starts_with("sxmk-exit-"))
+                    .is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x")))
                 {
                     exit_order_ids.insert(order_id);
                 }
             }
         }
 
-        for trade in trades {
-            let Some(order_id) = trade.order_id else {
-                continue;
-            };
-            if !maker_order_ids.contains(&order_id) {
-                continue;
-            }
-            if trade.id == 0 {
-                return Err(anyhow::anyhow!(
-                    "maker fill for order {} has no stable trade ID",
-                    order_id
-                ));
-            }
-            if !seen_fill_ids.insert(trade.id) {
-                continue;
-            }
-            let (side, price, qty) = maker_trade_fill(&trade)?;
-            stats.record_fill(side, price, qty, mark);
-            fills.push((side, price, qty));
-            exit_fill_observed |= exit_order_ids.contains(&order_id);
-        }
+        exit_fill_observed |= collect_current_run_fills(
+            trades,
+            maker_order_ids,
+            &exit_order_ids,
+            seen_fill_ids,
+            session_started_at,
+            now,
+            mark,
+            stats,
+            &mut fills,
+            expected_position,
+        )?;
 
-        position = positions
-            .iter()
-            .filter(|p| p.symbol.eq_ignore_ascii_case(symbol))
-            .map(|p| {
-                let qty: f64 = p.qty.parse().unwrap_or(0.0);
-                match p.side {
-                    Some(OrderSide::Sell) => -qty,
-                    _ => qty,
+        let positions = client.get_positions(Some(symbol)).await?;
+        let mut observed_position = position_for_symbol(&positions, symbol)?;
+        let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+        if (observed_position - *expected_position).abs() > qty_tolerance {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let retry_now = chrono::Utc::now().timestamp();
+            let (retry_orders, retry_filled_orders, retry_trades) = tokio::join!(
+                client.get_open_orders(Some(symbol)),
+                client.get_order_history(Some(symbol), Some(100)),
+                client.get_user_trades(symbol, session_started_at, retry_now, Some(500)),
+            );
+            orders = retry_orders?;
+            let retry_filled_orders = retry_filled_orders?;
+            for order in orders.iter().chain(retry_filled_orders.iter()) {
+                if is_current_run_order(order, run_order_prefix) {
+                    let order_id = order.id.parse::<u64>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "current-run maker order has non-integer exchange ID '{}'",
+                            order.id
+                        )
+                    })?;
+                    maker_order_ids.insert(order_id);
+                    if order
+                        .cl_ord_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x")))
+                    {
+                        exit_order_ids.insert(order_id);
+                    }
                 }
-            })
-            .sum();
+            }
+            exit_fill_observed |= collect_current_run_fills(
+                retry_trades?,
+                maker_order_ids,
+                &exit_order_ids,
+                seen_fill_ids,
+                session_started_at,
+                retry_now,
+                mark,
+                stats,
+                &mut fills,
+                expected_position,
+            )?;
+            let retry_positions = client.get_positions(Some(symbol)).await?;
+            observed_position = position_for_symbol(&retry_positions, symbol)?;
+            if (observed_position - *expected_position).abs() > qty_tolerance {
+                if output_format == OutputFormat::Json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "symbol": symbol,
+                            "cycle": cycle,
+                            "action": "position_reconciliation",
+                            "event": "failed",
+                            "expected_position": *expected_position,
+                            "observed_position": observed_position,
+                            "message": "venue position cannot be explained by current-run maker fills",
+                        })
+                    );
+                } else {
+                    eprintln!(
+                        "⚠️  position reconciliation failed: expected {:+.8}, observed {:+.8}",
+                        *expected_position, observed_position
+                    );
+                }
+                return Err(anyhow::Error::new(PositionReconciliationError {
+                    expected: *expected_position,
+                    observed: observed_position,
+                }));
+            }
+        }
+        position = observed_position;
 
         let tick = cfg.price_tick();
         *resting = orders
             .into_iter()
-            .filter(is_maker_order)
+            .filter(|order| is_current_run_order(order, run_order_prefix))
             .map(|o| {
                 let price: f64 = o.price.parse().unwrap_or(0.0);
                 let qty: f64 = o.qty.parse().unwrap_or(0.0);
@@ -248,7 +409,15 @@ pub(super) async fn maker_cycle(
                     OrderSide::Sell => -q.qty,
                 };
                 stats.record_fill(q.side, q.price, q.qty, mark);
-                fills.push((q.side, q.price, q.qty));
+                fills.push(MakerFill {
+                    side: q.side,
+                    price: q.price,
+                    qty: q.qty,
+                    trade_id: None,
+                    order_id: None,
+                    trade_ts: None,
+                    origin: "paper",
+                });
             } else {
                 i += 1;
             }
@@ -371,7 +540,7 @@ pub(super) async fn maker_cycle(
                     if let Some(reason) = unhealthy_order_response(order_response_health) {
                         return Err(anyhow::anyhow!("{reason}; refusing live placement"));
                     }
-                    let cl_ord_id = format!("{}{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
+                    let cl_ord_id = quote_client_order_id(run_order_prefix, cycle, q.side, q.level);
                     match client
                         .create_order(CreateOrderParams {
                             symbol: symbol.to_string(),
@@ -445,7 +614,7 @@ pub(super) async fn maker_cycle(
             if let Some(reason) = unhealthy_order_response(order_response_health) {
                 return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
             }
-            let cl_ord_id = format!("{}exit-{}", MAKER_CL_ORD_ID_PREFIX, uuid::Uuid::new_v4());
+            let cl_ord_id = exit_client_order_id(run_order_prefix, cycle);
             client
                 .create_order(CreateOrderParams {
                     symbol: symbol.to_string(),
@@ -492,6 +661,7 @@ pub(super) async fn maker_cycle(
         best_bid,
         best_ask,
         position,
+        starting_position,
         account_balance.as_ref(),
         &actions,
         &fills,
@@ -663,5 +833,109 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("invalid price"));
+    }
+
+    #[test]
+    fn current_run_fill_is_recorded_once_with_trade_identity() {
+        let trade = trade(Some("buy"), "59.50", "0.20");
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut stats = MakerStats::default();
+        let mut seen = HashSet::new();
+        let maker_orders = HashSet::from([7]);
+        let mut fills = Vec::new();
+        let mut expected_position = 0.0;
+
+        collect_current_run_fills(
+            vec![trade.clone()],
+            &maker_orders,
+            &HashSet::new(),
+            &mut seen,
+            start,
+            start + 60,
+            59.50,
+            &mut stats,
+            &mut fills,
+            &mut expected_position,
+        )
+        .unwrap();
+        collect_current_run_fills(
+            vec![trade],
+            &maker_orders,
+            &HashSet::new(),
+            &mut seen,
+            start,
+            start + 60,
+            59.50,
+            &mut stats,
+            &mut fills,
+            &mut expected_position,
+        )
+        .unwrap();
+
+        assert_eq!(stats.fills(), 1);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].trade_id, Some(42));
+        assert_eq!(fills[0].order_id, Some(7));
+        assert_eq!(fills[0].origin, "current_run");
+        assert!((expected_position - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn historical_trade_without_current_run_order_is_ignored() {
+        let mut stats = MakerStats::default();
+        let mut seen = HashSet::new();
+        let mut fills = Vec::new();
+        let mut expected_position = -0.13;
+        collect_current_run_fills(
+            vec![trade(Some("sell"), "59.50", "0.20")],
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut seen,
+            1_783_000_000,
+            1_784_000_000,
+            59.50,
+            &mut stats,
+            &mut fills,
+            &mut expected_position,
+        )
+        .unwrap();
+        assert_eq!(stats.fills(), 0);
+        assert!(fills.is_empty());
+        assert_eq!(expected_position, -0.13);
+    }
+
+    #[test]
+    fn current_run_trade_outside_session_is_rejected() {
+        let mut stats = MakerStats::default();
+        let mut seen = HashSet::new();
+        let mut fills = Vec::new();
+        let mut expected_position = 0.0;
+        let error = collect_current_run_fills(
+            vec![trade(Some("buy"), "59.50", "0.20")],
+            &HashSet::from([7]),
+            &HashSet::new(),
+            &mut seen,
+            1_783_700_000,
+            1_783_700_100,
+            59.50,
+            &mut stats,
+            &mut fills,
+            &mut expected_position,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside the session"));
+    }
+
+    #[test]
+    fn current_run_client_order_ids_are_bounded_and_scoped() {
+        let prefix = "sxmk-0123456789ab-";
+        let quote = quote_client_order_id(prefix, u64::MAX, OrderSide::Sell, u32::MAX);
+        let exit = exit_client_order_id(prefix, u64::MAX);
+        assert!(quote.starts_with(prefix));
+        assert!(exit.starts_with(prefix));
+        assert!(quote.len() <= 41, "{quote}");
+        assert!(exit.len() <= 41, "{exit}");
     }
 }

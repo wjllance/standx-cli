@@ -17,7 +17,7 @@ mod cycle;
 mod feed;
 mod output;
 
-use cycle::{cancel_maker_orders_with_retry, maker_cycle};
+use cycle::{cancel_maker_orders_with_retry, maker_cycle, PositionReconciliationError};
 use feed::{market_snapshot, spawn_market_feed};
 
 // ============================================================================
@@ -38,6 +38,8 @@ enum MakerExit {
     OrderResponse(String),
     /// Three consecutive transient maker-cycle failures.
     ConsecutiveErrors(String),
+    /// Venue position cannot be explained by fills owned by this run.
+    PositionReconciliation(String),
 }
 
 impl MakerExit {
@@ -49,6 +51,9 @@ impl MakerExit {
             }
             Self::ConsecutiveErrors(error) => {
                 format!("fail-safe: 3 consecutive maker cycle errors: {error}")
+            }
+            Self::PositionReconciliation(error) => {
+                format!("fail-safe: position reconciliation failed: {error}")
             }
         }
     }
@@ -62,8 +67,22 @@ impl MakerExit {
             Self::ConsecutiveErrors(error) => Some(format!(
                 "maker stopped after 3 consecutive maker cycle errors (fail-safe): {error}"
             )),
+            Self::PositionReconciliation(error) => Some(format!(
+                "maker stopped immediately (fail-safe): position reconciliation failed: {error}"
+            )),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct MakerFill {
+    side: OrderSide,
+    price: f64,
+    qty: f64,
+    trade_id: Option<u64>,
+    order_id: Option<u64>,
+    trade_ts: Option<String>,
+    origin: &'static str,
 }
 
 /// Pending place awaiting order-id adoption in live mode. The HTTP request is
@@ -87,6 +106,39 @@ fn is_maker_order(order: &Order) -> bool {
         .cl_ord_id
         .as_deref()
         .is_some_and(|id| id.starts_with(MAKER_CL_ORD_ID_PREFIX))
+}
+
+fn is_current_run_order(order: &Order, run_order_prefix: &str) -> bool {
+    order
+        .cl_ord_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with(run_order_prefix))
+}
+
+fn position_for_symbol(positions: &[Position], symbol: &str) -> Result<f64> {
+    positions
+        .iter()
+        .filter(|position| position.symbol.eq_ignore_ascii_case(symbol))
+        .try_fold(0.0, |total, position| {
+            let qty = position.qty.parse::<f64>().map_err(|_| {
+                anyhow::anyhow!("position on {symbol} has invalid qty '{}'", position.qty)
+            })?;
+            if !qty.is_finite() || qty < 0.0 {
+                return Err(anyhow::anyhow!(
+                    "position on {symbol} has invalid non-finite/negative qty"
+                ));
+            }
+            Ok(total
+                + match position.side {
+                    Some(OrderSide::Sell) => -qty,
+                    _ => qty,
+                })
+        })
+}
+
+fn starting_position_within_limit(position: f64, max_position: f64, qty_decimals: u32) -> bool {
+    let qty_tolerance = 10_f64.powi(-(qty_decimals as i32)) / 2.0;
+    position.abs() <= max_position + qty_tolerance
 }
 
 /// A submitted placement reserves its `(side, level)` until it is either
@@ -250,6 +302,81 @@ async fn notify_lifecycle(
         } else {
             tokio::spawn(post_webhook(client.clone(), url.clone(), body));
         }
+    }
+}
+
+fn emit_ledger_sync(
+    output_format: OutputFormat,
+    symbol: &str,
+    starting_position: f64,
+    baseline_mark: f64,
+    historical_orders: usize,
+    historical_trades: usize,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "action": "ledger_sync",
+                "event": "complete",
+                "starting_position": starting_position,
+                "baseline_mark": baseline_mark,
+                "pnl_baseline": 0.0,
+                "historical_maker_orders": historical_orders,
+                "historical_maker_trades_ignored": historical_trades,
+                "history_window_seconds": 24 * 60 * 60,
+                "history_order_limit": 100,
+                "history_trade_limit": 500,
+                "current_run_fills": 0,
+            })
+        );
+        if starting_position.abs() > f64::EPSILON {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "symbol": symbol,
+                    "action": "inventory_adopted",
+                    "event": "complete",
+                    "starting_position": starting_position,
+                    "baseline_mark": baseline_mark,
+                    "pnl_baseline": 0.0,
+                })
+            );
+        }
+    } else {
+        eprintln!(
+            "✅ maker ledger synchronized: position={starting_position:+.8}, baseline mark={baseline_mark:.8}, ignored historical fills={historical_trades}"
+        );
+    }
+}
+
+fn emit_startup_rejected(
+    output_format: OutputFormat,
+    symbol: &str,
+    position: f64,
+    max_position: f64,
+) {
+    let message = format!(
+        "starting position {position:+.8} exceeds max_position {max_position:.8}; refusing live maker"
+    );
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "action": "startup_rejected",
+                "event": "position_over_limit",
+                "position": position,
+                "max_position": max_position,
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!("⚠️  {message}");
     }
 }
 
@@ -454,6 +581,7 @@ fn order_response_reconnect_available(failure: &str, attempts_used: u32, max: u3
 
 fn validate_reconnect_snapshot(
     symbol: &str,
+    run_order_prefix: &str,
     open_orders: &[Order],
     positions: &[Position],
     filled_orders: &[Order],
@@ -495,7 +623,7 @@ fn validate_reconnect_snapshot(
 
     let maker_filled_order_ids = filled_orders
         .iter()
-        .filter(|order| is_maker_order(order))
+        .filter(|order| is_current_run_order(order, run_order_prefix))
         .map(|order| {
             order.id.parse::<u64>().map_err(|_| {
                 anyhow::anyhow!(
@@ -535,6 +663,7 @@ async fn query_reconnect_snapshot(
     client: &StandXClient,
     symbol: &str,
     session_started_at: i64,
+    run_order_prefix: &str,
 ) -> Result<ReconnectSnapshot> {
     let now = chrono::Utc::now().timestamp();
     let (open_orders, positions, filled_orders, trades) = tokio::join!(
@@ -545,6 +674,7 @@ async fn query_reconnect_snapshot(
     );
     validate_reconnect_snapshot(
         symbol,
+        run_order_prefix,
         &open_orders?,
         &positions?,
         &filled_orders?,
@@ -557,6 +687,9 @@ async fn reconnect_order_response(
     cleanup_client: StandXClient,
     symbol: &str,
     session_started_at: i64,
+    run_order_prefix: &str,
+    expected_position: f64,
+    qty_tolerance: f64,
     output_format: OutputFormat,
     attempts_used: u32,
     max_attempts: u32,
@@ -590,10 +723,22 @@ async fn reconnect_order_response(
             let stream = OrderResponseStream::new(&session_id)?;
             match tokio::time::timeout(Duration::from_secs(15), stream.connect()).await {
                 Ok(Ok((responses, health, handle))) => {
-                    match query_reconnect_snapshot(&candidate_client, symbol, session_started_at)
-                        .await
+                    match query_reconnect_snapshot(
+                        &candidate_client,
+                        symbol,
+                        session_started_at,
+                        run_order_prefix,
+                    )
+                    .await
                     {
                         Ok(snapshot) => {
+                            if (snapshot.position - expected_position).abs() > qty_tolerance {
+                                handle.abort();
+                                return Err(anyhow::Error::new(PositionReconciliationError {
+                                    expected: expected_position,
+                                    observed: snapshot.position,
+                                }));
+                            }
                             if !health.is_healthy() {
                                 let reason = health.failure_reason().unwrap_or_else(|| {
                                     "new order-response session became unhealthy during reconciliation without a recorded reason".to_string()
@@ -682,6 +827,11 @@ async fn reconnect_order_response(
 
 async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputFormat) -> Result<()> {
     let order_session_id = args.live.then(|| uuid::Uuid::new_v4().to_string());
+    let run_uuid = uuid::Uuid::new_v4().simple().to_string();
+    let run_order_prefix = format!("{}{}-", MAKER_CL_ORD_ID_PREFIX, &run_uuid[..12]);
+    let mut starting_position = 0.0_f64;
+    let mut baseline_mark = 0.0_f64;
+    let mut session_started_at = chrono::Utc::now().timestamp();
 
     if let Some(after) = args.controlled_disconnect_after {
         if !args.live {
@@ -836,6 +986,56 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         // be adopted or cancelled as stale.
         cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await?;
 
+        // Establish the session ledger boundary before any new order can be
+        // submitted. Existing inventory is adopted at the current mark, so
+        // maker-session PnL starts at zero while account upnl remains intact.
+        let history_to = chrono::Utc::now().timestamp();
+        let history_from = history_to.saturating_sub(24 * 60 * 60);
+        let (positions, startup_market, filled_orders, historical_trades) = tokio::join!(
+            client.get_positions(Some(&symbol)),
+            market_snapshot(&client, &symbol, None),
+            client.get_order_history(Some(&symbol), Some(100)),
+            client.get_user_trades(&symbol, history_from, history_to, Some(500)),
+        );
+        let positions = positions?;
+        let (mark, _, _, _) = startup_market?;
+        let filled_orders = filled_orders?;
+        let historical_trades = historical_trades?;
+        starting_position = position_for_symbol(&positions, &symbol)?;
+        baseline_mark = mark;
+
+        let historical_order_ids = filled_orders
+            .iter()
+            .filter(|order| is_maker_order(order))
+            .map(|order| {
+                order.id.parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "historical maker order has non-integer exchange ID '{}'",
+                        order.id
+                    )
+                })
+            })
+            .collect::<Result<HashSet<_>>>()?;
+        let historical_maker_orders = historical_order_ids.len();
+        let historical_maker_trades = historical_trades
+            .iter()
+            .filter(|trade| {
+                trade
+                    .order_id
+                    .is_some_and(|order_id| historical_order_ids.contains(&order_id))
+            })
+            .count();
+
+        if !starting_position_within_limit(starting_position, cfg.max_position, cfg.qty_decimals) {
+            emit_startup_rejected(output_format, &symbol, starting_position, cfg.max_position);
+            return Err(anyhow::anyhow!(
+                "starting position {:+.8} exceeds max_position {:.8}",
+                starting_position,
+                cfg.max_position
+            ));
+        }
+        session_started_at = chrono::Utc::now().timestamp();
+
         let stream = OrderResponseStream::new(
             order_session_id
                 .as_deref()
@@ -862,6 +1062,14 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         order_responses = Some(responses);
         order_response_health = Some(health);
         order_response_handle = Some(handle);
+        emit_ledger_sync(
+            output_format,
+            &symbol,
+            starting_position,
+            baseline_mark,
+            historical_maker_orders,
+            historical_maker_trades,
+        );
     }
 
     let mode = if args.live { "LIVE" } else { "PAPER" };
@@ -989,7 +1197,6 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut inventory_exit_pending = false;
     let mut maker_order_ids: HashSet<u64> = HashSet::new();
     let mut seen_fill_ids: HashSet<u64> = HashSet::new();
-    let session_started_at = chrono::Utc::now().timestamp();
     let mut consecutive_errors: u32 = 0;
     let mut total_places: u64 = 0;
     let mut total_cancels: u64 = 0;
@@ -997,7 +1204,12 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_fills: u64 = 0;
     let mut total_halted: u64 = 0;
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
-    let mut stats = MakerStats::default();
+    let mut expected_position = starting_position;
+    let mut stats = if args.live {
+        MakerStats::with_inventory_baseline(starting_position, baseline_mark)
+    } else {
+        MakerStats::default()
+    };
     let mut breaker = VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut alerts =
         AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
@@ -1029,6 +1241,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         client.clone(),
                         &symbol,
                         session_started_at,
+                        &run_order_prefix,
+                        expected_position,
+                        10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
                         output_format,
                         order_response_reconnect_attempts_used,
                         args.order_response_reconnect_attempts,
@@ -1052,6 +1267,25 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                             continue;
                         }
                         Err(error) => {
+                            if let Some(reconciliation) =
+                                error.downcast_ref::<PositionReconciliationError>()
+                            {
+                                if output_format == OutputFormat::Json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({
+                                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                            "symbol": symbol,
+                                            "action": "position_reconciliation",
+                                            "event": "failed_during_reconnect",
+                                            "expected_position": reconciliation.expected,
+                                            "observed_position": reconciliation.observed,
+                                            "message": "post-reconnect venue position cannot be explained by current-run maker fills",
+                                        })
+                                    );
+                                }
+                                break MakerExit::PositionReconciliation(error.to_string());
+                            }
                             break MakerExit::OrderResponse(format!(
                                 "{detail}; safe reconnect failed: {error}; refusing further live orders"
                             ));
@@ -1115,6 +1349,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut maker_order_ids,
                 &mut seen_fill_ids,
                 session_started_at,
+                &run_order_prefix,
+                starting_position,
+                &mut expected_position,
                 &mut sim_position,
                 &mut stats,
                 &mut breaker,
@@ -1165,6 +1402,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 }
             }
             Err(e) => {
+                if e.downcast_ref::<PositionReconciliationError>().is_some() {
+                    break 'main MakerExit::PositionReconciliation(e.to_string());
+                }
                 consecutive_errors += 1;
                 eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
                 if consecutive_errors >= 3 {
@@ -1332,6 +1572,23 @@ mod tests {
     }
 
     #[test]
+    fn position_reconciliation_exit_is_immediate() {
+        let exit = MakerExit::PositionReconciliation(
+            "expected position -0.13000000, venue reported +0.07000000".to_string(),
+        );
+        let terminal = exit.terminal_error().unwrap();
+        assert!(terminal.contains("stopped immediately"));
+        assert!(!terminal.contains("3 consecutive"));
+    }
+
+    #[test]
+    fn inherited_position_allows_half_tick_tolerance_but_rejects_real_excess() {
+        assert!(starting_position_within_limit(0.800_05, 0.8, 3));
+        assert!(!starting_position_within_limit(0.800_6, 0.8, 3));
+        assert!(starting_position_within_limit(-0.8, 0.8, 3));
+    }
+
+    #[test]
     fn reconnect_policy_is_bounded_and_preserves_controlled_fail_safe() {
         assert!(order_response_reconnect_available(
             "order-response WebSocket error: reset",
@@ -1443,6 +1700,7 @@ mod tests {
         let filled = test_order("42", Some("sxmk-filled"));
         let snapshot = validate_reconnect_snapshot(
             "XAG-USD",
+            "sxmk-",
             &[manual],
             &[test_position("sell", "0.2")],
             &[filled],
@@ -1459,6 +1717,7 @@ mod tests {
     fn reconnect_snapshot_rejects_residual_maker_order() {
         let error = validate_reconnect_snapshot(
             "XAG-USD",
+            "sxmk-",
             &[test_order("42", Some("sxmk-still-open"))],
             &[],
             &[],
@@ -1473,6 +1732,7 @@ mod tests {
     fn reconnect_snapshot_rejects_unstable_maker_trade_id() {
         let error = validate_reconnect_snapshot(
             "XAG-USD",
+            "sxmk-",
             &[],
             &[],
             &[test_order("42", Some("sxmk-filled"))],
