@@ -14,6 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
+const MAKER_CLEANUP_VERIFY_DELAY: Duration = Duration::from_millis(500);
+const MAKER_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub(super) struct PositionReconciliationError {
     pub(super) expected: f64,
@@ -729,73 +732,72 @@ pub(super) async fn cancel_maker_orders_with_retry(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+
+            if order_ids.is_empty() {
+                return Ok::<_, anyhow::Error>(());
+            }
+
             client.cancel_orders(&order_ids).await?;
-            Ok::<_, anyhow::Error>(())
+            // Cancellation is accepted asynchronously by the venue. Do not
+            // treat an immediately stale open-orders response as a reason to
+            // abandon a safe reconnect; verify after a short grace period and
+            // reissue cancellation only for still-visible maker orders.
+            tokio::time::sleep(MAKER_CLEANUP_VERIFY_DELAY).await;
+            let residual_ids = client
+                .get_open_orders(Some(symbol))
+                .await?
+                .iter()
+                .filter(|order| is_maker_order(order))
+                .map(|order| order.id.clone())
+                .collect::<Vec<_>>();
+            if residual_ids.is_empty() {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "RESIDUAL MAKER ORDERS on {} after cancellation: [{}]",
+                    symbol,
+                    residual_ids.join(", ")
+                ))
+            }
         }
         .await;
         match result {
             Ok(()) => {
-                last_err = None;
-                break;
+                if output_format == OutputFormat::Json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "symbol": symbol,
+                            "action": "maker_cleanup",
+                            "event": "complete",
+                            "remaining_maker_orders": 0,
+                        })
+                    );
+                } else {
+                    println!("✅ All maker-owned {} orders cancelled", symbol);
+                }
+                return Ok(());
             }
             Err(e) => {
                 eprintln!(
-                    "⚠️  maker-order cancellation attempt {}/{} failed: {}",
+                    "⚠️  maker-order cancellation attempt {}/{} incomplete: {}",
                     attempt, attempts, e
                 );
                 last_err = Some(e);
                 if attempt < attempts {
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(MAKER_CLEANUP_RETRY_DELAY).await;
                 }
             }
         }
     }
 
-    // Verify only maker-owned orders. Foreign orders are intentionally left
-    // untouched and must not turn a clean maker shutdown into an error.
-    match client.get_open_orders(Some(symbol)).await {
-        Ok(orders) if orders.iter().all(|order| !is_maker_order(order)) => {
-            if output_format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "symbol": symbol,
-                        "action": "maker_cleanup",
-                        "event": "complete",
-                        "remaining_maker_orders": 0,
-                    })
-                );
-            } else {
-                println!("✅ All maker-owned {} orders cancelled", symbol);
-            }
-            Ok(())
-        }
-        Ok(orders) => {
-            let ids: Vec<_> = orders
-                .iter()
-                .filter(|order| is_maker_order(order))
-                .map(|order| order.id.as_str())
-                .collect();
-            Err(anyhow::anyhow!(
-                "⚠️  RESIDUAL MAKER ORDERS on {} after cancellation: [{}] — inspect or cancel manually with 'standx order cancel-all {}'",
-                symbol,
-                ids.join(", "),
-                symbol
-            ))
-        }
-        Err(e) => match last_err {
-            Some(cancel_err) => Err(anyhow::anyhow!(
-                "maker-order cancellation failed ({}) and verification failed ({}) — check open orders manually",
-                cancel_err,
-                e
-            )),
-            None => Err(anyhow::anyhow!(
-                "maker-order cancellation succeeded but verification failed ({}) — check open orders manually",
-                e
-            )),
-        },
-    }
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "maker-order cancellation had no attempts — inspect or cancel manually with 'standx order cancel-all {}'",
+            symbol
+        )
+    }))
 }
 
 #[cfg(test)]

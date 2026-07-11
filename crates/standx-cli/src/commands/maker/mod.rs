@@ -1638,13 +1638,23 @@ mod tests {
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
+
+    static MAKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            let lock = MAKER_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let original = std::env::var(key).ok();
             std::env::set_var(key, value);
-            Self { key, original }
+            Self {
+                key,
+                original,
+                _lock: lock,
+            }
         }
     }
 
@@ -2020,5 +2030,84 @@ mod tests {
         open_before.assert_async().await;
         cancel.assert_async().await;
         open_after.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn maker_cleanup_retries_stale_open_order_verification() {
+        let _jwt = EnvGuard::set("STANDX_JWT", "controlled-test-jwt");
+        let mut server = Server::new_async().await;
+        let maker_and_manual = r#"{"code":0,"message":"ok","result":[
+            {"id":"42","cl_ord_id":"sxmk-controlled-buy","symbol":"BTC-USD","side":"buy","order_type":"limit","qty":"0.001","fill_qty":"0","price":"63000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"},
+            {"id":"99","cl_ord_id":"manual-order","symbol":"BTC-USD","side":"sell","order_type":"limit","qty":"0.001","fill_qty":"0","price":"65000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}
+        ]}"#;
+        let manual_only = r#"{"code":0,"message":"ok","result":[
+            {"id":"99","cl_ord_id":"manual-order","symbol":"BTC-USD","side":"sell","order_type":"limit","qty":"0.001","fill_qty":"0","price":"65000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}
+        ]}"#;
+        let open_before = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(maker_and_manual)
+            .expect(1)
+            .create_async()
+            .await;
+        let cancel_first = server
+            .mock("POST", "/api/cancel_orders")
+            .match_body(Matcher::Json(serde_json::json!({ "order_id_list": [42] })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"code":0,"message":"accepted"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let stale_verify = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(maker_and_manual)
+            .expect(1)
+            .create_async()
+            .await;
+        let open_retry = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(maker_and_manual)
+            .expect(1)
+            .create_async()
+            .await;
+        let cancel_retry = server
+            .mock("POST", "/api/cancel_orders")
+            .match_body(Matcher::Json(serde_json::json!({ "order_id_list": [42] })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"code":0,"message":"accepted"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let cleared_verify = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manual_only)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        cancel_maker_orders_with_retry(&client, "BTC-USD", 3, OutputFormat::Quiet)
+            .await
+            .unwrap();
+
+        open_before.assert_async().await;
+        cancel_first.assert_async().await;
+        stale_verify.assert_async().await;
+        open_retry.assert_async().await;
+        cancel_retry.assert_async().await;
+        cleared_verify.assert_async().await;
     }
 }

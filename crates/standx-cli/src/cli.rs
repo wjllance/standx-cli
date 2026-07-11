@@ -277,7 +277,7 @@ pub enum OrderCommands {
     #[command(visible_alias = "cxl")]
     Cancel {
         symbol: String,
-        #[arg(short, long)]
+        #[arg(short = 'i', long)]
         order_id: String,
     },
     /// Cancel all orders for a symbol
