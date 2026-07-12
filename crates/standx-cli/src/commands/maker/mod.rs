@@ -2110,4 +2110,57 @@ mod tests {
         cancel_retry.assert_async().await;
         cleared_verify.assert_async().await;
     }
+
+    #[tokio::test]
+    async fn reconciliation_recovers_fast_current_run_fill_by_order_id() {
+        let _jwt = EnvGuard::set("STANDX_JWT", "controlled-test-jwt");
+        let mut server = Server::new_async().await;
+        let order_lookup = server
+            .mock("GET", "/api/query_order")
+            .match_query(Matcher::UrlEncoded(
+                "order_id".into(),
+                "11477424747".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"11477424747","cl_ord_id":"sxmk-0123456789ab-q00000001b0","symbol":"XAG-USD","side":"buy","order_type":"limit","qty":"0.001","fill_qty":"0.001","price":"59.89","status":"filled","created_at":"2026-07-11T07:06:05Z","updated_at":"2026-07-11T07:06:07Z"}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let trade = Trade {
+            id: 316_912_722,
+            time: "2026-07-11T07:06:07.128726Z".to_string(),
+            price: "59.89".to_string(),
+            qty: "0.001".to_string(),
+            side: Some("buy".to_string()),
+            is_buyer_taker: false,
+            fee_asset: Some("DUSD".to_string()),
+            fee_qty: Some("0.000005989".to_string()),
+            pnl: Some("0.00008".to_string()),
+            order_id: Some(11_477_424_747),
+            symbol: Some("XAG-USD".to_string()),
+            value: Some("0.05989".to_string()),
+        };
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let mut maker_order_ids = HashSet::new();
+        let mut exit_order_ids = HashSet::new();
+
+        cycle::recover_current_run_order_ids_for_reconciliation(
+            &client,
+            &[trade],
+            -0.001,
+            0.0,
+            0.0005,
+            "sxmk-0123456789ab-",
+            &mut maker_order_ids,
+            &mut exit_order_ids,
+        )
+        .await;
+
+        assert!(maker_order_ids.contains(&11_477_424_747));
+        assert!(exit_order_ids.is_empty());
+        order_lookup.assert_async().await;
+    }
 }

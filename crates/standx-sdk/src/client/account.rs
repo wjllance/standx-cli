@@ -186,6 +186,37 @@ impl StandXClient {
         Ok(wrapper.result)
     }
 
+    /// Get one order by its exchange ID.
+    ///
+    /// This is intentionally separate from order-history polling: an order
+    /// that fills between polling cycles can be absent from `/api/query_orders`
+    /// while still being retrievable by its stable exchange order ID.
+    pub async fn get_order(&self, order_id: u64) -> Result<Order> {
+        let url = format!("{}/api/query_order", self.base_url);
+        let headers = self.auth_headers()?;
+
+        let response = self
+            .client
+            .get(&url)
+            .headers(headers)
+            .query(&[("order_id", order_id)])
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(Error::Api {
+                code: status.as_u16(),
+                message: text,
+                endpoint: Some("/api/query_order".to_string()),
+                retryable: status.as_u16() >= 500,
+            });
+        }
+
+        Ok(response.json::<Order>().await?)
+    }
+
     /// Get order history
     pub async fn get_order_history(
         &self,

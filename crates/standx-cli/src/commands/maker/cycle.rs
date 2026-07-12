@@ -8,7 +8,7 @@ use anyhow::Result;
 use standx_maker::{self as maker, MakerConfig, MakerStats, RestingQuote, VolBreaker};
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
-use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
+use standx_sdk::models::{Balance, Order, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::OrderResponseHealth;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -123,6 +123,110 @@ fn collect_current_run_fills(
     Ok(exit_fill_observed)
 }
 
+fn adopt_current_run_order(
+    order: &Order,
+    run_order_prefix: &str,
+    maker_order_ids: &mut HashSet<u64>,
+    exit_order_ids: &mut HashSet<u64>,
+) -> Result<bool> {
+    if !is_current_run_order(order, run_order_prefix) {
+        return Ok(false);
+    }
+    let order_id = order.id.parse::<u64>().map_err(|_| {
+        anyhow::anyhow!(
+            "current-run maker order has non-integer exchange ID '{}'",
+            order.id
+        )
+    })?;
+    maker_order_ids.insert(order_id);
+    if order
+        .cl_ord_id
+        .as_deref()
+        .is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x")))
+    {
+        exit_order_ids.insert(order_id);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn recover_current_run_order_ids_for_reconciliation(
+    client: &StandXClient,
+    trades: &[Trade],
+    expected_position: f64,
+    observed_position: f64,
+    qty_tolerance: f64,
+    run_order_prefix: &str,
+    maker_order_ids: &mut HashSet<u64>,
+    exit_order_ids: &mut HashSet<u64>,
+) {
+    // A trade can settle into position before its order is visible in either
+    // open-order polling or `query_orders`. Only inspect unknown trades that
+    // could explain the signed reconciliation gap, then require a direct
+    // `query_order` lookup to prove the current run's client-order prefix.
+    const MAX_ORDER_LOOKUPS: usize = 8;
+    let position_gap = observed_position - expected_position;
+    if position_gap.abs() <= qty_tolerance {
+        return;
+    }
+
+    let mut candidate_ids = HashSet::new();
+    for trade in trades {
+        let Some(order_id) = trade.order_id else {
+            continue;
+        };
+        if maker_order_ids.contains(&order_id) {
+            continue;
+        }
+        let side = match trade
+            .side
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("buy") => 1.0,
+            Some("sell") => -1.0,
+            _ => continue,
+        };
+        let Ok(qty) = trade.qty.parse::<f64>() else {
+            continue;
+        };
+        if !qty.is_finite()
+            || qty <= 0.0
+            || side * position_gap <= 0.0
+            || qty > position_gap.abs() + qty_tolerance
+        {
+            continue;
+        }
+        candidate_ids.insert(order_id);
+        if candidate_ids.len() == MAX_ORDER_LOOKUPS {
+            break;
+        }
+    }
+
+    for order_id in candidate_ids {
+        match client.get_order(order_id).await {
+            Ok(order) => {
+                if let Err(error) = adopt_current_run_order(
+                    &order,
+                    run_order_prefix,
+                    maker_order_ids,
+                    exit_order_ids,
+                ) {
+                    eprintln!(
+                        "⚠️  reconciliation order lookup returned invalid order {}: {}",
+                        order_id, error
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "⚠️  reconciliation order lookup for {} failed: {}",
+                order_id, error
+            ),
+        }
+    }
+}
+
 fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<String> {
     match health {
         Some(health) if health.is_healthy() => None,
@@ -235,22 +339,12 @@ pub(super) async fn maker_cycle(
         // identify a quote that fully filled between two polling cycles.
         let mut exit_order_ids = HashSet::new();
         for order in orders.iter().chain(filled_orders.iter()) {
-            if is_current_run_order(order, run_order_prefix) {
-                let order_id = order.id.parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!(
-                        "current-run maker order has non-integer exchange ID '{}'",
-                        order.id
-                    )
-                })?;
-                maker_order_ids.insert(order_id);
-                if order
-                    .cl_ord_id
-                    .as_deref()
-                    .is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x")))
-                {
-                    exit_order_ids.insert(order_id);
-                }
-            }
+            adopt_current_run_order(
+                order,
+                run_order_prefix,
+                maker_order_ids,
+                &mut exit_order_ids,
+            )?;
         }
 
         exit_fill_observed |= collect_current_run_fills(
@@ -280,25 +374,27 @@ pub(super) async fn maker_cycle(
             orders = retry_orders?;
             let retry_filled_orders = retry_filled_orders?;
             for order in orders.iter().chain(retry_filled_orders.iter()) {
-                if is_current_run_order(order, run_order_prefix) {
-                    let order_id = order.id.parse::<u64>().map_err(|_| {
-                        anyhow::anyhow!(
-                            "current-run maker order has non-integer exchange ID '{}'",
-                            order.id
-                        )
-                    })?;
-                    maker_order_ids.insert(order_id);
-                    if order
-                        .cl_ord_id
-                        .as_deref()
-                        .is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x")))
-                    {
-                        exit_order_ids.insert(order_id);
-                    }
-                }
+                adopt_current_run_order(
+                    order,
+                    run_order_prefix,
+                    maker_order_ids,
+                    &mut exit_order_ids,
+                )?;
             }
+            let retry_trades = retry_trades?;
+            recover_current_run_order_ids_for_reconciliation(
+                client,
+                &retry_trades,
+                *expected_position,
+                observed_position,
+                qty_tolerance,
+                run_order_prefix,
+                maker_order_ids,
+                &mut exit_order_ids,
+            )
+            .await;
             exit_fill_observed |= collect_current_run_fills(
-                retry_trades?,
+                retry_trades,
                 maker_order_ids,
                 &exit_order_ids,
                 seen_fill_ids,
