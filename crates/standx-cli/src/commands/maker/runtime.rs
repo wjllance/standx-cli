@@ -1416,8 +1416,7 @@ pub(super) async fn run_maker(
                     }
                 }
                 Err(error) => {
-                    runtime_state
-                        .reduce(MakerEvent::AccountStreamDisconnected(error.to_string()));
+                    runtime_state.reduce(MakerEvent::AccountStreamDisconnected(error.to_string()));
                     if let Some(health) = account_stream_health.as_ref() {
                         health.mark_unhealthy(error.to_string());
                     }
