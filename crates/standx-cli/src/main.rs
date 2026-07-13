@@ -1,5 +1,5 @@
 use clap::Parser;
-use standx_cli::cli::{Cli, Commands, OutputFormat};
+use standx_cli::cli::{AlertWebhookFormat, Cli, Commands, MakerCommands, OutputFormat};
 use standx_cli::commands;
 use standx_cli::telemetry::Telemetry;
 
@@ -44,6 +44,15 @@ async fn main() {
     }
 
     let cli = Cli::parse();
+
+    // Install a last-resort panic notifier (issue #220): a silent panic never
+    // runs the maker cleanup/stop path, leaving resting orders on the venue
+    // with nobody notified. When a maker run configured a webhook, push one
+    // final critical message before the process dies.
+    if let Some((url, format)) = maker_panic_webhook(&cli.command) {
+        install_panic_notifier(url, format);
+    }
+
     let mut telemetry = Telemetry::new();
 
     // Initialize logging
@@ -129,6 +138,58 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Block { .. } => "block",
         Commands::Maker { .. } => "maker",
     }
+}
+
+/// Extract the alert webhook (URL + format) from a maker run so a panic can
+/// reuse the same push channel. Returns `None` for any other command or when
+/// no webhook was configured.
+fn maker_panic_webhook(command: &Commands) -> Option<(String, AlertWebhookFormat)> {
+    let Commands::Maker { command } = command else {
+        return None;
+    };
+    if let MakerCommands::Run {
+        alert_webhook: Some(url),
+        alert_webhook_format,
+        ..
+    } = command.as_ref()
+    {
+        return Some((url.clone(), *alert_webhook_format));
+    }
+    None
+}
+
+/// Chain a panic hook that POSTs one final critical notification, keeping the
+/// default hook (which prints the panic + backtrace) intact. The POST runs on
+/// a dedicated thread with its own runtime: the panicking task may be mid
+/// unwind inside the main tokio runtime, so we must not touch that runtime
+/// here. Best-effort and bounded — it never re-panics or blocks shutdown for
+/// long.
+fn install_panic_notifier(url: String, format: AlertWebhookFormat) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        let text = format!("🛑 standx maker PANIC — process crashed and cannot clean up: {info}");
+        let body = commands::panic_webhook_body(format, &text);
+        let url = url.clone();
+        let _ = std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let client = reqwest::Client::new();
+                let _ = client
+                    .post(&url)
+                    .json(&body)
+                    .timeout(std::time::Duration::from_secs(5))
+                    .send()
+                    .await;
+            });
+        })
+        .join();
+    }));
 }
 
 /// Execute the command, converting anyhow errors to our Error type

@@ -493,6 +493,25 @@ pub(super) async fn run_maker(
                 LIVE_MAKER_ENV
             ));
         }
+        // A live run with no push channel is how #220 happens: if the process
+        // dies (SIGKILL/OOM/panic/host down) nobody is notified and resting
+        // orders are left on the venue. Refuse to start live without a
+        // webhook, and refuse if the webhook can never fire because every
+        // alert threshold is disabled.
+        if args.alert_webhook.is_none() {
+            return Err(anyhow::anyhow!(
+                "live mode requires --alert-webhook so the maker can push risk/stop notifications; refusing to run live with no push channel"
+            ));
+        }
+        if args.alert_loss <= 0.0
+            && args.alert_inventory_pct <= 0.0
+            && args.alert_position_change_pct <= 0.0
+            && args.alert_uptime <= 0.0
+        {
+            return Err(anyhow::anyhow!(
+                "live mode requires at least one alert threshold (--alert-loss, --alert-inventory-pct, --alert-position-change-pct, or --alert-uptime); all are 0 so the webhook would never fire"
+            ));
+        }
         let creds = Credentials::load()?;
         if creds.is_expired() {
             return Err(anyhow::anyhow!(
