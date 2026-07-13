@@ -478,6 +478,22 @@ mod tests {
     }
 
     #[test]
+    fn alert_thresholds_reject_silent_disable_and_unfireable_ranges() {
+        use runtime::validate_alert_thresholds;
+        // Baseline: all valid.
+        assert!(validate_alert_thresholds(50.0, 80.0, 20.0, 3600.0).is_ok());
+        // Zero everywhere means "disabled" and is allowed.
+        assert!(validate_alert_thresholds(0.0, 0.0, 0.0, 0.0).is_ok());
+        // Negative thresholds silently disable the guard.
+        assert!(validate_alert_thresholds(-1.0, 80.0, 20.0, 3600.0).is_err());
+        assert!(validate_alert_thresholds(50.0, -1.0, 20.0, 3600.0).is_err());
+        assert!(validate_alert_thresholds(50.0, 80.0, 20.0, -1.0).is_err());
+        // Percentages above 100 can never fire.
+        assert!(validate_alert_thresholds(50.0, 170.0, 20.0, 3600.0).is_err());
+        assert!(validate_alert_thresholds(50.0, 80.0, 170.0, 3600.0).is_err());
+    }
+
+    #[test]
     fn webhook_body_shapes() {
         let txt = "🚨 ALERT [BTC-USD] loss — PnL -50 breached";
         // Structured object a caller would build for the Raw format.

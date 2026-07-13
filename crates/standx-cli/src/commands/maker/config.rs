@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 /// Values are optional so an explicit CLI flag can override one field without
 /// requiring every strategy default to be repeated in TOML.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct MakerFileConfig {
     pub spread_bps: Option<f64>,
     pub band_bps: Option<f64>,
@@ -100,6 +101,17 @@ mod tests {
         assert_eq!(config.order_response_reconnect_backoff, Some(2));
         assert_eq!(config.account_stream_reconnect_attempts, Some(3));
         assert_eq!(config.account_stream_reconnect_backoff, Some(2));
+    }
+
+    #[test]
+    fn rejects_unknown_keys_so_a_typo_does_not_silently_disable_a_guard() {
+        // `alert_los` is a typo for `alert_loss`; without deny_unknown_fields it
+        // parses fine and the loss guard stays off without warning.
+        let error = toml::from_str::<MakerFileConfig>("alert_los = 3.0\n").unwrap_err();
+        assert!(
+            error.to_string().contains("alert_los"),
+            "error should name the offending key: {error}"
+        );
     }
 
     #[test]

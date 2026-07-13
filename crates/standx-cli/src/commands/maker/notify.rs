@@ -1,6 +1,9 @@
 use crate::cli::{AlertWebhookFormat, OutputFormat};
-use standx_maker::{Alert, PositionAlertAnchor};
+use standx_maker::{Alert, PositionAlertAnchor, PositionRiskKind};
 use std::time::Duration;
+
+/// Number of extra attempts after the first POST fails or returns a 5xx.
+const WEBHOOK_RETRIES: u32 = 2;
 
 pub(super) fn webhook_body(
     format: AlertWebhookFormat,
@@ -20,18 +23,56 @@ pub(super) fn webhook_body(
 }
 
 async fn post_webhook(client: reqwest::Client, url: String, body: serde_json::Value) {
-    match client
-        .post(&url)
-        .json(&body)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(response) if !response.status().is_success() => {
-            eprintln!("⚠️  maker webhook returned {}", response.status())
+    // A single POST drops the alert on a transient 5xx or timeout, so retry a
+    // couple of times with linear backoff before giving up.
+    for attempt in 0..=WEBHOOK_RETRIES {
+        match client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return,
+            Ok(response) => {
+                let status = response.status();
+                if attempt == WEBHOOK_RETRIES {
+                    eprintln!("⚠️  maker webhook returned {status}");
+                    return;
+                }
+                eprintln!(
+                    "⚠️  maker webhook returned {status}; retrying ({}/{})",
+                    attempt + 1,
+                    WEBHOOK_RETRIES
+                );
+            }
+            Err(error) => {
+                if attempt == WEBHOOK_RETRIES {
+                    eprintln!("⚠️  maker webhook POST failed: {error}");
+                    return;
+                }
+                eprintln!(
+                    "⚠️  maker webhook POST failed: {error}; retrying ({}/{})",
+                    attempt + 1,
+                    WEBHOOK_RETRIES
+                );
+            }
         }
-        Err(error) => eprintln!("⚠️  maker webhook POST failed: {error}"),
-        _ => {}
+        tokio::time::sleep(Duration::from_secs(u64::from(attempt) + 1)).await;
+    }
+}
+
+/// Stable machine-readable name and delivery severity for a position-risk kind.
+///
+/// `Jump` keeps its historical `position_jump` name for backward compatibility;
+/// the direction flip and max-position crossings escalate to `critical` so a
+/// reversal or breach is distinguishable from an ordinary threshold jump.
+fn risk_kind_descriptor(kind: PositionRiskKind) -> (&'static str, &'static str) {
+    match kind {
+        PositionRiskKind::Jump => ("position_jump", "warning"),
+        PositionRiskKind::DirectionFlip => ("direction_flip", "critical"),
+        PositionRiskKind::MaxPositionCrossed => ("max_position_crossed", "critical"),
+        PositionRiskKind::InventoryExitCrossed => ("inventory_exit_crossed", "warning"),
     }
 }
 
@@ -88,8 +129,14 @@ impl MakerNotifier {
             .position_before
             .zip(notice.position_after)
             .map(|(before, after)| after - before);
+        // Give the webhook the same `[severity/kind] symbol:` prefix the stderr
+        // line carries so a phone alert identifies its source across instances.
+        let text = format!(
+            "[{}/{}] {}: {}",
+            notice.severity, notice.kind, notice.symbol, notice.message
+        );
         let raw = serde_json::json!({
-            "text": notice.message,
+            "text": text,
             "ts": ts,
             "symbol": notice.symbol,
             "cycle": notice.cycle,
@@ -112,7 +159,7 @@ impl MakerNotifier {
                 notice.severity, notice.kind, notice.symbol, notice.message
             );
         }
-        self.deliver(notice.message, raw, await_delivery).await;
+        self.deliver(&text, raw, await_delivery).await;
     }
 
     pub(super) async fn position_jump(
@@ -131,6 +178,7 @@ impl MakerNotifier {
         let before = event.before;
         let after = event.after;
         let delta = event.delta;
+        let (kind, severity) = risk_kind_descriptor(event.kind);
         let attribution = if (change.observed - change.expected).abs() <= change.qty_tolerance {
             "current-run maker fills"
         } else {
@@ -141,8 +189,8 @@ impl MakerNotifier {
         );
         self.risk(
             RiskNotice {
-                kind: "position_jump",
-                severity: "warning",
+                kind,
+                severity,
                 event: "detected",
                 message: &message,
                 symbol: change.symbol,
@@ -157,7 +205,7 @@ impl MakerNotifier {
         .await;
     }
 
-    pub(super) fn alert(&self, alert: &Alert, symbol: &str) {
+    pub(super) async fn alert(&self, alert: &Alert, symbol: &str, await_delivery: bool) {
         let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let label = if alert.firing {
             "🚨 ALERT"
@@ -176,15 +224,12 @@ impl MakerNotifier {
         } else {
             eprintln!("{} [{}] {} — {}", label, alert.kind, symbol, alert.message);
         }
-        if let (Some(client), Some(url)) = (&self.http, &self.webhook_url) {
-            let text = format!("{} [{}] {} — {}", label, symbol, alert.kind, alert.message);
-            let raw = serde_json::json!({
-                "text": text, "ts": ts, "symbol": symbol, "action": "alert",
-                "kind": alert.kind, "firing": alert.firing, "message": alert.message,
-            });
-            let body = webhook_body(self.webhook_format, &text, &raw);
-            tokio::spawn(post_webhook(client.clone(), url.clone(), body));
-        }
+        let text = format!("{} [{}] {} — {}", label, symbol, alert.kind, alert.message);
+        let raw = serde_json::json!({
+            "text": text, "ts": ts, "symbol": symbol, "action": "alert",
+            "kind": alert.kind, "firing": alert.firing, "message": alert.message,
+        });
+        self.deliver(&text, raw, await_delivery).await;
     }
 
     async fn deliver(&self, text: &str, raw: serde_json::Value, await_delivery: bool) {
@@ -221,4 +266,32 @@ pub(super) struct PositionChange<'a> {
     pub(super) qty_tolerance: f64,
     pub(super) symbol: &'a str,
     pub(super) cycle: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn risk_kind_descriptor_escalates_flip_and_breach_to_critical() {
+        // Ordinary jump keeps its historical name and warning severity.
+        assert_eq!(
+            risk_kind_descriptor(PositionRiskKind::Jump),
+            ("position_jump", "warning")
+        );
+        // A reversal and a max-position breach must be distinguishable and
+        // escalated so they are not lost among routine jumps.
+        assert_eq!(
+            risk_kind_descriptor(PositionRiskKind::DirectionFlip),
+            ("direction_flip", "critical")
+        );
+        assert_eq!(
+            risk_kind_descriptor(PositionRiskKind::MaxPositionCrossed),
+            ("max_position_crossed", "critical")
+        );
+        assert_eq!(
+            risk_kind_descriptor(PositionRiskKind::InventoryExitCrossed),
+            ("inventory_exit_crossed", "warning")
+        );
+    }
 }
