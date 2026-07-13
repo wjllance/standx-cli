@@ -515,10 +515,10 @@ pub(super) async fn maker_cycle(
                 return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
             }
             let cl_ord_id = maker::exit_client_order_id(run_order_prefix, cycle);
-            client
+            let submission = client
                 .create_order(CreateOrderParams {
                     symbol: symbol.to_string(),
-                    cl_ord_id: Some(cl_ord_id),
+                    cl_ord_id: Some(cl_ord_id.clone()),
                     side: exit.side,
                     order_type: OrderType::Market,
                     quantity: format_decimals(exit.qty, cfg.qty_decimals),
@@ -530,6 +530,21 @@ pub(super) async fn maker_cycle(
                     tp_price: None,
                 })
                 .await?;
+            // Register the exit submission so its asynchronous ack correlates
+            // to a pending entry instead of counting as an unmatched response.
+            // The sentinel level keeps it out of quote-slot reservation; a
+            // reduce-only market order never rests, so reconciliation drops it
+            // when `pending` ages out.
+            pending.push(PendingPlace {
+                request_id: submission.id,
+                cl_ord_id,
+                side: exit.side,
+                price: mark,
+                qty: exit.qty,
+                level: u32::MAX,
+                ref_center: mark,
+                cycle,
+            });
             *inventory_exit_pending = true;
             log_maker_event(MakerLogEvent {
                 output_format,

@@ -33,7 +33,7 @@ pub(super) fn apply_order_responses(
             runtime_state.reduce(if matched {
                 MakerEvent::OrderResponseMatched(request_id)
             } else {
-                MakerEvent::OrderResponseUnmatched(request_id)
+                MakerEvent::OrderResponseUnmatched { request_id, cycle }
             });
         }
         if runtime_state.is_frozen() {
@@ -1366,7 +1366,7 @@ pub(super) async fn run_maker(
                 runtime_state.reduce(if matched {
                     MakerEvent::OrderResponseMatched(request_id)
                 } else {
-                    MakerEvent::OrderResponseUnmatched(request_id)
+                    MakerEvent::OrderResponseUnmatched { request_id, cycle }
                 });
             }
             if runtime_state.is_frozen() {
