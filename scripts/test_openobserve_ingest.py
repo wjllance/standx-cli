@@ -102,8 +102,62 @@ class IncrementalIngestTests(unittest.TestCase):
             )
             self.assertEqual(first["uploaded"], 1)
             self.assertEqual(second["uploaded"], 1)
-            self.assertEqual(state[key], 2)
+            self.assertEqual(ingest.checkpoint_line(state[key]), 2)
             self.assertEqual([event["cycle"] for event in posted], [1, 2])
+
+    def test_truncated_file_resets_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "run.ndjson"
+            state_file = root / "state.json"
+            log.write_text(
+                '{"action":"cycle_summary","cycle":1}\n'
+                '{"action":"cycle_summary","cycle":2}\n',
+                encoding="utf-8",
+            )
+            args = self.args(log, state_file)
+            state: dict[str, object] = {}
+            posted: list[dict[str, object]] = []
+
+            with mock.patch.object(
+                ingest,
+                "post_batch",
+                side_effect=lambda _endpoint, _user, _password, events, _retries: posted.extend(events),
+            ):
+                first = self.upload(args, state)
+                # Rotation/truncation: the file is replaced with fewer lines.
+                log.write_text(
+                    '{"action":"cycle_summary","cycle":9}\n', encoding="utf-8"
+                )
+                second = self.upload(args, state)
+
+            self.assertEqual(first["uploaded"], 2)
+            # A naive line checkpoint (>=2) would skip the whole truncated file;
+            # identity validation resets it so the new line is uploaded.
+            self.assertEqual(second["uploaded"], 1)
+            self.assertEqual(posted[-1]["cycle"], 9)
+
+    def test_corrupt_state_file_auto_resets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text("{not json", encoding="utf-8")
+            self.assertEqual(ingest.load_state(state_file), {})
+
+    def test_legacy_int_state_is_still_honored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            state_file.write_text('{"abc": 7}', encoding="utf-8")
+            loaded = ingest.load_state(state_file)
+            self.assertEqual(ingest.checkpoint_line(loaded["abc"]), 7)
+
+    def test_bound_state_evicts_least_recently_updated(self) -> None:
+        state: dict[str, object] = {
+            f"key-{index}": {"line": 1, "inode": 1, "size": 1, "updated": index}
+            for index in range(5)
+        }
+        ingest.bound_state(state, limit=3)
+        self.assertEqual(len(state), 3)
+        self.assertEqual(set(state), {"key-2", "key-3", "key-4"})
 
     def test_failed_upload_does_not_advance_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

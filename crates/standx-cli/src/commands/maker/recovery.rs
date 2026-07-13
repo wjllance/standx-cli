@@ -187,10 +187,29 @@ pub(super) async fn cancel_maker_orders_with_retry(
                 return Ok(());
             }
             Err(error) => {
-                eprintln!(
-                    "⚠️  maker-order cancellation attempt {}/{} incomplete: {}",
-                    attempt, attempts, error
-                );
+                // Precursor signal: an incomplete cleanup retry often precedes a
+                // failed shutdown. Emit it on stdout (JSON mode) so the ingest
+                // pipeline uploads it, instead of leaving it only in local stderr.
+                if output_format == OutputFormat::Json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "symbol": symbol,
+                            "action": "maker_cleanup",
+                            "event": "retry_incomplete",
+                            "severity": "warning",
+                            "attempt": attempt,
+                            "max_attempts": attempts,
+                            "message": error.to_string(),
+                        })
+                    );
+                } else {
+                    eprintln!(
+                        "⚠️  maker-order cancellation attempt {}/{} incomplete: {}",
+                        attempt, attempts, error
+                    );
+                }
                 last_err = Some(error);
                 if attempt < attempts {
                     tokio::time::sleep(MAKER_CLEANUP_RETRY_DELAY).await;

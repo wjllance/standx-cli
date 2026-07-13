@@ -111,7 +111,7 @@ def markdown_panel(content: str) -> dict[str, Any]:
                 "config": {"promql_legend": ""},
             }
         ],
-        "layout": {"x": 0, "y": 29, "w": 192, "h": 4, "i": 11},
+        "layout": {"x": 0, "y": 37, "w": 192, "h": 4, "i": 11},
         "htmlContent": "",
         "markdownContent": content,
     }
@@ -128,7 +128,7 @@ def build_dashboard(stream: str, latest_run: str) -> dict[str, Any]:
             "Fill events in the selected maker run and dashboard time range.",
             query(
                 stream,
-                f'SELECT count(*) AS fills FROM "{stream}" WHERE action = \'fill\' AND {selected}',
+                f'SELECT count(DISTINCT event_id) AS fills FROM "{stream}" WHERE action = \'fill\' AND {selected}',
                 [],
                 [axis("fills", "Fills")],
             ),
@@ -237,19 +237,55 @@ def build_dashboard(stream: str, latest_run: str) -> dict[str, Any]:
             legends=True,
         ),
         panel(
+            "standx_account_trend",
+            "line",
+            "Equity / uPnL / Available",
+            "Authenticated account equity, unrealized PnL, and cross-available margin (live runs only; account is null in paper mode).",
+            query(
+                stream,
+                f'''SELECT histogram(_timestamp) AS ts,
+       avg(cast(account_equity AS DOUBLE)) AS equity,
+       avg(cast(account_upnl AS DOUBLE)) AS upnl,
+       avg(cast(account_available AS DOUBLE)) AS available
+FROM "{stream}" WHERE {cycles}
+GROUP BY histogram(_timestamp) ORDER BY ts''',
+                [axis("ts", "Time")],
+                [axis("equity", "Equity"), axis("upnl", "uPnL"), axis("available", "Available")],
+            ),
+            (0, 21, 96, 8, 12),
+            unit="currency-dollar",
+            legends=True,
+        ),
+        panel(
+            "standx_data_freshness",
+            "table",
+            "Data Freshness",
+            "Newest ingested event for the selected run. A stale max(_timestamp) signals a stalled maker or a stalled upload pipeline.",
+            query(
+                stream,
+                f'''SELECT max(_timestamp) AS last_event,
+       count(DISTINCT event_id) AS events
+FROM "{stream}" WHERE {selected}''',
+                [axis("last_event", "Last event")],
+                [axis("events", "Events")],
+            ),
+            (96, 21, 96, 8, 13),
+            decimals=None,
+        ),
+        panel(
             "standx_cancel_reasons",
             "bar",
             "Cancel Reasons",
             "Maker order cancellations grouped by reason.",
             query(
                 stream,
-                f'''SELECT coalesce(reason, 'unknown') AS reason, count(*) AS cancels
+                f'''SELECT coalesce(reason, 'unknown') AS reason, count(DISTINCT event_id) AS cancels
 FROM "{stream}" WHERE action = 'cancel' AND {selected}
 GROUP BY reason ORDER BY cancels DESC''',
                 [axis("reason", "Reason")],
                 [axis("cancels", "Cancels")],
             ),
-            (0, 21, 64, 8, 9),
+            (0, 29, 64, 8, 9),
             decimals=0,
         ),
         panel(
@@ -265,7 +301,7 @@ ORDER BY _timestamp DESC LIMIT 1''',
                 [axis("_timestamp", "Time"), axis("run_id", "Run"), axis("symbol", "Symbol"), axis("mode", "Mode"), axis("config_hash", "Config")],
                 [axis("fills_total", "Fills"), axis("pnl", "PnL"), axis("uptime_pct", "Uptime"), axis("position", "Position")],
             ),
-            (64, 21, 128, 8, 10),
+            (64, 29, 128, 8, 10),
             decimals=None,
         ),
         markdown_panel(
@@ -281,7 +317,7 @@ ORDER BY _timestamp DESC LIMIT 1''',
             "Alert events for the selected run.",
             query(
                 stream,
-                f'SELECT count(*) AS alerts FROM "{stream}" WHERE action = \'alert\' AND {selected}',
+                f'SELECT count(DISTINCT event_id) AS alerts FROM "{stream}" WHERE action = \'alert\' AND {selected}',
                 [],
                 [axis("alerts", "Alerts")],
             ),
@@ -295,7 +331,7 @@ ORDER BY _timestamp DESC LIMIT 1''',
             "Structured maker order cleanup events for the selected run.",
             query(
                 stream,
-                f'SELECT count(*) AS cleanups FROM "{stream}" WHERE action = \'maker_cleanup\' AND {selected}',
+                f"SELECT count(DISTINCT event_id) AS cleanups FROM \"{stream}\" WHERE action = 'maker_cleanup' AND event = 'complete' AND {selected}",
                 [],
                 [axis("cleanups", "Cleanups")],
             ),
@@ -309,7 +345,7 @@ ORDER BY _timestamp DESC LIMIT 1''',
             "Reduce-only inventory-exit events for the selected run.",
             query(
                 stream,
-                f'SELECT count(*) AS exits FROM "{stream}" WHERE action = \'inventory_exit\' AND {selected}',
+                f'SELECT count(DISTINCT event_id) AS exits FROM "{stream}" WHERE action = \'inventory_exit\' AND {selected}',
                 [],
                 [axis("exits", "Exits")],
             ),
@@ -356,6 +392,42 @@ ORDER BY _timestamp DESC LIMIT 200''',
             ),
             (0, 15, 192, 12, 5),
             decimals=None,
+        ),
+        panel(
+            "standx_error_reject",
+            "bar",
+            "Rejections & Error Signals",
+            "Order rejections, startup rejections, warning/critical risk notifications, and reconciliation/cleanup precursor failures for the selected run.",
+            query(
+                stream,
+                f'''SELECT action AS action, count(DISTINCT event_id) AS events
+FROM "{stream}" WHERE {selected}
+  AND (action IN ('place_rejected', 'place_rejected_async', 'startup_rejected')
+       OR (action = 'risk_notification' AND severity IN ('warning', 'critical'))
+       OR (action = 'position_reconciliation' AND event IN ('frozen', 'snapshot_failed'))
+       OR (action = 'maker_cleanup' AND event = 'retry_incomplete'))
+GROUP BY action ORDER BY events DESC''',
+                [axis("action", "Signal")],
+                [axis("events", "Events")],
+            ),
+            (0, 27, 96, 8, 6),
+            decimals=0,
+        ),
+        panel(
+            "standx_stream_health",
+            "bar",
+            "Stream Health / Reconnects",
+            "Account/order-response reconnect lifecycle events by phase; repeated attempts or failures expose disconnect windows.",
+            query(
+                stream,
+                f'''SELECT coalesce(event, 'unknown') AS event, count(DISTINCT event_id) AS events
+FROM "{stream}" WHERE action = 'order_response_reconnect' AND {selected}
+GROUP BY event ORDER BY events DESC''',
+                [axis("event", "Phase")],
+                [axis("events", "Events")],
+            ),
+            (96, 27, 96, 8, 7),
+            decimals=0,
         ),
     ]
 

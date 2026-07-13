@@ -253,6 +253,34 @@ fn emit_stop_loss_triggered(
     }
 }
 
+fn emit_reconciliation_snapshot_error(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    message: &str,
+) {
+    // Precursor signal: a failed reconciliation snapshot inside the freeze
+    // window is an early warning that the fail-safe may not converge. Surface
+    // it on stdout (JSON mode) so ingest uploads it rather than losing it to
+    // local stderr only.
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "position_reconciliation",
+                "event": "snapshot_failed",
+                "severity": "warning",
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!("⚠️  bounded position reconciliation snapshot failed: {message}");
+    }
+}
+
 fn emit_ledger_sync(
     output_format: OutputFormat,
     symbol: &str,
@@ -1926,8 +1954,11 @@ pub(super) async fn run_maker(
                                     break;
                                 }
                             }
-                            Err(error) => eprintln!(
-                                "⚠️  bounded position reconciliation snapshot failed: {error}"
+                            Err(error) => emit_reconciliation_snapshot_error(
+                                output_format,
+                                &symbol,
+                                cycle,
+                                &error.to_string(),
                             ),
                         }
                     }

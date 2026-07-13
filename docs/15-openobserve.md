@@ -100,6 +100,11 @@ python3 scripts/openobserve_ingest.py \
 产生相同 `event_id` 的重复行，分析查询应继续使用 `count(DISTINCT event_id)`。手工导入
 已结束的不可变日志仍保持原有的文件哈希 checkpoint 语义。
 
+checkpoint 记录文件身份（inode + 大小）：日志轮转（inode 变化）或截断（大小变小）时
+自动从头重扫，避免行号错位；重复行仍靠 `event_id` 去重。状态文件损坏（非法 JSON）时
+自动重置而非启动即失败，`--follow` 不再需要人工删除。checkpoint 条目数量有上界，超出时
+淘汰最久未更新的条目，`openobserve-uploaded.json` 不会无界增长。
+
 JWT、private key、token、password、authorization、webhook 等字段在上传前会递归
 替换为 `[REDACTED]`。原始本地文件不被修改。
 
@@ -154,7 +159,12 @@ python3 scripts/openobserve_dashboard.py
 
 Dashboard 默认选择最新 maker run，包含 `Overview` 和 `Runs & Events` 两个页签。
 PnL 面板展示 maker session 自身的 PnL；reduce-only exit 演练所用的外部预置库存，
-通过 Inventory 和 Events 面板单独判断。
+通过 Inventory 和 Events 面板单独判断。计数类面板统一使用 `count(DISTINCT event_id)`，
+重复上传不会虚增指标。
+
+`Overview` 另含权益/uPnL/可用保证金趋势（live 模式的 `account` 字段；paper 为 null）
+与数据新鲜度（`max(_timestamp)`）；`Runs & Events` 含拒单/错误信号与流健康/重连面板，
+便于在告警触发前观察前兆。
 
 ## 6. Deadman 告警（进程静默死亡）
 
@@ -185,6 +195,8 @@ push 通道与 maker 进程解耦：即使进程已经无法自己发通知，de
 
 - OpenObserve 仅监听 `127.0.0.1:5080`，不要直接暴露公网。
 - `deploy/openobserve/.env` 使用独立密码，不复用交易所凭证。
-- stdout 才进入分析 stream；stderr 只本地保存，避免诊断噪声污染事件表。
+- stdout 才进入分析 stream；stderr 只本地保存，避免诊断噪声污染事件表。撤单重试失败、
+  reconciliation 快照失败等前兆信号在 JSON 模式下以结构化 stdout 事件（`severity=warning`）
+  输出，随 stdout 一并上传；非 JSON 模式仍打印人类可读的 stderr 行。
 - verbose WebSocket 日志不得包含认证载荷；SDK 只记录认证动作和 stream 数量。
 - 先落盘、后上传是有意设计：日志后端绝不能给 maker 施加背压。

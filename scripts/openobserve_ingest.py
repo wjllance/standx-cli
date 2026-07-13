@@ -30,6 +30,10 @@ SENSITIVE_KEYS = {
 }
 STREAM_RE = re.compile(r"^[A-Za-z0-9_]+$")
 STOP_REQUESTED = False
+# Cap the number of per-run/per-file checkpoints retained so the state file does
+# not grow without bound over many runs. Evicted keys simply re-scan from zero on
+# the rare chance they reappear; event_id idempotency suppresses duplicate rows.
+MAX_STATE_ENTRIES = 512
 
 
 def redact(value: Any) -> Any:
@@ -62,21 +66,105 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_state(path: Path) -> dict[str, int]:
+def checkpoint_line(entry: Any) -> int:
+    """Return the last-processed line number recorded for a checkpoint entry.
+
+    Legacy state files stored the line number as a bare int; the current format
+    stores a dict that also carries the file identity used for reset detection.
+    """
+    if isinstance(entry, bool):
+        return 0
+    if isinstance(entry, int):
+        return entry
+    if isinstance(entry, dict) and isinstance(entry.get("line"), int):
+        return entry["line"]
+    return 0
+
+
+def file_identity(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_ino, stat.st_size
+
+
+def resume_checkpoint(entry: Any, identity: tuple[int, int]) -> int:
+    """Resolve where to resume, resetting to 0 when the log's identity changed.
+
+    A different inode (rotation) or a smaller size (truncation) means the stored
+    line number no longer points at the same bytes, so replaying from zero is
+    the only safe choice. Duplicate rows are harmless: they share the same
+    ``event_id`` and OpenObserve analytics de-duplicate on it.
+    """
+    line = checkpoint_line(entry)
+    if line <= 0 or not isinstance(entry, dict):
+        return max(line, 0)
+    inode = entry.get("inode")
+    size = entry.get("size")
+    if not isinstance(inode, int) or not isinstance(size, int):
+        return line  # legacy entry without identity: trust the line number
+    current_inode, current_size = identity
+    if inode != current_inode or current_size < size:
+        return 0
+    return line
+
+
+def make_checkpoint(line: int, identity: tuple[int, int]) -> dict[str, int]:
+    inode, size = identity
+    return {"line": line, "inode": inode, "size": size, "updated": int(time.time())}
+
+
+def bound_state(state: dict[str, Any], limit: int = MAX_STATE_ENTRIES) -> None:
+    """Evict the least-recently-updated checkpoints so the file stays bounded."""
+    if len(state) <= limit:
+        return
+
+    def updated_at(item: tuple[str, Any]) -> int:
+        _, value = item
+        return value.get("updated", 0) if isinstance(value, dict) else 0
+
+    for key, _ in sorted(state.items(), key=updated_at)[: len(state) - limit]:
+        del state[key]
+
+
+def load_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
         raise RuntimeError(f"cannot read upload state {path}: {exc}") from exc
-    if not isinstance(value, dict) or not all(
-        isinstance(key, str) and isinstance(line, int) for key, line in value.items()
-    ):
-        raise RuntimeError(f"invalid upload state format in {path}")
-    return value
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # A corrupt state file must never wedge --follow at startup. Reset and
+        # rely on event_id idempotency to suppress any re-uploaded rows.
+        print(
+            f"OpenObserve upload state {path} is unreadable ({exc}); "
+            "resetting checkpoints",
+            file=sys.stderr,
+        )
+        return {}
+    if not isinstance(value, dict):
+        print(
+            f"OpenObserve upload state {path} has an unexpected shape; "
+            "resetting checkpoints",
+            file=sys.stderr,
+        )
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, entry in value.items():
+        if not isinstance(key, str):
+            continue
+        if isinstance(entry, bool):
+            continue
+        if isinstance(entry, int):
+            normalized[key] = entry
+        elif isinstance(entry, dict) and isinstance(entry.get("line"), int):
+            normalized[key] = entry
+        # Malformed entries are dropped; they simply re-scan under event_id dedup.
+    return normalized
 
 
-def save_state(path: Path, state: dict[str, int]) -> None:
+def save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -204,7 +292,11 @@ def upload_once(
             state_key = hashlib.sha256(
                 f"{url}|{org}|{stream}|{file_hash}".encode()
             ).hexdigest()
-        checkpoint = 0 if args.force or args.dry_run else state.get(state_key, 0)
+        identity = file_identity(path)
+        if args.force or args.dry_run:
+            checkpoint = 0
+        else:
+            checkpoint = resume_checkpoint(state.get(state_key), identity)
         batch: list[dict[str, Any]] = []
         last_processed = checkpoint
 
@@ -256,7 +348,8 @@ def upload_once(
                     if not args.dry_run:
                         post_batch(endpoint, username, password, batch, args.retries)
                         summary["uploaded"] += len(batch)
-                        state[state_key] = last_processed
+                        state[state_key] = make_checkpoint(last_processed, identity)
+                        bound_state(state)
                         save_state(args.state_file, state)
                     batch.clear()
 
@@ -264,7 +357,8 @@ def upload_once(
             post_batch(endpoint, username, password, batch, args.retries)
             summary["uploaded"] += len(batch)
         if not args.dry_run:
-            state[state_key] = last_processed
+            state[state_key] = make_checkpoint(last_processed, identity)
+            bound_state(state)
             save_state(args.state_file, state)
 
     return summary
@@ -395,8 +489,8 @@ def main() -> int:
             )
             merge_summary(totals, summary)
             if summary["uploaded"]:
-                checkpoint = state.get(
-                    incremental_state_key(url, org, stream, args.run_id), 0
+                checkpoint = checkpoint_line(
+                    state.get(incremental_state_key(url, org, stream, args.run_id))
                 )
                 print(
                     f"OpenObserve live upload: run_id={args.run_id} "
