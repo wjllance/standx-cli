@@ -1,12 +1,32 @@
 //! Credential management for StandX CLI
 
 use crate::error::{Error, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Environment variable names
 pub const ENV_JWT_TOKEN: &str = "STANDX_JWT";
 pub const ENV_PRIVATE_KEY: &str = "STANDX_PRIVATE_KEY";
+
+/// Decode the `exp` (expiration) claim from a JWT without verifying its
+/// signature. Returns the expiry as a Unix timestamp (seconds) when the token
+/// is a well-formed JWT whose payload carries a numeric `exp`.
+///
+/// This is best-effort: opaque or malformed tokens (including the fake tokens
+/// used in tests) yield `None`, in which case callers fall back to the stored
+/// `created_at + validity_seconds` metadata.
+pub fn decode_jwt_exp(token: &str) -> Option<i64> {
+    // JWTs are `header.payload.signature`; the payload is the second segment,
+    // base64url-encoded (no padding) JSON.
+    let payload_b64 = token.split('.').nth(1)?;
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    match payload.get("exp")? {
+        serde_json::Value::Number(exp) => exp.as_i64().or_else(|| exp.as_f64().map(|v| v as i64)),
+        _ => None,
+    }
+}
 
 /// Stored credentials
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,22 +113,50 @@ impl Credentials {
         Ok(credentials)
     }
 
-    /// Check if token is expired
+    /// The JWT `exp` claim (Unix seconds), when the stored token is a
+    /// well-formed JWT carrying a numeric `exp`. This is the authoritative
+    /// expiry the venue enforces, and can be much shorter than the stored
+    /// `validity_seconds` metadata (e.g. an env-var token is tracked as
+    /// effectively non-expiring locally while the real JWT lasts ~24h).
+    pub fn jwt_exp(&self) -> Option<i64> {
+        decode_jwt_exp(&self.token)
+    }
+
+    /// Check if token is expired.
+    ///
+    /// Prefers the JWT `exp` claim when decodable (the venue's real cutoff),
+    /// and always also honours the stored `created_at + validity_seconds`
+    /// metadata so opaque tokens keep their previous behaviour.
     pub fn is_expired(&self) -> bool {
         let now = chrono::Utc::now().timestamp();
+        if let Some(exp) = self.jwt_exp() {
+            if now >= exp {
+                return true;
+            }
+        }
         now > self.created_at + self.validity_seconds
     }
 
-    /// Get remaining validity in seconds
+    /// Get remaining validity in seconds.
+    ///
+    /// When the JWT carries an `exp` claim, the returned value is clamped to
+    /// whichever expiry (JWT vs. stored metadata) comes first, so callers see
+    /// the true remaining lifetime rather than optimistic local metadata.
     pub fn remaining_seconds(&self) -> i64 {
         let now = chrono::Utc::now().timestamp();
-        let expires_at = self.created_at + self.validity_seconds;
+        let mut expires_at = self.created_at + self.validity_seconds;
+        if let Some(exp) = self.jwt_exp() {
+            expires_at = expires_at.min(exp);
+        }
         (expires_at - now).max(0)
     }
 
     /// Get expiration date as string
     pub fn expires_at_string(&self) -> String {
-        let expires = self.created_at + self.validity_seconds;
+        let mut expires = self.created_at + self.validity_seconds;
+        if let Some(exp) = self.jwt_exp() {
+            expires = expires.min(exp);
+        }
         let datetime =
             chrono::DateTime::from_timestamp(expires, 0).unwrap_or_else(chrono::Utc::now);
         datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
@@ -465,6 +513,60 @@ mod tests {
         // Test with token expired by 1 second
         creds.created_at = now - 3601;
         assert!(creds.is_expired());
+    }
+
+    /// Build a signature-less JWT (`header.payload.`) whose payload carries the
+    /// given claims. The signature segment is irrelevant to `exp` decoding.
+    fn jwt_with_payload(payload: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        format!("{header}.{body}.")
+    }
+
+    #[test]
+    fn decode_jwt_exp_reads_numeric_exp() {
+        let token = jwt_with_payload(serde_json::json!({ "exp": 1_800_000_000_i64, "sub": "u" }));
+        assert_eq!(decode_jwt_exp(&token), Some(1_800_000_000));
+    }
+
+    #[test]
+    fn decode_jwt_exp_ignores_opaque_and_missing() {
+        // Not a JWT at all.
+        assert_eq!(decode_jwt_exp("opaque_token"), None);
+        // Well-formed JWT but no exp claim.
+        let token = jwt_with_payload(serde_json::json!({ "sub": "u" }));
+        assert_eq!(decode_jwt_exp(&token), None);
+        // Non-numeric exp.
+        let token = jwt_with_payload(serde_json::json!({ "exp": "soon" }));
+        assert_eq!(decode_jwt_exp(&token), None);
+    }
+
+    #[test]
+    fn jwt_exp_overrides_optimistic_metadata() {
+        let now = chrono::Utc::now().timestamp();
+        // Metadata claims ~1 year of validity, but the JWT expires in 10 minutes.
+        let creds = Credentials {
+            token: jwt_with_payload(serde_json::json!({ "exp": now + 600 })),
+            private_key: String::new(),
+            created_at: now,
+            validity_seconds: 365 * 24 * 60 * 60,
+        };
+        assert!(!creds.is_expired());
+        let remaining = creds.remaining_seconds();
+        assert!(remaining > 590 && remaining <= 600, "remaining={remaining}");
+    }
+
+    #[test]
+    fn jwt_exp_in_the_past_marks_expired() {
+        let now = chrono::Utc::now().timestamp();
+        let creds = Credentials {
+            token: jwt_with_payload(serde_json::json!({ "exp": now - 1 })),
+            private_key: String::new(),
+            created_at: now,
+            validity_seconds: 365 * 24 * 60 * 60,
+        };
+        assert!(creds.is_expired());
+        assert_eq!(creds.remaining_seconds(), 0);
     }
 
     #[test]

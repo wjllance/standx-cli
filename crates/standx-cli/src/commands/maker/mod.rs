@@ -34,7 +34,7 @@ use model::is_order_rejection;
 use model::{is_maker_order, position_for_symbol, MakerExit, PendingPlace};
 #[cfg(test)]
 use notify::webhook_body;
-use notify::{MakerNotifier, PositionChange, RiskNotice};
+use notify::{token_expiry_level, MakerNotifier, PositionChange, RiskNotice, TokenExpiryLevel};
 use pipeline::{CycleRequest, CycleState};
 use recovery::{
     cancel_maker_orders_with_retry, order_response_reconnect_available, reconcile_ledger_snapshot,
@@ -71,6 +71,14 @@ pub fn panic_webhook_body(format: AlertWebhookFormat, text: &str) -> serde_json:
 /// Env var gating live order placement. The live path ships code-complete but
 /// locked until it has been supervised-tested against production.
 const LIVE_MAKER_ENV: &str = "STANDX_ENABLE_LIVE_MAKER";
+
+/// Warn when the JWT has under 2h of life left; escalate under 15m. Token
+/// lifetime caps run duration (there is no renewal endpoint), so an operator
+/// needs lead time to re-authenticate before the bot halts.
+const TOKEN_EXPIRY_WARN_SECS: i64 = 2 * 60 * 60;
+const TOKEN_EXPIRY_CRITICAL_SECS: i64 = 15 * 60;
+/// Throttle disk/env credential reloads for the expiry check.
+const TOKEN_EXPIRY_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 pub async fn handle_maker(
     command: MakerCommands,
     output_format: OutputFormat,

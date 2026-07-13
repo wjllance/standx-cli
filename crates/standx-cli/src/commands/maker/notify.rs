@@ -245,6 +245,35 @@ impl MakerNotifier {
     }
 }
 
+/// Severity band for the maker's JWT remaining-lifetime monitor.
+///
+/// Token lifetime is a hard cap on run duration: once the JWT expires every
+/// reconnect and REST call is rejected and the bot halts. There is no renewal
+/// endpoint in the codebase, so the best we can do is warn early enough for an
+/// operator to re-authenticate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum TokenExpiryLevel {
+    Ok,
+    Warning,
+    Critical,
+}
+
+/// Classify remaining token lifetime into a severity band. Thresholds are in
+/// seconds; `critical_below` should be <= `warn_below`.
+pub(super) fn token_expiry_level(
+    remaining_secs: i64,
+    warn_below: i64,
+    critical_below: i64,
+) -> TokenExpiryLevel {
+    if remaining_secs <= critical_below {
+        TokenExpiryLevel::Critical
+    } else if remaining_secs <= warn_below {
+        TokenExpiryLevel::Warning
+    } else {
+        TokenExpiryLevel::Ok
+    }
+}
+
 pub(super) struct RiskNotice<'a> {
     pub(super) kind: &'a str,
     pub(super) severity: &'a str,
@@ -293,5 +322,42 @@ mod tests {
             risk_kind_descriptor(PositionRiskKind::InventoryExitCrossed),
             ("inventory_exit_crossed", "warning")
         );
+    }
+}
+
+#[cfg(test)]
+mod token_expiry_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_remaining_lifetime_into_bands() {
+        let warn = 2 * 60 * 60; // 2h
+        let critical = 15 * 60; // 15m
+        assert_eq!(
+            token_expiry_level(6 * 60 * 60, warn, critical),
+            TokenExpiryLevel::Ok
+        );
+        assert_eq!(
+            token_expiry_level(warn, warn, critical),
+            TokenExpiryLevel::Warning
+        );
+        assert_eq!(
+            token_expiry_level(30 * 60, warn, critical),
+            TokenExpiryLevel::Warning
+        );
+        assert_eq!(
+            token_expiry_level(critical, warn, critical),
+            TokenExpiryLevel::Critical
+        );
+        assert_eq!(
+            token_expiry_level(0, warn, critical),
+            TokenExpiryLevel::Critical
+        );
+    }
+
+    #[test]
+    fn severity_bands_are_ordered_for_escalation_checks() {
+        assert!(TokenExpiryLevel::Critical > TokenExpiryLevel::Warning);
+        assert!(TokenExpiryLevel::Warning > TokenExpiryLevel::Ok);
     }
 }
