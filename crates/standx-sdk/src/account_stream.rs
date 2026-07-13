@@ -15,6 +15,13 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_ACCOUNT_STREAM_URL: &str = "wss://perps.standx.com/ws-stream/v1";
 const ACCOUNT_STREAM_ROTATE_AFTER: Duration = Duration::from_secs(23 * 60 * 60 + 50 * 60);
+/// How often we send a client-side ping to keep the connection observably
+/// alive and to elicit a pong (which resets the idle deadline).
+const ACCOUNT_STREAM_PING_INTERVAL: Duration = Duration::from_secs(30);
+/// If no inbound frame (data, ping, or pong) arrives within this window the
+/// connection is treated as stale — this catches half-open TCP sessions where
+/// the socket never errors but the peer has silently gone away.
+const ACCOUNT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn string_or_number<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
 where
@@ -160,6 +167,8 @@ pub struct AccountStream {
     url: String,
     token: String,
     epoch: u64,
+    ping_interval: Duration,
+    idle_timeout: Duration,
 }
 
 impl AccountStream {
@@ -175,6 +184,8 @@ impl AccountStream {
             url: DEFAULT_ACCOUNT_STREAM_URL.to_string(),
             token: credentials.token,
             epoch,
+            ping_interval: ACCOUNT_STREAM_PING_INTERVAL,
+            idle_timeout: ACCOUNT_STREAM_IDLE_TIMEOUT,
         })
     }
 
@@ -184,7 +195,16 @@ impl AccountStream {
             url: url.into(),
             token: token.into(),
             epoch,
+            ping_interval: ACCOUNT_STREAM_PING_INTERVAL,
+            idle_timeout: ACCOUNT_STREAM_IDLE_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_heartbeat(mut self, ping_interval: Duration, idle_timeout: Duration) -> Self {
+        self.ping_interval = ping_interval;
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     pub async fn connect(
@@ -264,10 +284,22 @@ impl AccountStream {
         let health = AccountStreamHealth::new(self.epoch);
         let task_health = health.clone();
         let epoch = self.epoch;
+        let ping_interval = self.ping_interval;
+        let idle_timeout = self.idle_timeout;
         let _ = tx.send(AccountEvent::Connected { epoch }).await;
         let handle = tokio::spawn(async move {
             let rotation = tokio::time::sleep(ACCOUNT_STREAM_ROTATE_AFTER);
             tokio::pin!(rotation);
+            // First ping fires after one interval (not immediately), so the
+            // handshake and any buffered startup frames are handled first.
+            let mut ping = tokio::time::interval_at(
+                tokio::time::Instant::now() + ping_interval,
+                ping_interval,
+            );
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Read-side idle deadline; reset on every inbound frame.
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
             loop {
                 let message = tokio::select! {
                     _ = &mut rotation => {
@@ -276,8 +308,29 @@ impl AccountStream {
                         let _ = tx.send(AccountEvent::Disconnected { reason }).await;
                         return;
                     }
+                    _ = ping.tick() => {
+                        if let Err(error) = write.send(Message::Ping(Vec::new().into())).await {
+                            let reason = format!("account-stream ping failed: {error}");
+                            task_health.mark_unhealthy(reason.clone());
+                            let _ = tx.send(AccountEvent::Error { reason }).await;
+                            return;
+                        }
+                        continue;
+                    }
+                    _ = &mut idle => {
+                        let reason = format!(
+                            "account stream idle for {}s (no ping/pong/data; connection likely half-open)",
+                            idle_timeout.as_secs()
+                        );
+                        task_health.mark_unhealthy(reason.clone());
+                        let _ = tx.send(AccountEvent::Disconnected { reason }).await;
+                        return;
+                    }
                     message = read.next() => message,
                 };
+                // Any inbound frame proves the peer is alive; extend the deadline.
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + idle_timeout);
                 let Some(message) = message else {
                     let reason = "account stream ended without a close frame".to_string();
                     task_health.mark_unhealthy(reason.clone());
@@ -478,5 +531,50 @@ mod tests {
         .await
         .unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_connection_is_marked_unhealthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        // Server authenticates then stays connected but silent forever,
+        // simulating a half-open connection that never errors or closes.
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let _auth = websocket.next().await.unwrap().unwrap();
+            websocket
+                .send(Message::Text(
+                    r#"{"seq":1,"channel":"auth","data":{"code":200,"msg":"success"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            // Absorb the client's pings without replying, then hold the socket
+            // open so the client can only detect death via the idle timeout.
+            while let Some(Ok(_)) = websocket.next().await {}
+        });
+
+        // Idle timeout well below the ping interval so the idle deadline, not a
+        // ping write failure, is what trips health.
+        let stream = AccountStream::with_url_and_token(url, "jwt", 7)
+            .with_heartbeat(Duration::from_secs(10), Duration::from_millis(200));
+        let (mut events, health, handle) = stream.connect(&[AccountChannel::Order]).await.unwrap();
+        assert_eq!(
+            events.recv().await,
+            Some(AccountEvent::Connected { epoch: 7 })
+        );
+
+        let disconnect = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("idle timeout should surface a disconnect");
+        match disconnect {
+            Some(AccountEvent::Disconnected { reason }) => {
+                assert!(reason.contains("idle"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected idle Disconnected, got {other:?}"),
+        }
+        assert!(!health.is_healthy());
+        handle.await.unwrap();
+        server.abort();
     }
 }

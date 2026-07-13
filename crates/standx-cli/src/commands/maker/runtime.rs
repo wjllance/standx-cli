@@ -903,11 +903,60 @@ pub(super) async fn run_maker(
     let mut order_response_reconnect_attempts_used = 0_u32;
     let mut account_stream_reconnect_attempts_used = 0_u32;
     let mut account_position_mismatch: Option<f64> = None;
+    // JWT expiry monitor: highest severity already alerted, plus a throttle so
+    // credentials are only reloaded from disk/env periodically.
+    let mut token_expiry_alerted = TokenExpiryLevel::Ok;
+    let mut last_token_expiry_check: Option<std::time::Instant> = None;
     let mut runtime_state = MakerState::starting();
     runtime_state.reduce(MakerEvent::StartupReady);
 
     let exit = 'main: loop {
         if args.live {
+            // JWT expiry monitor. There is no renewal endpoint, so we can only
+            // warn: escalate through Warning → Critical and alert once per band.
+            let due = last_token_expiry_check
+                .map(|last| last.elapsed() >= TOKEN_EXPIRY_CHECK_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                last_token_expiry_check = Some(std::time::Instant::now());
+                if let Ok(creds) = Credentials::load() {
+                    let remaining = creds.remaining_seconds();
+                    let level = token_expiry_level(
+                        remaining,
+                        TOKEN_EXPIRY_WARN_SECS,
+                        TOKEN_EXPIRY_CRITICAL_SECS,
+                    );
+                    if level > token_expiry_alerted {
+                        token_expiry_alerted = level;
+                        let (severity, event) = match level {
+                            TokenExpiryLevel::Critical => ("critical", "token_expiry_critical"),
+                            _ => ("warning", "token_expiry_warning"),
+                        };
+                        let minutes = remaining / 60;
+                        let message = format!(
+                            "auth token expires in ~{minutes}m ({}); no renewal endpoint — run 'standx auth login' before it lapses or the bot will halt",
+                            creds.expires_at_string()
+                        );
+                        notifier
+                            .risk(
+                                RiskNotice {
+                                    kind: "token_expiry",
+                                    severity,
+                                    event,
+                                    message: &message,
+                                    symbol: &symbol,
+                                    cycle,
+                                    position_before: None,
+                                    position_after: None,
+                                    expected: None,
+                                    observed: None,
+                                },
+                                false,
+                            )
+                            .await;
+                    }
+                }
+            }
             if let Some(health) = account_stream_health
                 .as_ref()
                 .filter(|health| !health.is_healthy())
