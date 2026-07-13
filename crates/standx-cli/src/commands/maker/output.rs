@@ -3,26 +3,42 @@ use standx_maker::{self as maker, Action, MakerConfig, MakerStats};
 use standx_sdk::models::{Balance, OrderSide};
 
 /// Per-cycle output: one human line + indented actions, or JSON lines.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn emit_maker_cycle(
-    output_format: OutputFormat,
-    live: bool,
-    symbol: &str,
-    cycle: u64,
-    mark: f64,
-    best_bid: Option<f64>,
-    best_ask: Option<f64>,
-    position: f64,
-    starting_position: f64,
-    // Real venue account snapshot. Present only in live mode.
-    account: Option<&Balance>,
-    actions: &[Action],
-    fills: &[MakerFill],
-    stats: &MakerStats,
-    // Some(vol_bps) when the volatility breaker halted quoting this cycle.
-    halt_vol_bps: Option<f64>,
-    cfg: &MakerConfig,
-) {
+pub(super) struct CycleOutput<'a> {
+    pub(super) output_format: OutputFormat,
+    pub(super) live: bool,
+    pub(super) symbol: &'a str,
+    pub(super) cycle: u64,
+    pub(super) mark: f64,
+    pub(super) best_bid: Option<f64>,
+    pub(super) best_ask: Option<f64>,
+    pub(super) position: f64,
+    pub(super) starting_position: f64,
+    pub(super) account: Option<&'a Balance>,
+    pub(super) actions: &'a [Action],
+    pub(super) fills: &'a [MakerFill],
+    pub(super) stats: &'a MakerStats,
+    pub(super) halt_vol_bps: Option<f64>,
+    pub(super) cfg: &'a MakerConfig,
+}
+
+pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
+    let CycleOutput {
+        output_format,
+        live,
+        symbol,
+        cycle,
+        mark,
+        best_bid,
+        best_ask,
+        position,
+        starting_position,
+        account,
+        actions,
+        fills,
+        stats,
+        halt_vol_bps,
+        cfg,
+    } = output;
     use maker::format_decimals;
 
     let pnl = stats.pnl(position, mark);
@@ -265,18 +281,30 @@ fn side_str(side: OrderSide) -> &'static str {
 
 /// Emit a one-off maker event (order rejection, no-op cancel) inline,
 /// respecting the output format. Only reached in live mode.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn log_maker_event(
-    output_format: OutputFormat,
-    symbol: &str,
-    cycle: u64,
-    action: &str,
-    side: OrderSide,
-    level: u32,
-    price: f64,
-    price_decimals: u32,
-    detail: &str,
-) {
+pub(super) struct MakerLogEvent<'a> {
+    pub(super) output_format: OutputFormat,
+    pub(super) symbol: &'a str,
+    pub(super) cycle: u64,
+    pub(super) action: &'a str,
+    pub(super) side: OrderSide,
+    pub(super) level: u32,
+    pub(super) price: f64,
+    pub(super) price_decimals: u32,
+    pub(super) detail: &'a str,
+}
+
+pub(super) fn log_maker_event(event: MakerLogEvent<'_>) {
+    let MakerLogEvent {
+        output_format,
+        symbol,
+        cycle,
+        action,
+        side,
+        level,
+        price,
+        price_decimals,
+        detail,
+    } = event;
     use maker::format_decimals;
     match output_format {
         OutputFormat::Json => {

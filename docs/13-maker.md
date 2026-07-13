@@ -187,6 +187,8 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 
 live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order + position + trade-shadow` account stream 和 Order Response Stream。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。order 回调和 REST trade 以订单累计成交量双向去重。account stream 断开或仓位不一致时立即冻结 placements、撤净 maker 订单，并在约 0.5s、1.5s、3.0s 结合 WS 与 REST 核对；恢复后从空 maker book 继续，3 秒仍不一致则 fail-safe 停机。
 
+运行时使用单一事件循环同时等待周期任务、account/order-response 回调、行情刷新和 Ctrl+C。关键账户事件会取消当前 REST/下单 future、递增 generation 并进入冻结清理；旧 generation 的工作结果不会重新开启挂单。普通行情刷新在已有工作执行时会合并为一次后续 replan，避免并发 cycle。
+
 `alert_position_change_pct` 默认 `0`（关闭）。设置为 `20` 时，实际仓位相对上次通知锚点累计变化达到 `max_position` 的 20% 会输出 `risk_notification(kind=position_jump)` 并复用现有 webhook；跨越 inventory-exit/max-position 阈值或多空翻转不受该百分比限制。account stream 断流/恢复、reconciliation 冻结/恢复/失败、volatility breaker、inventory exit、cleanup residual 和最终 fail-safe 也会生成结构化风险通知。
 - **Quiet（`--quiet`）**：只打印成交与增删挂单。
 
