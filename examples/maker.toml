@@ -22,10 +22,19 @@ max_divergence_bps = 25.0
 vol_pause_bps = 40.0
 vol_window = 12
 
+# Financial brake: when session mark-to-market PnL drops to -stop_loss (quote
+# units), the bot runs the fail-safe shutdown (freeze, cancel the maker book,
+# await the critical webhook, exit). 0 disables.
+stop_loss = 0.0
+
 # Alerts and optional active inventory exit (0 disables)
 alert_loss = 50.0
 alert_inventory_pct = 80.0
 alert_uptime = 70.0
+# Account floors (live-only; need an account snapshot). Fire once when the
+# metric drops below the floor and clear once it recovers 10% above it.
+alert_equity_below = 0.0
+alert_margin_below = 0.0
 inventory_exit_pct = 0.0
 inventory_exit_qty = 0.0
 

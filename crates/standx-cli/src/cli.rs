@@ -443,6 +443,11 @@ pub enum MakerCommands {
         /// Number of recent cycles the volatility breaker measures range over
         #[arg(long)]
         vol_window: Option<u32>,
+        /// Financial brake: when session mark-to-market PnL drops to -this
+        /// (quote units), run the fail-safe shutdown (freeze, cancel the maker
+        /// book, await critical webhook, exit). 0 disables
+        #[arg(long)]
+        stop_loss: Option<f64>,
         /// Risk alert: fire when mark-to-market PnL drops to -this (quote
         /// units). 0 disables
         #[arg(long)]
@@ -460,6 +465,14 @@ pub enum MakerCommands {
         /// (after warmup). 0 disables
         #[arg(long)]
         alert_uptime: Option<f64>,
+        /// Risk alert: fire when account equity drops below this (quote
+        /// units). Live-only (needs an account snapshot). 0 disables
+        #[arg(long)]
+        alert_equity_below: Option<f64>,
+        /// Risk alert: fire when available cross margin drops below this
+        /// (quote units). Live-only. 0 disables
+        #[arg(long)]
+        alert_margin_below: Option<f64>,
         /// Also POST risk alerts to this URL. stderr/JSON always get them
         /// regardless. Payload shape is set by --alert-webhook-format
         #[arg(long)]

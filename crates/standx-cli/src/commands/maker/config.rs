@@ -23,10 +23,13 @@ pub(super) struct MakerFileConfig {
     pub max_divergence_bps: Option<f64>,
     pub vol_pause_bps: Option<f64>,
     pub vol_window: Option<u32>,
+    pub stop_loss: Option<f64>,
     pub alert_loss: Option<f64>,
     pub alert_inventory_pct: Option<f64>,
     pub alert_position_change_pct: Option<f64>,
     pub alert_uptime: Option<f64>,
+    pub alert_equity_below: Option<f64>,
+    pub alert_margin_below: Option<f64>,
     pub no_ws: Option<bool>,
     pub order_response_reconnect_attempts: Option<u32>,
     pub order_response_reconnect_backoff: Option<u64>,
@@ -71,6 +74,16 @@ mod tests {
         assert_eq!(config.account_stream_reconnect_attempts, Some(3));
         assert_eq!(config.account_stream_reconnect_backoff, Some(2));
         assert_eq!(config.size, None);
+    }
+
+    #[test]
+    fn parses_stop_loss_and_account_floor_fields() {
+        let config: MakerFileConfig =
+            toml::from_str("stop_loss = 25\nalert_equity_below = 100\nalert_margin_below = 40\n")
+                .unwrap();
+        assert_eq!(config.stop_loss, Some(25.0));
+        assert_eq!(config.alert_equity_below, Some(100.0));
+        assert_eq!(config.alert_margin_below, Some(40.0));
     }
 
     #[test]

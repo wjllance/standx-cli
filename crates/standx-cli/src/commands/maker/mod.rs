@@ -81,10 +81,13 @@ pub async fn handle_maker(
             max_divergence_bps,
             vol_pause_bps,
             vol_window,
+            stop_loss,
             alert_loss,
             alert_inventory_pct,
             alert_position_change_pct,
             alert_uptime,
+            alert_equity_below,
+            alert_margin_below,
             alert_webhook,
             alert_webhook_format,
             no_ws,
@@ -113,6 +116,7 @@ pub async fn handle_maker(
                     max_divergence_bps: choose(max_divergence_bps, file.max_divergence_bps, 25.0),
                     vol_pause_bps: choose(vol_pause_bps, file.vol_pause_bps, 0.0),
                     vol_window: choose(vol_window, file.vol_window, 12),
+                    stop_loss: choose(stop_loss, file.stop_loss, 0.0),
                     alert_loss: choose(alert_loss, file.alert_loss, 0.0),
                     alert_inventory_pct: choose(alert_inventory_pct, file.alert_inventory_pct, 0.0),
                     alert_position_change_pct: choose(
@@ -121,6 +125,8 @@ pub async fn handle_maker(
                         0.0,
                     ),
                     alert_uptime: choose(alert_uptime, file.alert_uptime, 0.0),
+                    alert_equity_below: choose(alert_equity_below, file.alert_equity_below, 0.0),
+                    alert_margin_below: choose(alert_margin_below, file.alert_margin_below, 0.0),
                     alert_webhook,
                     alert_webhook_format,
                     no_ws: no_ws || file.no_ws.unwrap_or(false),
@@ -174,10 +180,13 @@ struct MakerRunArgs {
     max_divergence_bps: f64,
     vol_pause_bps: f64,
     vol_window: u32,
+    stop_loss: f64,
     alert_loss: f64,
     alert_inventory_pct: f64,
     alert_position_change_pct: f64,
     alert_uptime: f64,
+    alert_equity_below: f64,
+    alert_margin_below: f64,
     alert_webhook: Option<String>,
     alert_webhook_format: AlertWebhookFormat,
     no_ws: bool,
@@ -245,6 +254,17 @@ mod tests {
         let terminal = exit.terminal_error().unwrap();
         assert!(terminal.contains("stopped immediately"));
         assert!(!terminal.contains("3 consecutive"));
+    }
+
+    #[test]
+    fn stop_loss_exit_reports_the_breach_and_is_terminal() {
+        let exit = MakerExit::StopLoss("session PnL -12.50 <= -10.00".to_string());
+        let lifecycle = exit.lifecycle_reason();
+        let terminal = exit.terminal_error().unwrap();
+        assert!(lifecycle.contains("stop-loss breached"), "{lifecycle}");
+        assert!(lifecycle.contains("-12.50"), "{lifecycle}");
+        assert!(terminal.contains("stopped immediately"), "{terminal}");
+        assert!(terminal.contains("stop-loss breached"), "{terminal}");
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub(super) enum MakerExit {
     OrderResponse(String),
     ConsecutiveErrors(String),
     PositionReconciliation(String),
+    StopLoss(String),
 }
 
 impl MakerExit {
@@ -21,6 +22,9 @@ impl MakerExit {
             Self::PositionReconciliation(error) => {
                 format!("fail-safe: position reconciliation failed: {error}")
             }
+            Self::StopLoss(detail) => {
+                format!("fail-safe: stop-loss breached: {detail}")
+            }
         }
     }
 
@@ -35,6 +39,9 @@ impl MakerExit {
             )),
             Self::PositionReconciliation(error) => Some(format!(
                 "maker stopped immediately (fail-safe): position reconciliation failed: {error}"
+            )),
+            Self::StopLoss(detail) => Some(format!(
+                "maker stopped immediately (fail-safe): stop-loss breached: {detail}"
             )),
         }
     }
