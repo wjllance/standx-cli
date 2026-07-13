@@ -1,0 +1,9 @@
+[Unit]
+Description=StandX supervision failure notifier for %i
+
+[Service]
+Type=oneshot
+# Optional (leading '-'): the notifier still logs to the journal if absent.
+EnvironmentFile=-/etc/standx/maker.env
+# %i is the failed unit name, passed via OnFailure=standx-notify@%n.service.
+ExecStart=/opt/standx/deploy/systemd/standx-notify.sh %i

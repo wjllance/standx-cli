@@ -64,6 +64,23 @@ forward_signal() {
   fi
 }
 
+# Emit an operational notice to stderr and, if configured, to a webhook.
+# The webhook is best-effort: a failed POST never affects the maker.
+notify() {
+  local message="$1"
+  printf '%s\n' "$message" >&2
+  if [[ -n "${STANDX_SUPERVISOR_WEBHOOK:-}" ]] && command -v curl >/dev/null 2>&1; then
+    # Escape backslashes and double quotes so the message is valid JSON.
+    local escaped="${message//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    curl -fsS -m 5 -X POST \
+      -H 'Content-Type: application/json' \
+      --data "{\"text\":\"$escaped\"}" \
+      "$STANDX_SUPERVISOR_WEBHOOK" >/dev/null 2>&1 ||
+      printf 'supervisor webhook post failed (message logged above)\n' >&2
+  fi
+}
+
 trap cleanup EXIT
 trap 'forward_signal INT' INT
 trap 'forward_signal TERM' TERM
@@ -82,29 +99,58 @@ if [[ -n "$config_file" && -f "$config_file" ]]; then
   config_hash="$(shasum -a 256 "$config_file" | awk '{print $1}')"
 fi
 
+uploader_enabled=0
+
+# Launch (or relaunch) the live follow uploader. Follow mode is incremental
+# and resumes from the on-disk checkpoint, so a relaunch never re-sends events
+# that were already ingested.
+start_uploader() {
+  local upload_args=(
+    "$script_dir/openobserve_ingest.py" "$stdout_log"
+    --run-id "$run_id"
+    --incremental
+    --follow
+    --preflight
+    --poll-interval "${OPENOBSERVE_UPLOAD_INTERVAL:-2}"
+  )
+  [[ -n "$git_sha" ]] && upload_args+=(--git-sha "$git_sha")
+  [[ -n "$config_hash" ]] && upload_args+=(--config-hash "$config_hash")
+  python3 "${upload_args[@]}" >&2 &
+  uploader_pid=$!
+}
+
 if [[ "${OPENOBSERVE_AUTO_UPLOAD:-0}" == "1" ]]; then
   if [[ -z "${OPENOBSERVE_USER:-}" || -z "${OPENOBSERVE_PASSWORD:-}" ]]; then
     printf 'OpenObserve live upload skipped: credentials are not exported\n' >&2
   else
-    upload_args=(
-      "$script_dir/openobserve_ingest.py" "$stdout_log"
-      --run-id "$run_id"
-      --incremental
-      --follow
-      --preflight
-      --poll-interval "${OPENOBSERVE_UPLOAD_INTERVAL:-2}"
-    )
-    [[ -n "$git_sha" ]] && upload_args+=(--git-sha "$git_sha")
-    [[ -n "$config_hash" ]] && upload_args+=(--config-hash "$config_hash")
-    python3 "${upload_args[@]}" >&2 &
-    uploader_pid=$!
-    printf 'OpenObserve live uploader starting: run_id=%s interval=%ss\n' \
-      "$run_id" "${OPENOBSERVE_UPLOAD_INTERVAL:-2}" >&2
+    uploader_enabled=1
+    start_uploader
+    printf 'OpenObserve live uploader starting: run_id=%s interval=%ss pid=%s\n' \
+      "$run_id" "${OPENOBSERVE_UPLOAD_INTERVAL:-2}" "$uploader_pid" >&2
   fi
 fi
 
 "${args[@]}" >"$pipe_dir/stdout" 2>"$pipe_dir/stderr" &
 child_pid=$!
+
+# Supervise the uploader while the maker runs. If the follow loop dies
+# mid-run (an uncaught error, OOM kill, etc.) the only remote symptom is a
+# stale dashboard, so relaunch it and emit a notice. We poll instead of
+# blocking on `wait "$child_pid"` so the check happens during the run, not
+# after the maker already exited.
+supervise_interval="${STANDX_SUPERVISE_INTERVAL:-5}"
+while kill -0 "$child_pid" 2>/dev/null; do
+  if ((uploader_enabled == 1)) && [[ -n "$uploader_pid" ]] &&
+    ! kill -0 "$uploader_pid" 2>/dev/null; then
+    uploader_exit=0
+    wait "$uploader_pid" 2>/dev/null || uploader_exit=$?
+    notify "OpenObserve live uploader died (run_id=$run_id status=$uploader_exit) while maker still running; relaunching"
+    start_uploader
+    notify "OpenObserve live uploader relaunched (run_id=$run_id pid=$uploader_pid)"
+  fi
+  sleep "$supervise_interval"
+done
+
 wait "$child_pid"
 child_status=$?
 wait "$stdout_tee_pid" || true

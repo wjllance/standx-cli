@@ -32,6 +32,7 @@ use feed::{market_snapshot, spawn_market_feed};
 #[cfg(test)]
 use model::is_order_rejection;
 use model::{is_maker_order, position_for_symbol, MakerExit, PendingPlace};
+pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 #[cfg(test)]
 use notify::webhook_body;
 use notify::{token_expiry_level, MakerNotifier, PositionChange, RiskNotice, TokenExpiryLevel};

@@ -1,6 +1,37 @@
 use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide, Position};
 
+/// Process exit code emitted when the maker performs an *intentional*
+/// fail-safe shutdown: the order-response stream was lost, three maker
+/// cycles failed in a row, position reconciliation failed, or residual
+/// maker-owned orders could not be cancelled on the way out.
+///
+/// Supervisors must treat this as "stop, do NOT auto-restart, notify a
+/// human" (systemd `RestartPreventExitStatus=`). It is deliberately
+/// distinct from `0` (a clean Ctrl+C / SIGTERM stop: no restart, no alert),
+/// from `1` (a generic startup/config/validation error), and from a panic
+/// (`101`) or a fatal signal (e.g. SIGKILL -> `137`), so that an
+/// *unexpected* death remains restartable while a designed fail-safe exit
+/// does not trigger a restart loop.
+pub const FAIL_SAFE_EXIT_CODE: i32 = 75;
+
+/// Typed marker for an intentional maker fail-safe shutdown. Carrying the
+/// reason as a concrete error (rather than a bare `anyhow::anyhow!`) lets
+/// `main` downcast it and map it to [`FAIL_SAFE_EXIT_CODE`] while still
+/// printing the message through the normal error path.
+#[derive(Debug)]
+pub struct FailSafeShutdown {
+    pub message: String,
+}
+
+impl std::fmt::Display for FailSafeShutdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FailSafeShutdown {}
+
 pub(super) enum MakerExit {
     CtrlC,
     OrderResponse(String),

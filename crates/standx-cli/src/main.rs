@@ -1,6 +1,7 @@
 use clap::Parser;
 use standx_cli::cli::{AlertWebhookFormat, Cli, Commands, MakerCommands, OutputFormat};
 use standx_cli::commands;
+use standx_cli::commands::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 use standx_cli::telemetry::Telemetry;
 
 /// Print cool splash screen
@@ -116,8 +117,22 @@ async fn main() {
         Err(e) => {
             print_error(&e, output);
             telemetry.track_command_complete(command_name, false, Some(&e.to_string()));
-            std::process::exit(1);
+            std::process::exit(exit_code_for(e.as_ref()));
         }
+    }
+}
+
+/// Map a command error to a process exit code.
+///
+/// An intentional maker fail-safe shutdown gets its own
+/// [`FAIL_SAFE_EXIT_CODE`] so supervisors can tell it apart from a generic
+/// failure (`1`) and from an unexpected crash, and refuse to auto-restart
+/// it. Everything else keeps the generic error code `1`.
+fn exit_code_for(error: &(dyn std::error::Error + 'static)) -> i32 {
+    if error.downcast_ref::<FailSafeShutdown>().is_some() {
+        FAIL_SAFE_EXIT_CODE
+    } else {
+        1
     }
 }
 
@@ -245,7 +260,16 @@ async fn execute_command(
             commands::handle_block(command, output).await?;
         }
         Commands::Maker { command } => {
-            commands::handle_maker(*command, output, verbose).await?;
+            // anyhow flattens the concrete error type when it is boxed into a
+            // `Box<dyn Error>`, so downcast the fail-safe marker here (where the
+            // original `anyhow::Error` is still intact) and re-box it concretely
+            // so `exit_code_for` can recognise it and pick the fail-safe code.
+            if let Err(err) = commands::handle_maker(*command, output, verbose).await {
+                return Err(match err.downcast::<FailSafeShutdown>() {
+                    Ok(fail_safe) => Box::new(fail_safe) as Box<dyn std::error::Error>,
+                    Err(other) => other.into(),
+                });
+            }
         }
     }
     Ok(())
@@ -322,5 +346,33 @@ fn print_error(error: &Box<dyn std::error::Error>, output: OutputFormat) {
         _ => {
             eprintln!("❌ Error: {}", error);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fail_safe_error_maps_to_fail_safe_exit_code() {
+        // Mirror how `execute_command` hands a maker fail-safe error back to
+        // `main`: built as an anyhow error, downcast to the concrete marker,
+        // then re-boxed concretely so the type survives.
+        let err = anyhow::Error::new(FailSafeShutdown {
+            message: "maker stopped immediately (fail-safe): order-response stream unavailable"
+                .to_string(),
+        });
+        let boxed: Box<dyn std::error::Error> = match err.downcast::<FailSafeShutdown>() {
+            Ok(fail_safe) => Box::new(fail_safe),
+            Err(other) => other.into(),
+        };
+        assert_eq!(exit_code_for(boxed.as_ref()), FAIL_SAFE_EXIT_CODE);
+    }
+
+    #[test]
+    fn generic_error_maps_to_exit_code_one() {
+        let boxed: Box<dyn std::error::Error> =
+            anyhow::anyhow!("could not load maker config").into();
+        assert_eq!(exit_code_for(boxed.as_ref()), 1);
     }
 }
