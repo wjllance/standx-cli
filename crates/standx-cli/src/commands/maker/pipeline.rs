@@ -37,12 +37,14 @@ pub(super) struct CycleState<'a> {
     pub(super) breaker: &'a mut VolBreaker,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct CycleResult {
     pub(super) places: u64,
     pub(super) cancels: u64,
     pub(super) holds: u64,
     pub(super) fills: u64,
+    /// Latest account snapshot (live mode only; `None` in paper mode).
+    pub(super) balance: Option<Balance>,
 }
 
 pub(super) struct VenueSnapshot {

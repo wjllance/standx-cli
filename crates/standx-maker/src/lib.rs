@@ -626,9 +626,16 @@ pub struct AlertMonitor {
     inventory_pct: f64,
     /// Alert when two-sided uptime% < uptime_floor (after warmup). 0 = off.
     uptime_floor: f64,
+    /// Alert when account equity drops below this (quote units). 0 = off.
+    equity_floor: f64,
+    /// Alert when available cross margin drops below this (quote units).
+    /// 0 = off.
+    margin_floor: f64,
     loss_on: bool,
     inv_on: bool,
     uptime_on: bool,
+    equity_on: bool,
+    margin_on: bool,
 }
 
 impl AlertMonitor {
@@ -645,9 +652,22 @@ impl AlertMonitor {
         }
     }
 
+    /// Configure the account equity / available-margin floors (quote units).
+    /// 0 disables either floor.
+    pub fn with_account_floors(mut self, equity_floor: f64, margin_floor: f64) -> Self {
+        self.equity_floor = equity_floor;
+        self.margin_floor = margin_floor;
+        self
+    }
+
     /// Whether any threshold is configured.
     pub fn enabled(&self) -> bool {
         self.loss_limit > 0.0 || self.inventory_pct > 0.0 || self.uptime_floor > 0.0
+    }
+
+    /// Whether an account equity or available-margin floor is configured.
+    pub fn account_enabled(&self) -> bool {
+        self.equity_floor > 0.0 || self.margin_floor > 0.0
     }
 
     /// Evaluate the current metrics and return only the alerts whose state
@@ -728,6 +748,59 @@ impl AlertMonitor {
                     kind: "uptime",
                     firing: false,
                     message: format!("uptime recovered to {:.0}%", uptime),
+                });
+            }
+        }
+
+        out
+    }
+
+    /// Evaluate the account equity / available-margin floors against the latest
+    /// account snapshot and return only the alerts whose state changed this
+    /// cycle. Like [`AlertMonitor::evaluate`], each floor is edge-triggered: it
+    /// fires once when it drops below the floor and clears once it recovers to
+    /// 10% above the floor (hysteresis avoids flapping around the threshold).
+    pub fn evaluate_account(&mut self, equity: f64, available: f64) -> Vec<Alert> {
+        let mut out = Vec::new();
+
+        if self.equity_floor > 0.0 {
+            if !self.equity_on && equity < self.equity_floor {
+                self.equity_on = true;
+                out.push(Alert {
+                    kind: "equity",
+                    firing: true,
+                    message: format!(
+                        "account equity {:.2} below floor {:.2}",
+                        equity, self.equity_floor
+                    ),
+                });
+            } else if self.equity_on && equity >= self.equity_floor * 1.1 {
+                self.equity_on = false;
+                out.push(Alert {
+                    kind: "equity",
+                    firing: false,
+                    message: format!("account equity recovered to {:.2}", equity),
+                });
+            }
+        }
+
+        if self.margin_floor > 0.0 {
+            if !self.margin_on && available < self.margin_floor {
+                self.margin_on = true;
+                out.push(Alert {
+                    kind: "margin",
+                    firing: true,
+                    message: format!(
+                        "available margin {:.2} below floor {:.2}",
+                        available, self.margin_floor
+                    ),
+                });
+            } else if self.margin_on && available >= self.margin_floor * 1.1 {
+                self.margin_on = false;
+                out.push(Alert {
+                    kind: "margin",
+                    firing: false,
+                    message: format!("available margin recovered to {:.2}", available),
                 });
             }
         }
@@ -1925,6 +1998,48 @@ mod tests {
         let a = m.evaluate(&s, 0.0, 100.0, 0.05, 25);
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].kind, "uptime");
+        assert!(a[0].firing);
+    }
+
+    // 32. Account floors disabled by default; account_enabled reflects config.
+    #[test]
+    fn alerts_account_disabled_by_default() {
+        let mut m = AlertMonitor::new(0.0, 0.0, 0.0);
+        assert!(!m.account_enabled());
+        assert!(m.evaluate_account(10.0, 5.0).is_empty());
+    }
+
+    // 33. Equity floor: edge-triggered fire then clear with hysteresis.
+    #[test]
+    fn alerts_equity_floor_edge() {
+        let mut m = AlertMonitor::new(0.0, 0.0, 0.0).with_account_floors(100.0, 0.0);
+        assert!(m.account_enabled());
+        // Above floor -> no alert.
+        assert!(m.evaluate_account(120.0, 999.0).is_empty());
+        // Drop below floor -> fire.
+        let a = m.evaluate_account(90.0, 999.0);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].kind, "equity");
+        assert!(a[0].firing);
+        // Held breach -> no repeat.
+        assert!(m.evaluate_account(90.0, 999.0).is_empty());
+        // Back above floor but within hysteresis band (< 110) -> still on.
+        assert!(m.evaluate_account(105.0, 999.0).is_empty());
+        // Recover to >= floor*1.1 -> clear.
+        let a = m.evaluate_account(111.0, 999.0);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].kind, "equity");
+        assert!(!a[0].firing);
+    }
+
+    // 34. Available-margin floor fires independently of equity.
+    #[test]
+    fn alerts_margin_floor_fires() {
+        let mut m = AlertMonitor::new(0.0, 0.0, 0.0).with_account_floors(0.0, 50.0);
+        assert!(m.evaluate_account(9999.0, 60.0).is_empty());
+        let a = m.evaluate_account(9999.0, 40.0);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].kind, "margin");
         assert!(a[0].firing);
     }
 }

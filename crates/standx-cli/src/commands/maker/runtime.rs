@@ -226,6 +226,33 @@ fn emit_reconciliation_state(
     }
 }
 
+fn emit_stop_loss_triggered(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    pnl: f64,
+    stop_loss: f64,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "stop_loss",
+                "event": "triggered",
+                "pnl": pnl,
+                "stop_loss": stop_loss,
+            })
+        );
+    } else {
+        eprintln!(
+            "🛑 stop-loss triggered: session PnL {pnl:+.2} breached -{stop_loss:.2}; shutting down"
+        );
+    }
+}
+
 fn emit_ledger_sync(
     output_format: OutputFormat,
     symbol: &str,
@@ -724,10 +751,18 @@ pub(super) async fn run_maker(
                 args.vol_pause_bps / 2.0
             );
         }
+        if args.stop_loss > 0.0 {
+            println!(
+                "│ stop-loss: session PnL -{} → fail-safe shutdown",
+                args.stop_loss
+            );
+        }
         if args.alert_loss > 0.0
             || args.alert_inventory_pct > 0.0
             || args.alert_position_change_pct > 0.0
             || args.alert_uptime > 0.0
+            || args.alert_equity_below > 0.0
+            || args.alert_margin_below > 0.0
         {
             let mut parts = Vec::new();
             if args.alert_loss > 0.0 {
@@ -741,6 +776,12 @@ pub(super) async fn run_maker(
             }
             if args.alert_uptime > 0.0 {
                 parts.push(format!("uptime {}%", args.alert_uptime));
+            }
+            if args.alert_equity_below > 0.0 {
+                parts.push(format!("equity <{}", args.alert_equity_below));
+            }
+            if args.alert_margin_below > 0.0 {
+                parts.push(format!("margin <{}", args.alert_margin_below));
             }
             let sink = if args.alert_webhook.is_some() {
                 format!("stderr + webhook ({:?})", args.alert_webhook_format).to_lowercase()
@@ -807,7 +848,8 @@ pub(super) async fn run_maker(
     };
     let mut breaker = VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut alerts =
-        AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime);
+        AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
+            .with_account_floors(args.alert_equity_below, args.alert_margin_below);
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
     let mut order_response_reconnect_attempts_used = 0_u32;
@@ -1286,6 +1328,7 @@ pub(super) async fn run_maker(
                 src,
                 breaker.halted(),
                 inventory_exit_pending,
+                result.balance,
             ))
         };
         let account_during_work = async {
@@ -1399,7 +1442,7 @@ pub(super) async fn run_maker(
         }
 
         match cycle_result {
-            Ok((places, cancels, holds, fills, mark, src, halted, exit_pending_after)) => {
+            Ok((places, cancels, holds, fills, mark, src, halted, exit_pending_after, balance)) => {
                 consecutive_errors = 0;
                 total_places += places;
                 total_cancels += cancels;
@@ -1492,6 +1535,60 @@ pub(super) async fn run_maker(
                         alerts.evaluate(&stats, stats.position(), mark, cfg.max_position, cycle);
                     for alert in fired {
                         notifier.alert(&alert, &symbol);
+                    }
+                }
+                // Account equity / available-margin floors. The snapshot is
+                // only fetched in live mode, so these stay quiet in paper.
+                if alerts.account_enabled() {
+                    if let Some(balance) = balance.as_ref() {
+                        let equity = balance.equity.parse::<f64>().ok();
+                        let available = balance.cross_available.parse::<f64>().ok();
+                        if let (Some(equity), Some(available)) = (equity, available) {
+                            let fired = alerts.evaluate_account(equity, available);
+                            for alert in fired {
+                                notifier.alert(&alert, &symbol);
+                            }
+                        }
+                    }
+                }
+                // Financial brake: a session loss breaching --stop-loss routes
+                // through the fail-safe shutdown (freeze, cancel the maker
+                // book, await the critical webhook, exit) — the same path the
+                // other MakerExit variants use.
+                if args.stop_loss > 0.0 {
+                    let pnl = stats.pnl(stats.position(), mark);
+                    if pnl <= -args.stop_loss {
+                        emit_stop_loss_triggered(
+                            output_format,
+                            &symbol,
+                            cycle,
+                            pnl,
+                            args.stop_loss,
+                        );
+                        notifier
+                            .risk(
+                                RiskNotice {
+                                    kind: "stop_loss",
+                                    severity: "critical",
+                                    event: "triggered",
+                                    message: &format!(
+                                        "session PnL {pnl:+.2} breached stop-loss -{:.2}; shutting down",
+                                        args.stop_loss
+                                    ),
+                                    symbol: &symbol,
+                                    cycle,
+                                    position_before: None,
+                                    position_after: Some(ledger.expected_position),
+                                    expected: Some(ledger.expected_position),
+                                    observed: None,
+                                },
+                                true,
+                            )
+                            .await;
+                        break 'main MakerExit::StopLoss(format!(
+                            "session PnL {pnl:+.2} <= -{:.2}",
+                            args.stop_loss
+                        ));
                     }
                 }
             }

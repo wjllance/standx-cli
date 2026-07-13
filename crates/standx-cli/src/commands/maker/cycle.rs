@@ -575,6 +575,7 @@ pub(super) async fn maker_cycle(
         cancels,
         holds,
         fills: fills.len() as u64,
+        balance: account_balance,
     })
 }
 
