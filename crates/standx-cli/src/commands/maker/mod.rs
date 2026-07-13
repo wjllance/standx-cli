@@ -3,6 +3,9 @@ use anyhow::Result;
 use standx_maker::{
     self as maker, Alert, AlertMonitor, MakerConfig, MakerStats, RestingQuote, VolBreaker,
 };
+use standx_sdk::account_stream::{
+    AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,
+};
 use standx_sdk::auth::Credentials;
 use standx_sdk::client::StandXClient;
 use standx_sdk::error::Error as StandxError;
@@ -17,7 +20,10 @@ mod cycle;
 mod feed;
 mod output;
 
-use cycle::{cancel_maker_orders_with_retry, maker_cycle, PositionReconciliationError};
+use cycle::{
+    cancel_maker_orders_with_retry, maker_cycle, reconcile_ledger_snapshot, MakerLedger,
+    PositionReconciliationError,
+};
 use feed::{market_snapshot, spawn_market_feed};
 
 // ============================================================================
@@ -201,6 +207,166 @@ fn apply_order_responses(
             rejected.price,
             price_decimals,
             &response.message,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_account_events(
+    receiver: &mut tokio::sync::mpsc::Receiver<AccountEvent>,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+    symbol: &str,
+    run_order_prefix: &str,
+    mark: f64,
+    cycle: u64,
+    output_format: OutputFormat,
+) -> Result<(u64, Option<f64>)> {
+    let mut fills_total = 0;
+    let mut latest_position = None;
+    loop {
+        let event = match receiver.try_recv() {
+            Ok(event) => event,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                return Ok((fills_total, latest_position));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return Err(anyhow::anyhow!("authenticated account stream disconnected"));
+            }
+        };
+        let (fills, position) = apply_account_event(
+            event,
+            ledger,
+            stats,
+            symbol,
+            run_order_prefix,
+            mark,
+            cycle,
+            output_format,
+        )?;
+        fills_total += fills;
+        if position.is_some() {
+            latest_position = position;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_account_event(
+    event: AccountEvent,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+    symbol: &str,
+    run_order_prefix: &str,
+    mark: f64,
+    cycle: u64,
+    output_format: OutputFormat,
+) -> Result<(u64, Option<f64>)> {
+    match event {
+        AccountEvent::Connected { .. } => Ok((0, None)),
+        AccountEvent::Order(update) => {
+            let mut fills = Vec::new();
+            ledger.apply_order_update(
+                &update,
+                symbol,
+                run_order_prefix,
+                mark,
+                stats,
+                &mut fills,
+            )?;
+            for fill in &fills {
+                emit_live_fill(fill, symbol, cycle, output_format);
+            }
+            Ok((fills.len() as u64, None))
+        }
+        AccountEvent::Position(update) => {
+            if !update.symbol.eq_ignore_ascii_case(symbol) {
+                return Ok((0, None));
+            }
+            let qty = update.qty.parse::<f64>().map_err(|_| {
+                anyhow::anyhow!("account position update has invalid qty '{}'", update.qty)
+            })?;
+            if !qty.is_finite() {
+                return Err(anyhow::anyhow!(
+                    "account position update has non-finite qty"
+                ));
+            }
+            Ok((0, Some(qty)))
+        }
+        AccountEvent::TradeShadow { seq, data } => {
+            if output_format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        "symbol": symbol,
+                        "cycle": cycle,
+                        "action": "account_trade_shadow",
+                        "seq": seq,
+                        "data": data,
+                    })
+                );
+            }
+            Ok((0, None))
+        }
+        AccountEvent::Disconnected { reason } | AccountEvent::Error { reason } => Err(
+            anyhow::anyhow!("authenticated account stream unhealthy: {reason}"),
+        ),
+    }
+}
+
+fn emit_live_fill(fill: &MakerFill, symbol: &str, cycle: u64, output_format: OutputFormat) {
+    match output_format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "fill",
+                "origin": fill.origin,
+                "order_id": fill.order_id,
+                "trade_id": fill.trade_id,
+                "trade_ts": fill.trade_ts,
+                "side": fill.side,
+                "price": fill.price,
+                "qty": fill.qty,
+            })
+        ),
+        _ => eprintln!(
+            "⚡ account fill {:?} {} @ {} (order {})",
+            fill.side,
+            fill.qty,
+            fill.price,
+            fill.order_id.unwrap_or_default()
+        ),
+    }
+}
+
+fn emit_reconciliation_state(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    event: &str,
+    expected: f64,
+    observed: f64,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "position_reconciliation",
+                "event": event,
+                "expected_position": expected,
+                "observed_position": observed,
+            })
+        );
+    } else {
+        eprintln!(
+            "⚠️  position reconciliation {event}: expected {expected:+.8}, observed {observed:+.8}"
         );
     }
 }
@@ -958,6 +1124,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut order_responses = None;
     let mut order_response_health = None;
     let mut order_response_handle = None;
+    let mut account_events = None;
+    let mut account_stream_health: Option<AccountStreamHealth> = None;
+    let mut account_stream_handle = None;
+    let mut account_stream_epoch = 1_u64;
     if args.live {
         if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
             return Err(anyhow::anyhow!(
@@ -1041,6 +1211,32 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             ));
         }
         session_started_at = chrono::Utc::now().timestamp();
+
+        // Authenticated account state is a hard live dependency. Connect it
+        // before order-response readiness, then require a second REST
+        // snapshot so events buffered during authentication cannot create an
+        // unobserved startup gap.
+        let account_stream = AccountStream::new(account_stream_epoch)?;
+        let (events, health, handle) = account_stream
+            .connect(&[
+                AccountChannel::Order,
+                AccountChannel::Position,
+                AccountChannel::Trade,
+            ])
+            .await?;
+        let post_auth_positions = client.get_positions(Some(&symbol)).await?;
+        let post_auth_position = position_for_symbol(&post_auth_positions, &symbol)?;
+        let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+        if (post_auth_position - starting_position).abs() > qty_tolerance {
+            handle.abort();
+            emit_startup_rejected(output_format, &symbol, post_auth_position, cfg.max_position);
+            return Err(anyhow::anyhow!(
+                "position changed while account stream was authenticating: baseline {starting_position:+.8}, snapshot {post_auth_position:+.8}"
+            ));
+        }
+        account_events = Some(events);
+        account_stream_health = Some(health);
+        account_stream_handle = Some(handle);
 
         let stream = OrderResponseStream::new(
             order_session_id
@@ -1201,8 +1397,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut adopted: HashMap<String, (u32, f64, u64)> = HashMap::new(); // id -> (level, ref_mark, cycle)
     let mut pending: Vec<PendingPlace> = Vec::new();
     let mut inventory_exit_pending = false;
-    let mut maker_order_ids: HashSet<u64> = HashSet::new();
-    let mut seen_fill_ids: HashSet<u64> = HashSet::new();
+    let mut ledger = MakerLedger::new(starting_position);
     let mut consecutive_errors: u32 = 0;
     let mut total_places: u64 = 0;
     let mut total_cancels: u64 = 0;
@@ -1210,7 +1405,6 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut total_fills: u64 = 0;
     let mut total_halted: u64 = 0;
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
-    let mut expected_position = starting_position;
     let mut stats = if args.live {
         MakerStats::with_inventory_baseline(starting_position, baseline_mark)
     } else {
@@ -1222,9 +1416,109 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
     let mut order_response_reconnect_attempts_used = 0_u32;
+    let mut account_position_mismatch: Option<f64> = None;
 
     let exit = 'main: loop {
         if args.live {
+            if let Some(health) = account_stream_health
+                .as_ref()
+                .filter(|health| !health.is_healthy())
+            {
+                let detail = health.failure_reason().unwrap_or_else(|| {
+                    "account stream became unhealthy without a recorded reason".to_string()
+                });
+                // Freeze immediately: no further cycle can place while the
+                // authoritative account stream is unavailable.
+                if let Err(cleanup_error) =
+                    cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                {
+                    break MakerExit::PositionReconciliation(format!(
+                        "account stream disconnected ({detail}); freeze cleanup failed: {cleanup_error}"
+                    ));
+                }
+                resting.clear();
+                adopted.clear();
+                pending.clear();
+                inventory_exit_pending = false;
+                if let Some(handle) = account_stream_handle.take() {
+                    handle.abort();
+                }
+                account_events.take();
+                account_stream_epoch = account_stream_epoch.saturating_add(1);
+                let reconnect = async {
+                    let stream = AccountStream::new(account_stream_epoch)?;
+                    stream
+                        .connect(&[
+                            AccountChannel::Order,
+                            AccountChannel::Position,
+                            AccountChannel::Trade,
+                        ])
+                        .await
+                        .map_err(anyhow::Error::from)
+                };
+                match tokio::time::timeout(Duration::from_secs(3), reconnect).await {
+                    Ok(Ok((mut events, health, handle))) => {
+                        let reconnect_fills = match apply_account_events(
+                            &mut events,
+                            &mut ledger,
+                            &mut stats,
+                            &symbol,
+                            &run_order_prefix,
+                            last_mark.unwrap_or(baseline_mark),
+                            cycle,
+                            output_format,
+                        ) {
+                            Ok((fills, _)) => fills,
+                            Err(error) => {
+                                handle.abort();
+                                break MakerExit::PositionReconciliation(format!(
+                                    "account stream reconnect event validation failed: {error}"
+                                ));
+                            }
+                        };
+                        let positions = match client.get_positions(Some(&symbol)).await {
+                            Ok(positions) => positions,
+                            Err(error) => {
+                                handle.abort();
+                                break MakerExit::PositionReconciliation(format!(
+                                    "account stream reconnect snapshot failed: {error}"
+                                ));
+                            }
+                        };
+                        let observed = match position_for_symbol(&positions, &symbol) {
+                            Ok(position) => position,
+                            Err(error) => {
+                                handle.abort();
+                                break MakerExit::PositionReconciliation(error.to_string());
+                            }
+                        };
+                        if (observed - ledger.expected_position).abs()
+                            > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+                        {
+                            handle.abort();
+                            break MakerExit::PositionReconciliation(format!(
+                                "account stream reconnect snapshot expected {:+.8}, observed {:+.8}",
+                                ledger.expected_position, observed
+                            ));
+                        }
+                        account_events = Some(events);
+                        account_stream_health = Some(health);
+                        account_stream_handle = Some(handle);
+                        total_fills += reconnect_fills;
+                        continue;
+                    }
+                    Ok(Err(error)) => {
+                        break MakerExit::PositionReconciliation(format!(
+                            "account stream reconnect failed after freeze: {error}"
+                        ));
+                    }
+                    Err(_) => {
+                        break MakerExit::PositionReconciliation(
+                            "account stream reconnect timed out after 3 seconds".to_string(),
+                        );
+                    }
+                }
+            }
             if let Some(health) = order_response_health
                 .as_ref()
                 .filter(|health| !health.is_healthy())
@@ -1248,7 +1542,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         &symbol,
                         session_started_at,
                         &run_order_prefix,
-                        expected_position,
+                        ledger.expected_position,
                         10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
                         output_format,
                         order_response_reconnect_attempts_used,
@@ -1330,10 +1624,52 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 break MakerExit::OrderResponse(error.to_string());
             }
         }
+        if let Some(receiver) = account_events.as_mut() {
+            match apply_account_events(
+                receiver,
+                &mut ledger,
+                &mut stats,
+                &symbol,
+                &run_order_prefix,
+                last_mark.unwrap_or(baseline_mark),
+                cycle,
+                output_format,
+            ) {
+                Ok((fills, position)) => {
+                    total_fills += fills;
+                    if let Some(position) = position.filter(|position| {
+                        (*position - ledger.expected_position).abs()
+                            > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+                    }) {
+                        account_position_mismatch = Some(position);
+                    }
+                }
+                Err(error) => {
+                    if let Some(health) = account_stream_health.as_ref() {
+                        health.mark_unhealthy(error.to_string());
+                        continue;
+                    }
+                    break MakerExit::PositionReconciliation(error.to_string());
+                }
+            }
+        }
+        if account_position_mismatch.is_some_and(|position| {
+            (position - ledger.expected_position).abs()
+                <= 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+        }) {
+            account_position_mismatch = None;
+        }
 
         // Work phase raced against Ctrl+C so a slow API call can be
         // interrupted (mirrors run_watch_loop).
+        let mismatch = account_position_mismatch.take();
         let work = async {
+            if let Some(observed) = mismatch {
+                return Err(anyhow::Error::new(PositionReconciliationError {
+                    expected: ledger.expected_position,
+                    observed,
+                }));
+            }
             let (mark, best_bid, best_ask, src) =
                 market_snapshot(&client, &symbol, feed.as_ref()).await?;
             let (places, cancels, holds, fills) = maker_cycle(
@@ -1352,12 +1688,10 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 &mut adopted,
                 &mut pending,
                 &mut inventory_exit_pending,
-                &mut maker_order_ids,
-                &mut seen_fill_ids,
+                &mut ledger,
                 session_started_at,
                 &run_order_prefix,
                 starting_position,
-                &mut expected_position,
                 &mut sim_position,
                 &mut stats,
                 &mut breaker,
@@ -1408,8 +1742,111 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 }
             }
             Err(e) => {
-                if e.downcast_ref::<PositionReconciliationError>().is_some() {
-                    break 'main MakerExit::PositionReconciliation(e.to_string());
+                if let Some(mismatch) = e.downcast_ref::<PositionReconciliationError>() {
+                    // A mismatch is not a normal cycle error. Freeze quoting,
+                    // empty the maker book, and give account-order callbacks
+                    // plus REST settlement a bounded three-second window to
+                    // converge before failing closed.
+                    emit_reconciliation_state(
+                        output_format,
+                        &symbol,
+                        cycle,
+                        "frozen",
+                        mismatch.expected,
+                        mismatch.observed,
+                    );
+                    if let Err(cleanup_error) =
+                        cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                    {
+                        break 'main MakerExit::PositionReconciliation(format!(
+                            "freeze cleanup failed: {cleanup_error}"
+                        ));
+                    }
+                    resting.clear();
+                    adopted.clear();
+                    pending.clear();
+                    inventory_exit_pending = false;
+                    let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+                    let mut recovered = false;
+                    let mut last_observed = mismatch.observed;
+                    for delay in [500_u64, 1_000, 1_500] {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        if let Some(receiver) = account_events.as_mut() {
+                            match apply_account_events(
+                                receiver,
+                                &mut ledger,
+                                &mut stats,
+                                &symbol,
+                                &run_order_prefix,
+                                last_mark.unwrap_or(baseline_mark),
+                                cycle,
+                                output_format,
+                            ) {
+                                Ok((fills, position)) => {
+                                    total_fills += fills;
+                                    if let Some(position) = position {
+                                        last_observed = position;
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Some(health) = account_stream_health.as_ref() {
+                                        health.mark_unhealthy(error.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        match reconcile_ledger_snapshot(
+                            &client,
+                            &symbol,
+                            session_started_at,
+                            &run_order_prefix,
+                            qty_tolerance,
+                            last_mark.unwrap_or(baseline_mark),
+                            &mut ledger,
+                            &mut stats,
+                        )
+                        .await
+                        {
+                            Ok((observed, fills)) => {
+                                last_observed = observed;
+                                total_fills += fills.len() as u64;
+                                for fill in &fills {
+                                    emit_live_fill(fill, &symbol, cycle, output_format);
+                                }
+                                if (observed - ledger.expected_position).abs() <= qty_tolerance {
+                                    recovered = true;
+                                    break;
+                                }
+                            }
+                            Err(error) => eprintln!(
+                                "⚠️  bounded position reconciliation snapshot failed: {error}"
+                            ),
+                        }
+                    }
+                    if recovered {
+                        emit_reconciliation_state(
+                            output_format,
+                            &symbol,
+                            cycle,
+                            "recovered",
+                            ledger.expected_position,
+                            last_observed,
+                        );
+                        consecutive_errors = 0;
+                        continue;
+                    }
+                    emit_reconciliation_state(
+                        output_format,
+                        &symbol,
+                        cycle,
+                        "failed",
+                        ledger.expected_position,
+                        last_observed,
+                    );
+                    break 'main MakerExit::PositionReconciliation(format!(
+                        "expected position {:+.8}, venue reported {:+.8} after 3s freeze",
+                        ledger.expected_position, last_observed
+                    ));
                 }
                 consecutive_errors += 1;
                 eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
@@ -1434,9 +1871,50 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                     None => std::future::pending().await,
                 }
             };
+            let account_update = async {
+                match account_events.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 _ = signal::ctrl_c() => break 'main MakerExit::CtrlC,
                 _ = tokio::time::sleep_until(deadline) => break,
+                event = account_update => {
+                    let Some(event) = event else {
+                        if let Some(health) = account_stream_health.as_ref() {
+                            health.mark_unhealthy("authenticated account stream disconnected");
+                        }
+                        break;
+                    };
+                    match apply_account_event(
+                        event,
+                        &mut ledger,
+                        &mut stats,
+                        &symbol,
+                        &run_order_prefix,
+                        last_mark.unwrap_or(baseline_mark),
+                        cycle,
+                        output_format,
+                    ) {
+                        Ok((fills, position)) => {
+                            total_fills += fills;
+                            if let Some(position) = position.filter(|position| {
+                                (*position - ledger.expected_position).abs()
+                                    > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+                            }) {
+                                account_position_mismatch = Some(position);
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            if let Some(health) = account_stream_health.as_ref() {
+                                health.mark_unhealthy(error.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
                 ok = update => {
                     if !ok {
                         // Feed task gone: fall back to plain interval waits.
@@ -1464,6 +1942,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 
     // ---- Cleanup on ALL exit paths ----
     if let Some(handle) = feed_handle {
+        handle.abort();
+    }
+    if let Some(handle) = account_stream_handle {
         handle.abort();
     }
     if output_format == OutputFormat::Table {
@@ -2144,8 +2625,7 @@ mod tests {
             value: Some("0.05989".to_string()),
         };
         let client = StandXClient::with_base_url(server.url()).unwrap();
-        let mut maker_order_ids = HashSet::new();
-        let mut exit_order_ids = HashSet::new();
+        let mut ledger = cycle::MakerLedger::new(-0.001);
 
         cycle::recover_current_run_order_ids_for_reconciliation(
             &client,
@@ -2154,13 +2634,12 @@ mod tests {
             0.0,
             0.0005,
             "sxmk-0123456789ab-",
-            &mut maker_order_ids,
-            &mut exit_order_ids,
+            &mut ledger,
         )
         .await;
 
-        assert!(maker_order_ids.contains(&11_477_424_747));
-        assert!(exit_order_ids.is_empty());
+        assert!(ledger.maker_order_ids.contains(&11_477_424_747));
+        assert!(ledger.exit_order_ids.is_empty());
         order_lookup.assert_async().await;
     }
 }

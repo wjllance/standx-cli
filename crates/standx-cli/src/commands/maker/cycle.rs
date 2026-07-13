@@ -6,6 +6,7 @@ use super::{
 use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{self as maker, MakerConfig, MakerStats, RestingQuote, VolBreaker};
+use standx_sdk::account_stream::OrderUpdate;
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, Order, OrderSide, OrderType, TimeInForce, Trade};
@@ -16,6 +17,134 @@ use std::time::Duration;
 
 const MAKER_CLEANUP_VERIFY_DELAY: Duration = Duration::from_millis(500);
 const MAKER_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FillTotals {
+    qty: f64,
+    notional: f64,
+}
+
+/// Current-run fill ledger shared by the account WebSocket and REST polling.
+/// Both sources report cumulative information in different shapes, so totals
+/// are reconciled per order before mutating position or PnL.
+#[derive(Debug)]
+pub(super) struct MakerLedger {
+    pub(super) expected_position: f64,
+    pub(super) maker_order_ids: HashSet<u64>,
+    pub(super) exit_order_ids: HashSet<u64>,
+    seen_fill_ids: HashSet<u64>,
+    accounted: HashMap<u64, FillTotals>,
+    rest_seen: HashMap<u64, FillTotals>,
+}
+
+impl MakerLedger {
+    pub(super) fn new(starting_position: f64) -> Self {
+        Self {
+            expected_position: starting_position,
+            maker_order_ids: HashSet::new(),
+            exit_order_ids: HashSet::new(),
+            seen_fill_ids: HashSet::new(),
+            accounted: HashMap::new(),
+            rest_seen: HashMap::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_delta(
+        &mut self,
+        order_id: u64,
+        side: OrderSide,
+        cumulative: FillTotals,
+        mark: f64,
+        stats: &mut MakerStats,
+        fills: &mut Vec<MakerFill>,
+        origin: &'static str,
+        trade_id: Option<u64>,
+        trade_ts: Option<String>,
+    ) -> Result<bool> {
+        let previous = self.accounted.get(&order_id).copied().unwrap_or_default();
+        let qty = cumulative.qty - previous.qty;
+        if qty <= 1e-12 {
+            return Ok(false);
+        }
+        let notional = cumulative.notional - previous.notional;
+        let price = notional / qty;
+        if !qty.is_finite() || !price.is_finite() || qty <= 0.0 || price <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "invalid cumulative fill for maker order {order_id}: qty={qty}, price={price}"
+            ));
+        }
+        stats.record_fill(side, price, qty, mark);
+        self.expected_position += match side {
+            OrderSide::Buy => qty,
+            OrderSide::Sell => -qty,
+        };
+        self.accounted.insert(order_id, cumulative);
+        fills.push(MakerFill {
+            side,
+            price,
+            qty,
+            trade_id,
+            order_id: Some(order_id),
+            trade_ts,
+            origin,
+        });
+        Ok(self.exit_order_ids.contains(&order_id))
+    }
+
+    pub(super) fn apply_order_update(
+        &mut self,
+        update: &OrderUpdate,
+        symbol: &str,
+        run_order_prefix: &str,
+        mark: f64,
+        stats: &mut MakerStats,
+        fills: &mut Vec<MakerFill>,
+    ) -> Result<bool> {
+        if update.symbol != symbol
+            || !update
+                .cl_ord_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with(run_order_prefix))
+        {
+            return Ok(false);
+        }
+        self.maker_order_ids.insert(update.order_id);
+        if update
+            .cl_ord_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x")))
+        {
+            self.exit_order_ids.insert(update.order_id);
+        }
+        let qty = update.fill_qty.parse::<f64>().map_err(|_| {
+            anyhow::anyhow!("account order {} has invalid fill_qty", update.order_id)
+        })?;
+        if qty <= 0.0 {
+            return Ok(false);
+        }
+        let avg = update.fill_avg_price.parse::<f64>().map_err(|_| {
+            anyhow::anyhow!(
+                "account order {} has invalid fill_avg_price",
+                update.order_id
+            )
+        })?;
+        self.record_delta(
+            update.order_id,
+            update.side,
+            FillTotals {
+                qty,
+                notional: qty * avg,
+            },
+            mark,
+            stats,
+            fills,
+            "current_run_ws_order",
+            None,
+            Some(update.updated_at.clone()),
+        )
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct PositionReconciliationError {
@@ -70,22 +199,19 @@ fn trade_is_in_session(trade: &Trade, session_started_at: i64, now: i64) -> Resu
 #[allow(clippy::too_many_arguments)]
 fn collect_current_run_fills(
     trades: Vec<Trade>,
-    maker_order_ids: &HashSet<u64>,
-    exit_order_ids: &HashSet<u64>,
-    seen_fill_ids: &mut HashSet<u64>,
+    ledger: &mut MakerLedger,
     session_started_at: i64,
     now: i64,
     mark: f64,
     stats: &mut MakerStats,
     fills: &mut Vec<MakerFill>,
-    expected_position: &mut f64,
 ) -> Result<bool> {
     let mut exit_fill_observed = false;
     for trade in trades {
         let Some(order_id) = trade.order_id else {
             continue;
         };
-        if !maker_order_ids.contains(&order_id) {
+        if !ledger.maker_order_ids.contains(&order_id) {
             continue;
         }
         if trade.id == 0 {
@@ -100,25 +226,27 @@ fn collect_current_run_fills(
                 trade.id
             ));
         }
-        if !seen_fill_ids.insert(trade.id) {
+        if !ledger.seen_fill_ids.insert(trade.id) {
             continue;
         }
         let (side, price, qty) = maker_trade_fill(&trade)?;
-        stats.record_fill(side, price, qty, mark);
-        *expected_position += match side {
-            OrderSide::Buy => qty,
-            OrderSide::Sell => -qty,
+        let totals = {
+            let totals = ledger.rest_seen.entry(order_id).or_default();
+            totals.qty += qty;
+            totals.notional += qty * price;
+            *totals
         };
-        fills.push(MakerFill {
+        exit_fill_observed |= ledger.record_delta(
+            order_id,
             side,
-            price,
-            qty,
-            trade_id: Some(trade.id),
-            order_id: Some(order_id),
-            trade_ts: Some(trade.time),
-            origin: "current_run",
-        });
-        exit_fill_observed |= exit_order_ids.contains(&order_id);
+            totals,
+            mark,
+            stats,
+            fills,
+            "current_run_rest_trade",
+            Some(trade.id),
+            Some(trade.time),
+        )?;
     }
     Ok(exit_fill_observed)
 }
@@ -149,6 +277,19 @@ fn adopt_current_run_order(
     Ok(true)
 }
 
+fn adopt_order_into_ledger(
+    order: &Order,
+    run_order_prefix: &str,
+    ledger: &mut MakerLedger,
+) -> Result<bool> {
+    adopt_current_run_order(
+        order,
+        run_order_prefix,
+        &mut ledger.maker_order_ids,
+        &mut ledger.exit_order_ids,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn recover_current_run_order_ids_for_reconciliation(
     client: &StandXClient,
@@ -157,8 +298,7 @@ pub(super) async fn recover_current_run_order_ids_for_reconciliation(
     observed_position: f64,
     qty_tolerance: f64,
     run_order_prefix: &str,
-    maker_order_ids: &mut HashSet<u64>,
-    exit_order_ids: &mut HashSet<u64>,
+    ledger: &mut MakerLedger,
 ) {
     // A trade can settle into position before its order is visible in either
     // open-order polling or `query_orders`. Only inspect unknown trades that
@@ -175,7 +315,7 @@ pub(super) async fn recover_current_run_order_ids_for_reconciliation(
         let Some(order_id) = trade.order_id else {
             continue;
         };
-        if maker_order_ids.contains(&order_id) {
+        if ledger.maker_order_ids.contains(&order_id) {
             continue;
         }
         let side = match trade
@@ -207,12 +347,7 @@ pub(super) async fn recover_current_run_order_ids_for_reconciliation(
     for order_id in candidate_ids {
         match client.get_order(order_id).await {
             Ok(order) => {
-                if let Err(error) = adopt_current_run_order(
-                    &order,
-                    run_order_prefix,
-                    maker_order_ids,
-                    exit_order_ids,
-                ) {
+                if let Err(error) = adopt_order_into_ledger(&order, run_order_prefix, ledger) {
                     eprintln!(
                         "⚠️  reconciliation order lookup returned invalid order {}: {}",
                         order_id, error
@@ -225,6 +360,54 @@ pub(super) async fn recover_current_run_order_ids_for_reconciliation(
             ),
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn reconcile_ledger_snapshot(
+    client: &StandXClient,
+    symbol: &str,
+    session_started_at: i64,
+    run_order_prefix: &str,
+    qty_tolerance: f64,
+    mark: f64,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+) -> Result<(f64, Vec<MakerFill>)> {
+    let now = chrono::Utc::now().timestamp();
+    let (orders, filled_orders, trades, positions) = tokio::join!(
+        client.get_open_orders(Some(symbol)),
+        client.get_order_history(Some(symbol), Some(100)),
+        client.get_user_trades(symbol, session_started_at, now, Some(500)),
+        client.get_positions(Some(symbol)),
+    );
+    let orders = orders?;
+    let filled_orders = filled_orders?;
+    for order in orders.iter().chain(filled_orders.iter()) {
+        adopt_order_into_ledger(order, run_order_prefix, ledger)?;
+    }
+    let trades = trades?;
+    let observed = position_for_symbol(&positions?, symbol)?;
+    recover_current_run_order_ids_for_reconciliation(
+        client,
+        &trades,
+        ledger.expected_position,
+        observed,
+        qty_tolerance,
+        run_order_prefix,
+        ledger,
+    )
+    .await;
+    let mut fills = Vec::new();
+    collect_current_run_fills(
+        trades,
+        ledger,
+        session_started_at,
+        now,
+        mark,
+        stats,
+        &mut fills,
+    )?;
+    Ok((observed, fills))
 }
 
 fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<String> {
@@ -257,12 +440,10 @@ pub(super) async fn maker_cycle(
     adopted: &mut HashMap<String, (u32, f64, u64)>,
     pending: &mut Vec<PendingPlace>,
     inventory_exit_pending: &mut bool,
-    maker_order_ids: &mut HashSet<u64>,
-    seen_fill_ids: &mut HashSet<u64>,
+    ledger: &mut MakerLedger,
     session_started_at: i64,
     run_order_prefix: &str,
     starting_position: f64,
-    expected_position: &mut f64,
     sim_position: &mut f64,
     stats: &mut MakerStats,
     breaker: &mut VolBreaker,
@@ -337,33 +518,24 @@ pub(super) async fn maker_cycle(
 
         // Open maker orders identify partial fills; historical maker orders
         // identify a quote that fully filled between two polling cycles.
-        let mut exit_order_ids = HashSet::new();
         for order in orders.iter().chain(filled_orders.iter()) {
-            adopt_current_run_order(
-                order,
-                run_order_prefix,
-                maker_order_ids,
-                &mut exit_order_ids,
-            )?;
+            adopt_order_into_ledger(order, run_order_prefix, ledger)?;
         }
 
         exit_fill_observed |= collect_current_run_fills(
             trades,
-            maker_order_ids,
-            &exit_order_ids,
-            seen_fill_ids,
+            ledger,
             session_started_at,
             now,
             mark,
             stats,
             &mut fills,
-            expected_position,
         )?;
 
         let positions = client.get_positions(Some(symbol)).await?;
         let mut observed_position = position_for_symbol(&positions, symbol)?;
         let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
-        if (observed_position - *expected_position).abs() > qty_tolerance {
+        if (observed_position - ledger.expected_position).abs() > qty_tolerance {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let retry_now = chrono::Utc::now().timestamp();
             let (retry_orders, retry_filled_orders, retry_trades) = tokio::join!(
@@ -374,40 +546,31 @@ pub(super) async fn maker_cycle(
             orders = retry_orders?;
             let retry_filled_orders = retry_filled_orders?;
             for order in orders.iter().chain(retry_filled_orders.iter()) {
-                adopt_current_run_order(
-                    order,
-                    run_order_prefix,
-                    maker_order_ids,
-                    &mut exit_order_ids,
-                )?;
+                adopt_order_into_ledger(order, run_order_prefix, ledger)?;
             }
             let retry_trades = retry_trades?;
             recover_current_run_order_ids_for_reconciliation(
                 client,
                 &retry_trades,
-                *expected_position,
+                ledger.expected_position,
                 observed_position,
                 qty_tolerance,
                 run_order_prefix,
-                maker_order_ids,
-                &mut exit_order_ids,
+                ledger,
             )
             .await;
             exit_fill_observed |= collect_current_run_fills(
                 retry_trades,
-                maker_order_ids,
-                &exit_order_ids,
-                seen_fill_ids,
+                ledger,
                 session_started_at,
                 retry_now,
                 mark,
                 stats,
                 &mut fills,
-                expected_position,
             )?;
             let retry_positions = client.get_positions(Some(symbol)).await?;
             observed_position = position_for_symbol(&retry_positions, symbol)?;
-            if (observed_position - *expected_position).abs() > qty_tolerance {
+            if (observed_position - ledger.expected_position).abs() > qty_tolerance {
                 if output_format == OutputFormat::Json {
                     println!(
                         "{}",
@@ -417,7 +580,7 @@ pub(super) async fn maker_cycle(
                             "cycle": cycle,
                             "action": "position_reconciliation",
                             "event": "failed",
-                            "expected_position": *expected_position,
+                            "expected_position": ledger.expected_position,
                             "observed_position": observed_position,
                             "message": "venue position cannot be explained by current-run maker fills",
                         })
@@ -425,11 +588,11 @@ pub(super) async fn maker_cycle(
                 } else {
                     eprintln!(
                         "⚠️  position reconciliation failed: expected {:+.8}, observed {:+.8}",
-                        *expected_position, observed_position
+                        ledger.expected_position, observed_position
                     );
                 }
                 return Err(anyhow::Error::new(PositionReconciliationError {
-                    expected: *expected_position,
+                    expected: ledger.expected_position,
                     observed: observed_position,
                 }));
             }
@@ -940,35 +1103,28 @@ mod tests {
             .unwrap()
             .timestamp();
         let mut stats = MakerStats::default();
-        let mut seen = HashSet::new();
-        let maker_orders = HashSet::from([7]);
+        let mut ledger = MakerLedger::new(0.0);
+        ledger.maker_order_ids.insert(7);
         let mut fills = Vec::new();
-        let mut expected_position = 0.0;
 
         collect_current_run_fills(
             vec![trade.clone()],
-            &maker_orders,
-            &HashSet::new(),
-            &mut seen,
+            &mut ledger,
             start,
             start + 60,
             59.50,
             &mut stats,
             &mut fills,
-            &mut expected_position,
         )
         .unwrap();
         collect_current_run_fills(
             vec![trade],
-            &maker_orders,
-            &HashSet::new(),
-            &mut seen,
+            &mut ledger,
             start,
             start + 60,
             59.50,
             &mut stats,
             &mut fills,
-            &mut expected_position,
         )
         .unwrap();
 
@@ -976,51 +1132,129 @@ mod tests {
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].trade_id, Some(42));
         assert_eq!(fills[0].order_id, Some(7));
-        assert_eq!(fills[0].origin, "current_run");
-        assert!((expected_position - 0.2).abs() < 1e-9);
+        assert_eq!(fills[0].origin, "current_run_rest_trade");
+        assert!((ledger.expected_position - 0.2).abs() < 1e-9);
+    }
+
+    fn order_update(fill_qty: &str, avg: &str) -> OrderUpdate {
+        OrderUpdate {
+            seq: 10,
+            order_id: 7,
+            cl_ord_id: Some("sxmk-0123456789ab-q00000001b0".to_string()),
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Buy,
+            qty: "0.20".to_string(),
+            fill_qty: fill_qty.to_string(),
+            fill_avg_price: avg.to_string(),
+            price: "59.50".to_string(),
+            status: standx_sdk::models::OrderStatus::PartiallyFilled,
+            reduce_only: false,
+            updated_at: "2026-07-10T00:00:01Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn websocket_then_rest_trade_is_not_double_counted() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut fills = Vec::new();
+        ledger
+            .apply_order_update(
+                &order_update("0.20", "59.50"),
+                "BTC-USD",
+                "sxmk-0123456789ab-",
+                59.50,
+                &mut stats,
+                &mut fills,
+            )
+            .unwrap();
+        collect_current_run_fills(
+            vec![trade(Some("buy"), "59.50", "0.20")],
+            &mut ledger,
+            start,
+            start + 60,
+            59.50,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+        assert_eq!(stats.fills(), 1);
+        assert_eq!(fills.len(), 1);
+        assert!((ledger.expected_position - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rest_then_websocket_only_accounts_cumulative_delta() {
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let mut ledger = MakerLedger::new(0.0);
+        ledger.maker_order_ids.insert(7);
+        let mut stats = MakerStats::default();
+        let mut fills = Vec::new();
+        collect_current_run_fills(
+            vec![trade(Some("buy"), "59.50", "0.10")],
+            &mut ledger,
+            start,
+            start + 60,
+            59.50,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+        ledger
+            .apply_order_update(
+                &order_update("0.20", "59.50"),
+                "BTC-USD",
+                "sxmk-0123456789ab-",
+                59.50,
+                &mut stats,
+                &mut fills,
+            )
+            .unwrap();
+        assert_eq!(stats.fills(), 2);
+        assert_eq!(fills.len(), 2);
+        assert!((fills[1].qty - 0.10).abs() < 1e-9);
+        assert!((ledger.expected_position - 0.20).abs() < 1e-9);
     }
 
     #[test]
     fn historical_trade_without_current_run_order_is_ignored() {
         let mut stats = MakerStats::default();
-        let mut seen = HashSet::new();
         let mut fills = Vec::new();
-        let mut expected_position = -0.13;
+        let mut ledger = MakerLedger::new(-0.13);
         collect_current_run_fills(
             vec![trade(Some("sell"), "59.50", "0.20")],
-            &HashSet::new(),
-            &HashSet::new(),
-            &mut seen,
+            &mut ledger,
             1_783_000_000,
             1_784_000_000,
             59.50,
             &mut stats,
             &mut fills,
-            &mut expected_position,
         )
         .unwrap();
         assert_eq!(stats.fills(), 0);
         assert!(fills.is_empty());
-        assert_eq!(expected_position, -0.13);
+        assert_eq!(ledger.expected_position, -0.13);
     }
 
     #[test]
     fn current_run_trade_outside_session_is_rejected() {
         let mut stats = MakerStats::default();
-        let mut seen = HashSet::new();
         let mut fills = Vec::new();
-        let mut expected_position = 0.0;
+        let mut ledger = MakerLedger::new(0.0);
+        ledger.maker_order_ids.insert(7);
         let error = collect_current_run_fills(
             vec![trade(Some("buy"), "59.50", "0.20")],
-            &HashSet::from([7]),
-            &HashSet::new(),
-            &mut seen,
+            &mut ledger,
             1_783_700_000,
             1_783_700_100,
             59.50,
             &mut stats,
             &mut fills,
-            &mut expected_position,
         )
         .unwrap_err();
         assert!(error.to_string().contains("outside the session"));
