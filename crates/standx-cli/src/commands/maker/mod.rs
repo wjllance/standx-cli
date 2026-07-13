@@ -55,6 +55,19 @@ use standx_sdk::order_response::OrderResponse;
 // Maker bot (SIP-5A community maker yield)
 // ============================================================================
 
+/// Build a webhook body for a one-shot panic notification, matching the alert
+/// webhook payload shape. Exposed for the top-level panic hook (issue #220) so
+/// a silent crash still pushes one last critical message before the process
+/// dies.
+pub fn panic_webhook_body(format: AlertWebhookFormat, text: &str) -> serde_json::Value {
+    let raw = serde_json::json!({
+        "text": text,
+        "action": "panic",
+        "severity": "critical",
+    });
+    notify::webhook_body(format, text, &raw)
+}
+
 /// Env var gating live order placement. The live path ships code-complete but
 /// locked until it has been supervised-tested against production.
 const LIVE_MAKER_ENV: &str = "STANDX_ENABLE_LIVE_MAKER";

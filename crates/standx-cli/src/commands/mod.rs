@@ -24,7 +24,7 @@ pub use block::handle_block;
 pub use config::handle_config;
 pub use dashboard::handle_dashboard;
 pub use leverage::handle_leverage;
-pub use maker::handle_maker;
+pub use maker::{handle_maker, panic_webhook_body};
 pub use margin::handle_margin;
 pub use market::handle_market;
 pub use order::handle_order;
