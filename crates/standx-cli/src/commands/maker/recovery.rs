@@ -1,8 +1,8 @@
-use super::ledger::MakerLedger;
-use super::model::{is_current_run_order, is_maker_order, position_for_symbol, MakerFill};
+use super::ledger::{adopt_order, apply_rest_trade};
+use super::model::{is_current_run_order, is_maker_order, position_for_symbol};
 use crate::cli::OutputFormat;
 use anyhow::Result;
-use standx_maker::MakerStats;
+use standx_maker::{MakerFill, MakerLedger, MakerStats};
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Order, OrderSide, Position, Trade};
 use standx_sdk::order_response::{OrderResponse, OrderResponseHealth, OrderResponseStream};
@@ -80,7 +80,7 @@ pub(super) async fn recover_current_run_order_ids_for_reconciliation(
     for order_id in candidate_ids {
         match client.get_order(order_id).await {
             Ok(order) => {
-                if let Err(error) = ledger.adopt_order(&order, gap.run_order_prefix) {
+                if let Err(error) = adopt_order(ledger, &order, gap.run_order_prefix) {
                     eprintln!(
                         "⚠️  reconciliation order lookup returned invalid order {}: {}",
                         order_id, error
@@ -118,7 +118,7 @@ pub(super) async fn reconcile_ledger_snapshot(
     let orders = orders?;
     let filled_orders = filled_orders?;
     for order in orders.iter().chain(filled_orders.iter()) {
-        ledger.adopt_order(order, request.run_order_prefix)?;
+        adopt_order(ledger, order, request.run_order_prefix)?;
     }
     let trades = trades?;
     let observed = position_for_symbol(&positions?, request.symbol)?;
@@ -136,7 +136,8 @@ pub(super) async fn reconcile_ledger_snapshot(
     .await;
     let mut fills = Vec::new();
     for trade in trades {
-        ledger.apply_rest_trade(
+        apply_rest_trade(
+            ledger,
             trade,
             request.session_started_at,
             now,

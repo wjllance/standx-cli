@@ -17,9 +17,11 @@
 
 use standx_sdk::models::OrderSide;
 
+pub mod ledger;
 pub mod ownership;
 pub mod risk;
 
+pub use ledger::{CumulativeFill, LedgerError, MakerFill, MakerLedger, RestFill};
 pub use ownership::{
     exit_client_order_id, is_current_run_client_order_id, is_maker_client_order_id,
     open_qty_adopts, pending_covers_slot, position_within_limit, quote_client_order_id, QuoteSlot,

@@ -1,9 +1,9 @@
 #[cfg(test)]
+use super::ledger::apply_order_update;
+#[cfg(test)]
 use super::ledger::maker_trade_fill;
-use super::ledger::MakerLedger;
-use super::model::{
-    is_current_run_order, is_order_rejection, position_for_symbol, MakerFill, PendingPlace,
-};
+use super::ledger::{adopt_order, apply_rest_trade};
+use super::model::{is_current_run_order, is_order_rejection, position_for_symbol, PendingPlace};
 use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
 use super::pipeline::{fetch_snapshot, CycleRequest, CycleResult, CycleState};
 use super::recovery::{
@@ -11,7 +11,7 @@ use super::recovery::{
 };
 use crate::cli::*;
 use anyhow::Result;
-use standx_maker::{self as maker, MakerStats, RestingQuote};
+use standx_maker::{self as maker, MakerFill, MakerLedger, MakerStats, RestingQuote};
 #[cfg(test)]
 use standx_sdk::account_stream::OrderUpdate;
 use standx_sdk::client::order::CreateOrderParams;
@@ -31,7 +31,7 @@ fn collect_current_run_fills(
     let mut exit_fill_observed = false;
     for trade in trades {
         exit_fill_observed |=
-            ledger.apply_rest_trade(trade, session_started_at, now, mark, stats, fills)?;
+            apply_rest_trade(ledger, trade, session_started_at, now, mark, stats, fills)?;
     }
     Ok(exit_fill_observed)
 }
@@ -145,7 +145,7 @@ pub(super) async fn maker_cycle(
         // Open maker orders identify partial fills; historical maker orders
         // identify a quote that fully filled between two polling cycles.
         for order in orders.iter().chain(filled_orders.iter()) {
-            ledger.adopt_order(order, run_order_prefix)?;
+            adopt_order(ledger, order, run_order_prefix)?;
         }
 
         exit_fill_observed |= collect_current_run_fills(
@@ -171,7 +171,7 @@ pub(super) async fn maker_cycle(
             orders = retry_orders?;
             let retry_filled_orders = retry_filled_orders?;
             for order in orders.iter().chain(retry_filled_orders.iter()) {
-                ledger.adopt_order(order, run_order_prefix)?;
+                adopt_order(ledger, order, run_order_prefix)?;
             }
             let retry_trades = retry_trades?;
             recover_current_run_order_ids_for_reconciliation(
@@ -680,16 +680,16 @@ mod tests {
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
         let mut fills = Vec::new();
-        ledger
-            .apply_order_update(
-                &order_update("0.20", "59.50"),
-                "BTC-USD",
-                "sxmk-0123456789ab-",
-                59.50,
-                &mut stats,
-                &mut fills,
-            )
-            .unwrap();
+        apply_order_update(
+            &mut ledger,
+            &order_update("0.20", "59.50"),
+            "BTC-USD",
+            "sxmk-0123456789ab-",
+            59.50,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
         collect_current_run_fills(
             vec![trade(Some("buy"), "59.50", "0.20")],
             &mut ledger,
@@ -724,16 +724,16 @@ mod tests {
             &mut fills,
         )
         .unwrap();
-        ledger
-            .apply_order_update(
-                &order_update("0.20", "59.50"),
-                "BTC-USD",
-                "sxmk-0123456789ab-",
-                59.50,
-                &mut stats,
-                &mut fills,
-            )
-            .unwrap();
+        apply_order_update(
+            &mut ledger,
+            &order_update("0.20", "59.50"),
+            "BTC-USD",
+            "sxmk-0123456789ab-",
+            59.50,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
         assert_eq!(stats.fills(), 2);
         assert_eq!(fills.len(), 2);
         assert!((fills[1].qty - 0.10).abs() < 1e-9);

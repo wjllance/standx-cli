@@ -40,17 +40,6 @@ impl MakerExit {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct MakerFill {
-    pub(super) side: OrderSide,
-    pub(super) price: f64,
-    pub(super) qty: f64,
-    pub(super) trade_id: Option<u64>,
-    pub(super) order_id: Option<u64>,
-    pub(super) trade_ts: Option<String>,
-    pub(super) origin: &'static str,
-}
-
 pub(super) struct PendingPlace {
     pub(super) request_id: String,
     pub(super) cl_ord_id: String,

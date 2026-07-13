@@ -124,7 +124,8 @@ fn apply_account_event(
         AccountEvent::Connected { .. } => Ok((0, None)),
         AccountEvent::Order(update) => {
             let mut fills = Vec::new();
-            state.ledger.apply_order_update(
+            ledger::apply_order_update(
+                state.ledger,
                 &update,
                 context.symbol,
                 context.run_order_prefix,
