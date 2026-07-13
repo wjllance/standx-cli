@@ -64,21 +64,29 @@ pub(super) fn position_for_symbol(positions: &[Position], symbol: &str) -> anyho
         .iter()
         .filter(|position| position.symbol.eq_ignore_ascii_case(symbol))
         .try_fold(0.0, |total, position| {
-            let qty = position.qty.parse::<f64>().map_err(|_| {
-                anyhow::anyhow!("position on {symbol} has invalid qty '{}'", position.qty)
-            })?;
-            if !qty.is_finite() {
-                return Err(anyhow::anyhow!(
-                    "position on {symbol} has invalid non-finite qty"
-                ));
-            }
-            let signed_qty = match position.side {
-                Some(OrderSide::Sell) => -qty.abs(),
-                Some(OrderSide::Buy) => qty.abs(),
-                None => qty,
-            };
+            let signed_qty =
+                signed_position_quantity(&position.qty, position.side).map_err(|error| {
+                    anyhow::anyhow!("position on {symbol} has invalid qty: {error}")
+                })?;
             Ok(total + signed_qty)
         })
+}
+
+pub(super) fn signed_position_quantity(
+    raw_qty: &str,
+    side: Option<OrderSide>,
+) -> anyhow::Result<f64> {
+    let qty = raw_qty
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("'{raw_qty}' is not numeric"))?;
+    if !qty.is_finite() {
+        return Err(anyhow::anyhow!("'{raw_qty}' is not finite"));
+    }
+    Ok(match side {
+        Some(OrderSide::Sell) => -qty.abs(),
+        Some(OrderSide::Buy) => qty.abs(),
+        None => qty,
+    })
 }
 
 pub(super) fn is_order_rejection(error: &StandxError) -> bool {

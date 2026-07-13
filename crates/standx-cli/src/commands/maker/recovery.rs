@@ -1,10 +1,12 @@
 use super::ledger::{adopt_order, apply_rest_trade};
-use super::model::{is_current_run_order, is_maker_order, position_for_symbol};
+use super::model::{
+    is_current_run_order, is_maker_order, position_for_symbol, signed_position_quantity,
+};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{MakerFill, MakerLedger, MakerStats};
 use standx_sdk::client::StandXClient;
-use standx_sdk::models::{Order, OrderSide, Position, Trade};
+use standx_sdk::models::{Order, Position, Trade};
 use standx_sdk::order_response::{OrderResponse, OrderResponseHealth, OrderResponseStream};
 use std::collections::HashSet;
 use std::fmt;
@@ -316,21 +318,11 @@ pub(super) fn validate_reconnect_snapshot(
         .iter()
         .filter(|position| position.symbol.eq_ignore_ascii_case(symbol))
     {
-        let qty = item.qty.parse::<f64>().map_err(|_| {
+        position += signed_position_quantity(&item.qty, item.side).map_err(|error| {
             anyhow::anyhow!(
-                "reconnect reconciliation found invalid position qty '{}' on {symbol}",
-                item.qty
+                "reconnect reconciliation found invalid position qty on {symbol}: {error}"
             )
         })?;
-        if !qty.is_finite() {
-            return Err(anyhow::anyhow!(
-                "reconnect reconciliation found non-finite position qty on {symbol}"
-            ));
-        }
-        position += match item.side {
-            Some(OrderSide::Sell) => -qty,
-            _ => qty,
-        };
     }
 
     let maker_filled_order_ids = filled_orders

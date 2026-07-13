@@ -142,14 +142,10 @@ fn apply_account_event(
             if !update.symbol.eq_ignore_ascii_case(context.symbol) {
                 return Ok((0, None));
             }
-            let qty = update.qty.parse::<f64>().map_err(|_| {
-                anyhow::anyhow!("account position update has invalid qty '{}'", update.qty)
-            })?;
-            if !qty.is_finite() {
-                return Err(anyhow::anyhow!(
-                    "account position update has non-finite qty"
-                ));
-            }
+            let qty =
+                model::signed_position_quantity(&update.qty, update.side).map_err(|error| {
+                    anyhow::anyhow!("account position update has invalid qty: {error}")
+                })?;
             Ok((0, Some(qty)))
         }
         AccountEvent::TradeShadow { seq, data } => {
