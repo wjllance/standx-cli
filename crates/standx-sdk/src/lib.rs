@@ -37,6 +37,7 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod account_stream;
 pub mod auth;
 pub mod client;
 pub mod error;
