@@ -184,7 +184,7 @@ async fn execute_command(
             commands::handle_block(command, output).await?;
         }
         Commands::Maker { command } => {
-            commands::handle_maker(command, output, verbose).await?;
+            commands::handle_maker(*command, output, verbose).await?;
         }
     }
     Ok(())

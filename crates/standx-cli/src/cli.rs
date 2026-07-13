@@ -125,7 +125,7 @@ pub enum Commands {
     #[command(visible_alias = "mk")]
     Maker {
         #[command(subcommand)]
-        command: MakerCommands,
+        command: Box<MakerCommands>,
     },
 }
 
