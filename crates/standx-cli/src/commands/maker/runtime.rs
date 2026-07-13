@@ -301,6 +301,34 @@ fn emit_startup_rejected(
     }
 }
 
+/// Reject alert thresholds that silently defeat the guard they configure.
+///
+/// A negative threshold turns the alert off without warning, and a percentage
+/// above 100 can never fire; both leave an operator believing a protection is
+/// armed when it is not.
+pub(super) fn validate_alert_thresholds(
+    alert_loss: f64,
+    alert_inventory_pct: f64,
+    alert_position_change_pct: f64,
+    alert_uptime: f64,
+) -> Result<()> {
+    if alert_loss < 0.0 {
+        return Err(anyhow::anyhow!("--alert-loss must be >= 0"));
+    }
+    if !(0.0..=100.0).contains(&alert_inventory_pct) {
+        return Err(anyhow::anyhow!("--alert-inventory-pct must be 0..=100"));
+    }
+    if !(0.0..=100.0).contains(&alert_position_change_pct) {
+        return Err(anyhow::anyhow!(
+            "--alert-position-change-pct must be 0..=100"
+        ));
+    }
+    if alert_uptime < 0.0 {
+        return Err(anyhow::anyhow!("--alert-uptime must be >= 0"));
+    }
+    Ok(())
+}
+
 pub(super) async fn run_maker(
     symbol: String,
     args: MakerRunArgs,
@@ -410,11 +438,12 @@ pub(super) async fn run_maker(
             "active inventory exit requires both --inventory-exit-pct and --inventory-exit-qty"
         ));
     }
-    if !(0.0..=100.0).contains(&args.alert_position_change_pct) {
-        return Err(anyhow::anyhow!(
-            "--alert-position-change-pct must be 0..=100"
-        ));
-    }
+    validate_alert_thresholds(
+        args.alert_loss,
+        args.alert_inventory_pct,
+        args.alert_position_change_pct,
+        args.alert_uptime,
+    )?;
     if cfg.band_bps <= cfg.spread_bps {
         return Err(anyhow::anyhow!(
             "--band-bps ({}) must be greater than --spread-bps ({}): quotes clamped to the band edge would sit exactly at the boundary",
@@ -1081,6 +1110,27 @@ pub(super) async fn run_maker(
                     order_response_reconnect_attempts_used,
                     args.order_response_reconnect_attempts,
                 );
+                // Mirror the account-stream path: the order-response stream was
+                // previously silent on the webhook across disconnect/reconnect.
+                let disconnect_message =
+                    format!("order-response stream unavailable; placements frozen: {detail}");
+                notifier
+                    .risk(
+                        RiskNotice {
+                            kind: "order_response",
+                            severity: "warning",
+                            event: "disconnected_frozen",
+                            message: &disconnect_message,
+                            symbol: &symbol,
+                            cycle,
+                            position_before: None,
+                            position_after: None,
+                            expected: Some(ledger.expected_position),
+                            observed: None,
+                        },
+                        false,
+                    )
+                    .await;
                 if reconnect_available {
                     if let Some(handle) = order_response_handle.take() {
                         handle.abort();
@@ -1113,6 +1163,23 @@ pub(super) async fn run_maker(
                             adopted.clear();
                             pending.clear();
                             consecutive_errors = 0;
+                            notifier
+                                .risk(
+                                    RiskNotice {
+                                        kind: "order_response",
+                                        severity: "resolved",
+                                        event: "reconnected",
+                                        message: "order-response stream reconnected; maker book verified empty before quoting resumes",
+                                        symbol: &symbol,
+                                        cycle,
+                                        position_before: None,
+                                        position_after: None,
+                                        expected: Some(ledger.expected_position),
+                                        observed: None,
+                                    },
+                                    false,
+                                )
+                                .await;
                             continue;
                         }
                         Err(error) => {
@@ -1133,11 +1200,49 @@ pub(super) async fn run_maker(
                                         })
                                     );
                                 }
+                                let reconciliation_message = format!(
+                                    "order-response reconnect failed reconciliation: {error}"
+                                );
+                                notifier
+                                    .risk(
+                                        RiskNotice {
+                                            kind: "order_response",
+                                            severity: "critical",
+                                            event: "reconnect_failed",
+                                            message: &reconciliation_message,
+                                            symbol: &symbol,
+                                            cycle,
+                                            position_before: None,
+                                            position_after: None,
+                                            expected: Some(ledger.expected_position),
+                                            observed: None,
+                                        },
+                                        true,
+                                    )
+                                    .await;
                                 break MakerExit::PositionReconciliation(error.to_string());
                             }
-                            break MakerExit::OrderResponse(format!(
+                            let reconnect_failed_message = format!(
                                 "{detail}; safe reconnect failed: {error}; refusing further live orders"
-                            ));
+                            );
+                            notifier
+                                .risk(
+                                    RiskNotice {
+                                        kind: "order_response",
+                                        severity: "critical",
+                                        event: "reconnect_failed",
+                                        message: &reconnect_failed_message,
+                                        symbol: &symbol,
+                                        cycle,
+                                        position_before: None,
+                                        position_after: None,
+                                        expected: Some(ledger.expected_position),
+                                        observed: None,
+                                    },
+                                    true,
+                                )
+                                .await;
+                            break MakerExit::OrderResponse(reconnect_failed_message);
                         }
                     }
                 }
@@ -1152,9 +1257,26 @@ pub(super) async fn run_maker(
                         args.order_response_reconnect_attempts
                     )
                 };
-                break MakerExit::OrderResponse(format!(
-                    "{detail}; {reconnect_note}; refusing further live orders"
-                ));
+                let refuse_message =
+                    format!("{detail}; {reconnect_note}; refusing further live orders");
+                notifier
+                    .risk(
+                        RiskNotice {
+                            kind: "order_response",
+                            severity: "critical",
+                            event: "reconnect_unavailable",
+                            message: &refuse_message,
+                            symbol: &symbol,
+                            cycle,
+                            position_before: None,
+                            position_after: None,
+                            expected: Some(ledger.expected_position),
+                            observed: None,
+                        },
+                        true,
+                    )
+                    .await;
+                break MakerExit::OrderResponse(refuse_message);
             }
         }
         if let Some(receiver) = order_responses.as_mut() {
@@ -1491,7 +1613,10 @@ pub(super) async fn run_maker(
                     let fired =
                         alerts.evaluate(&stats, stats.position(), mark, cfg.max_position, cycle);
                     for alert in fired {
-                        notifier.alert(&alert, &symbol);
+                        // Await firing alerts so a breach raised on the final
+                        // cycle before shutdown is not dropped with its task.
+                        let await_delivery = alert.firing;
+                        notifier.alert(&alert, &symbol, await_delivery).await;
                     }
                 }
             }
