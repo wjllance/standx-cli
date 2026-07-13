@@ -451,6 +451,11 @@ pub enum MakerCommands {
         /// --max-position. 0 disables
         #[arg(long)]
         alert_inventory_pct: Option<f64>,
+        /// Risk notification: fire when actual position changes by this
+        /// percent of --max-position since the last notification anchor.
+        /// Small changes accumulate; 0 disables.
+        #[arg(long)]
+        alert_position_change_pct: Option<f64>,
         /// Risk alert: fire when two-sided uptime drops below this percent
         /// (after warmup). 0 disables
         #[arg(long)]

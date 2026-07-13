@@ -33,6 +33,7 @@ vol_window = 20
 # Alerts and supervised active inventory exit
 alert_loss = 3.0
 alert_inventory_pct = 70.0
+alert_position_change_pct = 20.0
 alert_uptime = 60.0
 inventory_exit_pct = 25.0
 inventory_exit_qty = 0.2

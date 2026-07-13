@@ -25,6 +25,7 @@ pub(super) struct MakerFileConfig {
     pub vol_window: Option<u32>,
     pub alert_loss: Option<f64>,
     pub alert_inventory_pct: Option<f64>,
+    pub alert_position_change_pct: Option<f64>,
     pub alert_uptime: Option<f64>,
     pub no_ws: Option<bool>,
     pub order_response_reconnect_attempts: Option<u32>,
@@ -56,11 +57,12 @@ mod tests {
     #[test]
     fn parses_partial_non_sensitive_strategy_file() {
         let config: MakerFileConfig = toml::from_str(
-            "spread_bps = 8\nmax_position = 0.02\nno_ws = true\norder_response_reconnect_attempts = 3\norder_response_reconnect_backoff = 2\n",
+            "spread_bps = 8\nmax_position = 0.02\nalert_position_change_pct = 20\nno_ws = true\norder_response_reconnect_attempts = 3\norder_response_reconnect_backoff = 2\n",
         )
         .unwrap();
         assert_eq!(config.spread_bps, Some(8.0));
         assert_eq!(config.max_position, Some(0.02));
+        assert_eq!(config.alert_position_change_pct, Some(20.0));
         assert_eq!(config.no_ws, Some(true));
         assert_eq!(config.order_response_reconnect_attempts, Some(3));
         assert_eq!(config.order_response_reconnect_backoff, Some(2));
@@ -79,5 +81,17 @@ mod tests {
         assert_eq!(config.inventory_exit_qty, Some(0.0));
         assert_eq!(config.order_response_reconnect_attempts, Some(3));
         assert_eq!(config.order_response_reconnect_backoff, Some(2));
+    }
+
+    #[test]
+    fn xag_example_enables_twenty_percent_position_jump_alert() {
+        let config: MakerFileConfig = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-xag-100u.toml"
+        )))
+        .unwrap();
+
+        assert_eq!(config.max_position, Some(0.8));
+        assert_eq!(config.alert_position_change_pct, Some(20.0));
     }
 }

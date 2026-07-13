@@ -109,6 +109,7 @@ max_divergence_bps = 25.0
 vol_pause_bps = 40.0
 vol_window = 12
 alert_inventory_pct = 80.0
+alert_position_change_pct = 20.0
 no_ws = false
 ```
 
@@ -184,7 +185,9 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 - **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。Live 模式还会打印 `ACCOUNT balance= equity= available= upnl=`，数据来自该轮交易所账户快照；这里的账户 `upnl` 与机器人本次会话的 `pnl` 是两个不同口径。
 - **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`starting_position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live fill 还包含 `trade_id`、`order_id`、`trade_ts` 与 `origin=current_run`。
 
-live 启动时会先清理旧 `sxmk-` 订单并同步账本。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。之后若交易所仓位无法由本 run 的 maker fills 解释，复查一次仍不一致就立即 fail-safe 清理退出。
+live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order + position + trade-shadow` account stream 和 Order Response Stream。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。order 回调和 REST trade 以订单累计成交量双向去重。account stream 断开或仓位不一致时立即冻结 placements、撤净 maker 订单，并在约 0.5s、1.5s、3.0s 结合 WS 与 REST 核对；恢复后从空 maker book 继续，3 秒仍不一致则 fail-safe 停机。
+
+`alert_position_change_pct` 默认 `0`（关闭）。设置为 `20` 时，实际仓位相对上次通知锚点累计变化达到 `max_position` 的 20% 会输出 `risk_notification(kind=position_jump)` 并复用现有 webhook；跨越 inventory-exit/max-position 阈值或多空翻转不受该百分比限制。account stream 断流/恢复、reconciliation 冻结/恢复/失败、volatility breaker、inventory exit、cleanup residual 和最终 fail-safe 也会生成结构化风险通知。
 - **Quiet（`--quiet`）**：只打印成交与增删挂单。
 
 退出时打印本次会话统计：
