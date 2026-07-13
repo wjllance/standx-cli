@@ -1288,50 +1288,113 @@ pub(super) async fn run_maker(
                 inventory_exit_pending,
             ))
         };
-        let account_during_work = async {
-            match account_events.as_mut() {
-                Some(receiver) => receiver.recv().await,
-                None => std::future::pending().await,
-            }
-        };
-        let order_during_work = async {
-            match order_responses.as_mut() {
-                Some(receiver) => receiver.recv().await,
-                None => std::future::pending().await,
-            }
-        };
-        let cycle_result = tokio::select! {
-            _ = signal::ctrl_c() => {
-                runtime_state.reduce(MakerEvent::CtrlC);
-                break MakerExit::CtrlC
-            },
-            event = account_during_work => {
-                let Some(event) = event else {
-                    let reason = "authenticated account stream disconnected during cycle".to_string();
-                    runtime_state.reduce(MakerEvent::AccountStreamDisconnected(reason.clone()));
-                    if let Some(health) = account_stream_health.as_ref() {
-                        health.mark_unhealthy(reason);
+        // Stream events that arrive while `work` is placing/cancelling orders
+        // are buffered rather than acted on immediately: interrupting the work
+        // future would drop an in-flight create/cancel HTTP call, and a live
+        // cycle's own placements produce account events almost instantly, so
+        // acting mid-flight tore a multi-order cycle apart. We still keep the
+        // channels drained so the WS reader never backpressures and so a
+        // disconnect is noticed promptly. Buffered events are applied once the
+        // work future completes and releases its ledger/pending borrows.
+        let mut buffered_account: Vec<AccountEvent> = Vec::new();
+        let mut buffered_orders: Vec<OrderResponse> = Vec::new();
+        // Scope the pinned work future so it (and its ledger/pending borrows)
+        // is dropped once it resolves, before the buffered events are applied.
+        let cycle_result = {
+            tokio::pin!(work);
+            loop {
+                let account_during_work = async {
+                    match account_events.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
                     }
-                    continue 'main;
                 };
-                match apply_account_event(
-                    event,
-                    &mut AccountEventState {
-                        ledger: &mut ledger,
-                        stats: &mut stats,
+                let order_during_work = async {
+                    match order_responses.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    _ = signal::ctrl_c() => {
+                        runtime_state.reduce(MakerEvent::CtrlC);
+                        break 'main MakerExit::CtrlC;
                     },
-                    &AccountEventContext {
-                        symbol: &symbol,
-                        run_order_prefix: &run_order_prefix,
-                        mark: last_mark.unwrap_or(baseline_mark),
-                        cycle,
-                        output_format,
+                    event = account_during_work => {
+                        let Some(event) = event else {
+                            let reason = "authenticated account stream disconnected during cycle".to_string();
+                            runtime_state.reduce(MakerEvent::AccountStreamDisconnected(reason.clone()));
+                            if let Some(health) = account_stream_health.as_ref() {
+                                health.mark_unhealthy(reason);
+                            }
+                            continue 'main;
+                        };
+                        buffered_account.push(event);
                     },
-                ) {
-                    Ok((fills, position)) => {
-                        total_fills += fills;
-                        if let Some(position) = position {
-                            notifier.position_jump(
+                    response = order_during_work => {
+                        let Some(response) = response else {
+                            let reason = "order-response stream disconnected during cycle".to_string();
+                            runtime_state.reduce(MakerEvent::OrderResponseDisconnected(reason.clone()));
+                            if let Some(health) = order_response_health.as_ref() {
+                                health.mark_unhealthy(reason);
+                            }
+                            continue 'main;
+                        };
+                        buffered_orders.push(response);
+                    },
+                    result = &mut work => break result,
+                }
+            }
+        };
+        if let Some(token) = cycle_work_token {
+            runtime_state.reduce(MakerEvent::WorkFinished(token));
+        }
+
+        // Apply the events buffered during work, ordering order-responses
+        // before account events to mirror the top-of-loop drain.
+        for response in buffered_orders {
+            let request_id = response.request_id.clone();
+            let matched = apply_order_response(
+                response,
+                &mut pending,
+                output_format,
+                &symbol,
+                cycle,
+                cfg.price_decimals,
+            );
+            if let Some(request_id) = request_id {
+                runtime_state.reduce(if matched {
+                    MakerEvent::OrderResponseMatched(request_id)
+                } else {
+                    MakerEvent::OrderResponseUnmatched(request_id)
+                });
+            }
+            if runtime_state.is_frozen() {
+                if let Some(health) = order_response_health.as_ref() {
+                    health.mark_unhealthy("order-response correlation failed closed");
+                }
+            }
+        }
+        for event in buffered_account {
+            match apply_account_event(
+                event,
+                &mut AccountEventState {
+                    ledger: &mut ledger,
+                    stats: &mut stats,
+                },
+                &AccountEventContext {
+                    symbol: &symbol,
+                    run_order_prefix: &run_order_prefix,
+                    mark: last_mark.unwrap_or(baseline_mark),
+                    cycle,
+                    output_format,
+                },
+            ) {
+                Ok((fills, position)) => {
+                    total_fills += fills;
+                    if let Some(position) = position {
+                        notifier
+                            .position_jump(
                                 &mut position_alert_anchor,
                                 PositionChange {
                                     observed: position,
@@ -1342,60 +1405,24 @@ pub(super) async fn run_maker(
                                     symbol: &symbol,
                                     cycle,
                                 },
-                            ).await;
-                            if (position - ledger.expected_position).abs()
-                                > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
-                            {
-                                runtime_state.reduce(MakerEvent::PositionMismatch);
-                                account_position_mismatch = Some(position);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        runtime_state.reduce(MakerEvent::AccountStreamDisconnected(error.to_string()));
-                        if let Some(health) = account_stream_health.as_ref() {
-                            health.mark_unhealthy(error.to_string());
+                            )
+                            .await;
+                        if (position - ledger.expected_position).abs()
+                            > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+                        {
+                            runtime_state.reduce(MakerEvent::PositionMismatch);
+                            account_position_mismatch = Some(position);
                         }
                     }
                 }
-                continue 'main;
-            },
-            response = order_during_work => {
-                let Some(response) = response else {
-                    let reason = "order-response stream disconnected during cycle".to_string();
-                    runtime_state.reduce(MakerEvent::OrderResponseDisconnected(reason.clone()));
-                    if let Some(health) = order_response_health.as_ref() {
-                        health.mark_unhealthy(reason);
-                    }
-                    continue 'main;
-                };
-                let request_id = response.request_id.clone();
-                let matched = apply_order_response(
-                    response,
-                    &mut pending,
-                    output_format,
-                    &symbol,
-                    cycle,
-                    cfg.price_decimals,
-                );
-                if let Some(request_id) = request_id {
-                    runtime_state.reduce(if matched {
-                        MakerEvent::OrderResponseMatched(request_id)
-                    } else {
-                        MakerEvent::OrderResponseUnmatched(request_id)
-                    });
-                }
-                if runtime_state.is_frozen() {
-                    if let Some(health) = order_response_health.as_ref() {
-                        health.mark_unhealthy("order-response correlation failed closed");
+                Err(error) => {
+                    runtime_state
+                        .reduce(MakerEvent::AccountStreamDisconnected(error.to_string()));
+                    if let Some(health) = account_stream_health.as_ref() {
+                        health.mark_unhealthy(error.to_string());
                     }
                 }
-                continue 'main;
-            },
-            result = work => result,
-        };
-        if let Some(token) = cycle_work_token {
-            runtime_state.reduce(MakerEvent::WorkFinished(token));
+            }
         }
 
         match cycle_result {
