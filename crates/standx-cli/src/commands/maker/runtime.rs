@@ -1,6 +1,87 @@
 use super::*;
 use standx_sdk::order_response::OrderResponse;
 
+fn next_runtime_effect(runtime_state: &mut MakerState) -> Option<MakerEffect> {
+    runtime_state.next_effect().map(|effect| match effect {
+        MakerEffect::RunCycle(token) => MakerEffect::RunCycle(token),
+        MakerEffect::AbortInFlight(token) => MakerEffect::AbortInFlight(token),
+        MakerEffect::CommitCycle(token) => MakerEffect::CommitCycle(token),
+        MakerEffect::Cleanup { token, target } => MakerEffect::Cleanup { token, target },
+        MakerEffect::Recover { token, target } => MakerEffect::Recover { token, target },
+        MakerEffect::Stop(reason) => MakerEffect::Stop(reason),
+    })
+}
+
+fn take_cleanup_effect(
+    runtime_state: &mut MakerState,
+    expected_target: RecoveryTarget,
+) -> Result<WorkToken> {
+    loop {
+        match next_runtime_effect(runtime_state) {
+            Some(MakerEffect::AbortInFlight(_)) => {}
+            Some(MakerEffect::Cleanup { token, target }) if target == expected_target => {
+                return Ok(token);
+            }
+            Some(effect) => {
+                return Err(anyhow::anyhow!(
+                    "runtime expected {expected_target:?} cleanup, got {effect:?}"
+                ));
+            }
+            None => {
+                return Err(anyhow::anyhow!(
+                    "runtime did not emit {expected_target:?} cleanup"
+                ));
+            }
+        }
+    }
+}
+
+fn take_recovery_effect(
+    runtime_state: &mut MakerState,
+    expected_target: RecoveryTarget,
+) -> Result<WorkToken> {
+    match next_runtime_effect(runtime_state) {
+        Some(MakerEffect::Recover { token, target }) if target == expected_target => Ok(token),
+        Some(effect) => Err(anyhow::anyhow!(
+            "runtime expected {expected_target:?} recovery, got {effect:?}"
+        )),
+        None => Err(anyhow::anyhow!(
+            "runtime did not emit {expected_target:?} recovery"
+        )),
+    }
+}
+
+fn take_stop_effect(runtime_state: &mut MakerState) -> Result<MakerExit> {
+    loop {
+        match next_runtime_effect(runtime_state) {
+            Some(MakerEffect::AbortInFlight(_)) => {}
+            Some(MakerEffect::Stop(reason)) => return Ok(reason.into()),
+            Some(effect) => {
+                return Err(anyhow::anyhow!(
+                    "runtime expected stop effect, got {effect:?}"
+                ));
+            }
+            None => return Err(anyhow::anyhow!("runtime did not emit stop effect")),
+        }
+    }
+}
+
+fn recovery_failed_exit(
+    runtime_state: &mut MakerState,
+    token: WorkToken,
+    reason: String,
+) -> MakerExit {
+    runtime_state.handle(MakerEvent::RecoveryFailed { token, reason });
+    take_stop_effect(runtime_state)
+        .unwrap_or_else(|error| MakerExit::PositionReconciliation(error.to_string()))
+}
+
+fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason) -> MakerExit {
+    runtime_state.handle(MakerEvent::StopRequested(reason));
+    take_stop_effect(runtime_state)
+        .unwrap_or_else(|error| MakerExit::PositionReconciliation(error.to_string()))
+}
+
 pub(super) fn apply_order_responses(
     receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
     pending: &mut Vec<PendingPlace>,
@@ -30,13 +111,20 @@ pub(super) fn apply_order_responses(
             price_decimals,
         );
         if let Some(request_id) = request_id {
-            runtime_state.reduce(if matched {
+            runtime_state.handle(if matched {
                 MakerEvent::OrderResponseMatched(request_id)
             } else {
                 MakerEvent::OrderResponseUnmatched { request_id, cycle }
             });
         }
-        if runtime_state.is_frozen() {
+        if matches!(
+            runtime_state.pending_effect(),
+            Some(MakerEffect::AbortInFlight(_))
+                | Some(MakerEffect::Cleanup {
+                    target: RecoveryTarget::OrderResponse,
+                    ..
+                })
+        ) {
             return Err(anyhow::anyhow!("order-response correlation failed closed"));
         }
     }
@@ -936,7 +1024,7 @@ pub(super) async fn run_maker(
     let mut token_expiry_alerted = TokenExpiryLevel::Ok;
     let mut last_token_expiry_check: Option<std::time::Instant> = None;
     let mut runtime_state = MakerState::starting();
-    runtime_state.reduce(MakerEvent::StartupReady);
+    runtime_state.handle(MakerEvent::StartupReady);
 
     let exit = 'main: loop {
         if args.live {
@@ -992,7 +1080,20 @@ pub(super) async fn run_maker(
                 let detail = health.failure_reason().unwrap_or_else(|| {
                     "account stream became unhealthy without a recorded reason".to_string()
                 });
-                runtime_state.reduce(MakerEvent::AccountStreamDisconnected(detail.clone()));
+                runtime_state.handle(MakerEvent::AccountStreamDisconnected(detail.clone()));
+                let cleanup_token =
+                    match take_cleanup_effect(&mut runtime_state, RecoveryTarget::AccountStream) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            break stop_requested_exit(
+                                &mut runtime_state,
+                                RuntimeStopReason::CleanupFailure {
+                                    target: RecoveryTarget::AccountStream,
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                    };
                 let message = format!(
                     "account stream unavailable; placements frozen and cleanup starting: {detail}"
                 );
@@ -1018,9 +1119,16 @@ pub(super) async fn run_maker(
                 if let Err(cleanup_error) =
                     cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
                 {
-                    break MakerExit::PositionReconciliation(format!(
-                        "account stream disconnected ({detail}); freeze cleanup failed: {cleanup_error}"
-                    ));
+                    runtime_state.handle(MakerEvent::CleanupFailed {
+                        token: cleanup_token,
+                        reason: format!(
+                            "account stream disconnected ({detail}); freeze cleanup failed: {cleanup_error}"
+                        ),
+                    });
+                    break match take_stop_effect(&mut runtime_state) {
+                        Ok(exit) => exit,
+                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                    };
                 }
                 resting.clear();
                 adopted.clear();
@@ -1030,14 +1138,30 @@ pub(super) async fn run_maker(
                     handle.abort();
                 }
                 account_events.take();
+                runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
+                let recovery_token =
+                    match take_recovery_effect(&mut runtime_state, RecoveryTarget::AccountStream) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            break stop_requested_exit(
+                                &mut runtime_state,
+                                RuntimeStopReason::PositionReconciliation(error.to_string()),
+                            );
+                        }
+                    };
 
                 let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
                 if account_stream_reconnect_attempts_used >= args.account_stream_reconnect_attempts
                 {
-                    break MakerExit::PositionReconciliation(format!(
-                        "account stream disconnected ({detail}); reconnect disabled or budget exhausted ({}/{})",
-                        account_stream_reconnect_attempts_used, args.account_stream_reconnect_attempts
-                    ));
+                    break recovery_failed_exit(
+                        &mut runtime_state,
+                        recovery_token,
+                        format!(
+                            "account stream disconnected ({detail}); reconnect disabled or budget exhausted ({}/{})",
+                            account_stream_reconnect_attempts_used,
+                            args.account_stream_reconnect_attempts
+                        ),
+                    );
                 }
 
                 let mut last_connect_error: Option<String> = None;
@@ -1089,16 +1213,18 @@ pub(super) async fn run_maker(
                 }
 
                 let Some((mut events, health, handle)) = reconnected else {
-                    runtime_state.reduce(MakerEvent::RecoveryFailed(format!(
-                        "account stream reconnect exhausted: {}",
-                        last_connect_error
-                            .clone()
-                            .unwrap_or_else(|| "no attempts available".to_string())
-                    )));
-                    break MakerExit::PositionReconciliation(format!(
-                        "account stream disconnected ({detail}); reconnect exhausted: {}",
-                        last_connect_error.unwrap_or_else(|| "no attempts available".to_string())
-                    ));
+                    runtime_state.handle(MakerEvent::RecoveryFailed {
+                        token: recovery_token,
+                        reason: format!(
+                            "account stream disconnected ({detail}); reconnect exhausted: {}",
+                            last_connect_error
+                                .unwrap_or_else(|| "no attempts available".to_string())
+                        ),
+                    });
+                    break match take_stop_effect(&mut runtime_state) {
+                        Ok(exit) => exit,
+                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                    };
                 };
 
                 let mut reconnect_fills = match apply_account_events(
@@ -1118,25 +1244,33 @@ pub(super) async fn run_maker(
                     Ok((fills, _)) => fills,
                     Err(error) => {
                         handle.abort();
-                        break MakerExit::PositionReconciliation(format!(
-                            "account stream reconnect event validation failed: {error}"
-                        ));
+                        break recovery_failed_exit(
+                            &mut runtime_state,
+                            recovery_token,
+                            format!("account stream reconnect event validation failed: {error}"),
+                        );
                     }
                 };
                 let positions = match client.get_positions(Some(&symbol)).await {
                     Ok(positions) => positions,
                     Err(error) => {
                         handle.abort();
-                        break MakerExit::PositionReconciliation(format!(
-                            "account stream reconnect snapshot failed: {error}"
-                        ));
+                        break recovery_failed_exit(
+                            &mut runtime_state,
+                            recovery_token,
+                            format!("account stream reconnect snapshot failed: {error}"),
+                        );
                     }
                 };
                 let mut observed = match position_for_symbol(&positions, &symbol) {
                     Ok(position) => position,
                     Err(error) => {
                         handle.abort();
-                        break MakerExit::PositionReconciliation(error.to_string());
+                        break recovery_failed_exit(
+                            &mut runtime_state,
+                            recovery_token,
+                            error.to_string(),
+                        );
                     }
                 };
 
@@ -1165,9 +1299,13 @@ pub(super) async fn run_maker(
                             Ok((fills, _)) => reconnect_fills += fills,
                             Err(error) => {
                                 handle.abort();
-                                break 'main MakerExit::PositionReconciliation(format!(
-                                    "account stream reconnect event validation failed during REST backfill: {error}"
-                                ));
+                                break 'main recovery_failed_exit(
+                                    &mut runtime_state,
+                                    recovery_token,
+                                    format!(
+                                        "account stream reconnect event validation failed during REST backfill: {error}"
+                                    ),
+                                );
                             }
                         }
                         match reconcile_ledger_snapshot(
@@ -1202,10 +1340,14 @@ pub(super) async fn run_maker(
                     }
                     if !gap_closed {
                         handle.abort();
-                        break MakerExit::PositionReconciliation(format!(
-                            "account stream reconnect snapshot expected {:+.8}, observed {:+.8} (REST trade backfill did not close the gap)",
-                            ledger.expected_position, observed
-                        ));
+                        break recovery_failed_exit(
+                            &mut runtime_state,
+                            recovery_token,
+                            format!(
+                                "account stream reconnect snapshot expected {:+.8}, observed {:+.8} (REST trade backfill did not close the gap)",
+                                ledger.expected_position, observed
+                            ),
+                        );
                     }
                 }
 
@@ -1213,8 +1355,7 @@ pub(super) async fn run_maker(
                 account_stream_health = Some(health);
                 account_stream_handle = Some(handle);
                 total_fills += reconnect_fills;
-                runtime_state.reduce(MakerEvent::CleanupComplete);
-                runtime_state.reduce(MakerEvent::RecoverySucceeded);
+                runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                 notifier
                     .risk(
                         RiskNotice {
@@ -1241,7 +1382,17 @@ pub(super) async fn run_maker(
                 let detail = health.failure_reason().unwrap_or_else(|| {
                     "order-response stream became unhealthy without a recorded reason".to_string()
                 });
-                runtime_state.reduce(MakerEvent::OrderResponseDisconnected(detail.clone()));
+                runtime_state.handle(MakerEvent::OrderResponseDisconnected(detail.clone()));
+                let cleanup_token =
+                    match take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            break stop_requested_exit(
+                                &mut runtime_state,
+                                RuntimeStopReason::OrderResponse(error.to_string()),
+                            );
+                        }
+                    };
                 let controlled_fault = detail.starts_with("controlled fault injection");
                 let reconnect_available = order_response_reconnect_available(
                     &detail,
@@ -1269,6 +1420,33 @@ pub(super) async fn run_maker(
                         false,
                     )
                     .await;
+                if let Err(error) =
+                    cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                {
+                    runtime_state.handle(MakerEvent::CleanupFailed {
+                        token: cleanup_token,
+                        reason: format!("order-response freeze cleanup failed: {error}"),
+                    });
+                    break match take_stop_effect(&mut runtime_state) {
+                        Ok(exit) => exit,
+                        Err(error) => MakerExit::OrderResponse(error.to_string()),
+                    };
+                }
+                resting.clear();
+                adopted.clear();
+                pending.clear();
+                inventory_exit_pending = false;
+                runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
+                let recovery_token =
+                    match take_recovery_effect(&mut runtime_state, RecoveryTarget::OrderResponse) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            break stop_requested_exit(
+                                &mut runtime_state,
+                                RuntimeStopReason::OrderResponse(error.to_string()),
+                            );
+                        }
+                    };
                 if reconnect_available {
                     if let Some(handle) = order_response_handle.take() {
                         handle.abort();
@@ -1301,6 +1479,7 @@ pub(super) async fn run_maker(
                             adopted.clear();
                             pending.clear();
                             consecutive_errors = 0;
+                            runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                             notifier
                                 .risk(
                                     RiskNotice {
@@ -1358,7 +1537,16 @@ pub(super) async fn run_maker(
                                         true,
                                     )
                                     .await;
-                                break MakerExit::PositionReconciliation(error.to_string());
+                                runtime_state.handle(MakerEvent::RecoveryFailed {
+                                    token: recovery_token,
+                                    reason: error.to_string(),
+                                });
+                                break match take_stop_effect(&mut runtime_state) {
+                                    Ok(exit) => exit,
+                                    Err(runtime_error) => {
+                                        MakerExit::PositionReconciliation(runtime_error.to_string())
+                                    }
+                                };
                             }
                             let reconnect_failed_message = format!(
                                 "{detail}; safe reconnect failed: {error}; refusing further live orders"
@@ -1380,7 +1568,14 @@ pub(super) async fn run_maker(
                                     true,
                                 )
                                 .await;
-                            break MakerExit::OrderResponse(reconnect_failed_message);
+                            runtime_state.handle(MakerEvent::RecoveryFailed {
+                                token: recovery_token,
+                                reason: reconnect_failed_message,
+                            });
+                            break match take_stop_effect(&mut runtime_state) {
+                                Ok(exit) => exit,
+                                Err(error) => MakerExit::OrderResponse(error.to_string()),
+                            };
                         }
                     }
                 }
@@ -1414,7 +1609,14 @@ pub(super) async fn run_maker(
                         true,
                     )
                     .await;
-                break MakerExit::OrderResponse(refuse_message);
+                runtime_state.handle(MakerEvent::RecoveryFailed {
+                    token: recovery_token,
+                    reason: refuse_message,
+                });
+                break match take_stop_effect(&mut runtime_state) {
+                    Ok(exit) => exit,
+                    Err(error) => MakerExit::OrderResponse(error.to_string()),
+                };
             }
         }
         if let Some(receiver) = order_responses.as_mut() {
@@ -1431,7 +1633,10 @@ pub(super) async fn run_maker(
                     health.mark_unhealthy(error.to_string());
                     continue;
                 }
-                break MakerExit::OrderResponse(error.to_string());
+                break stop_requested_exit(
+                    &mut runtime_state,
+                    RuntimeStopReason::OrderResponse(error.to_string()),
+                );
             }
         }
         if let Some(receiver) = account_events.as_mut() {
@@ -1479,7 +1684,10 @@ pub(super) async fn run_maker(
                         health.mark_unhealthy(error.to_string());
                         continue;
                     }
-                    break MakerExit::PositionReconciliation(error.to_string());
+                    break stop_requested_exit(
+                        &mut runtime_state,
+                        RuntimeStopReason::PositionReconciliation(error.to_string()),
+                    );
                 }
             }
         }
@@ -1495,8 +1703,22 @@ pub(super) async fn run_maker(
         let mismatch = account_position_mismatch.take();
         let exit_pending_before = inventory_exit_pending;
         let breaker_halted_before = breaker.halted();
-        runtime_state.reduce(MakerEvent::Timer);
-        let cycle_work_token = runtime_state.in_flight();
+        if runtime_state.pending_effect().is_none() {
+            runtime_state.handle(MakerEvent::Timer);
+        }
+        let cycle_work_token = match next_runtime_effect(&mut runtime_state) {
+            Some(MakerEffect::RunCycle(token)) => token,
+            Some(MakerEffect::Stop(reason)) => break reason.into(),
+            Some(effect) => {
+                break stop_requested_exit(
+                    &mut runtime_state,
+                    RuntimeStopReason::PositionReconciliation(format!(
+                        "runtime emitted unexpected effect before cycle: {effect:?}"
+                    )),
+                );
+            }
+            None => continue,
+        };
         let work = async {
             if let Some(observed) = mismatch {
                 return Err(anyhow::Error::new(PositionReconciliationError {
@@ -1549,14 +1771,12 @@ pub(super) async fn run_maker(
                 result.balance,
             ))
         };
-        // Stream events that arrive while `work` is placing/cancelling orders
-        // are buffered rather than acted on immediately: interrupting the work
-        // future would drop an in-flight create/cancel HTTP call, and a live
-        // cycle's own placements produce account events almost instantly, so
-        // acting mid-flight tore a multi-order cycle apart. We still keep the
-        // channels drained so the WS reader never backpressures and so a
-        // disconnect is noticed promptly. Buffered events are applied once the
-        // work future completes and releases its ledger/pending borrows.
+        // Normal stream events that arrive while `work` is placing/cancelling
+        // are buffered so a cycle's own acknowledgements cannot tear apart a
+        // multi-order plan. A stream disconnect is different: it immediately
+        // invalidates the generation, drops this future via `continue 'main`,
+        // and lets the queued Cleanup effect compensate for any request that
+        // may already have reached the venue.
         let mut buffered_account: Vec<AccountEvent> = Vec::new();
         let mut buffered_orders: Vec<OrderResponse> = Vec::new();
         // Scope the pinned work future so it (and its ledger/pending borrows)
@@ -1578,13 +1798,16 @@ pub(super) async fn run_maker(
                 };
                 tokio::select! {
                     _ = signal::ctrl_c() => {
-                        runtime_state.reduce(MakerEvent::CtrlC);
-                        break 'main MakerExit::CtrlC;
+                        runtime_state.handle(MakerEvent::CtrlC);
+                        break 'main match take_stop_effect(&mut runtime_state) {
+                            Ok(exit) => exit,
+                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                        };
                     },
                     event = account_during_work => {
                         let Some(event) = event else {
                             let reason = "authenticated account stream disconnected during cycle".to_string();
-                            runtime_state.reduce(MakerEvent::AccountStreamDisconnected(reason.clone()));
+                            runtime_state.handle(MakerEvent::AccountStreamDisconnected(reason.clone()));
                             if let Some(health) = account_stream_health.as_ref() {
                                 health.mark_unhealthy(reason);
                             }
@@ -1595,7 +1818,7 @@ pub(super) async fn run_maker(
                     response = order_during_work => {
                         let Some(response) = response else {
                             let reason = "order-response stream disconnected during cycle".to_string();
-                            runtime_state.reduce(MakerEvent::OrderResponseDisconnected(reason.clone()));
+                            runtime_state.handle(MakerEvent::OrderResponseDisconnected(reason.clone()));
                             if let Some(health) = order_response_health.as_ref() {
                                 health.mark_unhealthy(reason);
                             }
@@ -1607,10 +1830,6 @@ pub(super) async fn run_maker(
                 }
             }
         };
-        if let Some(token) = cycle_work_token {
-            runtime_state.reduce(MakerEvent::WorkFinished(token));
-        }
-
         // Apply the events buffered during work, ordering order-responses
         // before account events to mirror the top-of-loop drain.
         for response in buffered_orders {
@@ -1624,13 +1843,20 @@ pub(super) async fn run_maker(
                 cfg.price_decimals,
             );
             if let Some(request_id) = request_id {
-                runtime_state.reduce(if matched {
+                runtime_state.handle(if matched {
                     MakerEvent::OrderResponseMatched(request_id)
                 } else {
                     MakerEvent::OrderResponseUnmatched { request_id, cycle }
                 });
             }
-            if runtime_state.is_frozen() {
+            if matches!(
+                runtime_state.pending_effect(),
+                Some(MakerEffect::AbortInFlight(_))
+                    | Some(MakerEffect::Cleanup {
+                        target: RecoveryTarget::OrderResponse,
+                        ..
+                    })
+            ) {
                 if let Some(health) = order_response_health.as_ref() {
                     health.mark_unhealthy("order-response correlation failed closed");
                 }
@@ -1671,13 +1897,14 @@ pub(super) async fn run_maker(
                         if (position - ledger.expected_position).abs()
                             > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
                         {
-                            runtime_state.reduce(MakerEvent::PositionMismatch);
                             account_position_mismatch = Some(position);
+                        } else {
+                            account_position_mismatch = None;
                         }
                     }
                 }
                 Err(error) => {
-                    runtime_state.reduce(MakerEvent::AccountStreamDisconnected(error.to_string()));
+                    runtime_state.handle(MakerEvent::AccountStreamDisconnected(error.to_string()));
                     if let Some(health) = account_stream_health.as_ref() {
                         health.mark_unhealthy(error.to_string());
                     }
@@ -1685,8 +1912,35 @@ pub(super) async fn run_maker(
             }
         }
 
+        let cycle_result = if let Some(observed) = mismatch.or(account_position_mismatch.take()) {
+            Err(anyhow::Error::new(PositionReconciliationError {
+                expected: ledger.expected_position,
+                observed,
+            }))
+        } else {
+            cycle_result
+        };
+
+        if !matches!(
+            runtime_state.pending_effect(),
+            None | Some(MakerEffect::RunCycle(_))
+        ) && cycle_result.is_ok()
+        {
+            // A fail-closed event invalidated the generation while cycle work
+            // was running. Do not commit its counters/alerts; the queued
+            // abort/cleanup effects are consumed by the recovery path.
+            continue 'main;
+        }
+
         match cycle_result {
             Ok((places, cancels, holds, fills, mark, src, halted, exit_pending_after, balance)) => {
+                runtime_state.handle(MakerEvent::CycleCompleted(cycle_work_token));
+                if !matches!(
+                    next_runtime_effect(&mut runtime_state),
+                    Some(MakerEffect::CommitCycle(token)) if token == cycle_work_token
+                ) {
+                    continue 'main;
+                }
                 consecutive_errors = 0;
                 total_places += places;
                 total_cancels += cancels;
@@ -1833,15 +2087,37 @@ pub(super) async fn run_maker(
                                 true,
                             )
                             .await;
-                        break 'main MakerExit::StopLoss(format!(
-                            "session PnL {pnl:+.2} <= -{:.2}",
-                            args.stop_loss
+                        runtime_state.handle(MakerEvent::StopRequested(
+                            RuntimeStopReason::StopLoss(format!(
+                                "session PnL {pnl:+.2} <= -{:.2}",
+                                args.stop_loss
+                            )),
                         ));
+                        break 'main match take_stop_effect(&mut runtime_state) {
+                            Ok(exit) => exit,
+                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                        };
                     }
                 }
             }
             Err(e) => {
                 if let Some(mismatch) = e.downcast_ref::<PositionReconciliationError>() {
+                    runtime_state.handle(MakerEvent::PositionMismatch);
+                    let cleanup_token = match take_cleanup_effect(
+                        &mut runtime_state,
+                        RecoveryTarget::PositionReconciliation,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            break 'main stop_requested_exit(
+                                &mut runtime_state,
+                                RuntimeStopReason::CleanupFailure {
+                                    target: RecoveryTarget::PositionReconciliation,
+                                    reason: error.to_string(),
+                                },
+                            );
+                        }
+                    };
                     // A mismatch is not a normal cycle error. Freeze quoting,
                     // empty the maker book, and give account-order callbacks
                     // plus REST settlement a bounded three-second window to
@@ -1874,14 +2150,32 @@ pub(super) async fn run_maker(
                     if let Err(cleanup_error) =
                         cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
                     {
-                        break 'main MakerExit::PositionReconciliation(format!(
-                            "freeze cleanup failed: {cleanup_error}"
-                        ));
+                        runtime_state.handle(MakerEvent::CleanupFailed {
+                            token: cleanup_token,
+                            reason: format!("freeze cleanup failed: {cleanup_error}"),
+                        });
+                        break 'main match take_stop_effect(&mut runtime_state) {
+                            Ok(exit) => exit,
+                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                        };
                     }
                     resting.clear();
                     adopted.clear();
                     pending.clear();
                     inventory_exit_pending = false;
+                    runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
+                    let recovery_token = match take_recovery_effect(
+                        &mut runtime_state,
+                        RecoveryTarget::PositionReconciliation,
+                    ) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            break 'main stop_requested_exit(
+                                &mut runtime_state,
+                                RuntimeStopReason::PositionReconciliation(error.to_string()),
+                            );
+                        }
+                    };
                     let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
                     let mut recovered = false;
                     let mut last_observed = mismatch.observed;
@@ -1989,6 +2283,7 @@ pub(super) async fn run_maker(
                             )
                         .await;
                         consecutive_errors = 0;
+                        runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                         continue;
                     }
                     emit_reconciliation_state(
@@ -2016,10 +2311,17 @@ pub(super) async fn run_maker(
                             true,
                         )
                     .await;
-                    break 'main MakerExit::PositionReconciliation(format!(
-                        "expected position {:+.8}, venue reported {:+.8} after 3s freeze",
-                        ledger.expected_position, last_observed
-                    ));
+                    runtime_state.handle(MakerEvent::RecoveryFailed {
+                        token: recovery_token,
+                        reason: format!(
+                            "expected position {:+.8}, venue reported {:+.8} after 3s freeze",
+                            ledger.expected_position, last_observed
+                        ),
+                    });
+                    break 'main match take_stop_effect(&mut runtime_state) {
+                        Ok(exit) => exit,
+                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                    };
                 }
                 if exit_pending_before {
                     let message = format!("inventory exit cycle failed: {e}");
@@ -2041,15 +2343,29 @@ pub(super) async fn run_maker(
                         )
                         .await;
                 }
+                runtime_state.handle(MakerEvent::CycleFailed {
+                    token: cycle_work_token,
+                    reason: e.to_string(),
+                });
                 consecutive_errors += 1;
                 eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
-                if consecutive_errors >= 3 {
-                    break MakerExit::ConsecutiveErrors(e.to_string());
+                if matches!(runtime_state.pending_effect(), Some(MakerEffect::Stop(_))) {
+                    break match take_stop_effect(&mut runtime_state) {
+                        Ok(exit) => exit,
+                        Err(error) => MakerExit::ConsecutiveErrors(error.to_string()),
+                    };
                 }
             }
         }
 
         cycle += 1;
+
+        if matches!(
+            runtime_state.pending_effect(),
+            Some(MakerEffect::RunCycle(_))
+        ) {
+            continue 'main;
+        }
 
         // Sleep until the next cycle, but wake early when the cached mark
         // has already drifted beyond refresh_bps — the quotes would be
@@ -2071,7 +2387,13 @@ pub(super) async fn run_maker(
                 }
             };
             tokio::select! {
-                _ = signal::ctrl_c() => break 'main MakerExit::CtrlC,
+                _ = signal::ctrl_c() => {
+                    runtime_state.handle(MakerEvent::CtrlC);
+                    break 'main match take_stop_effect(&mut runtime_state) {
+                        Ok(exit) => exit,
+                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                    };
+                },
                 _ = tokio::time::sleep_until(deadline) => break,
                 event = account_update => {
                     let Some(event) = event else {
@@ -2148,7 +2470,7 @@ pub(super) async fn run_maker(
                             .is_some_and(|m| maker::bps_diff(m, prev) > cfg.refresh_bps)
                     };
                     if drifted {
-                        runtime_state.reduce(MakerEvent::MarketChanged);
+                        runtime_state.handle(MakerEvent::MarketChanged);
                         break; // early re-quote cycle
                     }
                 }
@@ -2326,6 +2648,54 @@ mod tests {
     }
 
     #[test]
+    fn runtime_effect_executor_orders_abort_cleanup_and_recovery() {
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let cycle_token = match next_runtime_effect(&mut runtime_state) {
+            Some(MakerEffect::RunCycle(token)) => token,
+            effect => panic!("expected cycle effect, got {effect:?}"),
+        };
+
+        runtime_state.handle(MakerEvent::PositionMismatch);
+        let cleanup =
+            take_cleanup_effect(&mut runtime_state, RecoveryTarget::PositionReconciliation)
+                .expect("abort must be drained before cleanup");
+        runtime_state.handle(MakerEvent::CycleCompleted(cycle_token));
+        assert!(runtime_state.pending_effect().is_none());
+
+        runtime_state.handle(MakerEvent::CleanupCompleted(cleanup));
+        let recovery =
+            take_recovery_effect(&mut runtime_state, RecoveryTarget::PositionReconciliation)
+                .expect("cleanup completion must schedule recovery");
+        runtime_state.handle(MakerEvent::RecoverySucceeded(recovery));
+        assert!(matches!(
+            next_runtime_effect(&mut runtime_state),
+            Some(MakerEffect::RunCycle(_))
+        ));
+    }
+
+    #[test]
+    fn runtime_recovery_failure_is_the_stop_source_of_truth() {
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let _ = next_runtime_effect(&mut runtime_state);
+        runtime_state.handle(MakerEvent::OrderResponseDisconnected("closed".to_string()));
+        let cleanup = take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse)
+            .expect("cleanup effect");
+        runtime_state.handle(MakerEvent::CleanupCompleted(cleanup));
+        let recovery = take_recovery_effect(&mut runtime_state, RecoveryTarget::OrderResponse)
+            .expect("recovery effect");
+        let exit = recovery_failed_exit(
+            &mut runtime_state,
+            recovery,
+            "residual maker orders".to_string(),
+        );
+        assert!(
+            matches!(exit, MakerExit::OrderResponse(reason) if reason == "residual maker orders")
+        );
+    }
+
+    #[test]
     fn apply_order_response_keeps_accepted_placement() {
         let mut pending = vec![pending_place("req-1")];
         let matched = apply_order_response(
@@ -2382,7 +2752,11 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut pending = vec![pending_place("req-1"), pending_place("req-2")];
         let mut runtime_state = MakerState::starting();
-        runtime_state.reduce(MakerEvent::StartupReady);
+        runtime_state.handle(MakerEvent::StartupReady);
+        assert!(matches!(
+            next_runtime_effect(&mut runtime_state),
+            Some(MakerEffect::RunCycle(_))
+        ));
 
         // Benign matched acknowledgements for placements we are tracking.
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
@@ -2399,10 +2773,7 @@ mod tests {
         )
         .expect("benign matched acks must not fail closed");
 
-        assert!(
-            !runtime_state.is_frozen(),
-            "matched acks must not overflow the unmatched buffer"
-        );
+        assert!(runtime_state.pending_effect().is_none());
         // Accepted placements remain pending; the matched arm keeps them.
         assert_eq!(pending.len(), 2);
     }
@@ -2412,7 +2783,11 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut pending = Vec::new();
         let mut runtime_state = MakerState::starting();
-        runtime_state.reduce(MakerEvent::StartupReady);
+        runtime_state.handle(MakerEvent::StartupReady);
+        assert!(matches!(
+            next_runtime_effect(&mut runtime_state),
+            Some(MakerEffect::RunCycle(_))
+        ));
 
         // First response has no matching pending placement -> buffered as unmatched.
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
@@ -2426,7 +2801,7 @@ mod tests {
             2,
         )
         .unwrap();
-        assert!(!runtime_state.is_frozen());
+        assert!(runtime_state.pending_effect().is_none());
 
         // The matching placement arrives later; a matched ack clears the buffer entry.
         pending.push(pending_place("req-1"));
@@ -2441,7 +2816,7 @@ mod tests {
             2,
         )
         .unwrap();
-        assert!(!runtime_state.is_frozen());
+        assert!(runtime_state.pending_effect().is_none());
     }
 
     fn drain_positions(events: Vec<AccountEvent>) -> (u64, Option<f64>) {
