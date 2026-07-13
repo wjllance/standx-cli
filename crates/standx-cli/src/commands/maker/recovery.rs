@@ -438,6 +438,10 @@ pub(super) async fn reconnect_order_response(
     let mut cleanup_client = cleanup_client;
     let first_attempt = attempts_used.saturating_add(1);
     let mut last_error = None;
+    // The runtime Cleanup effect has already emptied and verified the maker
+    // book before it emits Recover. Only repeat cleanup between failed
+    // reconnect attempts, when a late venue-side request may have surfaced.
+    let mut cleanup_needed = false;
 
     for attempt in first_attempt..=max_attempts {
         emit_order_response_reconnect(
@@ -449,11 +453,18 @@ pub(super) async fn reconnect_order_response(
             original_failure,
         );
 
-        if let Err(error) =
-            cancel_maker_orders_with_retry(&cleanup_client, symbol, 3, output_format).await
-        {
-            last_error = Some(anyhow::anyhow!("pre-reconnect cleanup failed: {error}"));
+        let cleanup_ok = if cleanup_needed {
+            match cancel_maker_orders_with_retry(&cleanup_client, symbol, 3, output_format).await {
+                Ok(()) => true,
+                Err(error) => {
+                    last_error = Some(anyhow::anyhow!("retry cleanup failed: {error}"));
+                    false
+                }
+            }
         } else {
+            true
+        };
+        if cleanup_ok {
             // Give just-submitted HTTP orders time to become visible, then
             // require a second authoritative snapshot after authentication.
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -536,6 +547,7 @@ pub(super) async fn reconnect_order_response(
                 }
             }
         }
+        cleanup_needed = true;
 
         let error_text = last_error
             .as_ref()

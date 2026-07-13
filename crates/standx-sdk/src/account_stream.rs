@@ -60,6 +60,14 @@ impl AccountChannel {
             Self::Trade => "trade",
         }
     }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Order => 0,
+            Self::Position => 1,
+            Self::Trade => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -123,7 +131,7 @@ pub struct AccountStreamHealth {
     healthy: Arc<AtomicBool>,
     failure_reason: Arc<Mutex<Option<String>>>,
     epoch: Arc<AtomicU64>,
-    last_seq: Arc<AtomicU64>,
+    last_seq: Arc<[AtomicU64; 3]>,
 }
 
 impl AccountStreamHealth {
@@ -132,7 +140,7 @@ impl AccountStreamHealth {
             healthy: Arc::new(AtomicBool::new(true)),
             failure_reason: Arc::new(Mutex::new(None)),
             epoch: Arc::new(AtomicU64::new(epoch)),
-            last_seq: Arc::new(AtomicU64::new(0)),
+            last_seq: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
         }
     }
 
@@ -151,8 +159,8 @@ impl AccountStreamHealth {
         self.epoch.load(Ordering::Acquire)
     }
 
-    pub fn last_seq(&self) -> u64 {
-        self.last_seq.load(Ordering::Acquire)
+    pub fn last_seq(&self, channel: AccountChannel) -> u64 {
+        self.last_seq[channel.index()].load(Ordering::Acquire)
     }
 
     pub fn mark_unhealthy(&self, reason: impl Into<String>) {
@@ -397,40 +405,49 @@ fn parse_account_event(text: &str, health: &AccountStreamHealth) -> Result<Optio
     let Some(channel) = envelope.get("channel").and_then(|value| value.as_str()) else {
         return Ok(None);
     };
-    if channel == "auth" {
-        return Ok(None);
-    }
+    let account_channel = match channel {
+        "order" => AccountChannel::Order,
+        "position" => AccountChannel::Position,
+        "trade" => AccountChannel::Trade,
+        "auth" => return Ok(None),
+        _ => return Ok(None),
+    };
     let seq = envelope
         .get("seq")
         .and_then(|value| value.as_u64())
         .ok_or_else(|| Error::WebSocket {
             message: format!("{channel} event has no numeric seq"),
         })?;
-    let previous = health.last_seq.swap(seq, Ordering::AcqRel);
+    // StandX does not document whether `seq` is global or channel-local, nor
+    // whether it is contiguous. Channel-local monotonic validation is safe for
+    // either scope: reject duplicates/regressions within a channel, but allow
+    // interleaved channels and gaps without falsely declaring the stream dead.
+    let channel_seq = &health.last_seq[account_channel.index()];
+    let previous = channel_seq.load(Ordering::Acquire);
     if previous != 0 && seq <= previous {
         return Err(Error::WebSocket {
-            message: format!("account stream seq regressed from {previous} to {seq}"),
+            message: format!("account stream {channel} seq regressed from {previous} to {seq}"),
         });
     }
+    channel_seq.store(seq, Ordering::Release);
     let data = envelope
         .get("data")
         .cloned()
         .ok_or_else(|| Error::WebSocket {
             message: format!("{channel} event has no data"),
         })?;
-    match channel {
-        "order" => {
+    match account_channel {
+        AccountChannel::Order => {
             let mut order = serde_json::from_value::<OrderUpdate>(data)?;
             order.seq = seq;
             Ok(Some(AccountEvent::Order(order)))
         }
-        "position" => {
+        AccountChannel::Position => {
             let mut position = serde_json::from_value::<PositionUpdate>(data)?;
             position.seq = seq;
             Ok(Some(AccountEvent::Position(position)))
         }
-        "trade" => Ok(Some(AccountEvent::TradeShadow { seq, data })),
-        _ => Ok(None),
+        AccountChannel::Trade => Ok(Some(AccountEvent::TradeShadow { seq, data })),
     }
 }
 
@@ -478,6 +495,41 @@ mod tests {
         let health = AccountStreamHealth::new(1);
         parse_account_event(r#"{"seq":9,"channel":"trade","data":{}}"#, &health).unwrap();
         assert!(parse_account_event(r#"{"seq":8,"channel":"trade","data":{}}"#, &health,).is_err());
+        assert_eq!(health.last_seq(AccountChannel::Trade), 9);
+    }
+
+    #[test]
+    fn seq_is_monotonic_per_channel_and_allows_gaps() {
+        let health = AccountStreamHealth::new(1);
+        parse_account_event(r#"{"seq":100,"channel":"trade","data":{}}"#, &health).unwrap();
+        let position = r#"{"seq":3,"channel":"position","data":{"symbol":"BTC-USD","qty":"0","entry_price":"0","realized_pnl":"0","status":"closed","updated_at":"now"}}"#;
+        parse_account_event(position, &health).unwrap();
+        parse_account_event(r#"{"seq":900,"channel":"trade","data":{}}"#, &health).unwrap();
+
+        assert_eq!(health.last_seq(AccountChannel::Trade), 900);
+        assert_eq!(health.last_seq(AccountChannel::Position), 3);
+        assert_eq!(health.last_seq(AccountChannel::Order), 0);
+
+        assert!(parse_account_event(position, &health).is_err());
+    }
+
+    #[test]
+    fn auth_and_unknown_channels_do_not_change_seq_state() {
+        let health = AccountStreamHealth::new(1);
+        assert!(parse_account_event(
+            r#"{"seq":99,"channel":"auth","data":{"code":200}}"#,
+            &health,
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            parse_account_event(r#"{"seq":100,"channel":"balance","data":{}}"#, &health,)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(health.last_seq(AccountChannel::Order), 0);
+        assert_eq!(health.last_seq(AccountChannel::Position), 0);
+        assert_eq!(health.last_seq(AccountChannel::Trade), 0);
     }
 
     #[tokio::test]
