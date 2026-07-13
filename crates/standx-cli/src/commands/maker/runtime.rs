@@ -1716,7 +1716,8 @@ pub(super) async fn run_maker(
                         if let (Some(equity), Some(available)) = (equity, available) {
                             let fired = alerts.evaluate_account(equity, available);
                             for alert in fired {
-                                notifier.alert(&alert, &symbol);
+                                let await_delivery = alert.firing;
+                                notifier.alert(&alert, &symbol, await_delivery).await;
                             }
                         }
                     }
@@ -2189,14 +2190,17 @@ pub(super) async fn run_maker(
         .await;
 
     if let Some(error) = cleanup_error {
-        return Err(anyhow::anyhow!(
-            "maker stopped but maker-owned order cleanup failed: {}",
-            error
-        ));
+        // A residual-order cleanup failure is an intentional fail-safe stop
+        // that needs a human, not an automatic restart.
+        return Err(anyhow::Error::new(FailSafeShutdown {
+            message: format!(
+                "maker stopped (fail-safe) but maker-owned order cleanup failed: {error}"
+            ),
+        }));
     }
 
     match exit.terminal_error() {
-        Some(message) => Err(anyhow::anyhow!(message)),
+        Some(message) => Err(anyhow::Error::new(FailSafeShutdown { message })),
         None => Ok(()),
     }
 }

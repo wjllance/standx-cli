@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  StandX maker (macOS dev). Install to ~/Library/LaunchAgents/ and edit the
+  absolute paths below to your checkout. The supervise wrapper enforces the
+  exit-code policy (see deploy/README.md): fail-safe (75) is translated to a
+  clean exit so KeepAlive.SuccessfulExit=false does NOT restart it, while an
+  unexpected non-zero exit is passed through so launchd DOES restart.
+
+  Paper mode by default: there is no --live flag here and STANDX_ENABLE_LIVE_MAKER
+  is not set. See docs/14-maker-live-gate.md before enabling live trading.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.standx.maker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/opt/standx/deploy/launchd/standx-maker-supervise.sh</string>
+    <string>/opt/standx/bin/standx</string>
+    <string>--output</string>
+    <string>json</string>
+    <string>maker</string>
+    <string>run</string>
+    <string>BTC-USD</string>
+    <string>--maker-config</string>
+    <string>/opt/standx/examples/maker.toml</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/opt/standx</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OPENOBSERVE_AUTO_UPLOAD</key>
+    <string>1</string>
+    <key>STANDX_LOG_DIR</key>
+    <string>/opt/standx/var/standx</string>
+    <key>STANDX_ENV_FILE</key>
+    <string>/opt/standx/deploy/openobserve/.env</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart only on a non-zero (unexpected) exit; the wrapper maps the
+       intentional fail-safe to 0 so it is left stopped. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- Throttle restarts so an early crash cannot busy-loop. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/opt/standx/var/standx/launchd-maker.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/standx/var/standx/launchd-maker.err.log</string>
+</dict>
+</plist>

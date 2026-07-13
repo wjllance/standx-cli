@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  StandX OpenObserve crash/boot catch-up (macOS). RunAtLoad fires once when the
+  agent is loaded (e.g. at login/boot), re-uploading any un-ingested tail of
+  prior runs. No KeepAlive: this is a one-shot. Idempotent and best-effort.
+  Load it BEFORE com.standx.maker so a stale tail is flushed before the next run.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.standx.openobserve-catchup</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/opt/standx/scripts/openobserve_catchup.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/opt/standx</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>STANDX_LOG_DIR</key>
+    <string>/opt/standx/var/standx</string>
+    <key>OPENOBSERVE_ENV_FILE</key>
+    <string>/opt/standx/deploy/openobserve/.env</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/opt/standx/var/standx/launchd-catchup.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/standx/var/standx/launchd-catchup.err.log</string>
+</dict>
+</plist>

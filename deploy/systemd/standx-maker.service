@@ -1,0 +1,43 @@
+[Unit]
+Description=StandX maker bot (observed, with live OpenObserve upload)
+Documentation=file:/opt/standx/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+# Re-ingest any un-uploaded log tail from a previous crash before starting.
+After=standx-openobserve-catchup.service
+Wants=standx-openobserve-catchup.service
+# Notify a human on ANY failure, including the no-restart fail-safe (exit 75).
+OnFailure=standx-notify@%n.service
+# Break crash loops (e.g. a persistent config error that keeps exiting 1):
+# give up after 5 failures in 5 minutes and enter 'failed' (still fires
+# OnFailure) instead of restarting forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Operator-provided config: install paths, symbol, maker flags, OpenObserve
+# credentials, the optional STANDX_SUPERVISOR_WEBHOOK, and (only if live
+# trading is truly intended) STANDX_ENABLE_LIVE_MAKER. See maker.env.example.
+EnvironmentFile=/etc/standx/maker.env
+WorkingDirectory=/opt/standx
+# The wrapper enforces `maker run --output json`, tees logs, and co-supervises
+# the live uploader (relaunching it if it dies mid-run). $STANDX_MAKER_ARGS is
+# intentionally unquoted so extra flags are word-split into arguments.
+ExecStart=/opt/standx/scripts/run_maker_observed.sh /opt/standx/bin/standx --output json maker run ${STANDX_SYMBOL} --maker-config ${STANDX_MAKER_CONFIG} $STANDX_MAKER_ARGS
+
+# --- Exit-code policy (see deploy/README.md) ---
+#   0            clean stop (Ctrl+C / SIGTERM)             -> no restart, no alert
+#   75           intentional maker fail-safe shutdown      -> notify, NO restart
+#   1/101/signal startup error, panic, or unexpected kill  -> notify + restart
+SuccessExitStatus=0
+RestartPreventExitStatus=75
+Restart=on-failure
+RestartSec=5
+# Forward SIGTERM to the wrapper so the maker runs its fail-safe cleanup, and
+# give it time to cancel maker-owned orders before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
