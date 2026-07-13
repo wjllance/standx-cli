@@ -1,5 +1,7 @@
 use crate::cli::*;
 use anyhow::Result;
+use standx_sdk::account_stream::{AccountChannel, AccountEvent, AccountStream};
+use standx_sdk::models::Trade;
 use standx_sdk::websocket::{StandXWebSocket, WsMessage};
 
 /// Handle stream commands
@@ -107,29 +109,27 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
         }
         // User-level authenticated channels
         StreamCommands::Order => {
-            let ws = StandXWebSocket::new_with_verbose(verbose)?;
-            let _ = ws.subscribe("order", None).await;
-            let mut rx = ws.connect().await?;
+            let stream = AccountStream::new(1)?;
+            let (mut rx, _health, _handle) = stream.connect(&[AccountChannel::Order]).await?;
 
             println!("Streaming order updates");
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::Order(data) = msg {
+                if let AccountEvent::Order(data) = msg {
                     println!("Order update: {}", serde_json::to_string(&data)?);
                 }
             }
         }
         StreamCommands::Position => {
-            let ws = StandXWebSocket::new_with_verbose(verbose)?;
-            let _ = ws.subscribe("position", None).await;
-            let mut rx = ws.connect().await?;
+            let stream = AccountStream::new(1)?;
+            let (mut rx, _health, _handle) = stream.connect(&[AccountChannel::Position]).await?;
 
             println!("Streaming position updates");
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::Position(data) = msg {
+                if let AccountEvent::Position(data) = msg {
                     println!("Position update: {}", serde_json::to_string(&data)?);
                 }
             }
@@ -149,15 +149,23 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
             }
         }
         StreamCommands::Fills => {
-            let ws = StandXWebSocket::new_with_verbose(verbose)?;
-            let _ = ws.subscribe("trade", None).await;
-            let mut rx = ws.connect().await?;
+            let stream = AccountStream::new(1)?;
+            let (mut rx, _health, _handle) = stream.connect(&[AccountChannel::Trade]).await?;
 
             println!("Streaming fill/trade updates");
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::Trade(data) = msg {
+                if let AccountEvent::TradeShadow { data, .. } = msg {
+                    let data = match serde_json::from_value::<Trade>(data) {
+                        Ok(data) => data,
+                        Err(error) => {
+                            if verbose {
+                                eprintln!("Skipping undocumented trade payload: {error}");
+                            }
+                            continue;
+                        }
+                    };
                     let side = data.side.as_deref().unwrap_or({
                         if data.is_buyer_taker {
                             "buy"
