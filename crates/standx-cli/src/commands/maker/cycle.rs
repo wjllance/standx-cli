@@ -5,7 +5,7 @@ use super::model::{
     is_current_run_order, is_order_rejection, open_qty_adopts, pending_covers_slot,
     position_for_symbol, MakerFill, PendingPlace,
 };
-use super::output::{emit_maker_cycle, log_maker_event};
+use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
 use super::pipeline::{fetch_snapshot, CycleRequest, CycleResult, CycleState};
 use super::recovery::{
     recover_current_run_order_ids_for_reconciliation, PositionGap, PositionReconciliationError,
@@ -377,17 +377,17 @@ pub(super) async fn maker_cycle(
         .into_iter()
         .filter(|action| match action {
             Action::Place(q) if live && pending_covers_slot(pending, q.side, q.level) => {
-                log_maker_event(
+                log_maker_event(MakerLogEvent {
                     output_format,
                     symbol,
                     cycle,
-                    "place_pending",
-                    q.side,
-                    q.level,
-                    q.price,
-                    cfg.price_decimals,
-                    "awaiting asynchronous order confirmation",
-                );
+                    action: "place_pending",
+                    side: q.side,
+                    level: q.level,
+                    price: q.price,
+                    price_decimals: cfg.price_decimals,
+                    detail: "awaiting asynchronous order confirmation",
+                });
                 false
             }
             _ => true,
@@ -424,17 +424,17 @@ pub(super) async fn maker_cycle(
                                 // out from under us) — that IS the goal.
                                 adopted.remove(id);
                                 cancels += 1;
-                                log_maker_event(
+                                log_maker_event(MakerLogEvent {
                                     output_format,
                                     symbol,
                                     cycle,
-                                    "cancel_noop",
-                                    *side,
-                                    *level,
-                                    *price,
-                                    cfg.price_decimals,
-                                    "order already gone",
-                                );
+                                    action: "cancel_noop",
+                                    side: *side,
+                                    level: *level,
+                                    price: *price,
+                                    price_decimals: cfg.price_decimals,
+                                    detail: "order already gone",
+                                });
                             }
                             // Transient (network / 5xx) → fail-safe path.
                             Err(e) => return Err(e.into()),
@@ -485,17 +485,17 @@ pub(super) async fn maker_cycle(
                         Err(e) if is_order_rejection(&e) => {
                             // Post-only would-cross etc. — expected in fast
                             // markets. Re-quote next cycle, don't fail-safe.
-                            log_maker_event(
+                            log_maker_event(MakerLogEvent {
                                 output_format,
                                 symbol,
                                 cycle,
-                                "place_rejected",
-                                q.side,
-                                q.level,
-                                q.price,
-                                cfg.price_decimals,
-                                "post-only rejected",
-                            );
+                                action: "place_rejected",
+                                side: q.side,
+                                level: q.level,
+                                price: q.price,
+                                price_decimals: cfg.price_decimals,
+                                detail: "post-only rejected",
+                            });
                         }
                         Err(e) => return Err(e.into()),
                     }
@@ -541,17 +541,17 @@ pub(super) async fn maker_cycle(
                 })
                 .await?;
             *inventory_exit_pending = true;
-            log_maker_event(
+            log_maker_event(MakerLogEvent {
                 output_format,
                 symbol,
                 cycle,
-                "inventory_exit_submitted",
-                exit.side,
-                0,
-                mark,
-                cfg.price_decimals,
-                "reduce-only market order submitted after maker book cleared",
-            );
+                action: "inventory_exit_submitted",
+                side: exit.side,
+                level: 0,
+                price: mark,
+                price_decimals: cfg.price_decimals,
+                detail: "reduce-only market order submitted after maker book cleared",
+            });
         }
     }
 
@@ -562,7 +562,7 @@ pub(super) async fn maker_cycle(
     stats.end_cycle(position, two_sided);
 
     // 6. Emit.
-    emit_maker_cycle(
+    emit_maker_cycle(CycleOutput {
         output_format,
         live,
         symbol,
@@ -572,13 +572,13 @@ pub(super) async fn maker_cycle(
         best_ask,
         position,
         starting_position,
-        account_balance.as_ref(),
-        &actions,
-        &fills,
+        account: account_balance.as_ref(),
+        actions: &actions,
+        fills: &fills,
         stats,
-        halted.then(|| breaker.vol_bps()),
+        halt_vol_bps: halted.then(|| breaker.vol_bps()),
         cfg,
-    );
+    });
 
     Ok(CycleResult {
         places,
