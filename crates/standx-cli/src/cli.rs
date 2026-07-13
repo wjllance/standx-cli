@@ -483,6 +483,17 @@ pub enum MakerCommands {
         /// Later attempts use bounded exponential backoff.
         #[arg(long)]
         order_response_reconnect_backoff: Option<u64>,
+        /// Maximum account-stream reconnect attempts after an unhealthy
+        /// disconnect during a live maker run. Each attempt reconnects the
+        /// authenticated account stream, replays buffered events, and backs
+        /// fill gaps with REST trades before reconciling the venue position.
+        /// 0 disables reconnect entirely (fail closed immediately).
+        #[arg(long)]
+        account_stream_reconnect_attempts: Option<u32>,
+        /// Base delay in seconds between account-stream reconnect attempts.
+        /// Later attempts use bounded exponential backoff.
+        #[arg(long)]
+        account_stream_reconnect_backoff: Option<u64>,
         /// Supervised fault injection: close the local order-response stream
         /// after this many seconds. Hidden because it is only for live-gate
         /// validation and is limited by the maker command to 60 seconds.

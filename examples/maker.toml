@@ -35,5 +35,12 @@ inventory_exit_qty = 0.0
 order_response_reconnect_attempts = 3
 order_response_reconnect_backoff = 2
 
+# Account-stream recovery: each attempt reconnects the authenticated account
+# stream, replays buffered events, and backs any gap with REST trades before
+# reconciling the venue position. Set attempts to 0 to retain immediate
+# fail-safe shutdown on disconnect.
+account_stream_reconnect_attempts = 3
+account_stream_reconnect_backoff = 2
+
 # Use REST market polling instead of the WebSocket feed (normally false)
 no_ws = false

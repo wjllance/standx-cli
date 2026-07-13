@@ -30,6 +30,8 @@ pub(super) struct MakerFileConfig {
     pub no_ws: Option<bool>,
     pub order_response_reconnect_attempts: Option<u32>,
     pub order_response_reconnect_backoff: Option<u64>,
+    pub account_stream_reconnect_attempts: Option<u32>,
+    pub account_stream_reconnect_backoff: Option<u64>,
 }
 
 pub(super) fn load(path: Option<&Path>) -> Result<MakerFileConfig> {
@@ -57,7 +59,7 @@ mod tests {
     #[test]
     fn parses_partial_non_sensitive_strategy_file() {
         let config: MakerFileConfig = toml::from_str(
-            "spread_bps = 8\nmax_position = 0.02\nalert_position_change_pct = 20\nno_ws = true\norder_response_reconnect_attempts = 3\norder_response_reconnect_backoff = 2\n",
+            "spread_bps = 8\nmax_position = 0.02\nalert_position_change_pct = 20\nno_ws = true\norder_response_reconnect_attempts = 3\norder_response_reconnect_backoff = 2\naccount_stream_reconnect_attempts = 3\naccount_stream_reconnect_backoff = 2\n",
         )
         .unwrap();
         assert_eq!(config.spread_bps, Some(8.0));
@@ -66,6 +68,8 @@ mod tests {
         assert_eq!(config.no_ws, Some(true));
         assert_eq!(config.order_response_reconnect_attempts, Some(3));
         assert_eq!(config.order_response_reconnect_backoff, Some(2));
+        assert_eq!(config.account_stream_reconnect_attempts, Some(3));
+        assert_eq!(config.account_stream_reconnect_backoff, Some(2));
         assert_eq!(config.size, None);
     }
 
@@ -81,6 +85,8 @@ mod tests {
         assert_eq!(config.inventory_exit_qty, Some(0.0));
         assert_eq!(config.order_response_reconnect_attempts, Some(3));
         assert_eq!(config.order_response_reconnect_backoff, Some(2));
+        assert_eq!(config.account_stream_reconnect_attempts, Some(3));
+        assert_eq!(config.account_stream_reconnect_backoff, Some(2));
     }
 
     #[test]

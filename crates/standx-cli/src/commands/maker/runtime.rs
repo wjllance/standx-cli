@@ -337,6 +337,18 @@ pub(super) async fn run_maker(
             "--order-response-reconnect-backoff must be between 1 and 60 seconds when reconnect is enabled"
         ));
     }
+    if args.account_stream_reconnect_attempts > 10 {
+        return Err(anyhow::anyhow!(
+            "--account-stream-reconnect-attempts must be between 0 and 10"
+        ));
+    }
+    if args.account_stream_reconnect_attempts > 0
+        && !(1..=60).contains(&args.account_stream_reconnect_backoff)
+    {
+        return Err(anyhow::anyhow!(
+            "--account-stream-reconnect-backoff must be between 1 and 60 seconds when reconnect is enabled"
+        ));
+    }
     let mut client = match order_session_id.as_deref() {
         Some(session_id) => StandXClient::new()?.with_session_id(session_id),
         None => StandXClient::new()?,
@@ -691,6 +703,10 @@ pub(super) async fn run_maker(
                 "│ order-response recovery: {} attempt(s), {}s base backoff",
                 args.order_response_reconnect_attempts, args.order_response_reconnect_backoff
             );
+            println!(
+                "│ account-stream recovery: {} attempt(s), {}s base backoff",
+                args.account_stream_reconnect_attempts, args.account_stream_reconnect_backoff
+            );
         }
         if args.no_ws {
             println!("│ feed: REST polling (--no-ws)");
@@ -795,6 +811,7 @@ pub(super) async fn run_maker(
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
     let mut order_response_reconnect_attempts_used = 0_u32;
+    let mut account_stream_reconnect_attempts_used = 0_u32;
     let mut account_position_mismatch: Option<f64> = None;
     let mut runtime_state = MakerState::starting();
     runtime_state.reduce(MakerEvent::StartupReady);
@@ -846,21 +863,125 @@ pub(super) async fn run_maker(
                     handle.abort();
                 }
                 account_events.take();
-                account_stream_epoch = account_stream_epoch.saturating_add(1);
-                let reconnect = async {
-                    let stream = AccountStream::new(account_stream_epoch)?;
-                    stream
-                        .connect(&[
-                            AccountChannel::Order,
-                            AccountChannel::Position,
-                            AccountChannel::Trade,
-                        ])
-                        .await
-                        .map_err(anyhow::Error::from)
+
+                let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+                if account_stream_reconnect_attempts_used >= args.account_stream_reconnect_attempts
+                {
+                    break MakerExit::PositionReconciliation(format!(
+                        "account stream disconnected ({detail}); reconnect disabled or budget exhausted ({}/{})",
+                        account_stream_reconnect_attempts_used, args.account_stream_reconnect_attempts
+                    ));
+                }
+
+                let mut last_connect_error: Option<String> = None;
+                let mut reconnected = None;
+                while account_stream_reconnect_attempts_used
+                    < args.account_stream_reconnect_attempts
+                {
+                    account_stream_reconnect_attempts_used += 1;
+                    let attempt = account_stream_reconnect_attempts_used;
+                    account_stream_epoch = account_stream_epoch.saturating_add(1);
+                    let reconnect = async {
+                        let stream = AccountStream::new(account_stream_epoch)?;
+                        stream
+                            .connect(&[
+                                AccountChannel::Order,
+                                AccountChannel::Position,
+                                AccountChannel::Trade,
+                            ])
+                            .await
+                            .map_err(anyhow::Error::from)
+                    };
+                    match tokio::time::timeout(Duration::from_secs(15), reconnect).await {
+                        Ok(Ok(triple)) => {
+                            reconnected = Some(triple);
+                            break;
+                        }
+                        Ok(Err(error)) => {
+                            last_connect_error = Some(format!("connect failed: {error}"));
+                        }
+                        Err(_) => {
+                            last_connect_error =
+                                Some("connect timed out after 15 seconds".to_string());
+                        }
+                    }
+                    eprintln!(
+                        "⚠️  account stream reconnect attempt {}/{} failed: {}",
+                        attempt,
+                        args.account_stream_reconnect_attempts,
+                        last_connect_error.as_deref().unwrap_or("unknown error")
+                    );
+                    if attempt < args.account_stream_reconnect_attempts {
+                        let multiplier = 1_u32 << attempt.saturating_sub(1).min(4);
+                        tokio::time::sleep(
+                            Duration::from_secs(args.account_stream_reconnect_backoff)
+                                .saturating_mul(multiplier),
+                        )
+                        .await;
+                    }
+                }
+
+                let Some((mut events, health, handle)) = reconnected else {
+                    runtime_state.reduce(MakerEvent::RecoveryFailed(format!(
+                        "account stream reconnect exhausted: {}",
+                        last_connect_error
+                            .clone()
+                            .unwrap_or_else(|| "no attempts available".to_string())
+                    )));
+                    break MakerExit::PositionReconciliation(format!(
+                        "account stream disconnected ({detail}); reconnect exhausted: {}",
+                        last_connect_error.unwrap_or_else(|| "no attempts available".to_string())
+                    ));
                 };
-                match tokio::time::timeout(Duration::from_secs(3), reconnect).await {
-                    Ok(Ok((mut events, health, handle))) => {
-                        let reconnect_fills = match apply_account_events(
+
+                let mut reconnect_fills = match apply_account_events(
+                    &mut events,
+                    &mut AccountEventState {
+                        ledger: &mut ledger,
+                        stats: &mut stats,
+                    },
+                    &AccountEventContext {
+                        symbol: &symbol,
+                        run_order_prefix: &run_order_prefix,
+                        mark: last_mark.unwrap_or(baseline_mark),
+                        cycle,
+                        output_format,
+                    },
+                ) {
+                    Ok((fills, _)) => fills,
+                    Err(error) => {
+                        handle.abort();
+                        break MakerExit::PositionReconciliation(format!(
+                            "account stream reconnect event validation failed: {error}"
+                        ));
+                    }
+                };
+                let positions = match client.get_positions(Some(&symbol)).await {
+                    Ok(positions) => positions,
+                    Err(error) => {
+                        handle.abort();
+                        break MakerExit::PositionReconciliation(format!(
+                            "account stream reconnect snapshot failed: {error}"
+                        ));
+                    }
+                };
+                let mut observed = match position_for_symbol(&positions, &symbol) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        handle.abort();
+                        break MakerExit::PositionReconciliation(error.to_string());
+                    }
+                };
+
+                if (observed - ledger.expected_position).abs() > qty_tolerance {
+                    // WS events can lag REST settlement across a reconnect: give
+                    // a bounded window to explain the gap with REST trades
+                    // (mirrors the in-cycle freeze-path reconciliation) before
+                    // failing closed.
+                    let mut gap_closed = false;
+                    for delay in [500_u64, 1_000, 1_500] {
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        match apply_account_events(
                             &mut events,
                             &mut AccountEventState {
                                 ledger: &mut ledger,
@@ -874,78 +995,77 @@ pub(super) async fn run_maker(
                                 output_format,
                             },
                         ) {
-                            Ok((fills, _)) => fills,
+                            Ok((fills, _)) => reconnect_fills += fills,
                             Err(error) => {
                                 handle.abort();
-                                break MakerExit::PositionReconciliation(format!(
-                                    "account stream reconnect event validation failed: {error}"
+                                break 'main MakerExit::PositionReconciliation(format!(
+                                    "account stream reconnect event validation failed during REST backfill: {error}"
                                 ));
                             }
-                        };
-                        let positions = match client.get_positions(Some(&symbol)).await {
-                            Ok(positions) => positions,
-                            Err(error) => {
-                                handle.abort();
-                                break MakerExit::PositionReconciliation(format!(
-                                    "account stream reconnect snapshot failed: {error}"
-                                ));
-                            }
-                        };
-                        let observed = match position_for_symbol(&positions, &symbol) {
-                            Ok(position) => position,
-                            Err(error) => {
-                                handle.abort();
-                                break MakerExit::PositionReconciliation(error.to_string());
-                            }
-                        };
-                        if (observed - ledger.expected_position).abs()
-                            > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
-                        {
-                            handle.abort();
-                            break MakerExit::PositionReconciliation(format!(
-                                "account stream reconnect snapshot expected {:+.8}, observed {:+.8}",
-                                ledger.expected_position, observed
-                            ));
                         }
-                        account_events = Some(events);
-                        account_stream_health = Some(health);
-                        account_stream_handle = Some(handle);
-                        total_fills += reconnect_fills;
-                        runtime_state.reduce(MakerEvent::CleanupComplete);
-                        runtime_state.reduce(MakerEvent::RecoverySucceeded);
-                        notifier
-                            .risk(
-                                RiskNotice {
-                                    kind: "account_stream",
-                                    severity: "resolved",
-                                    event: "reconnected",
-                                    message: "account stream reauthenticated; empty maker book and position snapshot reconciled",
-                                    symbol: &symbol,
-                                    cycle,
-                                    position_before: None,
-                                    position_after: None,
-                                    expected: Some(ledger.expected_position),
-                                    observed: Some(observed),
-                                },
-                                false,
-                            )
-                        .await;
-                        continue;
+                        match reconcile_ledger_snapshot(
+                            &client,
+                            ReconcileRequest {
+                                symbol: &symbol,
+                                session_started_at,
+                                run_order_prefix: &run_order_prefix,
+                                qty_tolerance,
+                                mark: last_mark.unwrap_or(baseline_mark),
+                            },
+                            &mut ledger,
+                            &mut stats,
+                        )
+                        .await
+                        {
+                            Ok((obs, fills)) => {
+                                observed = obs;
+                                reconnect_fills += fills.len() as u64;
+                                for fill in &fills {
+                                    emit_live_fill(fill, &symbol, cycle, output_format);
+                                }
+                                if (observed - ledger.expected_position).abs() <= qty_tolerance {
+                                    gap_closed = true;
+                                    break;
+                                }
+                            }
+                            Err(error) => eprintln!(
+                                "⚠️  account stream reconnect REST trade backfill failed: {error}"
+                            ),
+                        }
                     }
-                    Ok(Err(error)) => {
+                    if !gap_closed {
+                        handle.abort();
                         break MakerExit::PositionReconciliation(format!(
-                            "account stream reconnect failed after freeze: {error}"
+                            "account stream reconnect snapshot expected {:+.8}, observed {:+.8} (REST trade backfill did not close the gap)",
+                            ledger.expected_position, observed
                         ));
-                    }
-                    Err(_) => {
-                        runtime_state.reduce(MakerEvent::RecoveryFailed(
-                            "account stream reconnect timed out after 3 seconds".to_string(),
-                        ));
-                        break MakerExit::PositionReconciliation(
-                            "account stream reconnect timed out after 3 seconds".to_string(),
-                        );
                     }
                 }
+
+                account_events = Some(events);
+                account_stream_health = Some(health);
+                account_stream_handle = Some(handle);
+                total_fills += reconnect_fills;
+                runtime_state.reduce(MakerEvent::CleanupComplete);
+                runtime_state.reduce(MakerEvent::RecoverySucceeded);
+                notifier
+                    .risk(
+                        RiskNotice {
+                            kind: "account_stream",
+                            severity: "resolved",
+                            event: "reconnected",
+                            message: "account stream reauthenticated; buffered events and REST trades reconciled against the venue position",
+                            symbol: &symbol,
+                            cycle,
+                            position_before: None,
+                            position_after: None,
+                            expected: Some(ledger.expected_position),
+                            observed: Some(observed),
+                        },
+                        false,
+                    )
+                .await;
+                continue;
             }
             if let Some(health) = order_response_health
                 .as_ref()

@@ -91,6 +91,8 @@ pub async fn handle_maker(
             live,
             order_response_reconnect_attempts,
             order_response_reconnect_backoff,
+            account_stream_reconnect_attempts,
+            account_stream_reconnect_backoff,
             controlled_disconnect_after,
         } => {
             let file = config::load(maker_config.as_deref())?;
@@ -133,6 +135,16 @@ pub async fn handle_maker(
                         file.order_response_reconnect_backoff,
                         2,
                     ),
+                    account_stream_reconnect_attempts: choose(
+                        account_stream_reconnect_attempts,
+                        file.account_stream_reconnect_attempts,
+                        3,
+                    ),
+                    account_stream_reconnect_backoff: choose(
+                        account_stream_reconnect_backoff,
+                        file.account_stream_reconnect_backoff,
+                        2,
+                    ),
                     controlled_disconnect_after,
                     verbose,
                 },
@@ -172,6 +184,8 @@ struct MakerRunArgs {
     live: bool,
     order_response_reconnect_attempts: u32,
     order_response_reconnect_backoff: u64,
+    account_stream_reconnect_attempts: u32,
+    account_stream_reconnect_backoff: u64,
     controlled_disconnect_after: Option<u64>,
     verbose: bool,
 }
