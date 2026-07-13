@@ -1,0 +1,68 @@
+# Standard XAG-USD maker profile for a 100 DUSD account at isolated 2x.
+#
+# Run with (live mode refuses to start without --alert-webhook):
+#   standx --output json maker run XAG-USD \
+#     --maker-config examples/maker-xag-100u-standard.toml \
+#     --alert-webhook <url> --live --yes
+#
+# Set isolated 2x leverage separately. Compared to the conservative profile
+# this quotes a two-level ladder with 1.5x the inventory cap for higher
+# capital utilization: around a 58.9 mark the full inventory is ~71 DUSD
+# notional (~35% of 2x capacity), ~35 DUSD isolated margin plus ~18 for the
+# resting ladder (worst case ~53 committed).
+#
+# ⚠️ The active-exit tuple below (max_position=1.2, inventory_exit_pct=25,
+# inventory_exit_qty=0.3) is scaled proportionally from the production-tested
+# (0.8 / 25 / 0.2) tuple. The code path is identical but this exact tuple has
+# NOT been validated live — run it in paper mode first (stop_loss also fires
+# in paper, so the brake can be verified in the same run).
+#
+# Pre-existing XAG inventory up to max_position is adopted automatically at
+# the startup mark, so maker-session PnL starts at zero. Larger inventory is
+# rejected after maker-order cleanup. Account upnl keeps the venue cost basis.
+
+# Quote geometry: slightly tighter spread and a two-level ladder trade more
+# volume for more adverse-selection exposure.
+spread_bps = 6.0
+band_bps = 8.0
+size = 0.3
+levels = 2
+level_step_bps = 4.0
+refresh_bps = 2.0
+interval = 3
+
+# Inventory and market-data guards
+max_position = 1.2
+skew_bps = 8.0
+max_divergence_bps = 6.0
+vol_pause_bps = 30.0
+vol_window = 20
+
+# Supervised active inventory exit (see the scaling caveat above)
+inventory_exit_pct = 25.0
+inventory_exit_qty = 0.3
+
+# Financial brakes: alert at 3% of the account, hard-stop at 6%. stop_loss
+# is session-scoped mark-to-market PnL and routes through the fail-safe
+# shutdown (freeze, cancel the book, critical webhook, exit). The equity
+# floor is an absolute cross-restart line that catches cumulative drawdown
+# the session-scoped stop cannot see.
+stop_loss = 6.0
+alert_loss = 3.0
+alert_equity_below = 90.0
+alert_margin_below = 25.0
+
+# Remaining alert thresholds (live mode requires at least one non-zero)
+alert_inventory_pct = 70.0
+alert_position_change_pct = 20.0
+alert_uptime = 60.0
+
+# Bounded safe recovery for both authenticated streams. Quoting resumes only
+# after maker cleanup and account/trade reconciliation succeed.
+account_stream_reconnect_attempts = 3
+account_stream_reconnect_backoff = 2
+order_response_reconnect_attempts = 3
+order_response_reconnect_backoff = 2
+
+# Use the WebSocket market feed, with REST fallback handled by the CLI.
+no_ws = false
