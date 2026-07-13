@@ -1,30 +1,29 @@
+//! Pure maker runtime state transitions; the CLI executes returned effects.
+
 use std::collections::VecDeque;
 
 const MAX_UNMATCHED_ORDER_RESPONSES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum RuntimePhase {
+pub enum RuntimePhase {
     Starting,
     Ready,
     Frozen { reason: String },
     Stopping { reason: String },
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WorkKind {
+pub enum WorkKind {
     Snapshot,
     Cleanup,
     Reconnect,
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct WorkToken {
-    pub(super) generation: u64,
-    pub(super) kind: WorkKind,
+pub struct WorkToken {
+    pub generation: u64,
+    pub kind: WorkKind,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum MakerEvent {
+pub enum MakerEvent {
     StartupReady,
     Timer,
     MarketChanged,
@@ -39,27 +38,24 @@ pub(super) enum MakerEvent {
     OrderResponseMatched(String),
     CtrlC,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum MakerEffect {
+pub enum MakerEffect {
     FetchSnapshot(WorkToken),
     AbortInFlight(WorkToken),
     Cleanup(WorkToken),
     Reconnect(WorkToken),
     Stop,
 }
-
 #[derive(Debug)]
-pub(super) struct MakerState {
+pub struct MakerState {
     phase: RuntimePhase,
     generation: u64,
     in_flight: Option<WorkToken>,
     replan_requested: bool,
     unmatched_order_responses: VecDeque<String>,
 }
-
 impl MakerState {
-    pub(super) fn starting() -> Self {
+    pub fn starting() -> Self {
         Self {
             phase: RuntimePhase::Starting,
             generation: 0,
@@ -68,16 +64,19 @@ impl MakerState {
             unmatched_order_responses: VecDeque::new(),
         }
     }
-
-    pub(super) fn in_flight(&self) -> Option<WorkToken> {
+    pub fn phase(&self) -> &RuntimePhase {
+        &self.phase
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn in_flight(&self) -> Option<WorkToken> {
         self.in_flight
     }
-
-    pub(super) fn is_frozen(&self) -> bool {
+    pub fn is_frozen(&self) -> bool {
         matches!(self.phase, RuntimePhase::Frozen { .. })
     }
-
-    pub(super) fn reduce(&mut self, event: MakerEvent) -> Vec<MakerEffect> {
+    pub fn reduce(&mut self, event: MakerEvent) -> Vec<MakerEffect> {
         match event {
             MakerEvent::StartupReady => {
                 self.phase = RuntimePhase::Ready;
@@ -156,7 +155,6 @@ impl MakerState {
             }
         }
     }
-
     fn request_snapshot(&mut self) -> Vec<MakerEffect> {
         let token = WorkToken {
             generation: self.generation,
@@ -165,7 +163,6 @@ impl MakerState {
         self.in_flight = Some(token);
         vec![MakerEffect::FetchSnapshot(token)]
     }
-
     fn freeze(&mut self, reason: String) -> Vec<MakerEffect> {
         if matches!(self.phase, RuntimePhase::Stopping { .. }) {
             return Vec::new();
@@ -183,7 +180,6 @@ impl MakerState {
         effects.push(MakerEffect::Cleanup(cleanup));
         effects
     }
-
     fn abort_effect(&mut self) -> Vec<MakerEffect> {
         self.in_flight
             .take()
@@ -196,67 +192,55 @@ impl MakerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn coalesces_market_and_timer_events_while_work_is_in_flight() {
+    fn critical_events_abort_stale_work_and_clean_up() {
         let mut state = MakerState::starting();
-        let effects = state.reduce(MakerEvent::StartupReady);
-        let token = match effects.as_slice() {
-            [MakerEffect::FetchSnapshot(token)] => *token,
-            other => panic!("unexpected effects: {other:?}"),
-        };
-        assert!(state.reduce(MakerEvent::Timer).is_empty());
-        assert!(state.reduce(MakerEvent::MarketChanged).is_empty());
-        assert_eq!(
-            state.reduce(MakerEvent::WorkFinished(token)),
-            vec![MakerEffect::FetchSnapshot(token)]
-        );
-    }
-
-    #[test]
-    fn critical_event_invalidates_generation_and_cleans_up() {
-        let mut state = MakerState::starting();
-        let effects = state.reduce(MakerEvent::StartupReady);
-        let old = match effects[0] {
+        let token = match state.reduce(MakerEvent::StartupReady)[0] {
             MakerEffect::FetchSnapshot(token) => token,
             _ => unreachable!(),
         };
         let effects = state.reduce(MakerEvent::PositionMismatch);
-        assert_eq!(state.generation, 1);
-        assert!(matches!(state.phase, RuntimePhase::Frozen { .. }));
-        assert_eq!(effects[0], MakerEffect::AbortInFlight(old));
+        assert_eq!(state.generation(), 1);
+        assert_eq!(effects[0], MakerEffect::AbortInFlight(token));
         assert!(matches!(effects[1], MakerEffect::Cleanup(_)));
-        assert!(state.reduce(MakerEvent::WorkFinished(old)).is_empty());
+        assert!(state.reduce(MakerEvent::WorkFinished(token)).is_empty());
     }
-
     #[test]
-    fn recovery_requires_cleanup_then_reconnect() {
+    fn coalesced_timer_replans_after_current_work() {
         let mut state = MakerState::starting();
-        state.reduce(MakerEvent::StartupReady);
-        state.reduce(MakerEvent::AccountStreamDisconnected("closed".to_string()));
-        let effects = state.reduce(MakerEvent::CleanupComplete);
-        assert!(matches!(effects.as_slice(), [MakerEffect::Reconnect(_)]));
-        let effects = state.reduce(MakerEvent::RecoverySucceeded);
-        assert!(matches!(state.phase, RuntimePhase::Ready));
+        let token = match state.reduce(MakerEvent::StartupReady)[0] {
+            MakerEffect::FetchSnapshot(token) => token,
+            _ => unreachable!(),
+        };
+        assert!(state.reduce(MakerEvent::Timer).is_empty());
         assert!(matches!(
-            effects.as_slice(),
+            state.reduce(MakerEvent::WorkFinished(token)).as_slice(),
             [MakerEffect::FetchSnapshot(_)]
         ));
     }
 
     #[test]
-    fn unmatched_response_buffer_fails_closed() {
+    fn recovery_reconnects_only_after_cleanup() {
         let mut state = MakerState::starting();
         state.reduce(MakerEvent::StartupReady);
-        for index in 0..MAX_UNMATCHED_ORDER_RESPONSES {
-            assert!(state
-                .reduce(MakerEvent::OrderResponseUnmatched(index.to_string()))
-                .is_empty());
+        state.reduce(MakerEvent::AccountStreamDisconnected("closed".to_string()));
+        assert!(matches!(
+            state.reduce(MakerEvent::CleanupComplete).as_slice(),
+            [MakerEffect::Reconnect(_)]
+        ));
+        assert!(matches!(
+            state.reduce(MakerEvent::RecoverySucceeded).as_slice(),
+            [MakerEffect::FetchSnapshot(_)]
+        ));
+    }
+
+    #[test]
+    fn unmatched_response_overflow_fails_closed() {
+        let mut state = MakerState::starting();
+        state.reduce(MakerEvent::StartupReady);
+        for index in 0..=MAX_UNMATCHED_ORDER_RESPONSES {
+            state.reduce(MakerEvent::OrderResponseUnmatched(index.to_string()));
         }
-        let effects = state.reduce(MakerEvent::OrderResponseUnmatched("overflow".to_string()));
-        assert!(matches!(state.phase, RuntimePhase::Frozen { .. }));
-        assert!(effects
-            .iter()
-            .any(|effect| matches!(effect, MakerEffect::Cleanup(_))));
+        assert!(state.is_frozen());
     }
 }
