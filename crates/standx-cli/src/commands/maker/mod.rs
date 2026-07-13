@@ -91,6 +91,50 @@ struct MakerFill {
     origin: &'static str,
 }
 
+#[derive(Debug)]
+struct PositionAlertAnchor {
+    position: f64,
+    change_pct: f64,
+}
+
+impl PositionAlertAnchor {
+    fn new(position: f64, change_pct: f64) -> Self {
+        Self {
+            position,
+            change_pct,
+        }
+    }
+
+    fn evaluate(
+        &mut self,
+        observed: f64,
+        max_position: f64,
+        inventory_exit_pct: f64,
+        qty_tolerance: f64,
+    ) -> Option<(f64, f64, f64)> {
+        let old = self.position;
+        let delta = observed - old;
+        if delta.abs() <= qty_tolerance {
+            return None;
+        }
+        let jump_threshold = max_position * self.change_pct / 100.0;
+        let jump = self.change_pct > 0.0 && delta.abs() + qty_tolerance >= jump_threshold;
+        let direction_flip = old * observed < 0.0;
+        let crossed_max = old.abs() + qty_tolerance < max_position
+            && observed.abs() + qty_tolerance >= max_position;
+        let exit_threshold = max_position * inventory_exit_pct / 100.0;
+        let crossed_exit = inventory_exit_pct > 0.0
+            && old.abs() + qty_tolerance < exit_threshold
+            && observed.abs() + qty_tolerance >= exit_threshold;
+        if jump || direction_flip || crossed_max || crossed_exit {
+            self.position = observed;
+            Some((old, observed, delta))
+        } else {
+            None
+        }
+    }
+}
+
 /// Pending place awaiting order-id adoption in live mode. The HTTP request is
 /// correlated to its asynchronous response by request ID, then to the visible
 /// open order by client order ID. Side, price, and quantity remain only as a
@@ -477,6 +521,104 @@ async fn notify_lifecycle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn notify_risk(
+    kind: &str,
+    severity: &str,
+    event: &str,
+    message: &str,
+    symbol: &str,
+    cycle: u64,
+    position_before: Option<f64>,
+    position_after: Option<f64>,
+    expected: Option<f64>,
+    observed: Option<f64>,
+    output_format: OutputFormat,
+    http: Option<&reqwest::Client>,
+    webhook_url: &Option<String>,
+    webhook_format: AlertWebhookFormat,
+    await_delivery: bool,
+) {
+    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let delta = position_before
+        .zip(position_after)
+        .map(|(before, after)| after - before);
+    let raw = serde_json::json!({
+        "text": message,
+        "ts": ts,
+        "symbol": symbol,
+        "cycle": cycle,
+        "action": "risk_notification",
+        "kind": kind,
+        "severity": severity,
+        "event": event,
+        "message": message,
+        "position_before": position_before,
+        "position_after": position_after,
+        "position_delta": delta,
+        "expected_position": expected,
+        "observed_position": observed,
+    });
+    if output_format == OutputFormat::Json {
+        println!("{raw}");
+    } else {
+        eprintln!("⚠️  risk [{severity}/{kind}] {symbol}: {message}");
+    }
+    if let (Some(client), Some(url)) = (http, webhook_url.as_ref()) {
+        let body = webhook_body(webhook_format, message, &raw);
+        if await_delivery {
+            post_webhook(client.clone(), url.clone(), body).await;
+        } else {
+            tokio::spawn(post_webhook(client.clone(), url.clone(), body));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maybe_notify_position_jump(
+    anchor: &mut PositionAlertAnchor,
+    observed: f64,
+    expected: f64,
+    max_position: f64,
+    inventory_exit_pct: f64,
+    qty_tolerance: f64,
+    symbol: &str,
+    cycle: u64,
+    output_format: OutputFormat,
+    http: Option<&reqwest::Client>,
+    webhook_url: &Option<String>,
+    webhook_format: AlertWebhookFormat,
+) {
+    let Some((before, after, delta)) =
+        anchor.evaluate(observed, max_position, inventory_exit_pct, qty_tolerance)
+    else {
+        return;
+    };
+    let attribution = if (observed - expected).abs() <= qty_tolerance {
+        "current-run maker fills"
+    } else {
+        "unreconciled"
+    };
+    notify_risk(
+        "position_jump",
+        "warning",
+        "detected",
+        &format!("position changed {before:+.8} → {after:+.8} (delta {delta:+.8}, {attribution})"),
+        symbol,
+        cycle,
+        Some(before),
+        Some(after),
+        Some(expected),
+        Some(observed),
+        output_format,
+        http,
+        webhook_url,
+        webhook_format,
+        false,
+    )
+    .await;
+}
+
 fn emit_ledger_sync(
     output_format: OutputFormat,
     symbol: &str,
@@ -619,6 +761,7 @@ pub async fn handle_maker(
             vol_window,
             alert_loss,
             alert_inventory_pct,
+            alert_position_change_pct,
             alert_uptime,
             alert_webhook,
             alert_webhook_format,
@@ -648,6 +791,11 @@ pub async fn handle_maker(
                     vol_window: choose(vol_window, file.vol_window, 12),
                     alert_loss: choose(alert_loss, file.alert_loss, 0.0),
                     alert_inventory_pct: choose(alert_inventory_pct, file.alert_inventory_pct, 0.0),
+                    alert_position_change_pct: choose(
+                        alert_position_change_pct,
+                        file.alert_position_change_pct,
+                        0.0,
+                    ),
                     alert_uptime: choose(alert_uptime, file.alert_uptime, 0.0),
                     alert_webhook,
                     alert_webhook_format,
@@ -694,6 +842,7 @@ struct MakerRunArgs {
     vol_window: u32,
     alert_loss: f64,
     alert_inventory_pct: f64,
+    alert_position_change_pct: f64,
     alert_uptime: f64,
     alert_webhook: Option<String>,
     alert_webhook_format: AlertWebhookFormat,
@@ -1090,6 +1239,11 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             "active inventory exit requires both --inventory-exit-pct and --inventory-exit-qty"
         ));
     }
+    if !(0.0..=100.0).contains(&args.alert_position_change_pct) {
+        return Err(anyhow::anyhow!(
+            "--alert-position-change-pct must be 0..=100"
+        ));
+    }
     if cfg.band_bps <= cfg.spread_bps {
         return Err(anyhow::anyhow!(
             "--band-bps ({}) must be greater than --spread-bps ({}): quotes clamped to the band edge would sit exactly at the boundary",
@@ -1119,6 +1273,9 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     {
         eprintln!("⚠️  outer quote levels exceed the band and will be clamped/collapsed");
     }
+
+    // Webhook client also carries lifecycle and structured risk notifications.
+    let alert_http = args.alert_webhook.as_ref().map(|_| reqwest::Client::new());
 
     // ---- Live gating & clean start ----
     let mut order_responses = None;
@@ -1204,6 +1361,27 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 
         if !starting_position_within_limit(starting_position, cfg.max_position, cfg.qty_decimals) {
             emit_startup_rejected(output_format, &symbol, starting_position, cfg.max_position);
+            notify_risk(
+                "startup_position_limit",
+                "critical",
+                "startup_rejected",
+                &format!(
+                    "starting position {starting_position:+.8} exceeds max_position {:.8}",
+                    cfg.max_position
+                ),
+                &symbol,
+                0,
+                None,
+                Some(starting_position),
+                None,
+                Some(starting_position),
+                output_format,
+                alert_http.as_ref(),
+                &args.alert_webhook,
+                args.alert_webhook_format,
+                true,
+            )
+            .await;
             return Err(anyhow::anyhow!(
                 "starting position {:+.8} exceeds max_position {:.8}",
                 starting_position,
@@ -1229,7 +1407,24 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
         if (post_auth_position - starting_position).abs() > qty_tolerance {
             handle.abort();
-            emit_startup_rejected(output_format, &symbol, post_auth_position, cfg.max_position);
+            notify_risk(
+                "position_reconciliation",
+                "critical",
+                "startup_sync_failed",
+                "position changed while the account stream was authenticating",
+                &symbol,
+                0,
+                Some(starting_position),
+                Some(post_auth_position),
+                Some(starting_position),
+                Some(post_auth_position),
+                output_format,
+                alert_http.as_ref(),
+                &args.alert_webhook,
+                args.alert_webhook_format,
+                true,
+            )
+            .await;
             return Err(anyhow::anyhow!(
                 "position changed while account stream was authenticating: baseline {starting_position:+.8}, snapshot {post_auth_position:+.8}"
             ));
@@ -1272,6 +1467,26 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             historical_maker_orders,
             historical_maker_trades,
         );
+        if starting_position.abs() > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0 {
+            notify_risk(
+                "inventory_adopted",
+                "warning",
+                "startup",
+                &format!("adopted non-zero starting inventory {starting_position:+.8}"),
+                &symbol,
+                0,
+                Some(0.0),
+                Some(starting_position),
+                Some(starting_position),
+                Some(starting_position),
+                output_format,
+                alert_http.as_ref(),
+                &args.alert_webhook,
+                args.alert_webhook_format,
+                false,
+            )
+            .await;
+        }
     }
 
     let mode = if args.live { "LIVE" } else { "PAPER" };
@@ -1332,13 +1547,20 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 args.vol_pause_bps / 2.0
             );
         }
-        if args.alert_loss > 0.0 || args.alert_inventory_pct > 0.0 || args.alert_uptime > 0.0 {
+        if args.alert_loss > 0.0
+            || args.alert_inventory_pct > 0.0
+            || args.alert_position_change_pct > 0.0
+            || args.alert_uptime > 0.0
+        {
             let mut parts = Vec::new();
             if args.alert_loss > 0.0 {
                 parts.push(format!("loss -{}", args.alert_loss));
             }
             if args.alert_inventory_pct > 0.0 {
                 parts.push(format!("inv {}%", args.alert_inventory_pct));
+            }
+            if args.alert_position_change_pct > 0.0 {
+                parts.push(format!("position Δ {}%", args.alert_position_change_pct));
             }
             if args.alert_uptime > 0.0 {
                 parts.push(format!("uptime {}%", args.alert_uptime));
@@ -1353,9 +1575,6 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         println!("│ Ctrl+C to stop (cancels maker-owned resting orders on exit)");
         println!("└──────────────────────────────────────────────────────────┘");
     }
-
-    // Webhook client (also carries lifecycle + risk-alert messages).
-    let alert_http = args.alert_webhook.as_ref().map(|_| reqwest::Client::new());
 
     // Notify start (fire-and-forget; the process keeps running).
     notify_lifecycle(
@@ -1398,6 +1617,8 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let mut pending: Vec<PendingPlace> = Vec::new();
     let mut inventory_exit_pending = false;
     let mut ledger = MakerLedger::new(starting_position);
+    let mut position_alert_anchor =
+        PositionAlertAnchor::new(starting_position, args.alert_position_change_pct);
     let mut consecutive_errors: u32 = 0;
     let mut total_places: u64 = 0;
     let mut total_cancels: u64 = 0;
@@ -1427,6 +1648,24 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 let detail = health.failure_reason().unwrap_or_else(|| {
                     "account stream became unhealthy without a recorded reason".to_string()
                 });
+                notify_risk(
+                    "account_stream",
+                    "warning",
+                    "disconnected_frozen",
+                    &format!("account stream unavailable; placements frozen and cleanup starting: {detail}"),
+                    &symbol,
+                    cycle,
+                    None,
+                    None,
+                    Some(ledger.expected_position),
+                    None,
+                    output_format,
+                    alert_http.as_ref(),
+                    &args.alert_webhook,
+                    args.alert_webhook_format,
+                    false,
+                )
+                .await;
                 // Freeze immediately: no further cycle can place while the
                 // authoritative account stream is unavailable.
                 if let Err(cleanup_error) =
@@ -1505,6 +1744,24 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         account_stream_health = Some(health);
                         account_stream_handle = Some(handle);
                         total_fills += reconnect_fills;
+                        notify_risk(
+                            "account_stream",
+                            "resolved",
+                            "reconnected",
+                            "account stream reauthenticated; empty maker book and position snapshot reconciled",
+                            &symbol,
+                            cycle,
+                            None,
+                            None,
+                            Some(ledger.expected_position),
+                            Some(observed),
+                            output_format,
+                            alert_http.as_ref(),
+                            &args.alert_webhook,
+                            args.alert_webhook_format,
+                            false,
+                        )
+                        .await;
                         continue;
                     }
                     Ok(Err(error)) => {
@@ -1637,6 +1894,23 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             ) {
                 Ok((fills, position)) => {
                     total_fills += fills;
+                    if let Some(position) = position {
+                        maybe_notify_position_jump(
+                            &mut position_alert_anchor,
+                            position,
+                            ledger.expected_position,
+                            cfg.max_position,
+                            args.inventory_exit_pct,
+                            10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
+                            &symbol,
+                            cycle,
+                            output_format,
+                            alert_http.as_ref(),
+                            &args.alert_webhook,
+                            args.alert_webhook_format,
+                        )
+                        .await;
+                    }
                     if let Some(position) = position.filter(|position| {
                         (*position - ledger.expected_position).abs()
                             > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
@@ -1663,6 +1937,8 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         // Work phase raced against Ctrl+C so a slow API call can be
         // interrupted (mirrors run_watch_loop).
         let mismatch = account_position_mismatch.take();
+        let exit_pending_before = inventory_exit_pending;
+        let breaker_halted_before = breaker.halted();
         let work = async {
             if let Some(observed) = mismatch {
                 return Err(anyhow::Error::new(PositionReconciliationError {
@@ -1699,7 +1975,16 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 order_response_health.as_ref(),
             )
             .await?;
-            Ok::<_, anyhow::Error>((places, cancels, holds, fills, mark, src, breaker.halted()))
+            Ok::<_, anyhow::Error>((
+                places,
+                cancels,
+                holds,
+                fills,
+                mark,
+                src,
+                breaker.halted(),
+                inventory_exit_pending,
+            ))
         };
         let cycle_result = tokio::select! {
             _ = signal::ctrl_c() => break MakerExit::CtrlC,
@@ -1707,7 +1992,7 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
         };
 
         match cycle_result {
-            Ok((places, cancels, holds, fills, mark, src, halted)) => {
+            Ok((places, cancels, holds, fills, mark, src, halted, exit_pending_after)) => {
                 consecutive_errors = 0;
                 total_places += places;
                 total_cancels += cancels;
@@ -1715,6 +2000,78 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                 total_fills += fills;
                 total_halted += halted as u64;
                 last_mark = Some(mark);
+                if halted != breaker_halted_before {
+                    let (severity, event, message) = if halted {
+                        (
+                            "warning",
+                            "entered",
+                            "volatility breaker entered; maker quotes are being pulled",
+                        )
+                    } else {
+                        (
+                            "resolved",
+                            "cleared",
+                            "volatility breaker cleared; quoting may resume",
+                        )
+                    };
+                    notify_risk(
+                        "volatility_breaker",
+                        severity,
+                        event,
+                        message,
+                        &symbol,
+                        cycle,
+                        None,
+                        Some(ledger.expected_position),
+                        Some(ledger.expected_position),
+                        None,
+                        output_format,
+                        alert_http.as_ref(),
+                        &args.alert_webhook,
+                        args.alert_webhook_format,
+                        false,
+                    )
+                    .await;
+                }
+                if !exit_pending_before && exit_pending_after {
+                    notify_risk(
+                        "inventory_exit",
+                        "warning",
+                        "submitted",
+                        "reduce-only inventory exit submitted",
+                        &symbol,
+                        cycle,
+                        None,
+                        Some(ledger.expected_position),
+                        Some(ledger.expected_position),
+                        None,
+                        output_format,
+                        alert_http.as_ref(),
+                        &args.alert_webhook,
+                        args.alert_webhook_format,
+                        false,
+                    )
+                    .await;
+                } else if exit_pending_before && !exit_pending_after {
+                    notify_risk(
+                        "inventory_exit",
+                        "resolved",
+                        "confirmed",
+                        "reduce-only inventory exit is no longer pending after ledger reconciliation",
+                        &symbol,
+                        cycle,
+                        None,
+                        Some(ledger.expected_position),
+                        Some(ledger.expected_position),
+                        Some(ledger.expected_position),
+                        output_format,
+                        alert_http.as_ref(),
+                        &args.alert_webhook,
+                        args.alert_webhook_format,
+                        false,
+                    )
+                    .await;
+                }
                 if !args.no_ws && last_src != Some(src) {
                     match src {
                         "ws" => eprintln!("✅ market feed: websocket live"),
@@ -1755,6 +2112,24 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         mismatch.expected,
                         mismatch.observed,
                     );
+                    notify_risk(
+                        "position_reconciliation",
+                        "warning",
+                        "frozen",
+                        "position mismatch detected; placements frozen and maker cleanup starting",
+                        &symbol,
+                        cycle,
+                        None,
+                        None,
+                        Some(mismatch.expected),
+                        Some(mismatch.observed),
+                        output_format,
+                        alert_http.as_ref(),
+                        &args.alert_webhook,
+                        args.alert_webhook_format,
+                        false,
+                    )
+                    .await;
                     if let Err(cleanup_error) =
                         cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
                     {
@@ -1785,6 +2160,21 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                                 Ok((fills, position)) => {
                                     total_fills += fills;
                                     if let Some(position) = position {
+                                        maybe_notify_position_jump(
+                                            &mut position_alert_anchor,
+                                            position,
+                                            ledger.expected_position,
+                                            cfg.max_position,
+                                            args.inventory_exit_pct,
+                                            qty_tolerance,
+                                            &symbol,
+                                            cycle,
+                                            output_format,
+                                            alert_http.as_ref(),
+                                            &args.alert_webhook,
+                                            args.alert_webhook_format,
+                                        )
+                                        .await;
                                         last_observed = position;
                                     }
                                 }
@@ -1832,6 +2222,24 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                             ledger.expected_position,
                             last_observed,
                         );
+                        notify_risk(
+                            "position_reconciliation",
+                            "resolved",
+                            "recovered",
+                            "position ledger recovered within the 3-second freeze window; quoting may resume from an empty maker book",
+                            &symbol,
+                            cycle,
+                            None,
+                            None,
+                            Some(ledger.expected_position),
+                            Some(last_observed),
+                            output_format,
+                            alert_http.as_ref(),
+                            &args.alert_webhook,
+                            args.alert_webhook_format,
+                            false,
+                        )
+                        .await;
                         consecutive_errors = 0;
                         continue;
                     }
@@ -1843,10 +2251,48 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         ledger.expected_position,
                         last_observed,
                     );
+                    notify_risk(
+                        "position_reconciliation",
+                        "critical",
+                        "failed",
+                        "position ledger remained inconsistent after the 3-second freeze window",
+                        &symbol,
+                        cycle,
+                        None,
+                        None,
+                        Some(ledger.expected_position),
+                        Some(last_observed),
+                        output_format,
+                        alert_http.as_ref(),
+                        &args.alert_webhook,
+                        args.alert_webhook_format,
+                        true,
+                    )
+                    .await;
                     break 'main MakerExit::PositionReconciliation(format!(
                         "expected position {:+.8}, venue reported {:+.8} after 3s freeze",
                         ledger.expected_position, last_observed
                     ));
+                }
+                if exit_pending_before {
+                    notify_risk(
+                        "inventory_exit",
+                        "warning",
+                        "failed",
+                        &format!("inventory exit cycle failed: {e}"),
+                        &symbol,
+                        cycle,
+                        None,
+                        Some(ledger.expected_position),
+                        Some(ledger.expected_position),
+                        None,
+                        output_format,
+                        alert_http.as_ref(),
+                        &args.alert_webhook,
+                        args.alert_webhook_format,
+                        false,
+                    )
+                    .await;
                 }
                 consecutive_errors += 1;
                 eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
@@ -1899,6 +2345,23 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                     ) {
                         Ok((fills, position)) => {
                             total_fills += fills;
+                            if let Some(position) = position {
+                                maybe_notify_position_jump(
+                                    &mut position_alert_anchor,
+                                    position,
+                                    ledger.expected_position,
+                                    cfg.max_position,
+                                    args.inventory_exit_pct,
+                                    10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
+                                    &symbol,
+                                    cycle,
+                                    output_format,
+                                    alert_http.as_ref(),
+                                    &args.alert_webhook,
+                                    args.alert_webhook_format,
+                                )
+                                .await;
+                            }
                             if let Some(position) = position.filter(|position| {
                                 (*position - ledger.expected_position).abs()
                                     > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
@@ -1996,6 +2459,46 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
     let cleanup_note = cleanup_error.as_ref().map_or_else(String::new, |error| {
         format!(" | ⚠️ cleanup failed: {error}")
     });
+    if let Some(error) = cleanup_error.as_ref() {
+        notify_risk(
+            "maker_cleanup",
+            "critical",
+            "residual_orders",
+            &format!("maker cleanup failed or left residual orders: {error}"),
+            &symbol,
+            cycle,
+            None,
+            None,
+            Some(ledger.expected_position),
+            None,
+            output_format,
+            alert_http.as_ref(),
+            &args.alert_webhook,
+            args.alert_webhook_format,
+            true,
+        )
+        .await;
+    }
+    if !matches!(&exit, MakerExit::CtrlC) {
+        notify_risk(
+            "fail_safe",
+            "critical",
+            "stopped",
+            &reason,
+            &symbol,
+            cycle,
+            None,
+            None,
+            Some(ledger.expected_position),
+            None,
+            output_format,
+            alert_http.as_ref(),
+            &args.alert_webhook,
+            args.alert_webhook_format,
+            true,
+        )
+        .await;
+    }
     notify_lifecycle(
         "stopped",
         &format!(
@@ -2034,6 +2537,25 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
+
+    #[test]
+    fn position_jump_alert_uses_anchor_and_half_tick_tolerance() {
+        let mut anchor = PositionAlertAnchor::new(0.001, 20.0);
+        assert!(anchor.evaluate(0.10, 0.8, 25.0, 0.0005).is_none());
+        let alert = anchor.evaluate(0.161, 0.8, 25.0, 0.0005).unwrap();
+        assert!((alert.0 - 0.001).abs() < 1e-9);
+        assert!((alert.2 - 0.160).abs() < 1e-9);
+        assert!(anchor.evaluate(0.161, 0.8, 25.0, 0.0005).is_none());
+    }
+
+    #[test]
+    fn position_jump_alert_fires_on_direction_flip_and_exit_crossing() {
+        let mut direction = PositionAlertAnchor::new(0.01, 0.0);
+        assert!(direction.evaluate(-0.01, 0.8, 0.0, 0.0005).is_some());
+
+        let mut exit = PositionAlertAnchor::new(0.19, 0.0);
+        assert!(exit.evaluate(0.20, 0.8, 25.0, 0.0005).is_some());
+    }
 
     #[test]
     fn order_response_exit_message_does_not_claim_three_errors() {

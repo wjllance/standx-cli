@@ -343,14 +343,16 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
             "Operational and session-ledger event timeline for the selected run.",
             query(
                 stream,
-                f'''SELECT _timestamp, action, event, side, price, qty, reason, message
+                f'''SELECT _timestamp, action, kind, severity, event, side, price, qty,
+       position_delta, expected_position, observed_position, reason, message
 FROM "{stream}" WHERE {selected}
-  AND action IN ('fill', 'cancel', 'alert', 'maker_cleanup', 'inventory_exit',
+  AND action IN ('fill', 'cancel', 'alert', 'risk_notification', 'maker_cleanup', 'inventory_exit',
                  'order_response_reconnect', 'position_reconciliation',
-                 'ledger_sync', 'inventory_adopted', 'startup_rejected', 'lifecycle')
+                 'account_trade_shadow', 'ledger_sync', 'inventory_adopted',
+                 'startup_rejected', 'lifecycle')
 ORDER BY _timestamp DESC LIMIT 200''',
-                [axis("_timestamp", "Time"), axis("action", "Action"), axis("event", "Event"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
-                [axis("price", "Price"), axis("qty", "Qty")],
+                [axis("_timestamp", "Time"), axis("action", "Action"), axis("kind", "Kind"), axis("severity", "Severity"), axis("event", "Event"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
+                [axis("price", "Price"), axis("qty", "Qty"), axis("position_delta", "Position Delta"), axis("expected_position", "Expected Position"), axis("observed_position", "Observed Position")],
             ),
             (0, 15, 192, 12, 5),
             decimals=None,
@@ -361,7 +363,7 @@ ORDER BY _timestamp DESC LIMIT 200''',
         "version": 8,
         "dashboardId": "",
         "title": DASHBOARD_TITLE,
-        "description": "Maker paper/live validation: uptime, fills, maker-session PnL, inventory, cancellations, fail-safe cleanup, and inventory exit evidence.",
+        "description": "Maker paper/live validation: uptime, fills, maker-session PnL, authenticated account-stream health, position jumps, reconciliation, cleanup, volatility breaker, and inventory exit evidence.",
         "role": "",
         "owner": "",
         "tabs": [
