@@ -212,6 +212,7 @@ mod tests {
         };
         let effects = state.reduce(MakerEvent::PositionMismatch);
         assert_eq!(state.generation(), 1);
+        assert!(matches!(state.phase(), RuntimePhase::Frozen { .. }));
         assert_eq!(effects[0], MakerEffect::AbortInFlight(token));
         assert!(matches!(effects[1], MakerEffect::Cleanup(_)));
         assert!(state.reduce(MakerEvent::WorkFinished(token)).is_empty());
@@ -224,6 +225,7 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(state.reduce(MakerEvent::Timer).is_empty());
+        assert!(state.reduce(MakerEvent::MarketChanged).is_empty());
         assert!(matches!(
             state.reduce(MakerEvent::WorkFinished(token)).as_slice(),
             [MakerEffect::FetchSnapshot(_)]
@@ -243,6 +245,7 @@ mod tests {
             state.reduce(MakerEvent::RecoverySucceeded).as_slice(),
             [MakerEffect::FetchSnapshot(_)]
         ));
+        assert!(matches!(state.phase(), RuntimePhase::Ready));
     }
 
     #[test]
@@ -250,14 +253,24 @@ mod tests {
         let mut state = MakerState::starting();
         state.reduce(MakerEvent::StartupReady);
         // A sustained flood inside one decay window is a genuine correlation
-        // failure and must still fail closed.
-        for index in 0..=MAX_UNMATCHED_ORDER_RESPONSES {
-            state.reduce(MakerEvent::OrderResponseUnmatched {
-                request_id: index.to_string(),
-                cycle: 0,
-            });
+        // failure and must still fail closed. Sub-threshold pushes emit no
+        // effect; the push that crosses the cap freezes and emits Cleanup.
+        for index in 0..MAX_UNMATCHED_ORDER_RESPONSES {
+            assert!(state
+                .reduce(MakerEvent::OrderResponseUnmatched {
+                    request_id: index.to_string(),
+                    cycle: 0,
+                })
+                .is_empty());
         }
+        let effects = state.reduce(MakerEvent::OrderResponseUnmatched {
+            request_id: "overflow".to_string(),
+            cycle: 0,
+        });
         assert!(state.is_frozen());
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, MakerEffect::Cleanup(_))));
     }
 
     #[test]

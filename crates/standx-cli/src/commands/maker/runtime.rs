@@ -1716,7 +1716,8 @@ pub(super) async fn run_maker(
                         if let (Some(equity), Some(available)) = (equity, available) {
                             let fired = alerts.evaluate_account(equity, available);
                             for alert in fired {
-                                notifier.alert(&alert, &symbol);
+                                let await_delivery = alert.firing;
+                                notifier.alert(&alert, &symbol, await_delivery).await;
                             }
                         }
                     }
@@ -2198,5 +2199,234 @@ pub(super) async fn run_maker(
     match exit.terminal_error() {
         Some(message) => Err(anyhow::anyhow!(message)),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use standx_sdk::account_stream::PositionUpdate;
+
+    fn pending_place(request_id: &str) -> PendingPlace {
+        PendingPlace {
+            request_id: request_id.to_string(),
+            cl_ord_id: format!("cl-{request_id}"),
+            side: OrderSide::Buy,
+            price: 100.0,
+            qty: 1.0,
+            level: 0,
+            ref_center: 100.0,
+            cycle: 1,
+        }
+    }
+
+    fn order_response(request_id: Option<&str>, code: i64) -> OrderResponse {
+        OrderResponse {
+            code,
+            message: String::new(),
+            request_id: request_id.map(str::to_string),
+        }
+    }
+
+    fn position_update(symbol: &str, side: Option<OrderSide>, qty: &str) -> PositionUpdate {
+        PositionUpdate {
+            seq: 0,
+            id: 0,
+            symbol: symbol.to_string(),
+            side,
+            qty: qty.to_string(),
+            entry_price: String::new(),
+            realized_pnl: String::new(),
+            status: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn apply_order_response_keeps_accepted_placement() {
+        let mut pending = vec![pending_place("req-1")];
+        let matched = apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        );
+        assert!(matched);
+        assert_eq!(pending.len(), 1, "accepted placement stays pending");
+    }
+
+    #[test]
+    fn apply_order_response_drops_rejected_placement() {
+        let mut pending = vec![pending_place("req-1")];
+        let matched = apply_order_response(
+            order_response(Some("req-1"), 1),
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        );
+        assert!(matched);
+        assert!(pending.is_empty(), "rejected placement is removed");
+    }
+
+    #[test]
+    fn apply_order_response_reports_unmatched_ids() {
+        let mut pending = vec![pending_place("req-1")];
+        assert!(!apply_order_response(
+            order_response(Some("other"), 0),
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        ));
+        assert!(!apply_order_response(
+            order_response(None, 0),
+            &mut pending,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        ));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn apply_order_responses_matched_acks_do_not_grow_unmatched_buffer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut pending = vec![pending_place("req-1"), pending_place("req-2")];
+        let mut runtime_state = MakerState::starting();
+        runtime_state.reduce(MakerEvent::StartupReady);
+
+        // Benign matched acknowledgements for placements we are tracking.
+        tx.try_send(order_response(Some("req-1"), 0)).unwrap();
+        tx.try_send(order_response(Some("req-2"), 0)).unwrap();
+
+        apply_order_responses(
+            &mut rx,
+            &mut pending,
+            &mut runtime_state,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .expect("benign matched acks must not fail closed");
+
+        assert!(
+            !runtime_state.is_frozen(),
+            "matched acks must not overflow the unmatched buffer"
+        );
+        // Accepted placements remain pending; the matched arm keeps them.
+        assert_eq!(pending.len(), 2);
+    }
+
+    #[test]
+    fn apply_order_responses_matched_clears_prior_unmatched_entry() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let mut pending = Vec::new();
+        let mut runtime_state = MakerState::starting();
+        runtime_state.reduce(MakerEvent::StartupReady);
+
+        // First response has no matching pending placement -> buffered as unmatched.
+        tx.try_send(order_response(Some("req-1"), 0)).unwrap();
+        apply_order_responses(
+            &mut rx,
+            &mut pending,
+            &mut runtime_state,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap();
+        assert!(!runtime_state.is_frozen());
+
+        // The matching placement arrives later; a matched ack clears the buffer entry.
+        pending.push(pending_place("req-1"));
+        tx.try_send(order_response(Some("req-1"), 0)).unwrap();
+        apply_order_responses(
+            &mut rx,
+            &mut pending,
+            &mut runtime_state,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap();
+        assert!(!runtime_state.is_frozen());
+    }
+
+    fn drain_positions(events: Vec<AccountEvent>) -> (u64, Option<f64>) {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut state = AccountEventState {
+            ledger: &mut ledger,
+            stats: &mut stats,
+        };
+        let context = AccountEventContext {
+            symbol: "BTC-USD",
+            run_order_prefix: "sxmk-test-",
+            mark: 100.0,
+            cycle: 1,
+            output_format: OutputFormat::Quiet,
+        };
+        apply_account_events(&mut rx, &mut state, &context).expect("benign events drain cleanly")
+    }
+
+    #[test]
+    fn apply_account_events_records_position_mismatch_with_sign() {
+        let (_, buy) = drain_positions(vec![AccountEvent::Position(position_update(
+            "BTC-USD",
+            Some(OrderSide::Buy),
+            "0.5",
+        ))]);
+        assert_eq!(buy, Some(0.5));
+
+        let (_, sell) = drain_positions(vec![AccountEvent::Position(position_update(
+            "BTC-USD",
+            Some(OrderSide::Sell),
+            "0.5",
+        ))]);
+        assert_eq!(sell, Some(-0.5), "sell position is negative");
+    }
+
+    #[test]
+    fn apply_account_events_applies_buffered_events_in_order() {
+        // The last position update in the buffer wins; benign Connected /
+        // TradeShadow events are drained without contributing fills.
+        let (fills, latest) = drain_positions(vec![
+            AccountEvent::Connected { epoch: 1 },
+            AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Buy), "0.2")),
+            AccountEvent::TradeShadow {
+                seq: 1,
+                data: serde_json::json!({}),
+            },
+            AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Sell), "0.9")),
+        ]);
+        assert_eq!(fills, 0);
+        assert_eq!(latest, Some(-0.9), "latest position reflects last update");
+    }
+
+    #[test]
+    fn apply_account_events_ignores_other_symbols() {
+        let (fills, latest) = drain_positions(vec![AccountEvent::Position(position_update(
+            "ETH-USD",
+            Some(OrderSide::Buy),
+            "1.0",
+        ))]);
+        assert_eq!(fills, 0);
+        assert_eq!(
+            latest, None,
+            "position updates for other symbols are ignored"
+        );
     }
 }
