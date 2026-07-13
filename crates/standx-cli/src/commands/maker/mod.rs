@@ -1,7 +1,8 @@
 use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{
-    self as maker, AlertMonitor, MakerConfig, MakerStats, RestingQuote, VolBreaker,
+    self as maker, AlertMonitor, MakerConfig, MakerStats, PositionAlertAnchor, RestingQuote,
+    VolBreaker, MAKER_CL_ORD_ID_PREFIX,
 };
 use standx_sdk::account_stream::{
     AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,
@@ -30,15 +31,12 @@ mod runtime_state;
 use cycle::maker_cycle;
 use feed::{market_snapshot, spawn_market_feed};
 use ledger::MakerLedger;
-use model::{
-    is_maker_order, position_for_symbol, starting_position_within_limit, MakerExit, MakerFill,
-    PendingPlace, MAKER_CL_ORD_ID_PREFIX,
-};
 #[cfg(test)]
-use model::{is_order_rejection, open_qty_adopts, pending_covers_slot};
+use model::is_order_rejection;
+use model::{is_maker_order, position_for_symbol, MakerExit, MakerFill, PendingPlace};
 #[cfg(test)]
 use notify::webhook_body;
-use notify::{MakerNotifier, PositionAlertAnchor, PositionChange, RiskNotice};
+use notify::{MakerNotifier, PositionChange, RiskNotice};
 use pipeline::{CycleRequest, CycleState};
 use recovery::{
     cancel_maker_orders_with_retry, order_response_reconnect_available, reconcile_ledger_snapshot,
@@ -191,8 +189,8 @@ mod tests {
         let mut anchor = PositionAlertAnchor::new(0.001, 20.0);
         assert!(anchor.evaluate(0.10, 0.8, 25.0, 0.0005).is_none());
         let alert = anchor.evaluate(0.161, 0.8, 25.0, 0.0005).unwrap();
-        assert!((alert.0 - 0.001).abs() < 1e-9);
-        assert!((alert.2 - 0.160).abs() < 1e-9);
+        assert!((alert.before - 0.001).abs() < 1e-9);
+        assert!((alert.delta - 0.160).abs() < 1e-9);
         assert!(anchor.evaluate(0.161, 0.8, 25.0, 0.0005).is_none());
     }
 
@@ -240,9 +238,9 @@ mod tests {
 
     #[test]
     fn inherited_position_allows_half_tick_tolerance_but_rejects_real_excess() {
-        assert!(starting_position_within_limit(0.800_05, 0.8, 3));
-        assert!(!starting_position_within_limit(0.800_6, 0.8, 3));
-        assert!(starting_position_within_limit(-0.8, 0.8, 3));
+        assert!(maker::position_within_limit(0.800_05, 0.8, 3));
+        assert!(!maker::position_within_limit(0.800_6, 0.8, 3));
+        assert!(maker::position_within_limit(-0.8, 0.8, 3));
     }
 
     #[test]
@@ -482,17 +480,17 @@ mod tests {
     #[test]
     fn partial_fill_stays_adopted() {
         // Full remainder adopts.
-        assert!(open_qty_adopts(0.01, 0.01));
+        assert!(maker::open_qty_adopts(0.01, 0.01));
         // Partial remainder (half filled) still adopts.
-        assert!(open_qty_adopts(0.005, 0.01));
+        assert!(maker::open_qty_adopts(0.005, 0.01));
         // Tiny remainder adopts.
-        assert!(open_qty_adopts(0.0001, 0.01));
+        assert!(maker::open_qty_adopts(0.0001, 0.01));
         // Zero / fully filled does not adopt (no open order to match).
-        assert!(!open_qty_adopts(0.0, 0.01));
+        assert!(!maker::open_qty_adopts(0.0, 0.01));
         // Larger than placed is someone else's order.
-        assert!(!open_qty_adopts(0.02, 0.01));
+        assert!(!maker::open_qty_adopts(0.02, 0.01));
         // Float slop just under the placed qty is tolerated.
-        assert!(open_qty_adopts(0.01 + 1e-9, 0.01));
+        assert!(maker::open_qty_adopts(0.01 + 1e-9, 0.01));
     }
 
     #[test]
@@ -504,7 +502,7 @@ mod tests {
 
     #[test]
     fn pending_order_reserves_its_quote_slot() {
-        let pending = vec![PendingPlace {
+        let pending = [PendingPlace {
             request_id: "request-1".to_string(),
             cl_ord_id: "sxmk-1".to_string(),
             side: OrderSide::Buy,
@@ -515,9 +513,30 @@ mod tests {
             cycle: 1,
         }];
 
-        assert!(pending_covers_slot(&pending, OrderSide::Buy, 0));
-        assert!(!pending_covers_slot(&pending, OrderSide::Buy, 1));
-        assert!(!pending_covers_slot(&pending, OrderSide::Sell, 0));
+        assert!(maker::pending_covers_slot(
+            pending.iter().map(|place| maker::QuoteSlot {
+                side: place.side,
+                level: place.level,
+            }),
+            OrderSide::Buy,
+            0,
+        ));
+        assert!(!maker::pending_covers_slot(
+            pending.iter().map(|place| maker::QuoteSlot {
+                side: place.side,
+                level: place.level,
+            }),
+            OrderSide::Buy,
+            1,
+        ));
+        assert!(!maker::pending_covers_slot(
+            pending.iter().map(|place| maker::QuoteSlot {
+                side: place.side,
+                level: place.level,
+            }),
+            OrderSide::Sell,
+            0,
+        ));
     }
 
     #[test]

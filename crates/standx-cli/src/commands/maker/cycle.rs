@@ -2,8 +2,7 @@
 use super::ledger::maker_trade_fill;
 use super::ledger::MakerLedger;
 use super::model::{
-    is_current_run_order, is_order_rejection, open_qty_adopts, pending_covers_slot,
-    position_for_symbol, MakerFill, PendingPlace,
+    is_current_run_order, is_order_rejection, position_for_symbol, MakerFill, PendingPlace,
 };
 use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
 use super::pipeline::{fetch_snapshot, CycleRequest, CycleResult, CycleState};
@@ -19,26 +18,6 @@ use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::OrderResponseHealth;
 use std::time::Duration;
-
-fn quote_client_order_id(
-    run_order_prefix: &str,
-    cycle: u64,
-    side: OrderSide,
-    level: u32,
-) -> String {
-    let side_code = match side {
-        OrderSide::Buy => 'b',
-        OrderSide::Sell => 's',
-    };
-    format!(
-        "{run_order_prefix}q{:08x}{side_code}{level:x}",
-        cycle as u32
-    )
-}
-
-fn exit_client_order_id(run_order_prefix: &str, cycle: u64) -> String {
-    format!("{run_order_prefix}x{:08x}", cycle as u32)
-}
 
 fn collect_current_run_fills(
     trades: Vec<Trade>,
@@ -272,7 +251,7 @@ pub(super) async fn maker_cycle(
                                 pending.iter().position(|p| {
                                     p.side == o.side
                                         && (p.price - price).abs() < tick / 2.0
-                                        && open_qty_adopts(qty, p.qty)
+                                        && maker::open_qty_adopts(qty, p.qty)
                                 })
                             });
                         let meta = match matched {
@@ -376,7 +355,17 @@ pub(super) async fn maker_cycle(
         .actions
         .into_iter()
         .filter(|action| match action {
-            Action::Place(q) if live && pending_covers_slot(pending, q.side, q.level) => {
+            Action::Place(q)
+                if live
+                    && maker::pending_covers_slot(
+                        pending.iter().map(|place| maker::QuoteSlot {
+                            side: place.side,
+                            level: place.level,
+                        }),
+                        q.side,
+                        q.level,
+                    ) =>
+            {
                 log_maker_event(MakerLogEvent {
                     output_format,
                     symbol,
@@ -450,7 +439,8 @@ pub(super) async fn maker_cycle(
                     if let Some(reason) = unhealthy_order_response(order_response_health) {
                         return Err(anyhow::anyhow!("{reason}; refusing live placement"));
                     }
-                    let cl_ord_id = quote_client_order_id(run_order_prefix, cycle, q.side, q.level);
+                    let cl_ord_id =
+                        maker::quote_client_order_id(run_order_prefix, cycle, q.side, q.level);
                     match client
                         .create_order(CreateOrderParams {
                             symbol: symbol.to_string(),
@@ -524,7 +514,7 @@ pub(super) async fn maker_cycle(
             if let Some(reason) = unhealthy_order_response(order_response_health) {
                 return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
             }
-            let cl_ord_id = exit_client_order_id(run_order_prefix, cycle);
+            let cl_ord_id = maker::exit_client_order_id(run_order_prefix, cycle);
             client
                 .create_order(CreateOrderParams {
                     symbol: symbol.to_string(),
@@ -792,8 +782,8 @@ mod tests {
     #[test]
     fn current_run_client_order_ids_are_bounded_and_scoped() {
         let prefix = "sxmk-0123456789ab-";
-        let quote = quote_client_order_id(prefix, u64::MAX, OrderSide::Sell, u32::MAX);
-        let exit = exit_client_order_id(prefix, u64::MAX);
+        let quote = maker::quote_client_order_id(prefix, u64::MAX, OrderSide::Sell, u32::MAX);
+        let exit = maker::exit_client_order_id(prefix, u64::MAX);
         assert!(quote.starts_with(prefix));
         assert!(exit.starts_with(prefix));
         assert!(quote.len() <= 41, "{quote}");

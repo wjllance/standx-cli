@@ -17,6 +17,16 @@
 
 use standx_sdk::models::OrderSide;
 
+pub mod ownership;
+pub mod risk;
+
+pub use ownership::{
+    exit_client_order_id, is_current_run_client_order_id, is_maker_client_order_id,
+    open_qty_adopts, pending_covers_slot, position_within_limit, quote_client_order_id, QuoteSlot,
+    MAKER_CL_ORD_ID_PREFIX,
+};
+pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
+
 /// Static per-run configuration (CLI args + symbol metadata).
 #[derive(Debug, Clone)]
 pub struct MakerConfig {

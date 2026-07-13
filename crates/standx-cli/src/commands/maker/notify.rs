@@ -1,50 +1,6 @@
 use crate::cli::{AlertWebhookFormat, OutputFormat};
-use standx_maker::Alert;
+use standx_maker::{Alert, PositionAlertAnchor};
 use std::time::Duration;
-
-#[derive(Debug)]
-pub(super) struct PositionAlertAnchor {
-    position: f64,
-    change_pct: f64,
-}
-
-impl PositionAlertAnchor {
-    pub(super) fn new(position: f64, change_pct: f64) -> Self {
-        Self {
-            position,
-            change_pct,
-        }
-    }
-
-    pub(super) fn evaluate(
-        &mut self,
-        observed: f64,
-        max_position: f64,
-        inventory_exit_pct: f64,
-        qty_tolerance: f64,
-    ) -> Option<(f64, f64, f64)> {
-        let old = self.position;
-        let delta = observed - old;
-        if delta.abs() <= qty_tolerance {
-            return None;
-        }
-        let jump_threshold = max_position * self.change_pct / 100.0;
-        let jump = self.change_pct > 0.0 && delta.abs() + qty_tolerance >= jump_threshold;
-        let direction_flip = old * observed < 0.0;
-        let crossed_max = old.abs() + qty_tolerance < max_position
-            && observed.abs() + qty_tolerance >= max_position;
-        let exit_threshold = max_position * inventory_exit_pct / 100.0;
-        let crossed_exit = inventory_exit_pct > 0.0
-            && old.abs() + qty_tolerance < exit_threshold
-            && observed.abs() + qty_tolerance >= exit_threshold;
-        if jump || direction_flip || crossed_max || crossed_exit {
-            self.position = observed;
-            Some((old, observed, delta))
-        } else {
-            None
-        }
-    }
-}
 
 pub(super) fn webhook_body(
     format: AlertWebhookFormat,
@@ -164,7 +120,7 @@ impl MakerNotifier {
         anchor: &mut PositionAlertAnchor,
         change: PositionChange<'_>,
     ) {
-        let Some((before, after, delta)) = anchor.evaluate(
+        let Some(event) = anchor.evaluate(
             change.observed,
             change.max_position,
             change.inventory_exit_pct,
@@ -172,6 +128,9 @@ impl MakerNotifier {
         ) else {
             return;
         };
+        let before = event.before;
+        let after = event.after;
+        let delta = event.delta;
         let attribution = if (change.observed - change.expected).abs() <= change.qty_tolerance {
             "current-run maker fills"
         } else {

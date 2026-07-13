@@ -524,7 +524,7 @@ pub(super) async fn run_maker(
             })
             .count();
 
-        if !starting_position_within_limit(starting_position, cfg.max_position, cfg.qty_decimals) {
+        if !maker::position_within_limit(starting_position, cfg.max_position, cfg.qty_decimals) {
             emit_startup_rejected(output_format, &symbol, starting_position, cfg.max_position);
             let message = format!(
                 "starting position {starting_position:+.8} exceeds max_position {:.8}",

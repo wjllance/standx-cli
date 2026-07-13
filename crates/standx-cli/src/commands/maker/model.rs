@@ -1,8 +1,6 @@
 use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide, Position};
 
-pub(super) const MAKER_CL_ORD_ID_PREFIX: &str = "sxmk-";
-
 pub(super) enum MakerExit {
     CtrlC,
     OrderResponse(String),
@@ -65,17 +63,11 @@ pub(super) struct PendingPlace {
 }
 
 pub(super) fn is_maker_order(order: &Order) -> bool {
-    order
-        .cl_ord_id
-        .as_deref()
-        .is_some_and(|id| id.starts_with(MAKER_CL_ORD_ID_PREFIX))
+    standx_maker::is_maker_client_order_id(order.cl_ord_id.as_deref())
 }
 
 pub(super) fn is_current_run_order(order: &Order, run_order_prefix: &str) -> bool {
-    order
-        .cl_ord_id
-        .as_deref()
-        .is_some_and(|id| id.starts_with(run_order_prefix))
+    standx_maker::is_current_run_client_order_id(order.cl_ord_id.as_deref(), run_order_prefix)
 }
 
 pub(super) fn position_for_symbol(positions: &[Position], symbol: &str) -> anyhow::Result<f64> {
@@ -100,21 +92,6 @@ pub(super) fn position_for_symbol(positions: &[Position], symbol: &str) -> anyho
         })
 }
 
-pub(super) fn starting_position_within_limit(
-    position: f64,
-    max_position: f64,
-    qty_decimals: u32,
-) -> bool {
-    let qty_tolerance = 10_f64.powi(-(qty_decimals as i32)) / 2.0;
-    position.abs() <= max_position + qty_tolerance
-}
-
-pub(super) fn pending_covers_slot(pending: &[PendingPlace], side: OrderSide, level: u32) -> bool {
-    pending
-        .iter()
-        .any(|place| place.side == side && place.level == level)
-}
-
 pub(super) fn is_order_rejection(error: &StandxError) -> bool {
     matches!(
         error,
@@ -123,8 +100,4 @@ pub(super) fn is_order_rejection(error: &StandxError) -> bool {
             ..
         }
     )
-}
-
-pub(super) fn open_qty_adopts(open_qty: f64, placed_qty: f64) -> bool {
-    open_qty > 0.0 && open_qty <= placed_qty * (1.0 + 1e-6)
 }
