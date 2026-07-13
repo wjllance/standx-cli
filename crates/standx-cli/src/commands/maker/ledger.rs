@@ -46,7 +46,14 @@ pub(super) fn apply_order_update(
         .fill_qty
         .parse::<f64>()
         .map_err(|_| anyhow::anyhow!("account order {} has invalid fill_qty", update.order_id))?;
-    if qty <= 0.0 {
+    if !qty.is_finite() {
+        return Err(anyhow::anyhow!(
+            "account order {} has non-finite fill_qty",
+            update.order_id
+        ));
+    }
+    let qty = qty.abs();
+    if qty == 0.0 {
         return Ok(false);
     }
     let average = update.fill_avg_price.parse::<f64>().map_err(|_| {
@@ -163,4 +170,70 @@ pub(super) fn maker_trade_fill(trade: &Trade) -> Result<(OrderSide, f64, f64)> {
         ));
     }
     Ok((side, price, qty))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use standx_sdk::models::OrderStatus;
+
+    fn order_update(side: OrderSide, fill_qty: &str) -> OrderUpdate {
+        OrderUpdate {
+            seq: 1,
+            order_id: 7,
+            cl_ord_id: Some("sxmk-run-q00000001a0".to_string()),
+            symbol: "BTC-USD".to_string(),
+            side,
+            qty: "0.20".to_string(),
+            fill_qty: fill_qty.to_string(),
+            fill_avg_price: "100.00".to_string(),
+            price: "100.00".to_string(),
+            status: OrderStatus::Filled,
+            reduce_only: false,
+            updated_at: "2026-07-13T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn signed_sell_fill_quantity_is_normalized_before_ledger_ingestion() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut fills = Vec::new();
+
+        apply_order_update(
+            &mut ledger,
+            &order_update(OrderSide::Sell, "-0.20"),
+            "BTC-USD",
+            "sxmk-run-",
+            100.0,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].side, OrderSide::Sell);
+        assert!((fills[0].qty - 0.20).abs() < 1e-9);
+        assert!((ledger.expected_position + 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn non_finite_ws_fill_quantity_is_rejected_explicitly() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut fills = Vec::new();
+
+        let error = apply_order_update(
+            &mut ledger,
+            &order_update(OrderSide::Sell, "NaN"),
+            "BTC-USD",
+            "sxmk-run-",
+            100.0,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-finite fill_qty"));
+    }
 }

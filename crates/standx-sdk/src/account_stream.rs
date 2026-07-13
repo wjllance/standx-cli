@@ -2,7 +2,7 @@
 
 use crate::auth::Credentials;
 use crate::error::{Error, Result};
-use crate::models::{OrderSide, OrderStatus};
+use crate::models::{deserialize_order_side_optional, OrderSide, OrderStatus};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::{
@@ -87,6 +87,8 @@ pub struct PositionUpdate {
     #[serde(default, deserialize_with = "u64_string_or_number")]
     pub id: u64,
     pub symbol: String,
+    #[serde(default, deserialize_with = "deserialize_order_side_optional")]
+    pub side: Option<OrderSide>,
     #[serde(deserialize_with = "string_or_number")]
     pub qty: String,
     #[serde(default, deserialize_with = "string_or_number")]
@@ -404,7 +406,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(
-            matches!(position, AccountEvent::Position(update) if update.qty == "0.201" && update.seq == 36)
+            matches!(position, AccountEvent::Position(update) if update.qty == "0.201" && update.side.is_none() && update.seq == 36)
+        );
+
+        let short_position = parse_account_event(
+            r#"{"seq":37,"channel":"position","data":{"id":80853,"symbol":"XAG-USD","qty":"-0.116","entry_price":"58.24","realized_pnl":"7.12","status":"open","updated_at":"2026-07-13T05:56:25Z"}}"#,
+            &health,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(short_position, AccountEvent::Position(update) if update.side.is_none() && update.qty == "-0.116" && update.seq == 37)
         );
     }
 

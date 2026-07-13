@@ -35,14 +35,16 @@ where
 }
 
 /// Helper to deserialize optional OrderSide from string
-fn deserialize_order_side_optional<'de, D>(deserializer: D) -> Result<Option<OrderSide>, D::Error>
+pub(crate) fn deserialize_order_side_optional<'de, D>(
+    deserializer: D,
+) -> Result<Option<OrderSide>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
     match s.to_lowercase().as_str() {
-        "buy" => Ok(Some(OrderSide::Buy)),
-        "sell" => Ok(Some(OrderSide::Sell)),
+        "buy" | "long" => Ok(Some(OrderSide::Buy)),
+        "sell" | "short" => Ok(Some(OrderSide::Sell)),
         _ => Ok(None),
     }
 }

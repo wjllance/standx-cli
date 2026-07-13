@@ -255,6 +255,14 @@ mod tests {
             -0.13
         );
         assert!(position_for_symbol(&[test_position("sell", "NaN")], "XAG-USD").is_err());
+        assert_eq!(
+            model::signed_position_quantity("-0.13", None).unwrap(),
+            -0.13
+        );
+        assert_eq!(
+            model::signed_position_quantity("0.13", Some(OrderSide::Sell)).unwrap(),
+            -0.13
+        );
     }
 
     #[test]
