@@ -2,43 +2,23 @@
 use super::ledger::maker_trade_fill;
 use super::ledger::MakerLedger;
 use super::model::{
-    is_current_run_order, is_maker_order, is_order_rejection, open_qty_adopts, pending_covers_slot,
+    is_current_run_order, is_order_rejection, open_qty_adopts, pending_covers_slot,
     position_for_symbol, MakerFill, PendingPlace,
 };
 use super::output::{emit_maker_cycle, log_maker_event};
+use super::pipeline::{fetch_snapshot, CycleRequest, CycleResult, CycleState};
+use super::recovery::{
+    recover_current_run_order_ids_for_reconciliation, PositionGap, PositionReconciliationError,
+};
 use crate::cli::*;
 use anyhow::Result;
-use standx_maker::{self as maker, MakerConfig, MakerStats, RestingQuote, VolBreaker};
+use standx_maker::{self as maker, MakerStats, RestingQuote};
 #[cfg(test)]
 use standx_sdk::account_stream::OrderUpdate;
 use standx_sdk::client::order::CreateOrderParams;
-use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::OrderResponseHealth;
-use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::time::Duration;
-
-const MAKER_CLEANUP_VERIFY_DELAY: Duration = Duration::from_millis(500);
-const MAKER_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-#[derive(Debug)]
-pub(super) struct PositionReconciliationError {
-    pub(super) expected: f64,
-    pub(super) observed: f64,
-}
-
-impl fmt::Display for PositionReconciliationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "expected position {:+.8}, venue reported {:+.8}",
-            self.expected, self.observed
-        )
-    }
-}
-
-impl std::error::Error for PositionReconciliationError {}
 
 fn quote_client_order_id(
     run_order_prefix: &str,
@@ -77,126 +57,6 @@ fn collect_current_run_fills(
     Ok(exit_fill_observed)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn recover_current_run_order_ids_for_reconciliation(
-    client: &StandXClient,
-    trades: &[Trade],
-    expected_position: f64,
-    observed_position: f64,
-    qty_tolerance: f64,
-    run_order_prefix: &str,
-    ledger: &mut MakerLedger,
-) {
-    // A trade can settle into position before its order is visible in either
-    // open-order polling or `query_orders`. Only inspect unknown trades that
-    // could explain the signed reconciliation gap, then require a direct
-    // `query_order` lookup to prove the current run's client-order prefix.
-    const MAX_ORDER_LOOKUPS: usize = 8;
-    let position_gap = observed_position - expected_position;
-    if position_gap.abs() <= qty_tolerance {
-        return;
-    }
-
-    let mut candidate_ids = HashSet::new();
-    for trade in trades {
-        let Some(order_id) = trade.order_id else {
-            continue;
-        };
-        if ledger.maker_order_ids.contains(&order_id) {
-            continue;
-        }
-        let side = match trade
-            .side
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("buy") => 1.0,
-            Some("sell") => -1.0,
-            _ => continue,
-        };
-        let Ok(qty) = trade.qty.parse::<f64>() else {
-            continue;
-        };
-        if !qty.is_finite()
-            || qty <= 0.0
-            || side * position_gap <= 0.0
-            || qty > position_gap.abs() + qty_tolerance
-        {
-            continue;
-        }
-        candidate_ids.insert(order_id);
-        if candidate_ids.len() == MAX_ORDER_LOOKUPS {
-            break;
-        }
-    }
-
-    for order_id in candidate_ids {
-        match client.get_order(order_id).await {
-            Ok(order) => {
-                if let Err(error) = ledger.adopt_order(&order, run_order_prefix) {
-                    eprintln!(
-                        "⚠️  reconciliation order lookup returned invalid order {}: {}",
-                        order_id, error
-                    );
-                }
-            }
-            Err(error) => eprintln!(
-                "⚠️  reconciliation order lookup for {} failed: {}",
-                order_id, error
-            ),
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn reconcile_ledger_snapshot(
-    client: &StandXClient,
-    symbol: &str,
-    session_started_at: i64,
-    run_order_prefix: &str,
-    qty_tolerance: f64,
-    mark: f64,
-    ledger: &mut MakerLedger,
-    stats: &mut MakerStats,
-) -> Result<(f64, Vec<MakerFill>)> {
-    let now = chrono::Utc::now().timestamp();
-    let (orders, filled_orders, trades, positions) = tokio::join!(
-        client.get_open_orders(Some(symbol)),
-        client.get_order_history(Some(symbol), Some(100)),
-        client.get_user_trades(symbol, session_started_at, now, Some(500)),
-        client.get_positions(Some(symbol)),
-    );
-    let orders = orders?;
-    let filled_orders = filled_orders?;
-    for order in orders.iter().chain(filled_orders.iter()) {
-        ledger.adopt_order(order, run_order_prefix)?;
-    }
-    let trades = trades?;
-    let observed = position_for_symbol(&positions?, symbol)?;
-    recover_current_run_order_ids_for_reconciliation(
-        client,
-        &trades,
-        ledger.expected_position,
-        observed,
-        qty_tolerance,
-        run_order_prefix,
-        ledger,
-    )
-    .await;
-    let mut fills = Vec::new();
-    collect_current_run_fills(
-        trades,
-        ledger,
-        session_started_at,
-        now,
-        mark,
-        stats,
-        &mut fills,
-    )?;
-    Ok((observed, fills))
-}
-
 fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<String> {
     match health {
         Some(health) if health.is_healthy() => None,
@@ -210,33 +70,38 @@ fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<Stri
 /// One reconcile cycle over an already-acquired market snapshot.
 /// Returns (places, cancels, holds, fills) counts. `sim_position` carries the
 /// paper-mode simulated inventory across cycles (unused in live).
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn maker_cycle(
-    client: &StandXClient,
-    symbol: &str,
-    cfg: &MakerConfig,
-    live: bool,
-    cycle: u64,
-    mark: f64,
-    best_bid: Option<f64>,
-    best_ask: Option<f64>,
-    max_divergence_bps: f64,
-    inventory_exit_pct: f64,
-    inventory_exit_qty: f64,
-    resting: &mut Vec<RestingQuote>,
-    adopted: &mut HashMap<String, (u32, f64, u64)>,
-    pending: &mut Vec<PendingPlace>,
-    inventory_exit_pending: &mut bool,
-    ledger: &mut MakerLedger,
-    session_started_at: i64,
-    run_order_prefix: &str,
-    starting_position: f64,
-    sim_position: &mut f64,
-    stats: &mut MakerStats,
-    breaker: &mut VolBreaker,
-    output_format: OutputFormat,
-    order_response_health: Option<&OrderResponseHealth>,
-) -> Result<(u64, u64, u64, u64)> {
+    request: CycleRequest<'_>,
+    state: CycleState<'_>,
+) -> Result<CycleResult> {
+    let CycleRequest {
+        client,
+        symbol,
+        cfg,
+        live,
+        cycle,
+        mark,
+        best_bid,
+        best_ask,
+        max_divergence_bps,
+        inventory_exit_pct,
+        inventory_exit_qty,
+        session_started_at,
+        run_order_prefix,
+        starting_position,
+        output_format,
+        order_response_health,
+    } = request;
+    let CycleState {
+        resting,
+        adopted,
+        pending,
+        inventory_exit_pending,
+        ledger,
+        sim_position,
+        stats,
+        breaker,
+    } = state;
     use maker::{
         format_decimals, paper_quote_filled, Action, CycleInput, CycleSkip, MarketSnapshot,
     };
@@ -274,12 +139,12 @@ pub(super) async fn maker_cycle(
                     );
                 }
             }
-            return Ok((0, 0, 0, 0));
+            return Ok(CycleResult::default());
         }
         Some(CycleSkip::MissingTouch) => {
             // Fail-safe: without a touch we cannot guarantee no-cross pricing.
             eprintln!("⚠️  empty order book on {}; skipping this cycle", symbol);
-            return Ok((0, 0, 0, 0));
+            return Ok(CycleResult::default());
         }
         None => preflight.halted,
     };
@@ -292,16 +157,11 @@ pub(super) async fn maker_cycle(
     let mut exit_fill_observed = false;
     if live {
         let now = chrono::Utc::now().timestamp();
-        let (orders, filled_orders, trades, balance) = tokio::join!(
-            client.get_open_orders(Some(symbol)),
-            client.get_order_history(Some(symbol), Some(100)),
-            client.get_user_trades(symbol, session_started_at, now, Some(500)),
-            client.get_balance(),
-        );
-        let mut orders = orders?;
-        let filled_orders = filled_orders?;
-        let trades = trades?;
-        account_balance = Some(balance?);
+        let snapshot = fetch_snapshot(client, symbol, session_started_at, now).await?;
+        let mut orders = snapshot.open_orders;
+        let filled_orders = snapshot.filled_orders;
+        let trades = snapshot.trades;
+        account_balance = Some(snapshot.balance);
 
         // Open maker orders identify partial fills; historical maker orders
         // identify a quote that fully filled between two polling cycles.
@@ -319,8 +179,7 @@ pub(super) async fn maker_cycle(
             &mut fills,
         )?;
 
-        let positions = client.get_positions(Some(symbol)).await?;
-        let mut observed_position = position_for_symbol(&positions, symbol)?;
+        let mut observed_position = position_for_symbol(&snapshot.positions, symbol)?;
         let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
         if (observed_position - ledger.expected_position).abs() > qty_tolerance {
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -339,10 +198,12 @@ pub(super) async fn maker_cycle(
             recover_current_run_order_ids_for_reconciliation(
                 client,
                 &retry_trades,
-                ledger.expected_position,
-                observed_position,
-                qty_tolerance,
-                run_order_prefix,
+                PositionGap {
+                    expected: ledger.expected_position,
+                    observed: observed_position,
+                    qty_tolerance,
+                    run_order_prefix,
+                },
                 ledger,
             )
             .await;
@@ -719,98 +580,12 @@ pub(super) async fn maker_cycle(
         cfg,
     );
 
-    Ok((places, cancels, holds, fills.len() as u64))
-}
-
-/// Cancel maker-owned orders with retries, preserving manual/API orders.
-pub(super) async fn cancel_maker_orders_with_retry(
-    client: &StandXClient,
-    symbol: &str,
-    attempts: u32,
-    output_format: OutputFormat,
-) -> Result<()> {
-    let mut last_err: Option<anyhow::Error> = None;
-    for attempt in 1..=attempts {
-        let result = async {
-            let orders = client.get_open_orders(Some(symbol)).await?;
-            let order_ids = orders
-                .iter()
-                .filter(|order| is_maker_order(order))
-                .map(|order| {
-                    order.id.parse::<i64>().map_err(|_| {
-                        anyhow::anyhow!(
-                            "maker-owned order has non-integer exchange ID '{}'",
-                            order.id
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            if order_ids.is_empty() {
-                return Ok::<_, anyhow::Error>(());
-            }
-
-            client.cancel_orders(&order_ids).await?;
-            // Cancellation is accepted asynchronously by the venue. Do not
-            // treat an immediately stale open-orders response as a reason to
-            // abandon a safe reconnect; verify after a short grace period and
-            // reissue cancellation only for still-visible maker orders.
-            tokio::time::sleep(MAKER_CLEANUP_VERIFY_DELAY).await;
-            let residual_ids = client
-                .get_open_orders(Some(symbol))
-                .await?
-                .iter()
-                .filter(|order| is_maker_order(order))
-                .map(|order| order.id.clone())
-                .collect::<Vec<_>>();
-            if residual_ids.is_empty() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "RESIDUAL MAKER ORDERS on {} after cancellation: [{}]",
-                    symbol,
-                    residual_ids.join(", ")
-                ))
-            }
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                if output_format == OutputFormat::Json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "symbol": symbol,
-                            "action": "maker_cleanup",
-                            "event": "complete",
-                            "remaining_maker_orders": 0,
-                        })
-                    );
-                } else {
-                    println!("✅ All maker-owned {} orders cancelled", symbol);
-                }
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!(
-                    "⚠️  maker-order cancellation attempt {}/{} incomplete: {}",
-                    attempt, attempts, e
-                );
-                last_err = Some(e);
-                if attempt < attempts {
-                    tokio::time::sleep(MAKER_CLEANUP_RETRY_DELAY).await;
-                }
-            }
-        }
-    }
-
-    Err(last_err.unwrap_or_else(|| {
-        anyhow::anyhow!(
-            "maker-order cancellation had no attempts — inspect or cancel manually with 'standx order cancel-all {}'",
-            symbol
-        )
-    }))
+    Ok(CycleResult {
+        places,
+        cancels,
+        holds,
+        fills: fills.len() as u64,
+    })
 }
 
 #[cfg(test)]

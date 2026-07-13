@@ -21,11 +21,10 @@ mod ledger;
 mod model;
 mod notify;
 mod output;
+mod pipeline;
+mod recovery;
 
-use cycle::{
-    cancel_maker_orders_with_retry, maker_cycle, reconcile_ledger_snapshot,
-    PositionReconciliationError,
-};
+use cycle::maker_cycle;
 use feed::{market_snapshot, spawn_market_feed};
 use ledger::MakerLedger;
 use model::{
@@ -37,6 +36,13 @@ use model::{is_order_rejection, open_qty_adopts, pending_covers_slot};
 #[cfg(test)]
 use notify::webhook_body;
 use notify::{MakerNotifier, PositionAlertAnchor, PositionChange, RiskNotice};
+use pipeline::{CycleRequest, CycleState};
+use recovery::{
+    cancel_maker_orders_with_retry, reconcile_ledger_snapshot, PositionReconciliationError,
+    ReconcileRequest,
+};
+#[cfg(test)]
+use recovery::{recover_current_run_order_ids_for_reconciliation, PositionGap};
 #[cfg(test)]
 use standx_sdk::error::Error as StandxError;
 
@@ -1543,38 +1549,42 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
             }
             let (mark, best_bid, best_ask, src) =
                 market_snapshot(&client, &symbol, feed.as_ref()).await?;
-            let (places, cancels, holds, fills) = maker_cycle(
-                &client,
-                &symbol,
-                &cfg,
-                args.live,
-                cycle,
-                mark,
-                best_bid,
-                best_ask,
-                args.max_divergence_bps,
-                args.inventory_exit_pct,
-                args.inventory_exit_qty,
-                &mut resting,
-                &mut adopted,
-                &mut pending,
-                &mut inventory_exit_pending,
-                &mut ledger,
-                session_started_at,
-                &run_order_prefix,
-                starting_position,
-                &mut sim_position,
-                &mut stats,
-                &mut breaker,
-                output_format,
-                order_response_health.as_ref(),
+            let result = maker_cycle(
+                CycleRequest {
+                    client: &client,
+                    symbol: &symbol,
+                    cfg: &cfg,
+                    live: args.live,
+                    cycle,
+                    mark,
+                    best_bid,
+                    best_ask,
+                    max_divergence_bps: args.max_divergence_bps,
+                    inventory_exit_pct: args.inventory_exit_pct,
+                    inventory_exit_qty: args.inventory_exit_qty,
+                    session_started_at,
+                    run_order_prefix: &run_order_prefix,
+                    starting_position,
+                    output_format,
+                    order_response_health: order_response_health.as_ref(),
+                },
+                CycleState {
+                    resting: &mut resting,
+                    adopted: &mut adopted,
+                    pending: &mut pending,
+                    inventory_exit_pending: &mut inventory_exit_pending,
+                    ledger: &mut ledger,
+                    sim_position: &mut sim_position,
+                    stats: &mut stats,
+                    breaker: &mut breaker,
+                },
             )
             .await?;
             Ok::<_, anyhow::Error>((
-                places,
-                cancels,
-                holds,
-                fills,
+                result.places,
+                result.cancels,
+                result.holds,
+                result.fills,
                 mark,
                 src,
                 breaker.halted(),
@@ -1770,11 +1780,13 @@ async fn run_maker(symbol: String, args: MakerRunArgs, output_format: OutputForm
                         }
                         match reconcile_ledger_snapshot(
                             &client,
-                            &symbol,
-                            session_started_at,
-                            &run_order_prefix,
-                            qty_tolerance,
-                            last_mark.unwrap_or(baseline_mark),
+                            ReconcileRequest {
+                                symbol: &symbol,
+                                session_started_at,
+                                run_order_prefix: &run_order_prefix,
+                                qty_tolerance,
+                                mark: last_mark.unwrap_or(baseline_mark),
+                            },
                             &mut ledger,
                             &mut stats,
                         )
@@ -2727,13 +2739,15 @@ mod tests {
         let client = StandXClient::with_base_url(server.url()).unwrap();
         let mut ledger = MakerLedger::new(-0.001);
 
-        cycle::recover_current_run_order_ids_for_reconciliation(
+        recover_current_run_order_ids_for_reconciliation(
             &client,
             &[trade],
-            -0.001,
-            0.0,
-            0.0005,
-            "sxmk-0123456789ab-",
+            PositionGap {
+                expected: -0.001,
+                observed: 0.0,
+                qty_tolerance: 0.0005,
+                run_order_prefix: "sxmk-0123456789ab-",
+            },
             &mut ledger,
         )
         .await;
