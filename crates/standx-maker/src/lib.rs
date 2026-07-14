@@ -76,6 +76,11 @@ impl MakerConfig {
     pub fn price_tick(&self) -> f64 {
         10f64.powi(-(self.price_decimals as i32))
     }
+
+    /// One quantity tick: `10^-qty_decimals`.
+    pub fn qty_tick(&self) -> f64 {
+        10f64.powi(-(self.qty_decimals as i32))
+    }
 }
 
 /// A quote we want resting on the book (prices/qtys already tick-rounded).
@@ -123,7 +128,12 @@ pub fn inventory_exit_plan(
     }
 
     let abs_position = position.abs();
-    if abs_position + f64::EPSILON < max_position * trigger_pct / 100.0 {
+    // Trigger once |position| reaches the threshold. Exact comparison: the old
+    // `+ f64::EPSILON` nudge was sub-tick noise at any real qty scale (machine
+    // epsilon is the ULP at 1.0), so it changed nothing meaningful. Not
+    // reaching the threshold by a genuine tick means the exit legitimately
+    // should not fire yet.
+    if abs_position < max_position * trigger_pct / 100.0 {
         return None;
     }
     Some(InventoryExit {
@@ -1009,8 +1019,10 @@ pub fn cap_desired_exposure(
             };
             // Retain only full, tick-aligned orders. Shrinking a level would
             // create a quantity not represented by the strategy's config and
-            // could fall below the venue's minimum order size.
-            if quote.qty <= *budget + f64::EPSILON {
+            // could fall below the venue's minimum order size. Allow half a qty
+            // tick of slack so a budget that lands a hair under a whole-tick
+            // quote (float noise) still admits it.
+            if quote.qty <= *budget + cfg.qty_tick() / 2.0 {
                 *budget = (*budget - quote.qty).max(0.0);
                 true
             } else {

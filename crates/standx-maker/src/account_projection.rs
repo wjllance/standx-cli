@@ -278,16 +278,32 @@ pub struct MakerAccountProjection {
     orders: HashMap<u64, ProjectedOrder>,
     pending: Vec<PendingEntry>,
     observed_position: f64,
+    /// Half a price tick. Adopting a venue-echoed order by price must tolerate
+    /// the representation difference between the submitted and echoed values
+    /// (up to several ULPs at a ~100 price); an exact/EPSILON compare would
+    /// miss the pending place it belongs to.
+    price_tolerance: f64,
+    /// Half a qty tick. Open quantity at or below this is treated as fully
+    /// filled (sub-tick dust), not a still-resting order.
+    qty_tolerance: f64,
 }
 
 impl MakerAccountProjection {
-    pub fn new(generation: u64, run_order_prefix: impl Into<String>, position: f64) -> Self {
+    pub fn new(
+        generation: u64,
+        run_order_prefix: impl Into<String>,
+        position: f64,
+        price_tolerance: f64,
+        qty_tolerance: f64,
+    ) -> Self {
         Self {
             generation,
             run_order_prefix: run_order_prefix.into(),
             orders: HashMap::new(),
             pending: Vec::new(),
             observed_position: position,
+            price_tolerance,
+            qty_tolerance,
         }
     }
 
@@ -475,6 +491,7 @@ impl MakerAccountProjection {
             }
             AccountProjectionEvent::OrderObserved(observation) => self.observe_order(observation),
             AccountProjectionEvent::TradeApplied { order_id, qty } => {
+                let qty_tolerance = self.qty_tolerance;
                 let Some(order) = self.orders.get_mut(&order_id) else {
                     return ProjectionOutcome {
                         applied: true,
@@ -485,7 +502,7 @@ impl MakerAccountProjection {
                 order.open_qty = (order.total_qty
                     - order.stream_filled_qty.max(order.ledger_filled_qty))
                 .max(0.0);
-                if order.open_qty <= f64::EPSILON {
+                if order.open_qty <= qty_tolerance {
                     self.orders.remove(&order_id);
                 }
                 ProjectionOutcome {
@@ -540,7 +557,7 @@ impl MakerAccountProjection {
         ) {
             return ProjectionOutcome::default();
         }
-        if observation.terminal || observation.open_qty <= f64::EPSILON {
+        if observation.terminal || observation.open_qty <= self.qty_tolerance {
             self.handle_terminal_observation(&observation)
         } else {
             self.adopt_open_observation(observation)
@@ -614,6 +631,7 @@ impl MakerAccountProjection {
     /// else by a side/price/qty heuristic — close its slot, and return the slot
     /// info to adopt. Returns `None` when no pending place matches.
     fn match_pending_slot(&mut self, observation: &OrderObservation) -> Option<AdoptedSlot> {
+        let price_tolerance = self.price_tolerance;
         let index = self
             .pending
             .iter()
@@ -629,7 +647,7 @@ impl MakerAccountProjection {
                     entry.slot_open
                         && entry.place().is_some_and(|place| {
                             place.side == observation.side
-                                && (place.price - observation.price).abs() <= f64::EPSILON
+                                && (place.price - observation.price).abs() <= price_tolerance
                                 && open_qty_adopts(observation.open_qty, place.qty)
                         })
                 })
@@ -733,7 +751,7 @@ mod tests {
 
     #[test]
     fn order_then_trade_and_duplicate_trade_outcome_are_idempotent() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
         state.apply(
@@ -752,7 +770,7 @@ mod tests {
 
     #[test]
     fn trade_before_order_does_not_create_phantom_order() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(
             1,
@@ -768,7 +786,7 @@ mod tests {
 
     #[test]
     fn partial_fill_then_cancel_is_terminal_in_either_order() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
         state.apply(
@@ -785,7 +803,7 @@ mod tests {
 
     #[test]
     fn wrong_run_and_stale_generation_are_ignored() {
-        let mut state = MakerAccountProjection::new(2, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(2, PREFIX, 0.0, 0.005, 0.00005);
         let mut wrong = order(0.2, false);
         wrong.client_order_id = Some("sxmk-other-q00000001b0".to_string());
         assert!(
@@ -803,7 +821,7 @@ mod tests {
 
     #[test]
     fn cancel_ack_after_close_is_idempotent() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
         state.apply(
@@ -833,7 +851,7 @@ mod tests {
 
     #[test]
     fn late_place_ack_matches_after_account_order_is_already_terminal() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.0, true)));
         assert!(state.pending_places().is_empty());
@@ -854,7 +872,7 @@ mod tests {
 
     #[test]
     fn freeze_closes_quote_slots_but_preserves_unacked_response_registry() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(
             1,
@@ -905,7 +923,7 @@ mod tests {
 
     #[test]
     fn request_registry_is_strictly_bounded_and_rejects_duplicates() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         for index in 0..MAX_PENDING_ORDER_REQUESTS {
             let outcome = state.apply(
                 1,
@@ -926,7 +944,7 @@ mod tests {
             })
         ));
 
-        let mut duplicate = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut duplicate = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         duplicate.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("same")));
         let outcome = duplicate.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("same")));
         assert!(matches!(
@@ -937,7 +955,7 @@ mod tests {
 
     #[test]
     fn position_projects_independently_of_ordering() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         let outcome = state.apply(
             1,
             AccountProjectionEvent::PositionObserved { position: 0.2 },
@@ -948,7 +966,7 @@ mod tests {
 
     #[test]
     fn order_before_position_and_position_before_order_converge() {
-        let mut order_first = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut order_first = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         order_first.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         order_first.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
         order_first.apply(
@@ -956,7 +974,7 @@ mod tests {
             AccountProjectionEvent::PositionObserved { position: 0.2 },
         );
 
-        let mut position_first = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut position_first = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         position_first.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         position_first.apply(
             1,
@@ -976,7 +994,7 @@ mod tests {
 
     #[test]
     fn rest_audit_detects_order_and_position_drift_without_mutation() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
 
@@ -993,7 +1011,7 @@ mod tests {
 
     #[test]
     fn advance_cycle_expires_pending_slot_but_keeps_unacked_registry_entry() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         assert_eq!(state.pending_places().len(), 1);
 
@@ -1024,7 +1042,7 @@ mod tests {
 
     #[test]
     fn open_observation_adopts_pending_by_price_qty_heuristic() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
 
         // A different (but still current-run) client-order-id that matches the
@@ -1047,7 +1065,7 @@ mod tests {
 
     #[test]
     fn unknown_current_run_order_adopts_with_sentinel_level() {
-        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
 
         // A current-run order with no pending place and no prior projection is
         // adopted at the out-of-range sentinel level so reconcile cancels it.
@@ -1057,5 +1075,40 @@ mod tests {
         let resting = state.resting_quotes();
         assert_eq!(resting.len(), 1);
         assert_eq!(resting[0].level, UNKNOWN_ADOPTED_LEVEL);
+    }
+
+    #[test]
+    fn heuristic_adopts_pending_despite_one_ulp_price_echo_difference() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        // pending("p1") rests a buy at price 100.0, qty 0.2, level 0.
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+
+        // The venue echoes the "same" price one ULP away (~1.4e-14 at 100) —
+        // far above f64::EPSILON but far below half a price tick. The old
+        // `<= f64::EPSILON` compare would miss the pending place and adopt the
+        // order at the unknown sentinel level; the tick tolerance matches it.
+        let echoed_price = f64::from_bits(100.0_f64.to_bits() + 1);
+        assert_ne!(echoed_price, 100.0);
+        assert!((echoed_price - 100.0).abs() > f64::EPSILON);
+
+        let mut observation = order(0.2, false);
+        observation.order_id = 55;
+        // A current-run id that does NOT match the pending's client-order-id,
+        // forcing the side/price/qty heuristic branch.
+        observation.client_order_id = Some(format!("{PREFIX}q00000042c0"));
+        observation.price = echoed_price;
+
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(observation));
+        assert!(outcome.applied && outcome.order_changed);
+        assert!(
+            !outcome.unknown_current_run_order,
+            "a one-ULP price echo still matches its pending place"
+        );
+        assert_eq!(
+            state.resting_quotes()[0].level,
+            0,
+            "adopts the pending place's real level, not the unknown sentinel"
+        );
+        assert!(state.pending_places().is_empty());
     }
 }
