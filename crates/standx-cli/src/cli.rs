@@ -5,13 +5,13 @@ const SUPERVISOR_WEBHOOK_ENV: &str = "STANDX_SUPERVISOR_WEBHOOK";
 const SUPERVISOR_WEBHOOK_FORMAT_ENV: &str = "STANDX_SUPERVISOR_WEBHOOK_FORMAT";
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct WsCanaryLocalEnv {
+struct MakerLocalEnv {
     webhook: Option<String>,
     format: Option<String>,
 }
 
-fn parse_ws_canary_local_env(contents: &str) -> WsCanaryLocalEnv {
-    let mut parsed = WsCanaryLocalEnv::default();
+fn parse_maker_local_env(contents: &str) -> MakerLocalEnv {
+    let mut parsed = MakerLocalEnv::default();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -42,15 +42,15 @@ fn parse_ws_canary_local_env(contents: &str) -> WsCanaryLocalEnv {
     parsed
 }
 
-/// Load the two WS-canary notification settings from a local ignored env file.
+/// Load the maker notification settings from a local ignored env file.
 /// Existing process environment values remain authoritative.
-pub fn load_ws_canary_local_env(path: &Path) -> std::io::Result<()> {
+pub fn load_maker_local_env(path: &Path) -> std::io::Result<()> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    let parsed = parse_ws_canary_local_env(&contents);
+    let parsed = parse_maker_local_env(&contents);
     if std::env::var_os(SUPERVISOR_WEBHOOK_ENV).is_none() {
         if let Some(webhook) = parsed.webhook {
             std::env::set_var(SUPERVISOR_WEBHOOK_ENV, webhook);
@@ -62,6 +62,14 @@ pub fn load_ws_canary_local_env(path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Only live maker commands need local notification secrets at process start.
+pub fn should_load_maker_local_env(args: &[String]) -> bool {
+    args.iter().any(|argument| argument == "ws-command-canary")
+        || (args.iter().any(|argument| argument == "maker")
+            && args.iter().any(|argument| argument == "run")
+            && args.iter().any(|argument| argument == "--live"))
 }
 
 #[derive(Parser, Debug)]
@@ -543,10 +551,15 @@ pub enum MakerCommands {
         alert_margin_below: Option<f64>,
         /// Also POST risk alerts to this URL. stderr/JSON always get them
         /// regardless. Payload shape is set by --alert-webhook-format
-        #[arg(long)]
+        #[arg(long, env = "STANDX_SUPERVISOR_WEBHOOK")]
         alert_webhook: Option<String>,
         /// Webhook payload format for the target chat platform
-        #[arg(long, value_enum, default_value = "slack")]
+        #[arg(
+            long,
+            value_enum,
+            default_value = "slack",
+            env = "STANDX_SUPERVISOR_WEBHOOK_FORMAT"
+        )]
         alert_webhook_format: AlertWebhookFormat,
         /// Disable the WebSocket market feed and poll REST every cycle
         #[arg(long)]
@@ -639,34 +652,39 @@ mod tests {
     use clap::CommandFactory;
 
     #[test]
-    fn ws_command_canary_reads_supervisor_webhook_environment() {
+    fn maker_live_and_canary_read_supervisor_webhook_environment() {
         let command = Cli::command();
-        let canary = command
+        let maker = command
             .find_subcommand("maker")
-            .and_then(|maker| maker.find_subcommand("ws-command-canary"))
-            .expect("hidden WS command canary should remain registered");
-        let webhook = canary
-            .get_arguments()
-            .find(|argument| argument.get_id() == "alert_webhook")
-            .expect("canary webhook argument should remain registered");
-        let format = canary
-            .get_arguments()
-            .find(|argument| argument.get_id() == "alert_webhook_format")
-            .expect("canary webhook format should remain registered");
+            .expect("maker command should remain registered");
 
-        assert_eq!(
-            webhook.get_env().map(|value| value.to_string_lossy()),
-            Some("STANDX_SUPERVISOR_WEBHOOK".into())
-        );
-        assert_eq!(
-            format.get_env().map(|value| value.to_string_lossy()),
-            Some("STANDX_SUPERVISOR_WEBHOOK_FORMAT".into())
-        );
+        for subcommand in ["run", "ws-command-canary"] {
+            let command = maker
+                .find_subcommand(subcommand)
+                .expect("maker subcommand should remain registered");
+            let webhook = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == "alert_webhook")
+                .expect("webhook argument should remain registered");
+            let format = command
+                .get_arguments()
+                .find(|argument| argument.get_id() == "alert_webhook_format")
+                .expect("webhook format should remain registered");
+
+            assert_eq!(
+                webhook.get_env().map(|value| value.to_string_lossy()),
+                Some("STANDX_SUPERVISOR_WEBHOOK".into())
+            );
+            assert_eq!(
+                format.get_env().map(|value| value.to_string_lossy()),
+                Some("STANDX_SUPERVISOR_WEBHOOK_FORMAT".into())
+            );
+        }
     }
 
     #[test]
-    fn local_canary_env_parser_accepts_only_supervisor_settings() {
-        let parsed = parse_ws_canary_local_env(
+    fn local_maker_env_parser_accepts_only_supervisor_settings() {
+        let parsed = parse_maker_local_env(
             r#"
                 # ignored comment
                 export STANDX_SUPERVISOR_WEBHOOK='https://hooks.example/canary'
@@ -677,10 +695,33 @@ mod tests {
 
         assert_eq!(
             parsed,
-            WsCanaryLocalEnv {
+            MakerLocalEnv {
                 webhook: Some("https://hooks.example/canary".to_string()),
                 format: Some("feishu".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn local_maker_env_loads_for_canary_and_live_but_not_paper() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(should_load_maker_local_env(&args(&[
+            "standx",
+            "maker",
+            "ws-command-canary",
+            "XAG-USD",
+        ])));
+        assert!(should_load_maker_local_env(&args(&[
+            "standx", "maker", "run", "XAG-USD", "--live",
+        ])));
+        assert!(!should_load_maker_local_env(&args(&[
+            "standx", "maker", "run", "XAG-USD",
+        ])));
     }
 }

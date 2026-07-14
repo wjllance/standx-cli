@@ -36,7 +36,8 @@ maker by itself.
 - Observe startup, order response, fills, cancellations, alerts, and shutdown;
   retain timestamps and order/trade IDs. The hidden `ws-command-canary` emits
   these checks as `action=ws_command_canary` JSON events in every output mode.
-  It automatically loads `STANDX_SUPERVISOR_WEBHOOK` and optional
+  Both `ws-command-canary` and `maker run --live` automatically load
+  `STANDX_SUPERVISOR_WEBHOOK` and optional
   `STANDX_SUPERVISOR_WEBHOOK_FORMAT` from the process environment or a local
   ignored `.env.local` file. Process environment values override the file;
   explicit command-line options take precedence over both.

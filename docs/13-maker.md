@@ -253,12 +253,26 @@ standx maker run BTC-USD --alert-inventory-pct 80 \
 
 ## 13.5 Live（实盘）模式
 
-> ⚠️ **风险提示**：live 模式会下真实的 post-only（ALO）订单。它已实现但**尚未经过生产环境的监督测试**，因此锁定在环境变量之后。
+> ⚠️ **风险提示**：live 模式会持续下真实的 post-only（ALO）订单，且始终锁定在
+> release-owner 环境变量之后。生产 canary 记录见 [14-maker-live-gate.md](14-maker-live-gate.md)。
+
+在仓库根目录的 `.env.local` 配置通知地址：
+
+```bash
+STANDX_SUPERVISOR_WEBHOOK=https://your-webhook-url
+STANDX_SUPERVISOR_WEBHOOK_FORMAT=feishu
+```
+
+`maker run --live` 会自动读取这两个字段，无需再传 `--alert-webhook`：
 
 ```bash
 export STANDX_ENABLE_LIVE_MAKER=1        # 解锁（自行承担风险）
-standx maker run BTC-USD --size 0.0001 --max-position 0.001 --live
+standx --output json maker run XAG-USD \
+  --maker-config examples/maker-xag-100u-conservative.toml \
+  --live --yes
 ```
+
+优先级为：显式命令行参数 > 进程环境变量 > `.env.local`。
 
 live 模式的安全栏：
 

@@ -1,9 +1,9 @@
 # Standard XAG-USD maker profile for a 100 DUSD account at isolated 2x.
 #
-# Run with (live mode refuses to start without --alert-webhook):
+# Run with STANDX_SUPERVISOR_WEBHOOK configured in .env.local:
 #   standx --output json maker run XAG-USD \
 #     --maker-config examples/maker-xag-100u-standard.toml \
-#     --alert-webhook <url> --live --yes
+#     --live --yes
 #
 # Set isolated 2x leverage separately. Compared to the conservative profile
 # this quotes a two-level ladder with 1.5x the inventory cap for higher

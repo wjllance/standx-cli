@@ -1,9 +1,9 @@
 # Conservative XAG-USD maker profile for a 100 DUSD account at isolated 2x.
 #
-# Run with (live mode refuses to start without --alert-webhook):
+# Run with STANDX_SUPERVISOR_WEBHOOK configured in .env.local:
 #   standx --output json maker run XAG-USD \
 #     --maker-config examples/maker-xag-100u-conservative.toml \
-#     --alert-webhook <url> --live --yes
+#     --live --yes
 #
 # Set isolated 2x leverage separately. Quote geometry and the active-exit
 # tuple are unchanged from the production-tested maker-xag-100u.toml profile

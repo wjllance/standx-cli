@@ -2,8 +2,8 @@
 #
 # NOTE: superseded by maker-xag-100u-conservative.toml (same production-tested
 # geometry plus the stop-loss/equity/margin brakes) and, for higher capital
-# utilization, maker-xag-100u-standard.toml. Kept for reference; live mode now
-# additionally requires --alert-webhook on the command line.
+# utilization, maker-xag-100u-standard.toml. Kept for reference; live mode
+# requires STANDX_SUPERVISOR_WEBHOOK via .env.local, environment, or CLI.
 #
 # Run with:
 #   standx --output json maker run XAG-USD \

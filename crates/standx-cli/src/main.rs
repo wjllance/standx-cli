@@ -1,6 +1,7 @@
 use clap::Parser;
 use standx_cli::cli::{
-    load_ws_canary_local_env, AlertWebhookFormat, Cli, Commands, MakerCommands, OutputFormat,
+    load_maker_local_env, should_load_maker_local_env, AlertWebhookFormat, Cli, Commands,
+    MakerCommands, OutputFormat,
 };
 use standx_cli::commands;
 use standx_cli::commands::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
@@ -36,9 +37,9 @@ fn print_splash_screen() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|argument| argument == "ws-command-canary") {
-        if let Err(error) = load_ws_canary_local_env(std::path::Path::new(".env.local")) {
-            eprintln!("failed to read WS canary settings from .env.local: {error}");
+    if should_load_maker_local_env(&args) {
+        if let Err(error) = load_maker_local_env(std::path::Path::new(".env.local")) {
+            eprintln!("failed to read maker settings from .env.local: {error}");
             std::process::exit(2);
         }
     }

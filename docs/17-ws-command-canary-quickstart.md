@@ -21,8 +21,8 @@ chmod 600 .env.local
 git check-ignore .env.local
 ```
 
-CLI 仅在运行 `ws-command-canary` 时自动加载这两个字段。优先级为：命令行参数 >
-进程环境变量 > `.env.local`。
+CLI 在运行 `ws-command-canary` 或 `maker run --live` 时自动加载这两个字段。优先级为：
+命令行参数 > 进程环境变量 > `.env.local`。
 
 ## 2. 构建与认证
 
