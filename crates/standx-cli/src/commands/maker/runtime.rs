@@ -111,11 +111,9 @@ pub(super) fn apply_order_responses(
             price_decimals,
         );
         if let Some(request_id) = request_id {
-            runtime_state.handle(if matched {
-                MakerEvent::OrderResponseMatched(request_id)
-            } else {
-                MakerEvent::OrderResponseUnmatched { request_id, cycle }
-            });
+            if !matched {
+                runtime_state.handle(MakerEvent::OrderResponseUnmatched { request_id });
+            }
         }
         if matches!(
             runtime_state.pending_effect(),
@@ -141,66 +139,64 @@ fn apply_order_response(
     let Some(request_id) = response.request_id.as_deref() else {
         return false;
     };
-    if let Some(cancelled) = projection
-        .pending_cancels()
-        .iter()
-        .find(|pending| pending.request_id == request_id)
-        .cloned()
-    {
-        let generation = projection.generation();
-        projection.apply(
-            generation,
-            AccountProjectionEvent::CancelResolved {
-                request_id: request_id.to_string(),
-            },
-        );
-        // A cancellation rejected because the order is already gone is an
-        // acceptable terminal outcome. The next venue snapshot remains the
-        // authority for whether the order actually disappeared.
-        if !response.accepted() {
-            output::log_maker_event(output::MakerLogEvent {
-                output_format,
-                symbol,
-                cycle,
-                action: "cancel_noop",
-                side: cancelled.side,
-                level: cancelled.level,
-                price: cancelled.price,
-                price_decimals,
-                detail: "order already gone",
-            });
-        }
-        return true;
-    }
-    let Some(pending) = projection
-        .pending_places()
-        .iter()
-        .find(|place| place.request_id == request_id)
-        .cloned()
-    else {
+    let Some(pending) = projection.pending_request(request_id).cloned() else {
         return false;
     };
-    if response.accepted() {
-        return true;
-    }
     let generation = projection.generation();
-    projection.apply(
-        generation,
-        AccountProjectionEvent::PlaceRejected {
-            request_id: request_id.to_string(),
-        },
-    );
-    output::log_maker_event(output::MakerLogEvent {
-        output_format,
-        symbol,
-        cycle,
-        action: "place_rejected_async",
-        side: pending.side,
-        level: pending.level,
-        price: pending.price,
-        price_decimals,
-        detail: &response.message,
-    });
+    match pending {
+        ProjectionPendingRequest::Cancel(cancelled) => {
+            projection.apply(
+                generation,
+                AccountProjectionEvent::CancelResolved {
+                    request_id: request_id.to_string(),
+                },
+            );
+            // A cancellation rejected because the order is already gone is an
+            // acceptable terminal outcome. The next venue snapshot remains the
+            // authority for whether the order actually disappeared.
+            if !response.accepted() {
+                output::log_maker_event(output::MakerLogEvent {
+                    output_format,
+                    symbol,
+                    cycle,
+                    action: "cancel_noop",
+                    side: cancelled.side,
+                    level: cancelled.level,
+                    price: cancelled.price,
+                    price_decimals,
+                    detail: "order already gone",
+                });
+            }
+        }
+        ProjectionPendingRequest::Place(place) => {
+            if response.accepted() {
+                projection.apply(
+                    generation,
+                    AccountProjectionEvent::PlaceAccepted {
+                        request_id: request_id.to_string(),
+                    },
+                );
+            } else {
+                projection.apply(
+                    generation,
+                    AccountProjectionEvent::PlaceRejected {
+                        request_id: request_id.to_string(),
+                    },
+                );
+                output::log_maker_event(output::MakerLogEvent {
+                    output_format,
+                    symbol,
+                    cycle,
+                    action: "place_rejected_async",
+                    side: place.side,
+                    level: place.level,
+                    price: place.price,
+                    price_decimals,
+                    detail: &response.message,
+                });
+            }
+        }
+    }
     true
 }
 
@@ -253,6 +249,16 @@ fn apply_account_events(
         };
         outcome.merge(apply_account_event(event, state, context)?);
     }
+}
+
+fn account_event_invalidates_cycle(event: &AccountEvent) -> bool {
+    matches!(
+        event,
+        AccountEvent::Position(_)
+            | AccountEvent::Trade(_)
+            | AccountEvent::Disconnected { .. }
+            | AccountEvent::Error { .. }
+    )
 }
 
 fn apply_account_event(
@@ -1967,6 +1973,7 @@ pub(super) async fn run_maker(
                     output_format,
                     order_commands: order_commands.as_ref(),
                     order_response_health: order_response_health.as_ref(),
+                    account_stream_health: account_stream_health.as_ref(),
                 },
                 CycleState {
                     resting: &mut resting,
@@ -1992,14 +1999,15 @@ pub(super) async fn run_maker(
                 result.balance,
             ))
         };
-        // Normal stream events that arrive while `work` is placing/cancelling
-        // are buffered so a cycle's own acknowledgements cannot tear apart a
-        // multi-order plan. A stream disconnect is different: it immediately
-        // invalidates the generation, drops this future via `continue 'main`,
-        // and lets the queued Cleanup effect compensate for any request that
-        // may already have reached the venue.
+        // Order lifecycle and balance events are buffered so a cycle's own
+        // acknowledgement cannot tear apart a multi-order plan. Position,
+        // trade, and stream-failure events can change risk or invalidate the
+        // plan. They freeze the reducer before this future is dropped so the
+        // queued Cleanup effect compensates for any request that may already
+        // have reached the venue.
         let mut buffered_account: Vec<AccountEvent> = Vec::new();
         let mut buffered_orders: Vec<OrderResponse> = Vec::new();
+        let mut cycle_invalidated_by_account = false;
         // Scope the pinned work future so it (and its ledger/pending borrows)
         // is dropped once it resolves, before the buffered events are applied.
         let cycle_result = {
@@ -2018,6 +2026,7 @@ pub(super) async fn run_maker(
                     }
                 };
                 tokio::select! {
+                    biased;
                     _ = signal::ctrl_c() => {
                         runtime_state.handle(MakerEvent::CtrlC);
                         break 'main match take_stop_effect(&mut runtime_state) {
@@ -2034,7 +2043,15 @@ pub(super) async fn run_maker(
                             }
                             continue 'main;
                         };
+                        let invalidates = account_event_invalidates_cycle(&event);
                         buffered_account.push(event);
+                        if invalidates {
+                            runtime_state.handle(MakerEvent::CycleInvalidated {
+                                reason: "account state changed during maker cycle".to_string(),
+                            });
+                            cycle_invalidated_by_account = true;
+                            break None;
+                        }
                     },
                     response = order_during_work => {
                         let Some(response) = response else {
@@ -2047,10 +2064,17 @@ pub(super) async fn run_maker(
                         };
                         buffered_orders.push(response);
                     },
-                    result = &mut work => break result,
+                    result = &mut work => break Some(result),
                 }
             }
         };
+        if cycle_invalidated_by_account {
+            if let Some(receiver) = account_events.as_mut() {
+                while let Ok(event) = receiver.try_recv() {
+                    buffered_account.push(event);
+                }
+            }
+        }
         // Apply the events buffered during work, ordering order-responses
         // before account events to mirror the top-of-loop drain.
         for response in buffered_orders {
@@ -2066,11 +2090,9 @@ pub(super) async fn run_maker(
                 cfg.price_decimals,
             );
             if let Some(request_id) = request_id {
-                runtime_state.handle(if matched {
-                    MakerEvent::OrderResponseMatched(request_id)
-                } else {
-                    MakerEvent::OrderResponseUnmatched { request_id, cycle }
-                });
+                if !matched {
+                    runtime_state.handle(MakerEvent::OrderResponseUnmatched { request_id });
+                }
             }
             if matches!(
                 runtime_state.pending_effect(),
@@ -2159,8 +2181,10 @@ pub(super) async fn run_maker(
                 expected: ledger.expected_position,
                 observed,
             }))
-        } else {
+        } else if let Some(cycle_result) = cycle_result {
             cycle_result
+        } else {
+            continue 'main;
         };
 
         if !matches!(
@@ -2348,6 +2372,14 @@ pub(super) async fn run_maker(
                 }
             }
             Err(e) => {
+                if e.downcast_ref::<ProjectionRegistryError>().is_some() {
+                    let detail = format!("order-response correlation failed closed: {e}");
+                    if let Some(health) = order_response_health.as_ref() {
+                        health.mark_unhealthy(detail.clone());
+                    }
+                    runtime_state.handle(MakerEvent::OrderResponseDisconnected(detail));
+                    continue 'main;
+                }
                 if let Some(mismatch) = e.downcast_ref::<PositionReconciliationError>() {
                     runtime_state.handle(MakerEvent::PositionMismatch);
                     let cleanup_token = match take_cleanup_effect(
@@ -2889,7 +2921,7 @@ pub(super) async fn run_maker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use standx_maker::{ProjectionPendingCancel, ProjectionPendingPlace};
+    use standx_maker::{OrderObservation, ProjectionPendingCancel, ProjectionPendingPlace};
     use standx_sdk::account_stream::{OrderUpdate, PositionUpdate};
 
     fn pending_place(request_id: &str) -> ProjectionPendingPlace {
@@ -3003,6 +3035,7 @@ mod tests {
             1,
             "accepted placement stays pending"
         );
+        assert_eq!(projection.pending_request_count(), 0);
     }
 
     #[test]
@@ -3050,6 +3083,74 @@ mod tests {
     }
 
     #[test]
+    fn apply_order_response_matches_rejected_cancel_acknowledgement() {
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        projection.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "cancel-1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 1,
+            }),
+        );
+
+        assert!(apply_order_response(
+            order_response(Some("cancel-1"), 400),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        ));
+        assert!(projection.pending_cancels().is_empty());
+        assert_eq!(projection.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn apply_order_response_matches_late_ack_after_terminal_account_order() {
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        projection.apply(
+            1,
+            AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
+                request_id: "req-1".to_string(),
+                client_order_id: "sxmk-test-q00000001b0".to_string(),
+                side: OrderSide::Buy,
+                price: 100.0,
+                qty: 1.0,
+                level: 0,
+                ref_center: 100.0,
+                cycle: 1,
+            }),
+        );
+        projection.apply(
+            1,
+            AccountProjectionEvent::OrderObserved(OrderObservation {
+                order_id: 7,
+                client_order_id: Some("sxmk-test-q00000001b0".to_string()),
+                side: OrderSide::Buy,
+                price: 100.0,
+                open_qty: 0.0,
+                terminal: true,
+            }),
+        );
+        assert!(projection.pending_places().is_empty());
+        assert_eq!(projection.pending_request_count(), 1);
+
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        ));
+        assert_eq!(projection.pending_request_count(), 0);
+    }
+
+    #[test]
     fn apply_order_response_reports_unmatched_ids() {
         let mut projection = projection_with_pending(&["req-1"]);
         assert!(!apply_order_response(
@@ -3072,7 +3173,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_order_responses_matched_acks_do_not_grow_unmatched_buffer() {
+    fn apply_order_responses_matched_acks_clear_request_registry() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut projection = projection_with_pending(&["req-1", "req-2"]);
         let mut runtime_state = MakerState::starting();
@@ -3100,10 +3201,11 @@ mod tests {
         assert!(runtime_state.pending_effect().is_none());
         // Accepted placements remain pending; the matched arm keeps them.
         assert_eq!(projection.pending_places().len(), 2);
+        assert_eq!(projection.pending_request_count(), 0);
     }
 
     #[test]
-    fn apply_order_responses_matched_clears_prior_unmatched_entry() {
+    fn apply_order_responses_unknown_request_fails_closed() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut projection = projection_with_pending(&[]);
         let mut runtime_state = MakerState::starting();
@@ -3113,9 +3215,8 @@ mod tests {
             Some(MakerEffect::RunCycle(_))
         ));
 
-        // First response has no matching pending placement -> buffered as unmatched.
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
-        apply_order_responses(
+        let error = apply_order_responses(
             &mut rx,
             &mut projection,
             &mut runtime_state,
@@ -3124,26 +3225,41 @@ mod tests {
             1,
             2,
         )
-        .unwrap();
-        assert!(runtime_state.pending_effect().is_none());
+        .unwrap_err();
+        assert!(error.to_string().contains("correlation failed closed"));
+        assert!(matches!(
+            runtime_state.pending_effect(),
+            Some(MakerEffect::AbortInFlight(_))
+        ));
+    }
 
-        // The matching placement arrives later; a matched ack clears the buffer entry.
-        projection.apply(
-            1,
-            AccountProjectionEvent::PlaceSubmitted(pending_place("req-1")),
-        );
-        tx.try_send(order_response(Some("req-1"), 0)).unwrap();
-        apply_order_responses(
-            &mut rx,
-            &mut projection,
-            &mut runtime_state,
-            OutputFormat::Quiet,
-            "BTC-USD",
-            1,
-            2,
-        )
-        .unwrap();
-        assert!(runtime_state.pending_effect().is_none());
+    #[test]
+    fn plan_affecting_account_events_invalidate_cycle_work() {
+        assert!(account_event_invalidates_cycle(&AccountEvent::Position(
+            position_update("BTC-USD", Some(OrderSide::Buy), "0.5")
+        )));
+        assert!(account_event_invalidates_cycle(&AccountEvent::Error {
+            reason: "bad payload".to_string(),
+        }));
+        assert!(!account_event_invalidates_cycle(&AccountEvent::Order(
+            OrderUpdate {
+                seq: 1,
+                order_id: 7,
+                cl_ord_id: Some("sxmk-test-q00000001b0".to_string()),
+                symbol: "BTC-USD".to_string(),
+                side: OrderSide::Buy,
+                qty: "1".to_string(),
+                fill_qty: "0".to_string(),
+                fill_avg_price: "0".to_string(),
+                price: "100".to_string(),
+                status: standx_sdk::models::OrderStatus::Open,
+                reduce_only: false,
+                updated_at: String::new(),
+            }
+        )));
+        assert!(!account_event_invalidates_cycle(&AccountEvent::Connected {
+            epoch: 1,
+        }));
     }
 
     fn drain_positions(events: Vec<AccountEvent>) -> AccountEventOutcome {

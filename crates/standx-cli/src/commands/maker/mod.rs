@@ -3,7 +3,8 @@ use anyhow::Result;
 use standx_maker::{
     self as maker, AccountProjectionEvent, AlertMonitor, MakerAccountProjection, MakerConfig,
     MakerEffect, MakerEvent, MakerFill, MakerLedger, MakerState, MakerStats, PositionAlertAnchor,
-    RecoveryTarget, RestingQuote, RuntimeStopReason, VolBreaker, WorkToken, MAKER_CL_ORD_ID_PREFIX,
+    ProjectionPendingRequest, ProjectionRegistryError, RecoveryTarget, RestingQuote,
+    RuntimeStopReason, VolBreaker, WorkToken, MAKER_CL_ORD_ID_PREFIX,
 };
 use standx_sdk::account_stream::{
     AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,

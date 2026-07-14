@@ -14,6 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_ORDER_RESPONSE_URL: &str = "wss://perps.standx.com/ws-api/v1";
+const ORDER_RESPONSE_ROTATE_AFTER: Duration = Duration::from_secs(23 * 60 * 60 + 50 * 60);
+const ORDER_RESPONSE_PING_INTERVAL: Duration = Duration::from_secs(30);
 /// A healthy server sends a ping about every 10 seconds; a longer silent
 /// interval means the connection may be half-open and cannot be trusted.
 const ORDER_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -41,7 +43,9 @@ pub struct OrderResponseStream {
     token: String,
     signer: Option<Arc<StandXSigner>>,
     session_id: String,
+    ping_interval: Duration,
     idle_timeout: Duration,
+    rotate_after: Duration,
 }
 
 /// Sender for authenticated `order:new` and `order:cancel` WebSocket commands.
@@ -182,7 +186,9 @@ impl OrderResponseStream {
                 .transpose()?
                 .map(Arc::new),
             session_id: session_id.into(),
+            ping_interval: ORDER_RESPONSE_PING_INTERVAL,
             idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
+            rotate_after: ORDER_RESPONSE_ROTATE_AFTER,
         })
     }
 
@@ -197,7 +203,9 @@ impl OrderResponseStream {
             token: token.into(),
             signer: None,
             session_id: session_id.into(),
+            ping_interval: ORDER_RESPONSE_PING_INTERVAL,
             idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
+            rotate_after: ORDER_RESPONSE_ROTATE_AFTER,
         }
     }
 
@@ -213,13 +221,28 @@ impl OrderResponseStream {
             token: token.into(),
             signer: Some(Arc::new(signer)),
             session_id: session_id.into(),
+            ping_interval: ORDER_RESPONSE_PING_INTERVAL,
             idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
+            rotate_after: ORDER_RESPONSE_ROTATE_AFTER,
         }
     }
 
     #[cfg(test)]
     fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_liveness(
+        mut self,
+        ping_interval: Duration,
+        idle_timeout: Duration,
+        rotate_after: Duration,
+    ) -> Self {
+        self.ping_interval = ping_interval;
+        self.idle_timeout = idle_timeout;
+        self.rotate_after = rotate_after;
         self
     }
 
@@ -291,12 +314,33 @@ impl OrderResponseStream {
         };
         let health = OrderResponseHealth::default();
         let task_health = health.clone();
+        let ping_interval = self.ping_interval;
         let idle_timeout = self.idle_timeout;
+        let rotate_after = self.rotate_after;
         let handle = tokio::spawn(async move {
+            let rotation = tokio::time::sleep(rotate_after);
+            tokio::pin!(rotation);
+            let mut ping = tokio::time::interval_at(
+                tokio::time::Instant::now() + ping_interval,
+                ping_interval,
+            );
+            ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let idle = tokio::time::sleep(idle_timeout);
             tokio::pin!(idle);
             loop {
                 tokio::select! {
+                    _ = &mut rotation => {
+                        task_health.mark_unhealthy("order-response stream proactive 23h50m rotation");
+                        return;
+                    }
+                    _ = ping.tick() => {
+                        if let Err(error) = write.send(Message::Ping(Vec::new().into())).await {
+                            task_health.mark_unhealthy(format!(
+                                "failed to send order-response ping: {error}"
+                            ));
+                            return;
+                        }
+                    }
                     command = command_rx.recv() => {
                         let Some(command) = command else {
                             task_health.mark_unhealthy("order-command sender dropped".to_string());
@@ -327,11 +371,24 @@ impl OrderResponseStream {
                             .reset(tokio::time::Instant::now() + idle_timeout);
                         match message {
                         Some(Ok(Message::Text(text))) => {
-                            if let Ok(response) = serde_json::from_str::<OrderResponse>(&text) {
-                                if tx.send(response).await.is_err() {
-                                    task_health.mark_unhealthy("order-response receiver dropped".to_string());
+                            let response = match serde_json::from_str::<OrderResponse>(&text) {
+                                Ok(response) if response.request_id.is_some() => response,
+                                Ok(_) => {
+                                    task_health.mark_unhealthy(
+                                        "invalid order-response payload: missing request_id"
+                                    );
                                     return;
                                 }
+                                Err(error) => {
+                                    task_health.mark_unhealthy(format!(
+                                        "invalid order-response payload: {error}"
+                                    ));
+                                    return;
+                                }
+                            };
+                            if tx.send(response).await.is_err() {
+                                task_health.mark_unhealthy("order-response receiver dropped".to_string());
+                                return;
                             }
                         }
                         Some(Ok(Message::Ping(payload))) => {
@@ -676,7 +733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_sender_writes_signed_cancel_and_delivers_correlated_response() {
+    async fn command_sender_writes_signed_cancel_and_delivers_correlated_rejection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -723,8 +780,8 @@ mod tests {
             websocket
                 .send(Message::Text(
                     serde_json::json!({
-                        "code": 0,
-                        "message": "accepted",
+                        "code": 400,
+                        "message": "order already closed",
                         "request_id": command["request_id"],
                     })
                     .to_string()
@@ -746,9 +803,212 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response.request_id.as_deref(), Some(request_id.as_str()));
-        assert!(response.accepted());
+        assert!(!response.accepted());
+        assert_eq!(response.message, "order already closed");
         server.await.unwrap();
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn client_heartbeat_keeps_an_observably_live_connection_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (ping_seen_tx, ping_seen_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let frame = websocket.next().await.unwrap().unwrap();
+            let Message::Ping(payload) = frame else {
+                panic!("expected client heartbeat ping, got {frame:?}");
+            };
+            websocket.send(Message::Pong(payload)).await.unwrap();
+            let _ = ping_seen_tx.send(());
+            let _ = finish_rx.await;
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session")
+            .with_liveness(
+                Duration::from_millis(25),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            );
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), ping_seen_rx)
+            .await
+            .expect("client heartbeat should arrive")
+            .unwrap();
+        assert!(health.is_healthy());
+        let _ = finish_tx.send(());
+        handle.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_response_marks_stream_unhealthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text("{malformed".into()))
+                .await
+                .unwrap();
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("malformed response should stop the stream task")
+            .unwrap();
+        assert!(!health.is_healthy());
+        assert!(health
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("invalid order-response payload")));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_without_request_id_marks_stream_unhealthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "uncorrelated",
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("missing request ID should stop the stream task")
+            .unwrap();
+        assert!(!health.is_healthy());
+        assert!(health
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("missing request_id")));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proactive_rotation_marks_stream_unhealthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while websocket.next().await.is_some() {}
+        });
+
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session")
+            .with_liveness(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_millis(50),
+            );
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("proactive rotation should stop the stream task")
+            .unwrap();
+        assert!(!health.is_healthy());
+        assert!(health
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("proactive 23h50m rotation")));
+        server.await.unwrap();
     }
 
     #[tokio::test]

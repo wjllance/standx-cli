@@ -8,9 +8,11 @@ use super::recovery::PositionReconciliationError;
 use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{
-    self as maker, AccountProjectionEvent, MakerFill, MakerLedger, MakerStats,
-    ProjectionPendingCancel, ProjectionPendingPlace, RestingQuote,
+    self as maker, AccountProjectionEvent, MakerAccountProjection, MakerFill, MakerLedger,
+    MakerStats, ProjectionPendingCancel, ProjectionPendingPlace, ProjectionRegistryError,
+    RestingQuote, MAX_PENDING_ORDER_REQUESTS,
 };
+use standx_sdk::account_stream::AccountStreamHealth;
 #[cfg(test)]
 use standx_sdk::account_stream::{OrderUpdate, TradeUpdate};
 use standx_sdk::client::order::CreateOrderParams;
@@ -45,6 +47,56 @@ fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<Stri
     }
 }
 
+fn unhealthy_account_stream(health: Option<&AccountStreamHealth>) -> Option<String> {
+    match health {
+        Some(health) if health.is_healthy() => None,
+        Some(health) => Some(health.failure_reason().unwrap_or_else(|| {
+            "account stream became unhealthy without a recorded reason".to_string()
+        })),
+        None => Some("account stream health state is unavailable".to_string()),
+    }
+}
+
+fn ensure_live_streams_healthy(
+    account_health: Option<&AccountStreamHealth>,
+    order_health: Option<&OrderResponseHealth>,
+) -> Result<()> {
+    if let Some(reason) = unhealthy_account_stream(account_health) {
+        return Err(anyhow::anyhow!(
+            "{reason}; refusing further live order actions"
+        ));
+    }
+    if let Some(reason) = unhealthy_order_response(order_health) {
+        return Err(anyhow::anyhow!(
+            "{reason}; refusing further live order actions"
+        ));
+    }
+    Ok(())
+}
+
+fn apply_request_submission(
+    projection: &mut MakerAccountProjection,
+    event: AccountProjectionEvent,
+) -> Result<()> {
+    let generation = projection.generation();
+    let outcome = projection.apply(generation, event);
+    match outcome.request_registry_error {
+        Some(error) => Err(anyhow::Error::new(error)),
+        None => Ok(()),
+    }
+}
+
+fn ensure_request_registry_capacity(projection: Option<&MakerAccountProjection>) -> Result<()> {
+    let projection =
+        projection.ok_or_else(|| anyhow::anyhow!("live maker request registry is unavailable"))?;
+    if projection.pending_request_count() >= MAX_PENDING_ORDER_REQUESTS {
+        return Err(anyhow::Error::new(ProjectionRegistryError::Capacity {
+            limit: MAX_PENDING_ORDER_REQUESTS,
+        }));
+    }
+    Ok(())
+}
+
 fn live_order_commands(commands: Option<&OrderCommandSender>) -> Result<&OrderCommandSender> {
     commands.ok_or_else(|| anyhow::anyhow!("order-command stream is unavailable"))
 }
@@ -74,6 +126,7 @@ pub(super) async fn maker_cycle(
         output_format,
         order_commands,
         order_response_health,
+        account_stream_health,
     } = request;
     let CycleState {
         resting,
@@ -384,7 +437,9 @@ pub(super) async fn maker_cycle(
                 ..
             } => {
                 if live {
+                    ensure_live_streams_healthy(account_stream_health, order_response_health)?;
                     if let Some(id) = order_id {
+                        ensure_request_registry_capacity(account_projection.as_deref())?;
                         match live_order_commands(order_commands)?.cancel_order(id).await {
                             Ok(request_id) => {
                                 let order_id = id.parse::<u64>().map_err(|_| {
@@ -395,9 +450,8 @@ pub(super) async fn maker_cycle(
                                 let projection = account_projection.as_deref_mut().expect(
                                     "live maker cycles require initialized account projection",
                                 );
-                                let generation = projection.generation();
-                                projection.apply(
-                                    generation,
+                                apply_request_submission(
+                                    projection,
                                     AccountProjectionEvent::CancelSubmitted(
                                         ProjectionPendingCancel {
                                             request_id,
@@ -408,7 +462,7 @@ pub(super) async fn maker_cycle(
                                             cycle,
                                         },
                                     ),
-                                );
+                                )?;
                                 cancels += 1;
                             }
                             Err(e) => return Err(e.into()),
@@ -421,9 +475,8 @@ pub(super) async fn maker_cycle(
             }
             Action::Place(q) => {
                 if live {
-                    if let Some(reason) = unhealthy_order_response(order_response_health) {
-                        return Err(anyhow::anyhow!("{reason}; refusing live placement"));
-                    }
+                    ensure_live_streams_healthy(account_stream_health, order_response_health)?;
+                    ensure_request_registry_capacity(account_projection.as_deref())?;
                     let cl_ord_id =
                         maker::quote_client_order_id(run_order_prefix, cycle, q.side, q.level);
                     let request_id = live_order_commands(order_commands)?
@@ -446,9 +499,8 @@ pub(super) async fn maker_cycle(
                     let projection = account_projection
                         .as_deref_mut()
                         .expect("live maker cycles require initialized account projection");
-                    let generation = projection.generation();
-                    projection.apply(
-                        generation,
+                    apply_request_submission(
+                        projection,
                         AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
                             request_id,
                             client_order_id: cl_ord_id,
@@ -459,7 +511,7 @@ pub(super) async fn maker_cycle(
                             ref_center,
                             cycle,
                         }),
-                    );
+                    )?;
                     places += 1;
                 } else {
                     resting.push(RestingQuote {
@@ -488,9 +540,8 @@ pub(super) async fn maker_cycle(
                 && projection.pending_cancels().is_empty()
         });
         if account_clear {
-            if let Some(reason) = unhealthy_order_response(order_response_health) {
-                return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
-            }
+            ensure_live_streams_healthy(account_stream_health, order_response_health)?;
+            ensure_request_registry_capacity(account_projection.as_deref())?;
             let cl_ord_id = maker::exit_client_order_id(run_order_prefix, cycle);
             let request_id = live_order_commands(order_commands)?
                 .create_order(&CreateOrderParams {
@@ -515,9 +566,8 @@ pub(super) async fn maker_cycle(
             let projection = account_projection
                 .as_deref_mut()
                 .expect("live inventory exits require initialized account projection");
-            let generation = projection.generation();
-            projection.apply(
-                generation,
+            apply_request_submission(
+                projection,
                 AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
                     request_id,
                     client_order_id: cl_ord_id,
@@ -528,7 +578,7 @@ pub(super) async fn maker_cycle(
                     ref_center: mark,
                     cycle,
                 }),
-            );
+            )?;
             *inventory_exit_pending = true;
             log_maker_event(MakerLogEvent {
                 output_format,
