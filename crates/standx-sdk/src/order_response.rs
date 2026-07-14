@@ -13,6 +13,13 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_ORDER_RESPONSE_URL: &str = "wss://perps.standx.com/ws-api/v1";
+/// If no inbound frame arrives within this window the connection is treated as
+/// stale. The server sends a WebSocket ping every ~10s, so any healthy
+/// connection produces inbound frames well inside this deadline; a longer gap
+/// means the socket is half-open (peer gone, no error or close frame) and the
+/// maker must stop trusting the confirmation stream instead of placing live
+/// orders whose acknowledgements can never arrive.
+const ORDER_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Asynchronous acceptance or rejection for an order request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +42,7 @@ pub struct OrderResponseStream {
     url: String,
     token: String,
     session_id: String,
+    idle_timeout: Duration,
 }
 
 /// Shared liveness state for an authenticated order-response connection.
@@ -95,6 +103,7 @@ impl OrderResponseStream {
             url: DEFAULT_ORDER_RESPONSE_URL.to_string(),
             token: credentials.token,
             session_id: session_id.into(),
+            idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
         })
     }
 
@@ -108,7 +117,14 @@ impl OrderResponseStream {
             url: url.into(),
             token: token.into(),
             session_id: session_id.into(),
+            idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
         }
+    }
+
+    #[cfg(test)]
+    fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     pub fn session_id(&self) -> &str {
@@ -172,13 +188,40 @@ impl OrderResponseStream {
         let (tx, rx) = mpsc::channel(256);
         let health = OrderResponseHealth::default();
         let task_health = health.clone();
+        let idle_timeout = self.idle_timeout;
         let handle = tokio::spawn(async move {
-            while let Some(message) = read.next().await {
+            // Read-side idle deadline, reset on every inbound frame. This is the
+            // only defence against a half-open socket: the peer stops sending
+            // (including its ~10s server ping) but the connection never errors
+            // or delivers a close frame, so `read.next()` would otherwise block
+            // forever with the stream still reported healthy.
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            loop {
+                let message = tokio::select! {
+                    _ = &mut idle => {
+                        task_health.mark_unhealthy(format!(
+                            "order-response stream idle for {}s (no ping/pong/data; connection likely half-open)",
+                            idle_timeout.as_secs()
+                        ));
+                        return;
+                    }
+                    message = read.next() => message,
+                };
+                // Any inbound frame proves the peer is alive; extend the deadline.
+                idle.as_mut()
+                    .reset(tokio::time::Instant::now() + idle_timeout);
+                let Some(message) = message else {
+                    task_health.mark_unhealthy(
+                        "order-response WebSocket ended without a close frame or reported error",
+                    );
+                    return;
+                };
                 match message {
                     Ok(Message::Text(text)) => {
                         if let Ok(response) = serde_json::from_str::<OrderResponse>(&text) {
                             if tx.send(response).await.is_err() {
-                                break;
+                                return;
                             }
                         }
                     }
@@ -212,9 +255,6 @@ impl OrderResponseStream {
                     _ => {}
                 }
             }
-            task_health.mark_unhealthy(
-                "order-response WebSocket ended without a close frame or reported error",
-            );
         });
 
         Ok((rx, health, handle))
@@ -323,6 +363,60 @@ mod tests {
         assert!(health
             .failure_reason()
             .is_some_and(|reason| reason.contains("order-response WebSocket")));
+    }
+
+    #[tokio::test]
+    async fn idle_connection_is_marked_unhealthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        // Server authenticates then stays connected but silent — no data, no
+        // server ping, no close frame — simulating a half-open connection that
+        // never errors. Only the client's idle deadline can detect this.
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            // Hold the socket open and silent, absorbing any client frames so
+            // the client can only detect death via the idle timeout.
+            while let Some(Ok(_)) = websocket.next().await {}
+        });
+
+        // Idle timeout far below the 10s server-ping cadence so the deadline,
+        // not a real close/error, is what trips health.
+        let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session")
+            .with_idle_timeout(Duration::from_millis(200));
+        let (_responses, health, handle) = stream.connect().await.unwrap();
+        assert!(health.is_healthy());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while health.is_healthy() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle timeout should mark the response stream unhealthy");
+        handle.await.unwrap();
+        let reason = health.failure_reason().unwrap();
+        assert!(reason.contains("idle"), "{reason}");
+        server.abort();
     }
 
     #[tokio::test]
