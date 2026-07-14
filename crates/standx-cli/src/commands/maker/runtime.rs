@@ -1,5 +1,11 @@
+use super::model::PendingCancel;
 use super::*;
 use standx_sdk::order_response::OrderResponse;
+
+pub(super) struct PendingOrderCommands<'a> {
+    pub(super) places: &'a mut Vec<PendingPlace>,
+    pub(super) cancels: &'a mut Vec<PendingCancel>,
+}
 
 fn next_runtime_effect(runtime_state: &mut MakerState) -> Option<MakerEffect> {
     runtime_state.next_effect().map(|effect| match effect {
@@ -84,7 +90,7 @@ fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason
 
 pub(super) fn apply_order_responses(
     receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
-    pending: &mut Vec<PendingPlace>,
+    pending: PendingOrderCommands<'_>,
     runtime_state: &mut MakerState,
     output_format: OutputFormat,
     symbol: &str,
@@ -104,7 +110,8 @@ pub(super) fn apply_order_responses(
         let request_id = response.request_id.clone();
         let matched = apply_order_response(
             response,
-            pending,
+            pending.places,
+            pending.cancels,
             output_format,
             symbol,
             cycle,
@@ -133,6 +140,7 @@ pub(super) fn apply_order_responses(
 fn apply_order_response(
     response: OrderResponse,
     pending: &mut Vec<PendingPlace>,
+    pending_cancels: &mut Vec<PendingCancel>,
     output_format: OutputFormat,
     symbol: &str,
     cycle: u64,
@@ -141,6 +149,29 @@ fn apply_order_response(
     let Some(request_id) = response.request_id.as_deref() else {
         return false;
     };
+    if let Some(index) = pending_cancels
+        .iter()
+        .position(|pending| pending.request_id == request_id)
+    {
+        let cancelled = pending_cancels.remove(index);
+        // A cancellation rejected because the order is already gone is an
+        // acceptable terminal outcome. The next venue snapshot remains the
+        // authority for whether the order actually disappeared.
+        if !response.accepted() {
+            output::log_maker_event(output::MakerLogEvent {
+                output_format,
+                symbol,
+                cycle,
+                action: "cancel_noop",
+                side: cancelled.side,
+                level: cancelled.level,
+                price: cancelled.price,
+                price_decimals,
+                detail: "order already gone",
+            });
+        }
+        return true;
+    }
     let Some(index) = pending
         .iter()
         .position(|place| place.request_id == request_id)
@@ -691,6 +722,7 @@ pub(super) async fn run_maker(
 
     // ---- Live gating & clean start ----
     let mut order_responses = None;
+    let mut order_commands = None;
     let mut order_response_health = None;
     let mut order_response_handle = None;
     let mut account_events = None;
@@ -875,7 +907,7 @@ pub(super) async fn run_maker(
                 .as_deref()
                 .expect("live maker must have an order session"),
         )?;
-        let (responses, health, handle) = stream.connect().await?;
+        let (commands, responses, health, handle) = stream.connect().await?;
         if let Some(after) = args.controlled_disconnect_after {
             let health_for_fault = health.clone();
             let abort = handle.abort_handle();
@@ -894,6 +926,7 @@ pub(super) async fn run_maker(
             );
         }
         order_responses = Some(responses);
+        order_commands = Some(commands);
         order_response_health = Some(health);
         order_response_handle = Some(handle);
         emit_ledger_sync(
@@ -1067,6 +1100,7 @@ pub(super) async fn run_maker(
     let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
     let mut adopted: HashMap<String, (u32, f64, u64)> = HashMap::new(); // id -> (level, ref_mark, cycle)
     let mut pending: Vec<PendingPlace> = Vec::new();
+    let mut pending_cancels: Vec<PendingCancel> = Vec::new();
     let mut inventory_exit_pending = false;
     let mut ledger = MakerLedger::new(starting_position);
     let mut position_alert_anchor =
@@ -1207,6 +1241,7 @@ pub(super) async fn run_maker(
                 resting.clear();
                 adopted.clear();
                 pending.clear();
+                pending_cancels.clear();
                 inventory_exit_pending = false;
                 if let Some(handle) = account_stream_handle.take() {
                     handle.abort();
@@ -1509,6 +1544,7 @@ pub(super) async fn run_maker(
                 resting.clear();
                 adopted.clear();
                 pending.clear();
+                pending_cancels.clear();
                 inventory_exit_pending = false;
                 runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
                 let recovery_token =
@@ -1526,6 +1562,7 @@ pub(super) async fn run_maker(
                         handle.abort();
                     }
                     order_responses.take();
+                    order_commands.take();
                     match reconnect_order_response(ReconnectRequest {
                         cleanup_client: client.clone(),
                         symbol: &symbol,
@@ -1543,6 +1580,7 @@ pub(super) async fn run_maker(
                     {
                         Ok((reconnected, attempts_used)) => {
                             client = reconnected.client;
+                            order_commands = Some(reconnected.commands);
                             order_responses = Some(reconnected.responses);
                             order_response_health = Some(reconnected.health);
                             order_response_handle = Some(reconnected.handle);
@@ -1552,6 +1590,7 @@ pub(super) async fn run_maker(
                             resting.clear();
                             adopted.clear();
                             pending.clear();
+                            pending_cancels.clear();
                             consecutive_errors = 0;
                             runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                             notifier
@@ -1696,7 +1735,10 @@ pub(super) async fn run_maker(
         if let Some(receiver) = order_responses.as_mut() {
             if let Err(error) = apply_order_responses(
                 receiver,
-                &mut pending,
+                PendingOrderCommands {
+                    places: &mut pending,
+                    cancels: &mut pending_cancels,
+                },
                 &mut runtime_state,
                 output_format,
                 &symbol,
@@ -1835,12 +1877,14 @@ pub(super) async fn run_maker(
                     run_order_prefix: &run_order_prefix,
                     starting_position,
                     output_format,
+                    order_commands: order_commands.as_ref(),
                     order_response_health: order_response_health.as_ref(),
                 },
                 CycleState {
                     resting: &mut resting,
                     adopted: &mut adopted,
                     pending: &mut pending,
+                    pending_cancels: &mut pending_cancels,
                     inventory_exit_pending: &mut inventory_exit_pending,
                     ledger: &mut ledger,
                     sim_position: &mut sim_position,
@@ -1928,6 +1972,7 @@ pub(super) async fn run_maker(
             let matched = apply_order_response(
                 response,
                 &mut pending,
+                &mut pending_cancels,
                 output_format,
                 &symbol,
                 cycle,
@@ -2274,6 +2319,7 @@ pub(super) async fn run_maker(
                     resting.clear();
                     adopted.clear();
                     pending.clear();
+                    pending_cancels.clear();
                     inventory_exit_pending = false;
                     runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
                     let recovery_token = match take_recovery_effect(
@@ -2826,9 +2872,11 @@ mod tests {
     #[test]
     fn apply_order_response_keeps_accepted_placement() {
         let mut pending = vec![pending_place("req-1")];
+        let mut pending_cancels = Vec::new();
         let matched = apply_order_response(
             order_response(Some("req-1"), 0),
             &mut pending,
+            &mut pending_cancels,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
@@ -2841,9 +2889,11 @@ mod tests {
     #[test]
     fn apply_order_response_drops_rejected_placement() {
         let mut pending = vec![pending_place("req-1")];
+        let mut pending_cancels = Vec::new();
         let matched = apply_order_response(
             order_response(Some("req-1"), 1),
             &mut pending,
+            &mut pending_cancels,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
@@ -2854,11 +2904,36 @@ mod tests {
     }
 
     #[test]
+    fn apply_order_response_matches_cancel_acknowledgement() {
+        let mut pending = Vec::new();
+        let mut pending_cancels = vec![PendingCancel {
+            request_id: "cancel-1".to_string(),
+            side: OrderSide::Buy,
+            level: 0,
+            price: 100.0,
+            cycle: 1,
+        }];
+
+        assert!(apply_order_response(
+            order_response(Some("cancel-1"), 0),
+            &mut pending,
+            &mut pending_cancels,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        ));
+        assert!(pending_cancels.is_empty());
+    }
+
+    #[test]
     fn apply_order_response_reports_unmatched_ids() {
         let mut pending = vec![pending_place("req-1")];
+        let mut pending_cancels = Vec::new();
         assert!(!apply_order_response(
             order_response(Some("other"), 0),
             &mut pending,
+            &mut pending_cancels,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
@@ -2867,6 +2942,7 @@ mod tests {
         assert!(!apply_order_response(
             order_response(None, 0),
             &mut pending,
+            &mut pending_cancels,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
@@ -2879,6 +2955,7 @@ mod tests {
     fn apply_order_responses_matched_acks_do_not_grow_unmatched_buffer() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut pending = vec![pending_place("req-1"), pending_place("req-2")];
+        let mut pending_cancels = Vec::new();
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
         assert!(matches!(
@@ -2892,7 +2969,10 @@ mod tests {
 
         apply_order_responses(
             &mut rx,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -2910,6 +2990,7 @@ mod tests {
     fn apply_order_responses_matched_clears_prior_unmatched_entry() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut pending = Vec::new();
+        let mut pending_cancels = Vec::new();
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
         assert!(matches!(
@@ -2921,7 +3002,10 @@ mod tests {
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
         apply_order_responses(
             &mut rx,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -2936,7 +3020,10 @@ mod tests {
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
         apply_order_responses(
             &mut rx,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",

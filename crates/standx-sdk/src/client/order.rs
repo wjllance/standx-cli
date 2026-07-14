@@ -154,7 +154,7 @@ impl StandXClient {
     }
 }
 
-fn create_order_body(params: &CreateOrderParams) -> serde_json::Value {
+pub(crate) fn create_order_body(params: &CreateOrderParams) -> serde_json::Value {
     let order_type = match params.order_type {
         OrderType::Market => "market",
         OrderType::Limit => "limit",
@@ -199,7 +199,7 @@ fn create_order_body(params: &CreateOrderParams) -> serde_json::Value {
     body
 }
 
-fn cancel_order_body(order_id: i64) -> serde_json::Value {
+pub(crate) fn cancel_order_body(order_id: i64) -> serde_json::Value {
     json!({ "order_id": order_id })
 }
 

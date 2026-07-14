@@ -1,10 +1,10 @@
-use super::model::PendingPlace;
+use super::model::{PendingCancel, PendingPlace};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{MakerConfig, MakerLedger, MakerStats, RestingQuote, VolBreaker};
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, Order, Position, Trade};
-use standx_sdk::order_response::OrderResponseHealth;
+use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -29,6 +29,7 @@ pub(super) struct CycleRequest<'a> {
     pub(super) run_order_prefix: &'a str,
     pub(super) starting_position: f64,
     pub(super) output_format: OutputFormat,
+    pub(super) order_commands: Option<&'a OrderCommandSender>,
     pub(super) order_response_health: Option<&'a OrderResponseHealth>,
 }
 
@@ -36,6 +37,7 @@ pub(super) struct CycleState<'a> {
     pub(super) resting: &'a mut Vec<RestingQuote>,
     pub(super) adopted: &'a mut HashMap<String, (u32, f64, u64)>,
     pub(super) pending: &'a mut Vec<PendingPlace>,
+    pub(super) pending_cancels: &'a mut Vec<PendingCancel>,
     pub(super) inventory_exit_pending: &'a mut bool,
     pub(super) ledger: &'a mut MakerLedger,
     pub(super) sim_position: &'a mut f64,

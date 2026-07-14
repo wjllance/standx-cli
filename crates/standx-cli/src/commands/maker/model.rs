@@ -1,3 +1,4 @@
+#[cfg(test)]
 use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide, Position};
 
@@ -120,6 +121,18 @@ pub(super) struct PendingPlace {
     pub(super) cycle: u64,
 }
 
+/// A cancellation whose asynchronous order-response acknowledgement has not
+/// arrived yet. Cancellation state does not reserve a quote slot, but it must
+/// be correlated so a normal `order:cancel` response cannot look like an
+/// unknown response from a stale generation.
+pub(super) struct PendingCancel {
+    pub(super) request_id: String,
+    pub(super) side: OrderSide,
+    pub(super) level: u32,
+    pub(super) price: f64,
+    pub(super) cycle: u64,
+}
+
 pub(super) fn is_maker_order(order: &Order) -> bool {
     standx_maker::is_maker_client_order_id(order.cl_ord_id.as_deref())
 }
@@ -158,6 +171,7 @@ pub(super) fn signed_position_quantity(
     })
 }
 
+#[cfg(test)]
 pub(super) fn is_order_rejection(error: &StandxError) -> bool {
     matches!(
         error,

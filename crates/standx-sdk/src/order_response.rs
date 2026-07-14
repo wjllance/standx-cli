@@ -1,6 +1,7 @@
-//! Correlated asynchronous responses for HTTP order requests.
+//! Correlated asynchronous responses and command submission for order requests.
 
-use crate::auth::Credentials;
+use crate::auth::{Credentials, StandXSigner};
+use crate::client::order::{cancel_order_body, create_order_body, CreateOrderParams};
 use crate::error::{Error, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -9,17 +10,14 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_ORDER_RESPONSE_URL: &str = "wss://perps.standx.com/ws-api/v1";
-/// If no inbound frame arrives within this window the connection is treated as
-/// stale. The server sends a WebSocket ping every ~10s, so any healthy
-/// connection produces inbound frames well inside this deadline; a longer gap
-/// means the socket is half-open (peer gone, no error or close frame) and the
-/// maker must stop trusting the confirmation stream instead of placing live
-/// orders whose acknowledgements can never arrive.
+/// A healthy server sends a ping about every 10 seconds; a longer silent
+/// interval means the connection may be half-open and cannot be trusted.
 const ORDER_RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+const ORDER_COMMAND_QUEUE_CAPACITY: usize = 256;
 
 /// Asynchronous acceptance or rejection for an order request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,8 +39,85 @@ impl OrderResponse {
 pub struct OrderResponseStream {
     url: String,
     token: String,
+    signer: Option<Arc<StandXSigner>>,
     session_id: String,
     idle_timeout: Duration,
+}
+
+/// Sender for authenticated `order:new` and `order:cancel` WebSocket commands.
+///
+/// A successful call means the complete frame was written to the local
+/// WebSocket sink. It does *not* mean the venue accepted the order; callers
+/// must still correlate the returned request ID with [`OrderResponse`] and
+/// account-order events.
+#[derive(Clone, Debug)]
+pub struct OrderCommandSender {
+    session_id: String,
+    signer: Option<Arc<StandXSigner>>,
+    commands: mpsc::Sender<OutboundOrderCommand>,
+}
+
+struct OutboundOrderCommand {
+    text: String,
+    written: oneshot::Sender<Result<()>>,
+}
+
+impl OrderCommandSender {
+    /// Submit a signed order creation request over the authenticated socket.
+    pub async fn create_order(&self, params: &CreateOrderParams) -> Result<String> {
+        self.submit("order:new", create_order_body(params).to_string())
+            .await
+    }
+
+    /// Submit a signed cancellation request by exchange order ID.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<String> {
+        let order_id = order_id.parse::<i64>().map_err(|_| Error::Validation {
+            field: "order_id".to_string(),
+            message: format!("expected an integer order ID, got '{order_id}'"),
+        })?;
+        self.submit("order:cancel", cancel_order_body(order_id).to_string())
+            .await
+    }
+
+    async fn submit(&self, method: &str, params: String) -> Result<String> {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        // The WebSocket envelope request ID is the asynchronous response
+        // correlation key. The signature carries its own request ID, just as
+        // the HTTP headers do, so the two protocol roles cannot be confused.
+        let signer = self.signer.as_ref().ok_or_else(|| Error::AuthRequired {
+            message: "order command stream requires an Ed25519 private key".to_string(),
+            resolution: "Run 'standx auth login' with --private-key before live trading"
+                .to_string(),
+        })?;
+        let signature = signer.sign_request_now(&params);
+        let text = serde_json::json!({
+            "session_id": self.session_id,
+            "request_id": request_id,
+            "method": method,
+            "header": {
+                "x-request-sign-version": signature.version,
+                "x-request-id": signature.request_id,
+                "x-request-timestamp": signature.timestamp.to_string(),
+                "x-request-signature": signature.signature,
+            },
+            "params": params,
+        })
+        .to_string();
+        let (written_tx, written_rx) = oneshot::channel();
+        self.commands
+            .send(OutboundOrderCommand {
+                text,
+                written: written_tx,
+            })
+            .await
+            .map_err(|_| Error::WebSocket {
+                message: "order-command stream is unavailable".to_string(),
+            })?;
+        written_rx.await.map_err(|_| Error::WebSocket {
+            message: "order-command stream stopped before writing request".to_string(),
+        })??;
+        Ok(request_id)
+    }
 }
 
 /// Shared liveness state for an authenticated order-response connection.
@@ -102,6 +177,10 @@ impl OrderResponseStream {
         Ok(Self {
             url: DEFAULT_ORDER_RESPONSE_URL.to_string(),
             token: credentials.token,
+            signer: (!credentials.private_key.is_empty())
+                .then(|| StandXSigner::from_base58(&credentials.private_key))
+                .transpose()?
+                .map(Arc::new),
             session_id: session_id.into(),
             idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
         })
@@ -116,6 +195,23 @@ impl OrderResponseStream {
         Self {
             url: url.into(),
             token: token.into(),
+            signer: None,
+            session_id: session_id.into(),
+            idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_url_token_and_signer(
+        url: impl Into<String>,
+        token: impl Into<String>,
+        session_id: impl Into<String>,
+        signer: StandXSigner,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            token: token.into(),
+            signer: Some(Arc::new(signer)),
             session_id: session_id.into(),
             idle_timeout: ORDER_RESPONSE_IDLE_TIMEOUT,
         }
@@ -131,11 +227,12 @@ impl OrderResponseStream {
         &self.session_id
     }
 
-    /// Connect, wait for a successful authentication acknowledgement, and
-    /// return parsed asynchronous order responses plus a shared liveness flag.
+    /// Connect, wait for authentication, and return a command sender,
+    /// asynchronous responses, shared liveness state, and supervisor handle.
     pub async fn connect(
         &self,
     ) -> Result<(
+        OrderCommandSender,
         mpsc::Receiver<OrderResponse>,
         OrderResponseHealth,
         tokio::task::JoinHandle<()>,
@@ -185,20 +282,38 @@ impl OrderResponseStream {
             });
         }
 
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::channel(ORDER_COMMAND_QUEUE_CAPACITY);
+        let (command_tx, mut command_rx) = mpsc::channel(ORDER_COMMAND_QUEUE_CAPACITY);
+        let commands = OrderCommandSender {
+            session_id: self.session_id.clone(),
+            signer: self.signer.clone(),
+            commands: command_tx,
+        };
         let health = OrderResponseHealth::default();
         let task_health = health.clone();
         let idle_timeout = self.idle_timeout;
         let handle = tokio::spawn(async move {
-            // Read-side idle deadline, reset on every inbound frame. This is the
-            // only defence against a half-open socket: the peer stops sending
-            // (including its ~10s server ping) but the connection never errors
-            // or delivers a close frame, so `read.next()` would otherwise block
-            // forever with the stream still reported healthy.
             let idle = tokio::time::sleep(idle_timeout);
             tokio::pin!(idle);
             loop {
-                let message = tokio::select! {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        let Some(command) = command else {
+                            task_health.mark_unhealthy("order-command sender dropped".to_string());
+                            return;
+                        };
+                        match write.send(Message::Text(command.text.into())).await {
+                            Ok(()) => {
+                                let _ = command.written.send(Ok(()));
+                            }
+                            Err(error) => {
+                                let detail = format!("failed to send order command: {error}");
+                                task_health.mark_unhealthy(detail.clone());
+                                let _ = command.written.send(Err(Error::WebSocket { message: detail }));
+                                return;
+                            }
+                        }
+                    }
                     _ = &mut idle => {
                         task_health.mark_unhealthy(format!(
                             "order-response stream idle for {}s (no ping/pong/data; connection likely half-open)",
@@ -206,58 +321,59 @@ impl OrderResponseStream {
                         ));
                         return;
                     }
-                    message = read.next() => message,
-                };
-                // Any inbound frame proves the peer is alive; extend the deadline.
-                idle.as_mut()
-                    .reset(tokio::time::Instant::now() + idle_timeout);
-                let Some(message) = message else {
-                    task_health.mark_unhealthy(
-                        "order-response WebSocket ended without a close frame or reported error",
-                    );
-                    return;
-                };
-                match message {
-                    Ok(Message::Text(text)) => {
-                        if let Ok(response) = serde_json::from_str::<OrderResponse>(&text) {
-                            if tx.send(response).await.is_err() {
+                    message = read.next() => {
+                        // Only inbound traffic proves the peer is alive; command writes do not.
+                        idle.as_mut()
+                            .reset(tokio::time::Instant::now() + idle_timeout);
+                        match message {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(response) = serde_json::from_str::<OrderResponse>(&text) {
+                                if tx.send(response).await.is_err() {
+                                    task_health.mark_unhealthy("order-response receiver dropped".to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => {
+                            if let Err(error) = write.send(Message::Pong(payload)).await {
+                                task_health.mark_unhealthy(format!(
+                                    "failed to send order-response pong: {error}"
+                                ));
                                 return;
                             }
                         }
-                    }
-                    Ok(Message::Ping(payload)) => {
-                        if let Err(error) = write.send(Message::Pong(payload)).await {
-                            task_health.mark_unhealthy(format!(
-                                "failed to send order-response pong: {error}"
-                            ));
+                        Some(Ok(Message::Close(frame))) => {
+                            let reason = frame.map_or_else(
+                                || "order-response WebSocket closed without a close frame".to_string(),
+                                |frame| {
+                                    format!(
+                                        "order-response WebSocket closed: code={} reason={:?}",
+                                        u16::from(frame.code),
+                                        frame.reason
+                                    )
+                                },
+                            );
+                            task_health.mark_unhealthy(reason);
                             return;
                         }
+                        Some(Err(error)) => {
+                            task_health.mark_unhealthy(format!("order-response WebSocket error: {error}"));
+                            return;
+                        }
+                        Some(Ok(_)) => {}
+                        None => {
+                            task_health.mark_unhealthy(
+                                "order-response WebSocket ended without a close frame or reported error",
+                            );
+                            return;
+                        }
+                        }
                     }
-                    Ok(Message::Close(frame)) => {
-                        let reason = frame.map_or_else(
-                            || "order-response WebSocket closed without a close frame".to_string(),
-                            |frame| {
-                                format!(
-                                    "order-response WebSocket closed: code={} reason={:?}",
-                                    u16::from(frame.code),
-                                    frame.reason
-                                )
-                            },
-                        );
-                        task_health.mark_unhealthy(reason);
-                        return;
-                    }
-                    Err(error) => {
-                        task_health
-                            .mark_unhealthy(format!("order-response WebSocket error: {error}"));
-                        return;
-                    }
-                    _ => {}
                 }
             }
         });
 
-        Ok((rx, health, handle))
+        Ok((commands, rx, health, handle))
     }
 }
 
@@ -349,7 +465,7 @@ mod tests {
         });
 
         let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
-        let (_responses, health, handle) = stream.connect().await.unwrap();
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
         assert!(health.is_healthy());
         server.await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -369,9 +485,6 @@ mod tests {
     async fn idle_connection_is_marked_unhealthy() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
-        // Server authenticates then stays connected but silent — no data, no
-        // server ping, no close frame — simulating a half-open connection that
-        // never errors. Only the client's idle deadline can detect this.
         let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut websocket = accept_async(socket).await.unwrap();
@@ -395,17 +508,12 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            // Hold the socket open and silent, absorbing any client frames so
-            // the client can only detect death via the idle timeout.
             while let Some(Ok(_)) = websocket.next().await {}
         });
 
-        // Idle timeout far below the 10s server-ping cadence so the deadline,
-        // not a real close/error, is what trips health.
         let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session")
             .with_idle_timeout(Duration::from_millis(200));
-        let (_responses, health, handle) = stream.connect().await.unwrap();
-        assert!(health.is_healthy());
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while health.is_healthy() {
                 tokio::task::yield_now().await;
@@ -414,8 +522,9 @@ mod tests {
         .await
         .expect("idle timeout should mark the response stream unhealthy");
         handle.await.unwrap();
-        let reason = health.failure_reason().unwrap();
-        assert!(reason.contains("idle"), "{reason}");
+        assert!(health
+            .failure_reason()
+            .is_some_and(|reason| reason.contains("idle")));
         server.abort();
     }
 
@@ -456,7 +565,7 @@ mod tests {
         });
 
         let stream = OrderResponseStream::with_url_and_token(url, "jwt", "maker-session");
-        let (_responses, health, handle) = stream.connect().await.unwrap();
+        let (_commands, _responses, health, handle) = stream.connect().await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while health.is_healthy() {
                 tokio::task::yield_now().await;
@@ -470,6 +579,100 @@ mod tests {
         let reason = health.failure_reason().unwrap();
         assert!(reason.contains("code=1008"), "{reason}");
         assert!(reason.contains("maintenance"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn command_sender_writes_signed_order_and_delivers_correlated_response() {
+        use crate::models::{OrderSide, OrderType, TimeInForce};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let command = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let command: serde_json::Value = serde_json::from_str(&command).unwrap();
+            assert_eq!(command["session_id"], "maker-session");
+            assert_eq!(command["method"], "order:new");
+            assert_eq!(command["header"]["x-request-sign-version"], "v1");
+            assert!(command["header"]["x-request-id"].as_str().is_some());
+            assert!(command["header"]["x-request-timestamp"].as_str().is_some());
+            assert!(command["header"]["x-request-signature"].as_str().is_some());
+            let params: serde_json::Value =
+                serde_json::from_str(command["params"].as_str().unwrap()).unwrap();
+            assert_eq!(params["cl_ord_id"], "sxmk-test");
+            assert_eq!(params["time_in_force"], "alo");
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "accepted",
+                        "request_id": command["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let private_key = bs58::encode(signing_key.to_bytes()).into_string();
+        let signer = StandXSigner::from_base58(&private_key).unwrap();
+        let stream =
+            OrderResponseStream::with_url_token_and_signer(url, "jwt", "maker-session", signer);
+        let (commands, mut responses, _health, handle) = stream.connect().await.unwrap();
+        let request_id = commands
+            .create_order(&CreateOrderParams {
+                symbol: "BTC-USD".to_string(),
+                cl_ord_id: Some("sxmk-test".to_string()),
+                side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+                quantity: "0.001".to_string(),
+                price: Some("50000".to_string()),
+                time_in_force: Some(TimeInForce::Alo),
+                reduce_only: false,
+                stop_price: None,
+                sl_price: None,
+                tp_price: None,
+            })
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), responses.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.request_id.as_deref(), Some(request_id.as_str()));
+        assert!(response.accepted());
+        server.await.unwrap();
+        handle.abort();
     }
 
     #[tokio::test]
