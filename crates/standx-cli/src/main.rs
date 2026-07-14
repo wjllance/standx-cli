@@ -162,13 +162,18 @@ fn maker_panic_webhook(command: &Commands) -> Option<(String, AlertWebhookFormat
     let Commands::Maker { command } = command else {
         return None;
     };
-    if let MakerCommands::Run {
-        alert_webhook: Some(url),
-        alert_webhook_format,
-        ..
-    } = command.as_ref()
-    {
-        return Some((url.clone(), *alert_webhook_format));
+    match command.as_ref() {
+        MakerCommands::Run {
+            alert_webhook: Some(url),
+            alert_webhook_format,
+            ..
+        }
+        | MakerCommands::WsCommandCanary {
+            alert_webhook: Some(url),
+            alert_webhook_format,
+            ..
+        } => return Some((url.clone(), *alert_webhook_format)),
+        _ => {}
     }
     None
 }
@@ -295,9 +300,24 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         }
     };
 
+    let command_label = match command {
+        Commands::Config { .. } => "config",
+        Commands::Auth { .. } => "auth",
+        Commands::Market { .. } => "market",
+        Commands::Account { .. } => "account",
+        Commands::Order { .. } => "order",
+        Commands::Trade { .. } => "trade",
+        Commands::Leverage { .. } => "leverage",
+        Commands::Margin { .. } => "margin",
+        Commands::Stream { .. } => "stream",
+        Commands::Dashboard { .. } => "dashboard",
+        Commands::Portfolio { .. } => "portfolio",
+        Commands::Block { .. } => "block",
+        Commands::Maker { .. } => "maker",
+    };
     let dry_run_info = serde_json::json!({
         "dry_run": true,
-        "command": format!("{:?}", command),
+        "command": command_label,
         "description": description,
         "would_execute": !matches!(command, Commands::Order { .. } | Commands::Leverage { .. } | Commands::Margin { .. } | Commands::Maker { .. }),
         "note": "Remove --dry-run to execute"

@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tokio::signal;
 
+mod canary;
 mod config;
 mod cycle;
 mod feed;
@@ -179,6 +180,25 @@ pub async fn handle_maker(
                     controlled_disconnect_after,
                     verbose,
                 },
+                output_format,
+            )
+            .await
+        }
+        MakerCommands::WsCommandCanary {
+            symbol,
+            size,
+            price_offset_bps,
+            timeout_secs,
+            alert_webhook,
+            alert_webhook_format,
+        } => {
+            canary::run_ws_command_canary(
+                symbol,
+                size,
+                price_offset_bps,
+                timeout_secs,
+                alert_webhook,
+                alert_webhook_format,
                 output_format,
             )
             .await
