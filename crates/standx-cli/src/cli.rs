@@ -381,6 +381,11 @@ pub enum BlockCommands {
     },
 }
 
+// `Run` is intentionally a flat, user-facing strategy CLI. Keeping the
+// supervised canary as a separate small variant makes the command surface
+// clearer but triggers Clippy's enum-layout lint; boxing `Run` would make the
+// established Clap declarations needlessly indirect.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 pub enum MakerCommands {
     /// Run the maker quoting loop (paper mode by default; --live to place orders)
@@ -512,6 +517,27 @@ pub enum MakerCommands {
         /// validation and is limited by the maker command to 60 seconds.
         #[arg(long, hide = true)]
         controlled_disconnect_after: Option<u64>,
+    },
+    /// Supervised live-gate check for the WebSocket order:new/order:cancel path.
+    #[command(hide = true)]
+    WsCommandCanary {
+        /// Symbol to verify (e.g., BTC-USD)
+        symbol: String,
+        /// Order quantity; defaults to the venue minimum for the symbol
+        #[arg(long)]
+        size: Option<f64>,
+        /// Put the post-only buy this many bps below the mark to avoid taking
+        #[arg(long, default_value_t = 100.0)]
+        price_offset_bps: f64,
+        /// Bound each response and REST visibility check
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
+        /// Required push channel for start, failure, and completion events
+        #[arg(long)]
+        alert_webhook: Option<String>,
+        /// Webhook payload format for the target chat platform
+        #[arg(long, value_enum, default_value = "slack")]
+        alert_webhook_format: AlertWebhookFormat,
     },
 }
 
