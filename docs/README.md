@@ -24,7 +24,8 @@ docs/
 ├── 13-maker.md               # 做市机器人（Maker Bot）
 ├── 14-maker-live-gate.md     # Maker 实盘解锁门槛
 ├── 15-openobserve.md         # OpenObserve 遥测
-└── 16-ws-iteration-goals.md  # Maker WebSocket 迭代目标
+├── 16-ws-iteration-goals.md  # Maker WebSocket 迭代目标
+└── 17-ws-command-canary-quickstart.md # WS 生产 Canary 快速启动
 ```
 
 ---
@@ -49,6 +50,7 @@ docs/
 | [14-maker-live-gate.md](14-maker-live-gate.md) | Maker 实盘解锁门槛与证据 | 进阶 |
 | [15-openobserve.md](15-openobserve.md) | OpenObserve 遥测与看板 | 进阶 |
 | [16-ws-iteration-goals.md](16-ws-iteration-goals.md) | Maker WebSocket 迭代目标与验收边界 | 开发参考 |
+| [17-ws-command-canary-quickstart.md](17-ws-command-canary-quickstart.md) | WS 生产 Canary 配置、执行与成功判据 | 操作手册 |
 
 ---
 
