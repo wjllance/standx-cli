@@ -21,7 +21,10 @@ docs/
 ├── 10-special-features.md    # 特殊功能
 ├── 11-troubleshooting.md     # 故障排除
 ├── 12-version-checklist.md   # 版本发布检查清单
-└── 13-maker.md               # 做市机器人（Maker Bot）
+├── 13-maker.md               # 做市机器人（Maker Bot）
+├── 14-maker-live-gate.md     # Maker 实盘解锁门槛
+├── 15-openobserve.md         # OpenObserve 遥测
+└── 16-ws-iteration-goals.md  # Maker WebSocket 迭代目标
 ```
 
 ---
@@ -43,6 +46,9 @@ docs/
 | [11-troubleshooting.md](11-troubleshooting.md) | 常见问题解决 | 参考 |
 | [12-version-checklist.md](12-version-checklist.md) | 版本发布检查清单 | 参考 |
 | [13-maker.md](13-maker.md) | 做市机器人（SIP-5A、paper/live、遥测） | 进阶 |
+| [14-maker-live-gate.md](14-maker-live-gate.md) | Maker 实盘解锁门槛与证据 | 进阶 |
+| [15-openobserve.md](15-openobserve.md) | OpenObserve 遥测与看板 | 进阶 |
+| [16-ws-iteration-goals.md](16-ws-iteration-goals.md) | Maker WebSocket 迭代目标与验收边界 | 开发参考 |
 
 ---
 
@@ -59,7 +65,7 @@ docs/
 
 1. **新用户**: 按顺序阅读 01 → 02 → 03 → 04
 2. **开发者**: 重点关注 03, 05, 08, 09, 10
-3. **做市/量化**: 13-maker.md（依赖 02, 05, 08, 09）
+3. **做市/量化**: 13-maker.md（依赖 02, 05, 08, 09）；迭代 WS 能力时配合 16-ws-iteration-goals.md
 4. **测试人员**: 每个文档末尾的「测试检查清单」
 5. **故障排查**: 直接查阅 11-troubleshooting.md
 

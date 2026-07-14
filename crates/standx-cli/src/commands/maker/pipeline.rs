@@ -93,6 +93,17 @@ impl LiveAccountPollState {
         now >= self.next_balance_refresh_at
     }
 
+    /// Make the next maker cycle refresh the authoritative unified balance.
+    ///
+    /// The account stream's `balance` payload is a wallet-level view and does
+    /// not expose the derived `equity` / `cross_available` values used by the
+    /// configured account-risk floors. A stream update therefore acts as an
+    /// immediate refresh trigger rather than being reinterpreted as those REST
+    /// fields.
+    pub(super) fn request_balance_refresh(&mut self, now: Instant) {
+        self.next_balance_refresh_at = self.next_balance_refresh_at.min(now);
+    }
+
     pub(super) fn account_audit_due(&self, now: Instant) -> bool {
         now >= self.next_account_audit_at
     }
@@ -218,6 +229,20 @@ mod tests {
         assert!(state.balance_refresh_due(refresh_due + Duration::from_secs(5)));
         assert!(state.balance_is_within_stale_limit(now + Duration::from_secs(60)));
         assert!(!state.balance_is_within_stale_limit(now + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn account_stream_balance_update_makes_authoritative_refresh_due_immediately() {
+        let now = Instant::now();
+        let mut state = LiveAccountPollState::new(balance(), now);
+
+        assert!(!state.balance_refresh_due(now));
+        state.request_balance_refresh(now);
+        assert!(state.balance_refresh_due(now));
+
+        state.record_balance_refresh(balance(), now);
+        assert!(!state.balance_refresh_due(now + Duration::from_secs(29)));
+        assert!(state.balance_refresh_due(now + Duration::from_secs(30)));
     }
 
     #[test]

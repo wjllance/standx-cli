@@ -224,6 +224,7 @@ struct AccountEventOutcome {
     fills: u64,
     latest_position: Option<f64>,
     exit_fill_observed: bool,
+    balance_changed: bool,
 }
 
 impl AccountEventOutcome {
@@ -233,7 +234,22 @@ impl AccountEventOutcome {
             self.latest_position = other.latest_position;
         }
         self.exit_fill_observed |= other.exit_fill_observed;
+        self.balance_changed |= other.balance_changed;
     }
+}
+
+fn schedule_account_balance_refresh(
+    requested: &mut bool,
+    account_alerts_enabled: bool,
+    poll: Option<&mut LiveAccountPollState>,
+    now: std::time::Instant,
+) -> bool {
+    if !std::mem::take(requested) || !account_alerts_enabled {
+        return false;
+    }
+    poll.expect("live account floors require initialized account polling")
+        .request_balance_refresh(now);
+    true
 }
 
 fn apply_account_events(
@@ -344,6 +360,7 @@ fn apply_account_event(
                 fills: fills.len() as u64,
                 latest_position: None,
                 exit_fill_observed,
+                balance_changed: false,
             })
         }
         AccountEvent::Position(update) => {
@@ -363,6 +380,7 @@ fn apply_account_event(
                 fills: 0,
                 latest_position: Some(qty),
                 exit_fill_observed: false,
+                balance_changed: false,
             })
         }
         AccountEvent::Trade(trade) => {
@@ -392,6 +410,7 @@ fn apply_account_event(
                 fills: fills.len() as u64,
                 latest_position: None,
                 exit_fill_observed,
+                balance_changed: false,
             })
         }
         // Raw wallet fields are projected independently. The derived unified
@@ -402,7 +421,10 @@ fn apply_account_event(
                 generation,
                 AccountProjectionEvent::BalanceObserved(model::projected_balance(update)),
             );
-            Ok(AccountEventOutcome::default())
+            Ok(AccountEventOutcome {
+                balance_changed: true,
+                ..AccountEventOutcome::default()
+            })
         }
         AccountEvent::Disconnected { reason } | AccountEvent::Error { reason } => Err(
             anyhow::anyhow!("authenticated account stream unhealthy: {reason}"),
@@ -852,9 +874,11 @@ pub(super) async fn run_maker(
             && args.alert_inventory_pct <= 0.0
             && args.alert_position_change_pct <= 0.0
             && args.alert_uptime <= 0.0
+            && args.alert_equity_below <= 0.0
+            && args.alert_margin_below <= 0.0
         {
             return Err(anyhow::anyhow!(
-                "live mode requires at least one alert threshold (--alert-loss, --alert-inventory-pct, --alert-position-change-pct, or --alert-uptime); all are 0 so the webhook would never fire"
+                "live mode requires at least one alert threshold; all maker and account thresholds are 0 so the webhook would never fire"
             ));
         }
         let creds = Credentials::load()?;
@@ -1233,6 +1257,10 @@ pub(super) async fn run_maker(
     let mut order_response_reconnect_attempts_used = 0_u32;
     let mut account_stream_reconnect_attempts_used = 0_u32;
     let mut account_position_mismatch: Option<f64> = None;
+    // A wallet-level WS balance update cannot be substituted for the unified
+    // REST equity/margin model. Coalesce updates into one immediate
+    // authoritative refresh on the next cycle when account floors are active.
+    let mut account_balance_refresh_requested = false;
     // JWT expiry monitor: highest severity already alerted, plus a throttle so
     // credentials are only reloaded from disk/env periodically.
     let mut token_expiry_alerted = TokenExpiryLevel::Ok;
@@ -1448,7 +1476,7 @@ pub(super) async fn run_maker(
                     .expect("live account reconnect requires initialized projection");
                 projection.reset(account_stream_epoch, ledger.expected_position);
 
-                let mut reconnect_fills = match apply_account_events(
+                let reconnect_outcome = match apply_account_events(
                     &mut events,
                     &mut AccountEventState {
                         ledger: &mut ledger,
@@ -1463,7 +1491,7 @@ pub(super) async fn run_maker(
                         output_format,
                     },
                 ) {
-                    Ok(outcome) => outcome.fills,
+                    Ok(outcome) => outcome,
                     Err(error) => {
                         handle.abort();
                         break recovery_failed_exit(
@@ -1473,6 +1501,8 @@ pub(super) async fn run_maker(
                         );
                     }
                 };
+                account_balance_refresh_requested |= reconnect_outcome.balance_changed;
+                let mut reconnect_fills = reconnect_outcome.fills;
                 let positions = match client.get_positions(Some(&symbol)).await {
                     Ok(positions) => positions,
                     Err(error) => {
@@ -1519,7 +1549,10 @@ pub(super) async fn run_maker(
                                 output_format,
                             },
                         ) {
-                            Ok(outcome) => reconnect_fills += outcome.fills,
+                            Ok(outcome) => {
+                                reconnect_fills += outcome.fills;
+                                account_balance_refresh_requested |= outcome.balance_changed;
+                            }
                             Err(error) => {
                                 handle.abort();
                                 break 'main recovery_failed_exit(
@@ -1896,6 +1929,7 @@ pub(super) async fn run_maker(
             ) {
                 Ok(outcome) => {
                     total_fills += outcome.fills;
+                    account_balance_refresh_requested |= outcome.balance_changed;
                     if outcome.exit_fill_observed {
                         inventory_exit_pending = false;
                     }
@@ -1934,6 +1968,12 @@ pub(super) async fn run_maker(
                 }
             }
         }
+        schedule_account_balance_refresh(
+            &mut account_balance_refresh_requested,
+            alerts.account_enabled(),
+            live_account_poll.as_mut(),
+            std::time::Instant::now(),
+        );
         if account_position_mismatch
             .is_some_and(|position| (position - ledger.expected_position).abs() <= qty_tolerance)
         {
@@ -2148,6 +2188,7 @@ pub(super) async fn run_maker(
             ) {
                 Ok(outcome) => {
                     total_fills += outcome.fills;
+                    account_balance_refresh_requested |= outcome.balance_changed;
                     if outcome.exit_fill_observed {
                         inventory_exit_pending = false;
                     }
@@ -2502,6 +2543,7 @@ pub(super) async fn run_maker(
                             ) {
                                 Ok(outcome) => {
                                     total_fills += outcome.fills;
+                                    account_balance_refresh_requested |= outcome.balance_changed;
                                     if outcome.exit_fill_observed {
                                         inventory_exit_pending = false;
                                     }
@@ -2683,6 +2725,13 @@ pub(super) async fn run_maker(
         ) {
             continue 'main;
         }
+        if account_balance_refresh_requested && alerts.account_enabled() {
+            // A balance event arrived while the just-finished cycle was doing
+            // I/O. Skip the normal interval so the next cycle can fetch the
+            // authoritative unified balance and evaluate account floors.
+            continue 'main;
+        }
+        account_balance_refresh_requested = false;
 
         // Sleep until the next cycle, but wake early when a coherent market
         // update invalidates the prior decision: mark drift, a quote crossing
@@ -2738,6 +2787,7 @@ pub(super) async fn run_maker(
                     ) {
                         Ok(outcome) => {
                             total_fills += outcome.fills;
+                            account_balance_refresh_requested |= outcome.balance_changed;
                             if outcome.exit_fill_observed {
                                 inventory_exit_pending = false;
                             }
@@ -2976,6 +3026,23 @@ mod tests {
         }
     }
 
+    fn account_balance() -> standx_sdk::models::Balance {
+        standx_sdk::models::Balance {
+            balance: "100".to_string(),
+            cross_available: "90".to_string(),
+            cross_balance: "100".to_string(),
+            cross_margin: "0".to_string(),
+            cross_upnl: "0".to_string(),
+            equity: "100".to_string(),
+            isolated_balance: "0".to_string(),
+            isolated_upnl: "0".to_string(),
+            locked: "0".to_string(),
+            pnl_24h: "0".to_string(),
+            pnl_freeze: "0".to_string(),
+            upnl: "0".to_string(),
+        }
+    }
+
     fn projection_with_pending(request_ids: &[&str]) -> MakerAccountProjection {
         let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
         for request_id in request_ids {
@@ -3034,6 +3101,35 @@ mod tests {
             next_runtime_effect(&mut runtime_state),
             Some(MakerEffect::RunCycle(_))
         ));
+    }
+
+    #[test]
+    fn ws_balance_request_schedules_immediate_authoritative_refresh_for_account_alerts() {
+        let now = std::time::Instant::now();
+        let mut poll = LiveAccountPollState::new(account_balance(), now);
+        let mut requested = true;
+
+        assert!(!poll.balance_refresh_due(now));
+        assert!(schedule_account_balance_refresh(
+            &mut requested,
+            true,
+            Some(&mut poll),
+            now,
+        ));
+        assert!(!requested);
+        assert!(poll.balance_refresh_due(now));
+
+        let mut disabled_request = true;
+        let later = now + Duration::from_secs(1);
+        poll.record_balance_refresh(account_balance(), later);
+        assert!(!schedule_account_balance_refresh(
+            &mut disabled_request,
+            false,
+            Some(&mut poll),
+            later,
+        ));
+        assert!(!disabled_request);
+        assert!(!poll.balance_refresh_due(later));
     }
 
     #[test]
@@ -3535,6 +3631,7 @@ mod tests {
             .unwrap()
         };
         assert_eq!(outcome.fills, 0);
+        assert!(outcome.balance_changed);
         assert_eq!(projection.raw_balance("perps", "DUSD").unwrap().free, "90");
         assert_eq!(stats.fills(), 0);
     }
