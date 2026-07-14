@@ -287,22 +287,29 @@ fn apply_account_event(
                 exit_fill_observed: false,
             })
         }
-        AccountEvent::TradeShadow { seq, data } => {
-            if context.output_format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                        "symbol": context.symbol,
-                        "cycle": context.cycle,
-                        "action": "account_trade_shadow",
-                        "seq": seq,
-                        "data": data,
-                    })
-                );
+        AccountEvent::Trade(trade) => {
+            let mut fills = Vec::new();
+            let exit_fill_observed = ledger::apply_account_trade(
+                state.ledger,
+                trade,
+                context.symbol,
+                context.mark,
+                state.stats,
+                &mut fills,
+            )?;
+            for fill in &fills {
+                emit_live_fill(fill, context.symbol, context.cycle, context.output_format);
             }
-            Ok(AccountEventOutcome::default())
+            Ok(AccountEventOutcome {
+                fills: fills.len() as u64,
+                latest_position: None,
+                exit_fill_observed,
+            })
         }
+        // Raw wallet updates are intentionally typed and subscribed here. The
+        // derived equity/available snapshot remains REST-backed until the
+        // later account-state/cache stage.
+        AccountEvent::Balance(_) => Ok(AccountEventOutcome::default()),
         AccountEvent::Disconnected { reason } | AccountEvent::Error { reason } => Err(
             anyhow::anyhow!("authenticated account stream unhealthy: {reason}"),
         ),
@@ -870,6 +877,7 @@ pub(super) async fn run_maker(
                 AccountChannel::Order,
                 AccountChannel::Position,
                 AccountChannel::Trade,
+                AccountChannel::Balance,
             ])
             .await?;
         let post_auth_positions = client.get_positions(Some(&symbol)).await?;
@@ -1288,6 +1296,7 @@ pub(super) async fn run_maker(
                                 AccountChannel::Order,
                                 AccountChannel::Position,
                                 AccountChannel::Trade,
+                                AccountChannel::Balance,
                             ])
                             .await
                             .map_err(anyhow::Error::from)
@@ -3079,14 +3088,20 @@ mod tests {
     #[test]
     fn apply_account_events_applies_buffered_events_in_order() {
         // The last position update in the buffer wins; benign Connected /
-        // TradeShadow events are drained without contributing fills.
+        // Balance events are drained without contributing fills.
         let outcome = drain_positions(vec![
             AccountEvent::Connected { epoch: 1 },
             AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Buy), "0.2")),
-            AccountEvent::TradeShadow {
+            AccountEvent::Balance(standx_sdk::account_stream::BalanceUpdate {
                 seq: 1,
-                data: serde_json::json!({}),
-            },
+                account_type: "perps".to_string(),
+                token: "DUSD".to_string(),
+                free: "1".to_string(),
+                total: "1".to_string(),
+                locked: "0".to_string(),
+                occupied: "0".to_string(),
+                updated_at: "2026-07-14T00:00:00Z".to_string(),
+            }),
             AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Sell), "0.9")),
         ]);
         assert_eq!(outcome.fills, 0);
@@ -3095,6 +3110,42 @@ mod tests {
             Some(-0.9),
             "latest position reflects last update"
         );
+    }
+
+    #[test]
+    fn typed_trade_event_is_booked_once_after_order_ownership() {
+        let order = standx_sdk::account_stream::OrderUpdate {
+            seq: 1,
+            order_id: 7,
+            cl_ord_id: Some("sxmk-test-q00000001b0".to_string()),
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Buy,
+            qty: "0.2".to_string(),
+            fill_qty: "0.2".to_string(),
+            fill_avg_price: "100".to_string(),
+            price: "100".to_string(),
+            status: standx_sdk::models::OrderStatus::Filled,
+            reduce_only: false,
+            updated_at: "2026-07-14T00:00:00Z".to_string(),
+        };
+        let trade = standx_sdk::account_stream::TradeUpdate {
+            seq: 2,
+            trade_id: 11,
+            order_id: 7,
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Buy,
+            price: "100".to_string(),
+            qty: "0.2".to_string(),
+            trade_ts: "2026-07-14T00:00:00Z".to_string(),
+        };
+
+        let outcome = drain_positions(vec![
+            AccountEvent::Order(order),
+            AccountEvent::Trade(trade.clone()),
+            AccountEvent::Trade(trade),
+        ]);
+        assert_eq!(outcome.fills, 1);
+        assert_eq!(outcome.latest_position, None);
     }
 
     #[test]
@@ -3112,7 +3163,7 @@ mod tests {
     }
 
     #[test]
-    fn account_order_fill_reports_current_run_inventory_exit_once() {
+    fn stable_trade_reports_current_run_inventory_exit_once() {
         let mut ledger = MakerLedger::new(0.2);
         let mut stats = MakerStats::with_inventory_baseline(0.2, 100.0);
         let mut state = AccountEventState {
@@ -3141,12 +3192,27 @@ mod tests {
             updated_at: "2026-07-14T00:00:00Z".to_string(),
         };
 
-        let first = apply_account_event(AccountEvent::Order(update.clone()), &mut state, &context)
-            .expect("exit fill is valid");
+        let order = apply_account_event(AccountEvent::Order(update), &mut state, &context)
+            .expect("exit order is valid");
+        assert_eq!(order.fills, 0);
+        assert!(!order.exit_fill_observed);
+
+        let trade = standx_sdk::account_stream::TradeUpdate {
+            seq: 2,
+            trade_id: 11,
+            order_id: 7,
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Sell,
+            price: "100".to_string(),
+            qty: "0.2".to_string(),
+            trade_ts: "2026-07-14T00:00:00Z".to_string(),
+        };
+        let first = apply_account_event(AccountEvent::Trade(trade.clone()), &mut state, &context)
+            .expect("exit trade is valid");
         assert_eq!(first.fills, 1);
         assert!(first.exit_fill_observed);
 
-        let duplicate = apply_account_event(AccountEvent::Order(update), &mut state, &context)
+        let duplicate = apply_account_event(AccountEvent::Trade(trade), &mut state, &context)
             .expect("duplicate exit fill is valid");
         assert_eq!(duplicate.fills, 0);
         assert!(!duplicate.exit_fill_observed);

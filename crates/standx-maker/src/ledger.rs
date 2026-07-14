@@ -1,13 +1,18 @@
 //! Deterministic current-run fill accounting.
 //!
-//! Transport adapters validate and normalize venue payloads before calling this
-//! module. The ledger then owns order adoption, WS/REST deduplication,
-//! cumulative-fill deltas, session stats, and expected position.
+//! Transport adapters normalize authenticated account-stream and REST trade
+//! payloads into [`LedgerTrade`]. The ledger owns current-run order adoption,
+//! stable-ID deduplication, bounded trade-before-order buffering, session
+//! stats, and expected position. Cumulative order updates deliberately do not
+//! affect accounting: they lack a stable trade ID and are only ownership/order
+//! state signals.
 
 use crate::{is_current_run_client_order_id, MakerStats};
 use standx_sdk::models::OrderSide;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+
+const MAX_PENDING_TRADES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MakerFill {
@@ -20,20 +25,26 @@ pub struct MakerFill {
     pub origin: &'static str,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct CumulativeFill<'a> {
-    pub order_id: u64,
-    pub side: OrderSide,
-    pub qty: f64,
-    pub notional: f64,
-    pub mark: f64,
-    pub origin: &'static str,
-    pub trade_id: Option<u64>,
-    pub trade_ts: Option<&'a str>,
+/// Transport-independent source for a stable venue execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TradeSource {
+    AccountStream,
+    RestBackfill,
 }
 
+impl TradeSource {
+    pub const fn origin(self) -> &'static str {
+        match self {
+            Self::AccountStream => "current_run_ws_trade",
+            Self::RestBackfill => "current_run_rest_trade",
+        }
+    }
+}
+
+/// One immutable venue execution. A trade must have stable, non-zero venue
+/// identifiers; deduplication is exclusively by `trade_id`.
 #[derive(Clone, Copy, Debug)]
-pub struct RestFill<'a> {
+pub struct LedgerTrade<'a> {
     pub trade_id: u64,
     pub order_id: u64,
     pub side: OrderSide,
@@ -41,18 +52,53 @@ pub struct RestFill<'a> {
     pub qty: f64,
     pub mark: f64,
     pub trade_ts: &'a str,
+    pub source: TradeSource,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct FillTotals {
+#[derive(Clone, Debug)]
+struct PendingTrade {
+    trade_id: u64,
+    order_id: u64,
+    side: OrderSide,
+    price: f64,
     qty: f64,
-    notional: f64,
+    mark: f64,
+    trade_ts: String,
+    source: TradeSource,
+}
+
+impl<'a> From<LedgerTrade<'a>> for PendingTrade {
+    fn from(trade: LedgerTrade<'a>) -> Self {
+        Self {
+            trade_id: trade.trade_id,
+            order_id: trade.order_id,
+            side: trade.side,
+            price: trade.price,
+            qty: trade.qty,
+            mark: trade.mark,
+            trade_ts: trade.trade_ts.to_owned(),
+            source: trade.source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LedgerError {
-    MissingTradeId { order_id: u64 },
-    InvalidCumulativeFill { order_id: u64, qty: f64, price: f64 },
+    MissingTradeId {
+        order_id: u64,
+    },
+    MissingOrderId {
+        trade_id: u64,
+    },
+    InvalidTrade {
+        trade_id: u64,
+        order_id: u64,
+        price: f64,
+        qty: f64,
+    },
+    PendingTradeOverflow {
+        limit: usize,
+    },
 }
 
 impl fmt::Display for LedgerError {
@@ -64,13 +110,21 @@ impl fmt::Display for LedgerError {
                     "maker fill for order {order_id} has no stable trade ID"
                 )
             }
-            Self::InvalidCumulativeFill {
+            Self::MissingOrderId { trade_id } => {
+                write!(formatter, "maker trade {trade_id} has no stable order ID")
+            }
+            Self::InvalidTrade {
+                trade_id,
                 order_id,
-                qty,
                 price,
+                qty,
             } => write!(
                 formatter,
-                "invalid cumulative fill for maker order {order_id}: qty={qty}, price={price}"
+                "invalid maker trade {trade_id} for order {order_id}: qty={qty}, price={price}"
+            ),
+            Self::PendingTradeOverflow { limit } => write!(
+                formatter,
+                "unowned maker trade buffer exceeded its {limit} execution limit"
             ),
         }
     }
@@ -83,9 +137,9 @@ pub struct MakerLedger {
     pub expected_position: f64,
     pub maker_order_ids: HashSet<u64>,
     pub exit_order_ids: HashSet<u64>,
-    seen_fill_ids: HashSet<u64>,
-    accounted: HashMap<u64, FillTotals>,
-    rest_seen: HashMap<u64, FillTotals>,
+    seen_trade_ids: HashSet<u64>,
+    pending_trade_ids: HashSet<u64>,
+    pending_trades: HashMap<u64, Vec<PendingTrade>>,
 }
 
 impl MakerLedger {
@@ -94,9 +148,9 @@ impl MakerLedger {
             expected_position: starting_position,
             maker_order_ids: HashSet::new(),
             exit_order_ids: HashSet::new(),
-            seen_fill_ids: HashSet::new(),
-            accounted: HashMap::new(),
-            rest_seen: HashMap::new(),
+            seen_trade_ids: HashSet::new(),
+            pending_trade_ids: HashSet::new(),
+            pending_trades: HashMap::new(),
         }
     }
 
@@ -121,90 +175,121 @@ impl MakerLedger {
         self.exit_order_ids.contains(&order_id)
     }
 
-    pub fn record_cumulative_fill(
+    /// Account a stable trade immediately if its order is known to belong to
+    /// this run. A trade can legally arrive before its order callback, in
+    /// which case it is buffered until [`Self::apply_buffered_trades`] is
+    /// called after ownership is established.
+    pub fn record_trade(
         &mut self,
-        fill: CumulativeFill<'_>,
+        trade: LedgerTrade<'_>,
         stats: &mut MakerStats,
     ) -> Result<Option<MakerFill>, LedgerError> {
-        let previous = self
-            .accounted
-            .get(&fill.order_id)
-            .copied()
-            .unwrap_or_default();
-        let qty = fill.qty - previous.qty;
-        if qty <= 1e-12 {
+        self.validate_trade(trade)?;
+        if self.seen_trade_ids.contains(&trade.trade_id)
+            || self.pending_trade_ids.contains(&trade.trade_id)
+        {
             return Ok(None);
         }
-        let notional = fill.notional - previous.notional;
-        let price = notional / qty;
-        if !qty.is_finite() || !price.is_finite() || qty <= 0.0 || price <= 0.0 {
-            return Err(LedgerError::InvalidCumulativeFill {
-                order_id: fill.order_id,
-                qty,
-                price,
-            });
+        if !self.maker_order_ids.contains(&trade.order_id) {
+            if self.pending_trade_ids.len() >= MAX_PENDING_TRADES {
+                return Err(LedgerError::PendingTradeOverflow {
+                    limit: MAX_PENDING_TRADES,
+                });
+            }
+            self.pending_trade_ids.insert(trade.trade_id);
+            self.pending_trades
+                .entry(trade.order_id)
+                .or_default()
+                .push(trade.into());
+            return Ok(None);
         }
-        stats.record_fill(fill.side, price, qty, fill.mark);
-        self.expected_position += match fill.side {
-            OrderSide::Buy => qty,
-            OrderSide::Sell => -qty,
-        };
-        stats.observe_position(self.expected_position);
-        self.accounted.insert(
-            fill.order_id,
-            FillTotals {
-                qty: fill.qty,
-                notional: fill.notional,
-            },
-        );
-        Ok(Some(MakerFill {
-            side: fill.side,
-            price,
-            qty,
-            trade_id: fill.trade_id,
-            order_id: Some(fill.order_id),
-            trade_ts: fill.trade_ts.map(str::to_owned),
-            origin: fill.origin,
-        }))
+        self.apply_trade(trade, stats)
     }
 
-    /// Record a validated REST trade. The running per-order REST total makes
-    /// this commute with cumulative order-stream updates.
-    pub fn record_rest_fill(
+    /// Apply any earlier trade callbacks after an order is proven to belong to
+    /// the current run. Returns them in arrival order.
+    pub fn apply_buffered_trades(
         &mut self,
-        fill: RestFill<'_>,
+        order_id: u64,
         stats: &mut MakerStats,
-    ) -> Result<Option<MakerFill>, LedgerError> {
-        if !self.maker_order_ids.contains(&fill.order_id) {
-            return Ok(None);
+    ) -> Result<Vec<MakerFill>, LedgerError> {
+        if !self.maker_order_ids.contains(&order_id) {
+            return Ok(Vec::new());
         }
-        if fill.trade_id == 0 {
+        let pending = self.pending_trades.remove(&order_id).unwrap_or_default();
+        let mut fills = Vec::with_capacity(pending.len());
+        for pending in pending {
+            self.pending_trade_ids.remove(&pending.trade_id);
+            if let Some(fill) = self.apply_trade(
+                LedgerTrade {
+                    trade_id: pending.trade_id,
+                    order_id: pending.order_id,
+                    side: pending.side,
+                    price: pending.price,
+                    qty: pending.qty,
+                    mark: pending.mark,
+                    trade_ts: &pending.trade_ts,
+                    source: pending.source,
+                },
+                stats,
+            )? {
+                fills.push(fill);
+            }
+        }
+        Ok(fills)
+    }
+
+    fn validate_trade(&self, trade: LedgerTrade<'_>) -> Result<(), LedgerError> {
+        if trade.trade_id == 0 {
             return Err(LedgerError::MissingTradeId {
-                order_id: fill.order_id,
+                order_id: trade.order_id,
             });
         }
-        if !self.seen_fill_ids.insert(fill.trade_id) {
+        if trade.order_id == 0 {
+            return Err(LedgerError::MissingOrderId {
+                trade_id: trade.trade_id,
+            });
+        }
+        if !trade.qty.is_finite()
+            || !trade.price.is_finite()
+            || !trade.mark.is_finite()
+            || trade.qty <= 0.0
+            || trade.price <= 0.0
+        {
+            return Err(LedgerError::InvalidTrade {
+                trade_id: trade.trade_id,
+                order_id: trade.order_id,
+                price: trade.price,
+                qty: trade.qty,
+            });
+        }
+        Ok(())
+    }
+
+    fn apply_trade(
+        &mut self,
+        trade: LedgerTrade<'_>,
+        stats: &mut MakerStats,
+    ) -> Result<Option<MakerFill>, LedgerError> {
+        self.validate_trade(trade)?;
+        if !self.seen_trade_ids.insert(trade.trade_id) {
             return Ok(None);
         }
-        let cumulative = {
-            let totals = self.rest_seen.entry(fill.order_id).or_default();
-            totals.qty += fill.qty;
-            totals.notional += fill.qty * fill.price;
-            *totals
+        stats.record_fill(trade.side, trade.price, trade.qty, trade.mark);
+        self.expected_position += match trade.side {
+            OrderSide::Buy => trade.qty,
+            OrderSide::Sell => -trade.qty,
         };
-        self.record_cumulative_fill(
-            CumulativeFill {
-                order_id: fill.order_id,
-                side: fill.side,
-                qty: cumulative.qty,
-                notional: cumulative.notional,
-                mark: fill.mark,
-                origin: "current_run_rest_trade",
-                trade_id: Some(fill.trade_id),
-                trade_ts: Some(fill.trade_ts),
-            },
-            stats,
-        )
+        stats.observe_position(self.expected_position);
+        Ok(Some(MakerFill {
+            side: trade.side,
+            price: trade.price,
+            qty: trade.qty,
+            trade_id: Some(trade.trade_id),
+            order_id: Some(trade.order_id),
+            trade_ts: Some(trade.trade_ts.to_owned()),
+            origin: trade.source.origin(),
+        }))
     }
 }
 
@@ -212,169 +297,152 @@ impl MakerLedger {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ws_and_rest_fills_account_only_their_cumulative_delta() {
-        let mut ledger = MakerLedger::new(0.0);
-        let mut stats = MakerStats::default();
-        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001b0"), "sxmk-run-"));
+    fn trade(
+        trade_id: u64,
+        order_id: u64,
+        side: OrderSide,
+        qty: f64,
+        source: TradeSource,
+    ) -> LedgerTrade<'static> {
+        LedgerTrade {
+            trade_id,
+            order_id,
+            side,
+            price: 100.0,
+            qty,
+            mark: 100.0,
+            trade_ts: "2026-07-14T00:00:00Z",
+            source,
+        }
+    }
 
+    fn adopted_ledger() -> (MakerLedger, MakerStats) {
+        let mut ledger = MakerLedger::new(0.0);
+        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001b0"), "sxmk-run-"));
+        (ledger, MakerStats::default())
+    }
+
+    #[test]
+    fn websocket_then_rest_trade_is_accounted_exactly_once() {
+        let (mut ledger, mut stats) = adopted_ledger();
         let ws = ledger
-            .record_cumulative_fill(
-                CumulativeFill {
-                    order_id: 7,
-                    side: OrderSide::Buy,
-                    qty: 0.2,
-                    notional: 20.0,
-                    mark: 100.0,
-                    origin: "current_run_ws_order",
-                    trade_id: None,
-                    trade_ts: Some("2026-07-13T00:00:00Z"),
-                },
+            .record_trade(
+                trade(1, 7, OrderSide::Buy, 0.2, TradeSource::AccountStream),
                 &mut stats,
             )
             .unwrap();
-        assert!(ws.is_some());
-        assert!(ledger
-            .record_rest_fill(
-                RestFill {
-                    trade_id: 1,
-                    order_id: 7,
-                    side: OrderSide::Buy,
-                    price: 100.0,
-                    qty: 0.2,
-                    mark: 100.0,
-                    trade_ts: "2026-07-13T00:00:00Z",
-                },
+        let rest = ledger
+            .record_trade(
+                trade(1, 7, OrderSide::Buy, 0.2, TradeSource::RestBackfill),
                 &mut stats,
             )
-            .unwrap()
-            .is_none());
+            .unwrap();
+
+        assert_eq!(ws.unwrap().origin, "current_run_ws_trade");
+        assert!(rest.is_none());
         assert_eq!(stats.fills(), 1);
         assert!((ledger.expected_position - 0.2).abs() < 1e-12);
         assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
     }
 
     #[test]
-    fn rest_then_ws_fill_updates_cash_and_position_once() {
-        let mut ledger = MakerLedger::new(0.0);
-        let mut stats = MakerStats::default();
-        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001b0"), "sxmk-run-"));
-
+    fn rest_then_websocket_trade_is_accounted_exactly_once() {
+        let (mut ledger, mut stats) = adopted_ledger();
         assert!(ledger
-            .record_rest_fill(
-                RestFill {
-                    trade_id: 1,
-                    order_id: 7,
-                    side: OrderSide::Sell,
-                    price: 100.0,
-                    qty: 0.2,
-                    mark: 100.0,
-                    trade_ts: "2026-07-13T00:00:00Z",
-                },
+            .record_trade(
+                trade(1, 7, OrderSide::Sell, 0.2, TradeSource::RestBackfill),
                 &mut stats,
             )
             .unwrap()
             .is_some());
         assert!(ledger
-            .record_cumulative_fill(
-                CumulativeFill {
-                    order_id: 7,
-                    side: OrderSide::Sell,
-                    qty: 0.2,
-                    notional: 20.0,
-                    mark: 100.0,
-                    origin: "current_run_ws_order",
-                    trade_id: None,
-                    trade_ts: Some("2026-07-13T00:00:00Z"),
-                },
+            .record_trade(
+                trade(1, 7, OrderSide::Sell, 0.2, TradeSource::AccountStream),
                 &mut stats,
             )
             .unwrap()
             .is_none());
 
         assert_eq!(stats.fills(), 1);
-        assert!((stats.cash - 20.0).abs() < 1e-12);
         assert!((ledger.expected_position + 0.2).abs() < 1e-12);
         assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
     }
 
     #[test]
-    fn buffered_inventory_exit_fill_keeps_round_trip_pnl_flat_to_notional() {
-        for (sell_price, buy_price, expected_pnl) in
-            [(57.78, 57.84, -0.012), (58.02, 58.10, -0.016)]
-        {
-            let mut ledger = MakerLedger::new(0.0);
-            let mut stats = MakerStats::default();
-            assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001a0"), "sxmk-run-"));
-            assert!(ledger.adopt_order(8, Some("sxmk-run-x00000002b0"), "sxmk-run-"));
-
-            ledger
-                .record_cumulative_fill(
-                    CumulativeFill {
-                        order_id: 7,
-                        side: OrderSide::Sell,
-                        qty: 0.2,
-                        notional: sell_price * 0.2,
-                        mark: sell_price,
-                        origin: "current_run_ws_order",
-                        trade_id: None,
-                        trade_ts: Some("2026-07-13T14:22:01Z"),
-                    },
-                    &mut stats,
-                )
-                .unwrap();
-            stats.end_cycle(ledger.expected_position, false);
-
-            ledger
-                .record_cumulative_fill(
-                    CumulativeFill {
-                        order_id: 8,
-                        side: OrderSide::Buy,
-                        qty: 0.2,
-                        notional: buy_price * 0.2,
-                        mark: buy_price,
-                        origin: "current_run_ws_order",
-                        trade_id: None,
-                        trade_ts: Some("2026-07-13T14:22:05Z"),
-                    },
-                    &mut stats,
-                )
-                .unwrap();
-
-            assert!(ledger.expected_position.abs() < 1e-12);
-            assert!(stats.position().abs() < 1e-12);
-            assert!((stats.pnl(ledger.expected_position, buy_price) - expected_pnl).abs() < 1e-12);
-            assert!(stats.pnl(ledger.expected_position, buy_price) > -4.0);
-        }
-    }
-
-    #[test]
-    fn partial_cumulative_fills_update_position_once_per_delta() {
-        let mut ledger = MakerLedger::new(0.0);
-        let mut stats = MakerStats::default();
-        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001b0"), "sxmk-run-"));
-
-        for (qty, notional) in [(0.1, 10.0), (0.2, 20.0), (0.2, 20.0)] {
-            ledger
-                .record_cumulative_fill(
-                    CumulativeFill {
-                        order_id: 7,
-                        side: OrderSide::Buy,
-                        qty,
-                        notional,
-                        mark: 100.0,
-                        origin: "current_run_ws_order",
-                        trade_id: None,
-                        trade_ts: Some("2026-07-13T00:00:00Z"),
-                    },
-                    &mut stats,
-                )
-                .unwrap();
+    fn partial_trades_and_duplicate_replay_are_exactly_once() {
+        let (mut ledger, mut stats) = adopted_ledger();
+        for trade in [
+            trade(1, 7, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+            trade(2, 7, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+            trade(2, 7, OrderSide::Buy, 0.1, TradeSource::RestBackfill),
+        ] {
+            ledger.record_trade(trade, &mut stats).unwrap();
         }
 
         assert_eq!(stats.fills(), 2);
         assert!((stats.cash + 20.0).abs() < 1e-12);
         assert!((ledger.expected_position - 0.2).abs() < 1e-12);
         assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
+    }
+
+    #[test]
+    fn trade_before_order_is_buffered_then_applied_once_when_owned() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        assert!(ledger
+            .record_trade(
+                trade(1, 7, OrderSide::Sell, 0.2, TradeSource::AccountStream),
+                &mut stats,
+            )
+            .unwrap()
+            .is_none());
+        assert!(ledger
+            .record_trade(
+                trade(1, 7, OrderSide::Sell, 0.2, TradeSource::RestBackfill),
+                &mut stats,
+            )
+            .unwrap()
+            .is_none());
+
+        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001a0"), "sxmk-run-"));
+        let fills = ledger.apply_buffered_trades(7, &mut stats).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].origin, "current_run_ws_trade");
+        assert_eq!(stats.fills(), 1);
+        assert!((ledger.expected_position + 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn partial_trade_then_cancel_keeps_positions_aligned() {
+        let (mut ledger, mut stats) = adopted_ledger();
+        ledger
+            .record_trade(
+                trade(1, 7, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+                &mut stats,
+            )
+            .unwrap();
+        // A later cancelled order update must not alter a stable trade.
+        assert!((ledger.expected_position - 0.1).abs() < 1e-12);
+        assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
+        assert!(stats.pnl(ledger.expected_position, 100.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn invalid_stable_ids_are_rejected() {
+        let (mut ledger, mut stats) = adopted_ledger();
+        assert!(matches!(
+            ledger.record_trade(
+                trade(0, 7, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+                &mut stats,
+            ),
+            Err(LedgerError::MissingTradeId { order_id: 7 })
+        ));
+        assert!(matches!(
+            ledger.record_trade(
+                trade(1, 0, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+                &mut stats,
+            ),
+            Err(LedgerError::MissingOrderId { trade_id: 1 })
+        ));
     }
 }

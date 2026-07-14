@@ -1,8 +1,8 @@
 //! SDK payload adapter for the pure maker ledger.
 
 use anyhow::Result;
-use standx_maker::{CumulativeFill, MakerFill, MakerLedger, MakerStats, RestFill};
-use standx_sdk::account_stream::OrderUpdate;
+use standx_maker::{LedgerTrade, MakerFill, MakerLedger, MakerStats, TradeSource};
+use standx_sdk::account_stream::{OrderUpdate, TradeUpdate};
 use standx_sdk::models::{Order, OrderSide, Trade};
 
 pub(super) fn adopt_order(
@@ -42,44 +42,44 @@ pub(super) fn apply_order_update(
     ) {
         return Ok(false);
     }
-    let qty = update
-        .fill_qty
-        .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("account order {} has invalid fill_qty", update.order_id))?;
-    if !qty.is_finite() {
-        return Err(anyhow::anyhow!(
-            "account order {} has non-finite fill_qty",
-            update.order_id
-        ));
-    }
-    let qty = qty.abs();
-    if qty == 0.0 {
+    let exit = ledger.is_exit_order(update.order_id);
+    let buffered = ledger.apply_buffered_trades(update.order_id, stats)?;
+    let saw_exit_fill = exit && !buffered.is_empty();
+    fills.extend(buffered);
+    // The cumulative fill fields in an order callback are deliberately not
+    // booked here. Only a stable-ID TradeUpdate or REST trade may mutate PnL
+    // and expected position.
+    let _ = mark;
+    Ok(saw_exit_fill)
+}
+
+pub(super) fn apply_account_trade(
+    ledger: &mut MakerLedger,
+    trade: TradeUpdate,
+    symbol: &str,
+    mark: f64,
+    stats: &mut MakerStats,
+    fills: &mut Vec<MakerFill>,
+) -> Result<bool> {
+    if !trade.symbol.eq_ignore_ascii_case(symbol) {
         return Ok(false);
     }
-    let average = update.fill_avg_price.parse::<f64>().map_err(|_| {
-        anyhow::anyhow!(
-            "account order {} has invalid fill_avg_price",
-            update.order_id
-        )
-    })?;
-    let exit = ledger.is_exit_order(update.order_id);
-    if let Some(fill) = ledger.record_cumulative_fill(
-        CumulativeFill {
-            order_id: update.order_id,
-            side: update.side,
+    let (price, qty) = trade_values(trade.trade_id, &trade.price, &trade.qty)?;
+    apply_ledger_trade(
+        ledger,
+        LedgerTrade {
+            trade_id: trade.trade_id,
+            order_id: trade.order_id,
+            side: trade.side,
+            price,
             qty,
-            notional: qty * average,
             mark,
-            origin: "current_run_ws_order",
-            trade_id: None,
-            trade_ts: Some(&update.updated_at),
+            trade_ts: &trade.trade_ts,
+            source: TradeSource::AccountStream,
         },
         stats,
-    )? {
-        fills.push(fill);
-        return Ok(exit);
-    }
-    Ok(false)
+        fills,
+    )
 }
 
 pub(super) fn apply_rest_trade(
@@ -94,9 +94,6 @@ pub(super) fn apply_rest_trade(
     let Some(order_id) = trade.order_id else {
         return Ok(false);
     };
-    if !ledger.maker_order_ids.contains(&order_id) {
-        return Ok(false);
-    }
     if trade.id == 0 {
         return Err(anyhow::anyhow!(
             "maker fill for order {} has no stable trade ID",
@@ -110,9 +107,9 @@ pub(super) fn apply_rest_trade(
         ));
     }
     let (side, price, qty) = maker_trade_fill(&trade)?;
-    let exit = ledger.is_exit_order(order_id);
-    if let Some(fill) = ledger.record_rest_fill(
-        RestFill {
+    apply_ledger_trade(
+        ledger,
+        LedgerTrade {
             trade_id: trade.id,
             order_id,
             side,
@@ -120,9 +117,21 @@ pub(super) fn apply_rest_trade(
             qty,
             mark,
             trade_ts: &trade.time,
+            source: TradeSource::RestBackfill,
         },
         stats,
-    )? {
+        fills,
+    )
+}
+
+fn apply_ledger_trade(
+    ledger: &mut MakerLedger,
+    trade: LedgerTrade<'_>,
+    stats: &mut MakerStats,
+    fills: &mut Vec<MakerFill>,
+) -> Result<bool> {
+    let exit = ledger.is_exit_order(trade.order_id);
+    if let Some(fill) = ledger.record_trade(trade, stats)? {
         fills.push(fill);
         return Ok(exit);
     }
@@ -152,24 +161,23 @@ pub(super) fn maker_trade_fill(trade: &Trade) -> Result<(OrderSide, f64, f64)> {
             ));
         }
     };
-    let price = trade.price.parse::<f64>().map_err(|_| {
-        anyhow::anyhow!(
-            "maker trade {} has invalid price '{}'",
-            trade.id,
-            trade.price
-        )
-    })?;
-    let qty = trade
-        .qty
+    let (price, qty) = trade_values(trade.id, &trade.price, &trade.qty)?;
+    Ok((side, price, qty))
+}
+
+fn trade_values(trade_id: u64, price: &str, qty: &str) -> Result<(f64, f64)> {
+    let price = price
         .parse::<f64>()
-        .map_err(|_| anyhow::anyhow!("maker trade {} has invalid qty '{}'", trade.id, trade.qty))?;
+        .map_err(|_| anyhow::anyhow!("maker trade {trade_id} has invalid price '{price}'"))?;
+    let qty = qty
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("maker trade {trade_id} has invalid qty '{qty}'"))?;
     if !price.is_finite() || price <= 0.0 || !qty.is_finite() || qty <= 0.0 {
         return Err(anyhow::anyhow!(
-            "maker trade {} has non-positive price/qty",
-            trade.id
+            "maker trade {trade_id} has non-positive price/qty"
         ));
     }
-    Ok((side, price, qty))
+    Ok((price, qty))
 }
 
 #[cfg(test)]
@@ -194,8 +202,21 @@ mod tests {
         }
     }
 
+    fn trade_update(side: OrderSide, price: &str, qty: &str) -> TradeUpdate {
+        TradeUpdate {
+            seq: 2,
+            trade_id: 11,
+            order_id: 7,
+            symbol: "BTC-USD".to_string(),
+            side,
+            price: price.to_string(),
+            qty: qty.to_string(),
+            trade_ts: "2026-07-13T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
-    fn signed_sell_fill_quantity_is_normalized_before_ledger_ingestion() {
+    fn typed_account_trade_is_the_only_order_callback_accounting_path() {
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
         let mut fills = Vec::new();
@@ -211,6 +232,20 @@ mod tests {
         )
         .unwrap();
 
+        assert!(
+            fills.is_empty(),
+            "cumulative order fills must not be booked"
+        );
+        apply_account_trade(
+            &mut ledger,
+            trade_update(OrderSide::Sell, "100.00", "0.20"),
+            "BTC-USD",
+            100.0,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].side, OrderSide::Sell);
         assert!((fills[0].qty - 0.20).abs() < 1e-9);
@@ -218,12 +253,12 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_ws_fill_quantity_is_rejected_explicitly() {
+    fn non_finite_typed_trade_quantity_is_rejected_explicitly() {
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
         let mut fills = Vec::new();
 
-        let error = apply_order_update(
+        apply_order_update(
             &mut ledger,
             &order_update(OrderSide::Sell, "NaN"),
             "BTC-USD",
@@ -232,9 +267,18 @@ mod tests {
             &mut stats,
             &mut fills,
         )
+        .unwrap();
+        let error = apply_account_trade(
+            &mut ledger,
+            trade_update(OrderSide::Sell, "100.00", "NaN"),
+            "BTC-USD",
+            100.0,
+            &mut stats,
+            &mut fills,
+        )
         .unwrap_err();
 
-        assert!(error.to_string().contains("non-finite fill_qty"));
+        assert!(error.to_string().contains("non-positive price/qty"));
     }
 
     #[test]
@@ -250,6 +294,16 @@ mod tests {
             &update,
             "BTC-USD",
             "sxmk-run-",
+            100.0,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+
+        apply_account_trade(
+            &mut ledger,
+            trade_update(OrderSide::Buy, "100.00", "0.10"),
+            "BTC-USD",
             100.0,
             &mut stats,
             &mut fills,

@@ -1,8 +1,6 @@
-#[cfg(test)]
-use super::ledger::apply_order_update;
-#[cfg(test)]
-use super::ledger::maker_trade_fill;
 use super::ledger::{adopt_order, apply_rest_trade};
+#[cfg(test)]
+use super::ledger::{apply_account_trade, apply_order_update, maker_trade_fill};
 use super::model::{is_current_run_order, position_for_symbol, PendingCancel, PendingPlace};
 use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
 use super::pipeline::{
@@ -15,7 +13,7 @@ use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{self as maker, MakerFill, MakerLedger, MakerStats, RestingQuote};
 #[cfg(test)]
-use standx_sdk::account_stream::OrderUpdate;
+use standx_sdk::account_stream::{OrderUpdate, TradeUpdate};
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
@@ -714,6 +712,19 @@ mod tests {
         }
     }
 
+    fn account_trade(side: OrderSide, qty: &str) -> TradeUpdate {
+        TradeUpdate {
+            seq: 11,
+            trade_id: 42,
+            order_id: 7,
+            symbol: "BTC-USD".to_string(),
+            side,
+            price: "59.50".to_string(),
+            qty: qty.to_string(),
+            trade_ts: "2026-07-10T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn websocket_then_rest_trade_is_not_double_counted() {
         let start = chrono::DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
@@ -727,6 +738,15 @@ mod tests {
             &order_update("0.20", "59.50"),
             "BTC-USD",
             "sxmk-0123456789ab-",
+            59.50,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+        apply_account_trade(
+            &mut ledger,
+            account_trade(OrderSide::Buy, "0.20"),
+            "BTC-USD",
             59.50,
             &mut stats,
             &mut fills,
@@ -748,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn rest_then_websocket_only_accounts_cumulative_delta() {
+    fn rest_then_websocket_trade_is_not_double_counted() {
         let start = chrono::DateTime::parse_from_rfc3339("2026-07-10T00:00:00Z")
             .unwrap()
             .timestamp();
@@ -757,7 +777,7 @@ mod tests {
         let mut stats = MakerStats::default();
         let mut fills = Vec::new();
         collect_current_run_fills(
-            vec![trade(Some("buy"), "59.50", "0.10")],
+            vec![trade(Some("buy"), "59.50", "0.20")],
             &mut ledger,
             start,
             start + 60,
@@ -766,19 +786,17 @@ mod tests {
             &mut fills,
         )
         .unwrap();
-        apply_order_update(
+        apply_account_trade(
             &mut ledger,
-            &order_update("0.20", "59.50"),
+            account_trade(OrderSide::Buy, "0.20"),
             "BTC-USD",
-            "sxmk-0123456789ab-",
             59.50,
             &mut stats,
             &mut fills,
         )
         .unwrap();
-        assert_eq!(stats.fills(), 2);
-        assert_eq!(fills.len(), 2);
-        assert!((fills[1].qty - 0.10).abs() < 1e-9);
+        assert_eq!(stats.fills(), 1);
+        assert_eq!(fills.len(), 1);
         assert!((ledger.expected_position - 0.20).abs() < 1e-9);
     }
 

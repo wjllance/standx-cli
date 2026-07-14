@@ -1,7 +1,6 @@
 use crate::cli::*;
 use anyhow::Result;
 use standx_sdk::account_stream::{AccountChannel, AccountEvent, AccountStream};
-use standx_sdk::models::Trade;
 use standx_sdk::websocket::{StandXWebSocket, WsMessage};
 
 /// Handle stream commands
@@ -135,15 +134,14 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
             }
         }
         StreamCommands::Balance => {
-            let ws = StandXWebSocket::new_with_verbose(verbose)?;
-            let _ = ws.subscribe("balance", None).await;
-            let mut rx = ws.connect().await?;
+            let stream = AccountStream::new(1)?;
+            let (mut rx, _health, _handle) = stream.connect(&[AccountChannel::Balance]).await?;
 
             println!("Streaming balance updates");
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let WsMessage::Balance(data) = msg {
+                if let AccountEvent::Balance(data) = msg {
                     println!("Balance update: {}", serde_json::to_string(&data)?);
                 }
             }
@@ -156,26 +154,11 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
             println!("Press Ctrl+C to exit\n");
 
             while let Some(msg) = rx.recv().await {
-                if let AccountEvent::TradeShadow { data, .. } = msg {
-                    let data = match serde_json::from_value::<Trade>(data) {
-                        Ok(data) => data,
-                        Err(error) => {
-                            if verbose {
-                                eprintln!("Skipping undocumented trade payload: {error}");
-                            }
-                            continue;
-                        }
-                    };
-                    let side = data.side.as_deref().unwrap_or({
-                        if data.is_buyer_taker {
-                            "buy"
-                        } else {
-                            "sell"
-                        }
-                    });
+                if let AccountEvent::Trade(data) = msg {
                     println!(
-                        "Fill | {} | Price: {} | Qty: {}",
-                        side.to_uppercase(),
+                        "Fill {} | {} | Price: {} | Qty: {}",
+                        data.trade_id,
+                        format!("{:?}", data.side).to_uppercase(),
                         data.price,
                         data.qty
                     );
