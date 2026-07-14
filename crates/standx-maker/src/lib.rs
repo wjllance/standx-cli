@@ -272,16 +272,28 @@ pub fn skew_center(cfg: &MakerConfig, mark: f64, position: f64) -> f64 {
 ///
 /// This is a discrete-time "crossed → filled" proxy used only to simulate
 /// inventory in paper mode; a real venue matches on the trade stream.
-pub fn paper_quote_filled(
+/// Whether a quote at `price` on `side` crosses the current touch: a buy at or
+/// above the best ask, or a sell at or below the best bid. This single event is
+/// both "a paper quote would fill" and "a resting quote would cross the book".
+pub fn quote_crosses_touch(
     side: OrderSide,
     price: f64,
     best_bid: Option<f64>,
     best_ask: Option<f64>,
 ) -> bool {
     match side {
-        OrderSide::Buy => best_ask.is_some_and(|a| a <= price),
-        OrderSide::Sell => best_bid.is_some_and(|b| b >= price),
+        OrderSide::Buy => best_ask.is_some_and(|ask| price >= ask),
+        OrderSide::Sell => best_bid.is_some_and(|bid| price <= bid),
     }
+}
+
+pub fn paper_quote_filled(
+    side: OrderSide,
+    price: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+) -> bool {
+    quote_crosses_touch(side, price, best_bid, best_ask)
 }
 
 /// Running telemetry for a maker session: fills, mark-to-market PnL, spread
@@ -1015,10 +1027,9 @@ pub fn resting_quotes_would_cross(
     best_bid: Option<f64>,
     best_ask: Option<f64>,
 ) -> bool {
-    resting.iter().any(|quote| match quote.side {
-        OrderSide::Buy => best_ask.is_some_and(|ask| quote.price >= ask),
-        OrderSide::Sell => best_bid.is_some_and(|bid| quote.price <= bid),
-    })
+    resting
+        .iter()
+        .any(|quote| quote_crosses_touch(quote.side, quote.price, best_bid, best_ask))
 }
 
 /// Diff desired vs resting quotes, applying the anti-flicker hold rule.

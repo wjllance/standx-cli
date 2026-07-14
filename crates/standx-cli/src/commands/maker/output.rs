@@ -529,6 +529,69 @@ pub(super) fn emit_startup_rejected(
     }
 }
 
+/// The current instant as an RFC3339 string, truncated to whole seconds — the
+/// timestamp format every maker telemetry line uses.
+pub(super) fn ts_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Emit a skipped-cycle event. Unlike the previous inline handling, all three
+/// reasons — including `MissingTouch` — now produce a JSON event, so an ingest
+/// pipeline sees every skip rather than silently missing empty-book cycles.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_cycle_skip(
+    output_format: OutputFormat,
+    cycle: u64,
+    symbol: &str,
+    live: bool,
+    mark: f64,
+    price_decimals: u32,
+    max_divergence_bps: f64,
+    skip: maker::CycleSkip,
+) {
+    if output_format == OutputFormat::Json {
+        let mut event = serde_json::json!({
+            "ts": ts_now(),
+            "cycle": cycle,
+            "mode": if live { "live" } else { "paper" },
+            "symbol": symbol,
+            "action": "skip",
+            "mark": maker::format_decimals(mark, price_decimals),
+        });
+        let fields = event.as_object_mut().expect("json object");
+        match skip {
+            maker::CycleSkip::CrossedBook => {
+                fields.insert("reason".into(), "crossed_book".into());
+            }
+            maker::CycleSkip::MarkMidDivergence { divergence_bps } => {
+                fields.insert("reason".into(), "mark_mid_divergence".into());
+                fields.insert(
+                    "divergence_bps".into(),
+                    ((divergence_bps * 100.0).round() / 100.0).into(),
+                );
+                fields.insert("max_divergence_bps".into(), max_divergence_bps.into());
+            }
+            maker::CycleSkip::MissingTouch => {
+                fields.insert("reason".into(), "missing_touch".into());
+            }
+        }
+        println!("{event}");
+        return;
+    }
+    match skip {
+        maker::CycleSkip::CrossedBook => eprintln!(
+            "⚠️  #{cycle} crossed order book on {symbol}; skipping cycle (no actions)"
+        ),
+        maker::CycleSkip::MarkMidDivergence { divergence_bps } => eprintln!(
+            "⚠️  #{cycle} mark/mid divergence {divergence_bps:.1}bps > {max_divergence_bps}bps — skipping cycle (no actions)"
+        ),
+        maker::CycleSkip::MissingTouch => {
+            // Fail-safe: without a touch we cannot guarantee no-cross pricing.
+            eprintln!("⚠️  #{cycle} empty order book on {symbol}; skipping this cycle")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
