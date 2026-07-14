@@ -1,5 +1,7 @@
 use clap::Parser;
-use standx_cli::cli::{AlertWebhookFormat, Cli, Commands, MakerCommands, OutputFormat};
+use standx_cli::cli::{
+    load_ws_canary_local_env, AlertWebhookFormat, Cli, Commands, MakerCommands, OutputFormat,
+};
 use standx_cli::commands;
 use standx_cli::commands::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 use standx_cli::telemetry::Telemetry;
@@ -32,11 +34,21 @@ fn print_splash_screen() {
     println!();
 }
 
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|argument| argument == "ws-command-canary") {
+        if let Err(error) = load_ws_canary_local_env(std::path::Path::new(".env.local")) {
+            eprintln!("failed to read WS canary settings from .env.local: {error}");
+            std::process::exit(2);
+        }
+    }
+    async_main(args);
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main(args: Vec<String>) {
     // Check if we should show splash screen BEFORE parsing args
     // Show splash only when: no args, or --help/-h
-    let args: Vec<String> = std::env::args().collect();
     let should_show_splash =
         args.len() == 1 || (args.len() == 2 && (args[1] == "--help" || args[1] == "-h"));
 
