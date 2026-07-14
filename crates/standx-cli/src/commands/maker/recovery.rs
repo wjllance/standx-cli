@@ -35,6 +35,27 @@ impl fmt::Display for PositionReconciliationError {
 
 impl std::error::Error for PositionReconciliationError {}
 
+/// Marker error: the operator pressed Ctrl+C while a reconnect wait was in
+/// progress. The caller routes this to shutdown instead of RecoveryFailed.
+#[derive(Debug)]
+pub(super) struct ReconnectInterrupted;
+
+impl fmt::Display for ReconnectInterrupted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "order-response reconnect interrupted by Ctrl+C")
+    }
+}
+
+impl std::error::Error for ReconnectInterrupted {}
+
+/// Resolves once the runtime's Ctrl+C latch has been set (see runtime.rs);
+/// pends forever if the listener is gone so callers' selects don't spin.
+pub(super) async fn ctrl_c_latched(ctrl_c: &mut tokio::sync::watch::Receiver<bool>) {
+    if ctrl_c.wait_for(|pressed| *pressed).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
 pub(super) async fn recover_current_run_order_ids_for_reconciliation(
     client: &StandXClient,
     trades: &[Trade],
@@ -420,6 +441,7 @@ pub(super) struct ReconnectRequest<'a> {
     pub(super) max_attempts: u32,
     pub(super) base_backoff: Duration,
     pub(super) original_failure: &'a str,
+    pub(super) ctrl_c: tokio::sync::watch::Receiver<bool>,
 }
 
 pub(super) async fn reconnect_order_response(
@@ -437,8 +459,10 @@ pub(super) async fn reconnect_order_response(
         max_attempts,
         base_backoff,
         original_failure,
+        ctrl_c,
     } = request;
     let mut cleanup_client = cleanup_client;
+    let mut ctrl_c = ctrl_c;
     let first_attempt = attempts_used.saturating_add(1);
     let mut last_error = None;
     // The runtime Cleanup effect has already emptied and verified the maker
@@ -470,11 +494,26 @@ pub(super) async fn reconnect_order_response(
         if cleanup_ok {
             // Give just-submitted HTTP orders time to become visible, then
             // require a second authoritative snapshot after authentication.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            // The maker book is verified empty at this point, so aborting the
+            // reconnect waits on Ctrl+C is safe.
+            tokio::select! {
+                biased;
+                _ = ctrl_c_latched(&mut ctrl_c) => {
+                    return Err(anyhow::Error::new(ReconnectInterrupted));
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
             let session_id = uuid::Uuid::new_v4().to_string();
             let candidate_client = StandXClient::new()?.with_session_id(&session_id);
             let stream = OrderResponseStream::new(&session_id)?;
-            match tokio::time::timeout(Duration::from_secs(15), stream.connect()).await {
+            let connect_attempt = tokio::select! {
+                biased;
+                _ = ctrl_c_latched(&mut ctrl_c) => {
+                    return Err(anyhow::Error::new(ReconnectInterrupted));
+                }
+                result = tokio::time::timeout(Duration::from_secs(15), stream.connect()) => result,
+            };
+            match connect_attempt {
                 Ok(Ok((commands, responses, health, handle))) => {
                     match query_reconnect_snapshot(
                         &candidate_client,
@@ -568,7 +607,13 @@ pub(super) async fn reconnect_order_response(
         if attempt < max_attempts {
             let local_attempt = attempt.saturating_sub(first_attempt).min(4);
             let multiplier = 1_u32 << local_attempt;
-            tokio::time::sleep(base_backoff.saturating_mul(multiplier)).await;
+            tokio::select! {
+                biased;
+                _ = ctrl_c_latched(&mut ctrl_c) => {
+                    return Err(anyhow::Error::new(ReconnectInterrupted));
+                }
+                _ = tokio::time::sleep(base_backoff.saturating_mul(multiplier)) => {}
+            }
         }
     }
 

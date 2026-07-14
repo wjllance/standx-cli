@@ -375,11 +375,6 @@ impl MakerStats {
         self.cash + position * mark
     }
 
-    /// Mark-to-market equity using the last observed position.
-    pub fn mark_to_market(&self, mark: f64) -> f64 {
-        self.cash + self.last_position * mark
-    }
-
     /// The last observed position.
     pub fn position(&self) -> f64 {
         self.last_position
@@ -995,6 +990,19 @@ pub fn cap_desired_exposure(
         .collect()
 }
 
+/// Whether any resting quote crosses the current touch (buy at/above the ask,
+/// sell at/below the bid).
+pub fn resting_quotes_would_cross(
+    resting: &[RestingQuote],
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+) -> bool {
+    resting.iter().any(|quote| match quote.side {
+        OrderSide::Buy => best_ask.is_some_and(|ask| quote.price >= ask),
+        OrderSide::Sell => best_bid.is_some_and(|bid| quote.price <= bid),
+    })
+}
+
 /// Diff desired vs resting quotes, applying the anti-flicker hold rule.
 ///
 /// Decision table per resting quote (checked in order):
@@ -1014,17 +1022,6 @@ pub fn cap_desired_exposure(
 /// surviving resting counterpart yields a `Place`. The returned Vec orders all
 /// Cancels before all Places so the executor frees margin before re-placing;
 /// Holds come last.
-pub fn resting_quotes_would_cross(
-    resting: &[RestingQuote],
-    best_bid: Option<f64>,
-    best_ask: Option<f64>,
-) -> bool {
-    resting.iter().any(|quote| match quote.side {
-        OrderSide::Buy => best_ask.is_some_and(|ask| quote.price >= ask),
-        OrderSide::Sell => best_bid.is_some_and(|bid| quote.price <= bid),
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile(
     cfg: &MakerConfig,
@@ -1103,74 +1100,6 @@ pub fn reconcile(
     actions
 }
 
-/// One deterministic market/position observation for offline strategy replay.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ReplaySnapshot {
-    pub mark: f64,
-    pub best_bid: Option<f64>,
-    pub best_ask: Option<f64>,
-    pub position: f64,
-}
-
-/// Decisions generated for one replay observation.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReplayCycle {
-    pub cycle: u64,
-    pub actions: Vec<Action>,
-}
-
-/// Replay quote/reconcile decisions without network, credentials, or order I/O.
-///
-/// This simulator deliberately does not invent fills. Callers provide the
-/// observed position at every step, which makes it suitable for validating
-/// risk guards against recorded market/position sequences before canary use.
-pub fn replay_actions(cfg: &MakerConfig, snapshots: &[ReplaySnapshot]) -> Vec<ReplayCycle> {
-    let mut resting = Vec::<RestingQuote>::new();
-    let mut cycles = Vec::with_capacity(snapshots.len());
-
-    for (index, snapshot) in snapshots.iter().enumerate() {
-        let cycle = index as u64;
-        let raw = compute_desired_quotes(
-            cfg,
-            snapshot.mark,
-            snapshot.best_bid,
-            snapshot.best_ask,
-            snapshot.position,
-        );
-        let desired = cap_desired_exposure(cfg, snapshot.position, &raw, &[]);
-        let actions = reconcile(
-            cfg,
-            snapshot.mark,
-            snapshot.position,
-            snapshot.best_bid,
-            snapshot.best_ask,
-            &desired,
-            &resting,
-            cycle,
-        );
-
-        for action in &actions {
-            match action {
-                Action::Cancel { side, level, .. } => {
-                    resting.retain(|quote| !(quote.side == *side && quote.level == *level));
-                }
-                Action::Place(quote) => resting.push(RestingQuote {
-                    order_id: None,
-                    side: quote.side,
-                    level: quote.level,
-                    price: quote.price,
-                    qty: quote.qty,
-                    ref_center: skew_center(cfg, snapshot.mark, snapshot.position),
-                    placed_at_cycle: cycle,
-                }),
-                Action::Hold { .. } => {}
-            }
-        }
-        cycles.push(ReplayCycle { cycle, actions });
-    }
-    cycles
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1233,38 +1162,64 @@ mod tests {
     }
 
     #[test]
-    fn replay_requotes_on_touch_move_without_creating_crossed_quote() {
-        let snapshots = [
-            ReplaySnapshot {
-                mark: 100.0,
-                best_bid: Some(99.99),
-                best_ask: Some(100.01),
-                position: 0.0,
-            },
-            ReplaySnapshot {
-                mark: 100.0,
-                best_bid: Some(99.88),
-                best_ask: Some(99.90),
-                position: 0.0,
-            },
-        ];
-        let replay = replay_actions(&cfg(), &snapshots);
-        assert!(replay[0]
-            .actions
+    fn requotes_on_touch_move_without_creating_crossed_quote() {
+        // Cycle 0: quote a calm book and let the places rest.
+        let desired = compute_desired_quotes(&cfg(), 100.0, Some(99.99), Some(100.01), 0.0);
+        let actions = reconcile(
+            &cfg(),
+            100.0,
+            0.0,
+            Some(99.99),
+            Some(100.01),
+            &desired,
+            &[],
+            0,
+        );
+        assert!(actions
             .iter()
             .any(|action| matches!(action, Action::Place(_))));
-        assert!(replay[1].actions.iter().any(|action| matches!(
+        let resting: Vec<RestingQuote> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Place(quote) => Some(RestingQuote {
+                    order_id: None,
+                    side: quote.side,
+                    level: quote.level,
+                    price: quote.price,
+                    qty: quote.qty,
+                    ref_center: skew_center(&cfg(), 100.0, 0.0),
+                    placed_at_cycle: 0,
+                }),
+                _ => None,
+            })
+            .collect();
+
+        // Cycle 1: the touch drops below the resting sell; the stale quote is
+        // cancelled as WouldCross and no replacement crosses the new touch.
+        let (bid, ask) = (99.88, 99.90);
+        let desired = compute_desired_quotes(&cfg(), 100.0, Some(bid), Some(ask), 0.0);
+        let actions = reconcile(
+            &cfg(),
+            100.0,
+            0.0,
+            Some(bid),
+            Some(ask),
+            &desired,
+            &resting,
+            1,
+        );
+        assert!(actions.iter().any(|action| matches!(
             action,
             Action::Cancel {
                 reason: CancelReason::WouldCross,
                 ..
             }
         )));
-        for action in &replay[1].actions {
+        for action in &actions {
             if let Action::Place(quote) = action {
                 match quote.side {
-                    OrderSide::Buy => assert!(quote.price < snapshots[1].best_ask.unwrap()),
-                    OrderSide::Sell => assert!(quote.price > snapshots[1].best_bid.unwrap()),
+                    OrderSide::Buy => assert!(quote.price < ask),
+                    OrderSide::Sell => assert!(quote.price > bid),
                 }
             }
         }

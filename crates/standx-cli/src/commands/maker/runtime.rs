@@ -1,23 +1,12 @@
 use super::*;
 use standx_sdk::order_response::OrderResponse;
 
-fn next_runtime_effect(runtime_state: &mut MakerState) -> Option<MakerEffect> {
-    runtime_state.next_effect().map(|effect| match effect {
-        MakerEffect::RunCycle(token) => MakerEffect::RunCycle(token),
-        MakerEffect::AbortInFlight(token) => MakerEffect::AbortInFlight(token),
-        MakerEffect::CommitCycle(token) => MakerEffect::CommitCycle(token),
-        MakerEffect::Cleanup { token, target } => MakerEffect::Cleanup { token, target },
-        MakerEffect::Recover { token, target } => MakerEffect::Recover { token, target },
-        MakerEffect::Stop(reason) => MakerEffect::Stop(reason),
-    })
-}
-
 fn take_cleanup_effect(
     runtime_state: &mut MakerState,
     expected_target: RecoveryTarget,
 ) -> Result<WorkToken> {
     loop {
-        match next_runtime_effect(runtime_state) {
+        match runtime_state.next_effect() {
             Some(MakerEffect::AbortInFlight(_)) => {}
             Some(MakerEffect::Cleanup { token, target }) if target == expected_target => {
                 return Ok(token);
@@ -40,7 +29,7 @@ fn take_recovery_effect(
     runtime_state: &mut MakerState,
     expected_target: RecoveryTarget,
 ) -> Result<WorkToken> {
-    match next_runtime_effect(runtime_state) {
+    match runtime_state.next_effect() {
         Some(MakerEffect::Recover { token, target }) if target == expected_target => Ok(token),
         Some(effect) => Err(anyhow::anyhow!(
             "runtime expected {expected_target:?} recovery, got {effect:?}"
@@ -53,7 +42,7 @@ fn take_recovery_effect(
 
 fn take_stop_effect(runtime_state: &mut MakerState) -> Result<MakerExit> {
     loop {
-        match next_runtime_effect(runtime_state) {
+        match runtime_state.next_effect() {
             Some(MakerEffect::AbortInFlight(_)) => {}
             Some(MakerEffect::Stop(reason)) => return Ok(reason.into()),
             Some(effect) => {
@@ -770,7 +759,13 @@ pub(super) async fn run_maker(
     }
     let symbol = info.symbol.clone(); // canonical casing
 
-    let min_order_qty: f64 = info.min_order_qty.parse().unwrap_or(0.0);
+    let min_order_qty: f64 = info.min_order_qty.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "unparseable min_order_qty '{}' for {} from venue symbol info",
+            info.min_order_qty,
+            info.symbol
+        )
+    })?;
     let cfg = MakerConfig {
         spread_bps: args.spread_bps,
         band_bps: args.band_bps,
@@ -1265,8 +1260,21 @@ pub(super) async fn run_maker(
     // credentials are only reloaded from disk/env periodically.
     let mut token_expiry_alerted = TokenExpiryLevel::Ok;
     let mut last_token_expiry_check: Option<std::time::Instant> = None;
+    let mut balance_floor_parse_warned = false;
     let mut runtime_state = MakerState::starting();
     runtime_state.handle(MakerEvent::StartupReady);
+
+    // Long-lived Ctrl+C listener. Tokio's first ctrl_c() call permanently
+    // replaces the process SIGINT handler, so a per-select future silently
+    // drops presses that arrive between selects (and the process no longer
+    // dies on SIGINT either). Latch presses into a watch channel every wait
+    // point can observe.
+    let (ctrl_c_tx, mut ctrl_c_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        while signal::ctrl_c().await.is_ok() {
+            let _ = ctrl_c_tx.send(true);
+        }
+    });
 
     let exit = 'main: loop {
         if args.live {
@@ -1427,7 +1435,23 @@ pub(super) async fn run_maker(
                             .await
                             .map_err(anyhow::Error::from)
                     };
-                    match tokio::time::timeout(Duration::from_secs(15), reconnect).await {
+                    // The maker book is already cancelled (cleanup completed),
+                    // so aborting the reconnect wait on Ctrl+C is safe.
+                    let connect_attempt = tokio::select! {
+                        biased;
+                        _ = ctrl_c_latched(&mut ctrl_c_rx) => None,
+                        result = tokio::time::timeout(Duration::from_secs(15), reconnect) => {
+                            Some(result)
+                        }
+                    };
+                    let Some(connect_attempt) = connect_attempt else {
+                        runtime_state.handle(MakerEvent::CtrlC);
+                        break 'main match take_stop_effect(&mut runtime_state) {
+                            Ok(exit) => exit,
+                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
+                        };
+                    };
+                    match connect_attempt {
                         Ok(Ok(triple)) => {
                             reconnected = Some(triple);
                             break;
@@ -1448,11 +1472,21 @@ pub(super) async fn run_maker(
                     );
                     if attempt < args.account_stream_reconnect_attempts {
                         let multiplier = 1_u32 << attempt.saturating_sub(1).min(4);
-                        tokio::time::sleep(
-                            Duration::from_secs(args.account_stream_reconnect_backoff)
-                                .saturating_mul(multiplier),
-                        )
-                        .await;
+                        let backoff = Duration::from_secs(args.account_stream_reconnect_backoff)
+                            .saturating_mul(multiplier);
+                        tokio::select! {
+                            biased;
+                            _ = ctrl_c_latched(&mut ctrl_c_rx) => {
+                                runtime_state.handle(MakerEvent::CtrlC);
+                                break 'main match take_stop_effect(&mut runtime_state) {
+                                    Ok(exit) => exit,
+                                    Err(error) => {
+                                        MakerExit::PositionReconciliation(error.to_string())
+                                    }
+                                };
+                            }
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
                     }
                 }
 
@@ -1729,6 +1763,7 @@ pub(super) async fn run_maker(
                         max_attempts: args.order_response_reconnect_attempts,
                         base_backoff: Duration::from_secs(args.order_response_reconnect_backoff),
                         original_failure: &detail,
+                        ctrl_c: ctrl_c_rx.clone(),
                     })
                     .await
                     {
@@ -1767,6 +1802,13 @@ pub(super) async fn run_maker(
                             continue;
                         }
                         Err(error) => {
+                            if error.downcast_ref::<ReconnectInterrupted>().is_some() {
+                                runtime_state.handle(MakerEvent::CtrlC);
+                                break match take_stop_effect(&mut runtime_state) {
+                                    Ok(exit) => exit,
+                                    Err(error) => MakerExit::OrderResponse(error.to_string()),
+                                };
+                            }
                             if let Some(reconciliation) =
                                 error.downcast_ref::<PositionReconciliationError>()
                             {
@@ -2002,7 +2044,7 @@ pub(super) async fn run_maker(
         if runtime_state.pending_effect().is_none() {
             runtime_state.handle(MakerEvent::Timer);
         }
-        let cycle_work_token = match next_runtime_effect(&mut runtime_state) {
+        let cycle_work_token = match runtime_state.next_effect() {
             Some(MakerEffect::RunCycle(token)) => token,
             Some(MakerEffect::Stop(reason)) => break reason.into(),
             Some(effect) => {
@@ -2097,7 +2139,7 @@ pub(super) async fn run_maker(
                 };
                 tokio::select! {
                     biased;
-                    _ = signal::ctrl_c() => {
+                    _ = ctrl_c_latched(&mut ctrl_c_rx) => {
                         runtime_state.handle(MakerEvent::CtrlC);
                         break 'main match take_stop_effect(&mut runtime_state) {
                             Ok(exit) => exit,
@@ -2264,7 +2306,7 @@ pub(super) async fn run_maker(
             Ok((places, cancels, holds, fills, mark, src, halted, exit_pending_after, balance)) => {
                 runtime_state.handle(MakerEvent::CycleCompleted(cycle_work_token));
                 if !matches!(
-                    next_runtime_effect(&mut runtime_state),
+                    runtime_state.next_effect(),
                     Some(MakerEffect::CommitCycle(token)) if token == cycle_work_token
                 ) {
                     continue 'main;
@@ -2378,11 +2420,20 @@ pub(super) async fn run_maker(
                         let equity = balance.equity.parse::<f64>().ok();
                         let available = balance.cross_available.parse::<f64>().ok();
                         if let (Some(equity), Some(available)) = (equity, available) {
+                            balance_floor_parse_warned = false;
                             let fired = alerts.evaluate_account(equity, available);
                             for alert in fired {
                                 let await_delivery = alert.firing;
                                 notifier.alert(&alert, &symbol, await_delivery).await;
                             }
+                        } else if !balance_floor_parse_warned {
+                            // An armed --alert-equity-below / --alert-margin-below
+                            // must not go silently dark on unparseable balances.
+                            balance_floor_parse_warned = true;
+                            eprintln!(
+                                "⚠️  equity/margin floor alerts skipped: unparseable balance fields (equity='{}', cross_available='{}')",
+                                balance.equity, balance.cross_available
+                            );
                         }
                     }
                 }
@@ -2753,7 +2804,7 @@ pub(super) async fn run_maker(
                 }
             };
             tokio::select! {
-                _ = signal::ctrl_c() => {
+                _ = ctrl_c_latched(&mut ctrl_c_rx) => {
                     runtime_state.handle(MakerEvent::CtrlC);
                     break 'main match take_stop_effect(&mut runtime_state) {
                         Ok(exit) => exit,
@@ -3080,7 +3131,7 @@ mod tests {
     fn runtime_effect_executor_orders_abort_cleanup_and_recovery() {
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
-        let cycle_token = match next_runtime_effect(&mut runtime_state) {
+        let cycle_token = match runtime_state.next_effect() {
             Some(MakerEffect::RunCycle(token)) => token,
             effect => panic!("expected cycle effect, got {effect:?}"),
         };
@@ -3098,7 +3149,7 @@ mod tests {
                 .expect("cleanup completion must schedule recovery");
         runtime_state.handle(MakerEvent::RecoverySucceeded(recovery));
         assert!(matches!(
-            next_runtime_effect(&mut runtime_state),
+            runtime_state.next_effect(),
             Some(MakerEffect::RunCycle(_))
         ));
     }
@@ -3136,7 +3187,7 @@ mod tests {
     fn runtime_recovery_failure_is_the_stop_source_of_truth() {
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
-        let _ = next_runtime_effect(&mut runtime_state);
+        let _ = runtime_state.next_effect();
         runtime_state.handle(MakerEvent::OrderResponseDisconnected("closed".to_string()));
         let cleanup = take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse)
             .expect("cleanup effect");
@@ -3196,7 +3247,7 @@ mod tests {
 
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
-        let cycle_token = match next_runtime_effect(&mut runtime_state) {
+        let cycle_token = match runtime_state.next_effect() {
             Some(MakerEffect::RunCycle(token)) => token,
             effect => panic!("expected cycle effect, got {effect:?}"),
         };
@@ -3252,7 +3303,7 @@ mod tests {
         // target and fail closed into a stop.
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
-        let _ = next_runtime_effect(&mut runtime_state);
+        let _ = runtime_state.next_effect();
         runtime_state.handle(MakerEvent::CycleInvalidated {
             reason: "account state changed during maker cycle".to_string(),
         });
@@ -3402,7 +3453,7 @@ mod tests {
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
         assert!(matches!(
-            next_runtime_effect(&mut runtime_state),
+            runtime_state.next_effect(),
             Some(MakerEffect::RunCycle(_))
         ));
 
@@ -3434,7 +3485,7 @@ mod tests {
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
         assert!(matches!(
-            next_runtime_effect(&mut runtime_state),
+            runtime_state.next_effect(),
             Some(MakerEffect::RunCycle(_))
         ));
 
