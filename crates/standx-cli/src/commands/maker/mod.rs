@@ -364,11 +364,9 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
-    static MAKER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
-            let lock = MAKER_ENV_LOCK
+            let lock = crate::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let original = std::env::var(key).ok();

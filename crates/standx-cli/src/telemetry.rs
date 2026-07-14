@@ -263,6 +263,12 @@ mod tests {
 
     #[test]
     fn test_telemetry_disabled() {
+        // Serialize with every other env-touching test across the crate; a bare
+        // set_var here otherwise races the process-global environ against reads
+        // like Credentials::load() elsewhere. See crate::TEST_ENV_LOCK.
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Save original value
         let original = env::var(TELEMETRY_ENV_VAR).ok();
 
@@ -279,6 +285,9 @@ mod tests {
 
     #[test]
     fn test_telemetry_enabled_by_default() {
+        let _env = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         env::remove_var(TELEMETRY_ENV_VAR);
         let _telemetry = Telemetry::new();
         // Note: This might fail if user has env var set
