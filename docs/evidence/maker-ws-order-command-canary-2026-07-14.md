@@ -72,3 +72,26 @@ position mismatch; the harness does not flatten it automatically.
 This is an implementation and offline-test update only. No additional
 production command, cancellation, disconnect, or position change was executed,
 so the pending limitation and locked decision above remain unchanged.
+
+## XAG-USD correlated command canary
+
+A separately authorized supervised run used the hardened harness after the
+offline workspace checks passed.
+
+- Window: `2026-07-14T12:24:47.785Z`–`2026-07-14T12:24:51.898Z`.
+- Symbol and bounds: `XAG-USD`, venue-minimum quantity `0.001`, post-only buy
+  price `57.35` (100 bps below the observed mark calculation).
+- Client-order ID: `sxmk-canary-a041fedd9a53`.
+- Create request `c9d50ec7-7dc2-4147-8356-3bac8386d1bf` received code `0`
+  (`success`). REST then observed venue order `11545819148` with the expected
+  client-order ID.
+- Cancel request `9ca9e810-214b-4c3c-aba5-6b8b032528e4` received code `0`
+  (`success`). REST then verified the client order was absent.
+- The harness verified final `XAG-USD` position `0.0` and exited successfully.
+  Independent REST post-checks immediately afterward returned `orders=[]` and
+  `positions=[]`.
+
+This run supplies the previously missing correlated production acceptance,
+normal WS cancellation, in-flight REST visibility, empty-book verification,
+and flat-position evidence for the changed command path. It does not by itself
+record a release-owner decision to unlock the re-locked live gate.

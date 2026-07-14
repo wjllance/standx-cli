@@ -36,6 +36,10 @@ maker by itself.
 - Observe startup, order response, fills, cancellations, alerts, and shutdown;
   retain timestamps and order/trade IDs. The hidden `ws-command-canary` emits
   these checks as `action=ws_command_canary` JSON events in every output mode.
+  It automatically loads `STANDX_SUPERVISOR_WEBHOOK` and optional
+  `STANDX_SUPERVISOR_WEBHOOK_FORMAT` from the process environment or a local
+  ignored `.env.local` file. Process environment values override the file;
+  explicit command-line options take precedence over both.
 - Stop immediately on residual maker orders, uncorrelated fills, stream disconnect, unexpected position change, failed cleanup, or breached risk limit.
 
 ## Unlock decision
@@ -44,6 +48,11 @@ Only a release owner may enable the environment variable after the preceding
 evidence is reviewed. The explicit unlock approval was recorded on
 2026-07-10. Any strategy, venue API, credential, or risk-control change
 re-locks the gate and requires a new canary record.
+
+The 2026-07-14 XAG-USD correlated command canary now supplies the create/cancel
+and post-check evidence required for the WS command transport change. The
+successful experiment is evidence for review, not an implicit release-owner
+unlock decision.
 
 ## Execution records
 

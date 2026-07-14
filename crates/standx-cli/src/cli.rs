@@ -1,5 +1,68 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+const SUPERVISOR_WEBHOOK_ENV: &str = "STANDX_SUPERVISOR_WEBHOOK";
+const SUPERVISOR_WEBHOOK_FORMAT_ENV: &str = "STANDX_SUPERVISOR_WEBHOOK_FORMAT";
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct WsCanaryLocalEnv {
+    webhook: Option<String>,
+    format: Option<String>,
+}
+
+fn parse_ws_canary_local_env(contents: &str) -> WsCanaryLocalEnv {
+    let mut parsed = WsCanaryLocalEnv::default();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, raw_value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = raw_value.trim();
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        if value.is_empty() {
+            continue;
+        }
+        match key.trim() {
+            SUPERVISOR_WEBHOOK_ENV => parsed.webhook = Some(value.to_string()),
+            SUPERVISOR_WEBHOOK_FORMAT_ENV => parsed.format = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    parsed
+}
+
+/// Load the two WS-canary notification settings from a local ignored env file.
+/// Existing process environment values remain authoritative.
+pub fn load_ws_canary_local_env(path: &Path) -> std::io::Result<()> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let parsed = parse_ws_canary_local_env(&contents);
+    if std::env::var_os(SUPERVISOR_WEBHOOK_ENV).is_none() {
+        if let Some(webhook) = parsed.webhook {
+            std::env::set_var(SUPERVISOR_WEBHOOK_ENV, webhook);
+        }
+    }
+    if std::env::var_os(SUPERVISOR_WEBHOOK_FORMAT_ENV).is_none() {
+        if let Some(format) = parsed.format {
+            std::env::set_var(SUPERVISOR_WEBHOOK_FORMAT_ENV, format);
+        }
+    }
+    Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "standx")]
@@ -533,10 +596,15 @@ pub enum MakerCommands {
         #[arg(long, default_value_t = 10)]
         timeout_secs: u64,
         /// Required push channel for start, failure, and completion events
-        #[arg(long)]
+        #[arg(long, env = "STANDX_SUPERVISOR_WEBHOOK")]
         alert_webhook: Option<String>,
         /// Webhook payload format for the target chat platform
-        #[arg(long, value_enum, default_value = "slack")]
+        #[arg(
+            long,
+            value_enum,
+            default_value = "slack",
+            env = "STANDX_SUPERVISOR_WEBHOOK_FORMAT"
+        )]
         alert_webhook_format: AlertWebhookFormat,
     },
 }
@@ -563,4 +631,56 @@ pub enum AlertWebhookFormat {
     Telegram,
     /// Generic: the full structured object (text + ts/symbol/kind/firing).
     Raw,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn ws_command_canary_reads_supervisor_webhook_environment() {
+        let command = Cli::command();
+        let canary = command
+            .find_subcommand("maker")
+            .and_then(|maker| maker.find_subcommand("ws-command-canary"))
+            .expect("hidden WS command canary should remain registered");
+        let webhook = canary
+            .get_arguments()
+            .find(|argument| argument.get_id() == "alert_webhook")
+            .expect("canary webhook argument should remain registered");
+        let format = canary
+            .get_arguments()
+            .find(|argument| argument.get_id() == "alert_webhook_format")
+            .expect("canary webhook format should remain registered");
+
+        assert_eq!(
+            webhook.get_env().map(|value| value.to_string_lossy()),
+            Some("STANDX_SUPERVISOR_WEBHOOK".into())
+        );
+        assert_eq!(
+            format.get_env().map(|value| value.to_string_lossy()),
+            Some("STANDX_SUPERVISOR_WEBHOOK_FORMAT".into())
+        );
+    }
+
+    #[test]
+    fn local_canary_env_parser_accepts_only_supervisor_settings() {
+        let parsed = parse_ws_canary_local_env(
+            r#"
+                # ignored comment
+                export STANDX_SUPERVISOR_WEBHOOK='https://hooks.example/canary'
+                STANDX_SUPERVISOR_WEBHOOK_FORMAT="feishu"
+                STANDX_JWT=must-not-be-loaded
+            "#,
+        );
+
+        assert_eq!(
+            parsed,
+            WsCanaryLocalEnv {
+                webhook: Some("https://hooks.example/canary".to_string()),
+                format: Some("feishu".to_string()),
+            }
+        );
+    }
 }
