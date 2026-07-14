@@ -328,6 +328,23 @@ fn account_event_invalidates_cycle(event: &AccountEvent) -> bool {
     )
 }
 
+/// A position/trade event that arrives while a cycle owns in-flight work must
+/// still take the reconciliation cleanup path even when its observed position
+/// already agrees with the ledger. The reducer has queued `AbortInFlight` and
+/// `Cleanup` at that point; skipping straight to the next cycle would leave
+/// those effects pending and turn the abort into a spurious fail-safe stop.
+fn reconciliation_error_for_cycle(
+    expected: f64,
+    mismatch: Option<f64>,
+    account_position_mismatch: Option<f64>,
+    cycle_invalidated_by_account: bool,
+) -> Option<PositionReconciliationError> {
+    mismatch
+        .or(account_position_mismatch)
+        .or(cycle_invalidated_by_account.then_some(expected))
+        .map(|observed| PositionReconciliationError { expected, observed })
+}
+
 fn market_update_requires_replan(
     previous_mark: f64,
     mark: f64,
@@ -2124,11 +2141,13 @@ pub(super) async fn run_maker(
             }
         }
 
-        let cycle_result = if let Some(observed) = mismatch.or(account_position_mismatch.take()) {
-            Err(anyhow::Error::new(PositionReconciliationError {
-                expected: ledger.expected_position,
-                observed,
-            }))
+        let cycle_result = if let Some(reconciliation) = reconciliation_error_for_cycle(
+            ledger.expected_position,
+            mismatch,
+            account_position_mismatch.take(),
+            cycle_invalidated_by_account,
+        ) {
+            Err(anyhow::Error::new(reconciliation))
         } else if let Some(cycle_result) = cycle_result {
             cycle_result
         } else {
@@ -2350,6 +2369,8 @@ pub(super) async fn run_maker(
                     continue 'main;
                 }
                 if let Some(mismatch) = e.downcast_ref::<PositionReconciliationError>() {
+                    let invalidated_without_position_gap =
+                        (mismatch.expected - mismatch.observed).abs() <= qty_tolerance;
                     runtime_state.handle(MakerEvent::PositionMismatch);
                     let cleanup_token = match take_cleanup_effect(
                         &mut runtime_state,
@@ -2381,10 +2402,14 @@ pub(super) async fn run_maker(
                     notifier
                         .risk(
                             RiskNotice {
-                                kind: "position_reconciliation",
-                                severity: "warning",
-                                event: "frozen",
-                                message: "position mismatch detected; placements frozen and maker cleanup starting",
+                            kind: "position_reconciliation",
+                            severity: "warning",
+                            event: "frozen",
+                            message: if invalidated_without_position_gap {
+                                "account update invalidated active cycle; placements frozen and maker cleanup starting"
+                            } else {
+                                "position mismatch detected; placements frozen and maker cleanup starting"
+                            },
                                 symbol: &symbol,
                                 cycle,
                                 position_before: None,
@@ -3374,6 +3399,41 @@ mod tests {
         assert!(!account_event_invalidates_cycle(&AccountEvent::Connected {
             epoch: 1,
         }));
+    }
+
+    #[test]
+    fn account_cycle_invalidation_routes_through_cleanup_without_a_position_gap() {
+        let reconciliation = reconciliation_error_for_cycle(0.2, None, None, true)
+            .expect("an invalidated cycle must enter reconciliation cleanup");
+        assert_eq!(reconciliation.expected, 0.2);
+        assert_eq!(reconciliation.observed, 0.2);
+
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let cycle_token = match runtime_state.next_effect() {
+            Some(MakerEffect::RunCycle(token)) => token,
+            effect => panic!("expected cycle effect, got {effect:?}"),
+        };
+        runtime_state.handle(MakerEvent::CycleInvalidated {
+            reason: "account state changed during maker cycle".to_string(),
+        });
+        // `PositionMismatch` is deliberately a no-op while frozen. The
+        // pending abort is consumed by the cleanup executor instead of being
+        // misread as an unexpected effect before the next cycle.
+        runtime_state.handle(MakerEvent::PositionMismatch);
+        let cleanup =
+            take_cleanup_effect(&mut runtime_state, RecoveryTarget::PositionReconciliation)
+                .expect("invalidated cycle must drain AbortInFlight before cleanup");
+        runtime_state.handle(MakerEvent::CycleCompleted(cycle_token));
+        runtime_state.handle(MakerEvent::CleanupCompleted(cleanup));
+        let recovery =
+            take_recovery_effect(&mut runtime_state, RecoveryTarget::PositionReconciliation)
+                .expect("cleanup must lead to recovery");
+        runtime_state.handle(MakerEvent::RecoverySucceeded(recovery));
+        assert!(matches!(
+            runtime_state.next_effect(),
+            Some(MakerEffect::RunCycle(_))
+        ));
     }
 
     #[test]
