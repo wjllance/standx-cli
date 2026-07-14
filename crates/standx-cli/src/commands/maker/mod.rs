@@ -680,7 +680,7 @@ mod tests {
             ref_center: 100.0,
             cycle: 1,
         };
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         for pending in [pending_place("request-1"), pending_place("request-2")] {
             projection.apply(1, AccountProjectionEvent::PlaceSubmitted(pending));
         }
@@ -721,7 +721,7 @@ mod tests {
             ref_center: 100.0,
             cycle: 1,
         };
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         projection.apply(1, AccountProjectionEvent::PlaceSubmitted(pending));
         let mut runtime_state = MakerState::starting();
         sender
@@ -750,7 +750,7 @@ mod tests {
     fn disconnected_order_response_stream_is_fail_closed() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         let mut runtime_state = MakerState::starting();
 
         let error = apply_order_responses(
@@ -771,7 +771,7 @@ mod tests {
     async fn controlled_disconnect_fails_closed_then_cleans_only_maker_orders() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         let mut runtime_state = MakerState::starting();
 
         let error = apply_order_responses(
