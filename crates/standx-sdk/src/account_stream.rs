@@ -45,11 +45,23 @@ where
     value.parse::<u64>().map_err(serde::de::Error::custom)
 }
 
+fn nonzero_u64_string_or_number<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64_string_or_number(deserializer)?;
+    if value == 0 {
+        return Err(serde::de::Error::custom("expected a non-zero stable ID"));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountChannel {
     Order,
     Position,
     Trade,
+    Balance,
 }
 
 impl AccountChannel {
@@ -58,6 +70,7 @@ impl AccountChannel {
             Self::Order => "order",
             Self::Position => "position",
             Self::Trade => "trade",
+            Self::Balance => "balance",
         }
     }
 
@@ -66,6 +79,7 @@ impl AccountChannel {
             Self::Order => 0,
             Self::Position => 1,
             Self::Trade => 2,
+            Self::Balance => 3,
         }
     }
 }
@@ -116,12 +130,71 @@ pub struct PositionUpdate {
     pub updated_at: String,
 }
 
+/// A single user trade from the authenticated account stream.
+///
+/// Unlike an order update's cumulative fill quantity, this is an immutable
+/// venue execution. Both IDs are required so consumers can safely deduplicate
+/// it against REST reconciliation data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TradeUpdate {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(
+        rename = "id",
+        alias = "trade_id",
+        deserialize_with = "nonzero_u64_string_or_number"
+    )]
+    pub trade_id: u64,
+    #[serde(deserialize_with = "nonzero_u64_string_or_number")]
+    pub order_id: u64,
+    pub symbol: String,
+    pub side: OrderSide,
+    #[serde(deserialize_with = "string_or_number")]
+    pub price: String,
+    #[serde(deserialize_with = "string_or_number")]
+    pub qty: String,
+    #[serde(
+        rename = "time",
+        alias = "created_at",
+        alias = "updated_at",
+        deserialize_with = "string_or_number"
+    )]
+    pub trade_ts: String,
+}
+
+/// Raw wallet balance notification from the authenticated account stream.
+///
+/// This deliberately does not reuse [`crate::models::Balance`]: the stream
+/// reports wallet fields (`free`, `total`, `locked`, `occupied`), while the
+/// REST model is a derived unified margin snapshot (`equity`, `upnl`,
+/// `cross_available`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BalanceUpdate {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub account_type: String,
+    #[serde(default)]
+    pub token: String,
+    #[serde(deserialize_with = "string_or_number")]
+    pub free: String,
+    #[serde(deserialize_with = "string_or_number")]
+    pub total: String,
+    #[serde(deserialize_with = "string_or_number")]
+    pub locked: String,
+    #[serde(deserialize_with = "string_or_number")]
+    pub occupied: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccountEvent {
     Connected { epoch: u64 },
     Order(OrderUpdate),
     Position(PositionUpdate),
-    TradeShadow { seq: u64, data: serde_json::Value },
+    Trade(TradeUpdate),
+    Balance(BalanceUpdate),
     Disconnected { reason: String },
     Error { reason: String },
 }
@@ -131,7 +204,7 @@ pub struct AccountStreamHealth {
     healthy: Arc<AtomicBool>,
     failure_reason: Arc<Mutex<Option<String>>>,
     epoch: Arc<AtomicU64>,
-    last_seq: Arc<[AtomicU64; 3]>,
+    last_seq: Arc<[AtomicU64; 4]>,
 }
 
 impl AccountStreamHealth {
@@ -409,6 +482,7 @@ fn parse_account_event(text: &str, health: &AccountStreamHealth) -> Result<Optio
         "order" => AccountChannel::Order,
         "position" => AccountChannel::Position,
         "trade" => AccountChannel::Trade,
+        "balance" => AccountChannel::Balance,
         "auth" => return Ok(None),
         _ => return Ok(None),
     };
@@ -447,7 +521,16 @@ fn parse_account_event(text: &str, health: &AccountStreamHealth) -> Result<Optio
             position.seq = seq;
             Ok(Some(AccountEvent::Position(position)))
         }
-        AccountChannel::Trade => Ok(Some(AccountEvent::TradeShadow { seq, data })),
+        AccountChannel::Trade => {
+            let mut trade = serde_json::from_value::<TradeUpdate>(data)?;
+            trade.seq = seq;
+            Ok(Some(AccountEvent::Trade(trade)))
+        }
+        AccountChannel::Balance => {
+            let mut balance = serde_json::from_value::<BalanceUpdate>(data)?;
+            balance.seq = seq;
+            Ok(Some(AccountEvent::Balance(balance)))
+        }
     }
 }
 
@@ -457,7 +540,7 @@ mod tests {
     use tokio_tungstenite::accept_async;
 
     #[test]
-    fn parses_official_order_and_position_shapes() {
+    fn parses_account_channel_fixtures_into_typed_events() {
         let health = AccountStreamHealth::new(1);
         let order = parse_account_event(
             r#"{"seq":35,"channel":"order","data":{"id":2547027,"cl_ord_id":"sxmk-run-q1b0","symbol":"XAG-USD","side":"buy","qty":"0.200","fill_qty":"0.200","fill_avg_price":"58.87","price":"58.87","status":"filled","reduce_only":false,"updated_at":"2026-07-12T22:10:04Z"}}"#,
@@ -488,6 +571,47 @@ mod tests {
         assert!(
             matches!(short_position, AccountEvent::Position(update) if update.side.is_none() && update.qty == "-0.116" && update.seq == 37)
         );
+
+        // The authenticated trade payload follows the user-trade shape and
+        // must carry both stable identifiers for ledger deduplication.
+        let trade = parse_account_event(
+            r#"{"seq":38,"channel":"trade","data":{"id":409870,"order_id":1820682,"side":"sell","symbol":"BTC-USD","price":"121900","qty":"0.01","created_at":"2025-08-11T03:36:19.352620Z"}}"#,
+            &health,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(trade, AccountEvent::Trade(update) if update.trade_id == 409870 && update.order_id == 1820682 && update.side == OrderSide::Sell && update.seq == 38)
+        );
+
+        // This is the documented balance-stream shape. It is raw wallet
+        // state, not the REST unified margin Balance model.
+        let balance = parse_account_event(
+            r#"{"seq":39,"channel":"balance","data":{"account_type":"perps","free":"906946.976225666","locked":"0.000000000","occupied":"0","token":"DUSD","total":"923207.752500717","updated_at":"2025-08-09T09:36:54.504639Z"}}"#,
+            &health,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(balance, AccountEvent::Balance(update) if update.total == "923207.752500717" && update.free == "906946.976225666" && update.seq == 39)
+        );
+    }
+
+    #[test]
+    fn rejects_trade_without_stable_trade_or_order_id() {
+        let health = AccountStreamHealth::new(1);
+        assert!(parse_account_event(
+            r#"{"seq":1,"channel":"trade","data":{"id":0,"order_id":7,"side":"buy","symbol":"BTC-USD","price":"100","qty":"0.1","time":"2026-07-14T00:00:00Z"}}"#,
+            &health,
+        )
+        .is_err());
+
+        let health = AccountStreamHealth::new(1);
+        assert!(parse_account_event(
+            r#"{"seq":1,"channel":"trade","data":{"id":9,"order_id":0,"side":"buy","symbol":"BTC-USD","price":"100","qty":"0.1","time":"2026-07-14T00:00:00Z"}}"#,
+            &health,
+        )
+        .is_err());
     }
 
     #[test]
@@ -523,13 +647,14 @@ mod tests {
         .unwrap()
         .is_none());
         assert!(
-            parse_account_event(r#"{"seq":100,"channel":"balance","data":{}}"#, &health,)
+            parse_account_event(r#"{"seq":100,"channel":"unknown","data":{}}"#, &health,)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(health.last_seq(AccountChannel::Order), 0);
         assert_eq!(health.last_seq(AccountChannel::Position), 0);
         assert_eq!(health.last_seq(AccountChannel::Trade), 0);
+        assert_eq!(health.last_seq(AccountChannel::Balance), 0);
     }
 
     #[tokio::test]
