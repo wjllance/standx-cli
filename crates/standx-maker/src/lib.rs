@@ -37,7 +37,7 @@ pub use ownership::{
 pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
 pub use runtime::{
     order_cancel_rejection_reason, MakerEffect, MakerEvent, MakerState, RecoveryTarget,
-    RuntimePhase, RuntimeStopReason, WorkKind, WorkToken,
+    RuntimeStopReason, WorkToken,
 };
 
 /// Static per-run configuration (CLI args + symbol metadata).
@@ -109,7 +109,7 @@ pub struct InventoryExit {
 /// as a percentage of `max_position`; values over 100 are invalid/disabled so
 /// a typo cannot create a surprising late exit. The result is only a plan —
 /// callers must cancel stale quotes and submit a reduce-only order separately.
-pub fn inventory_exit_plan(
+pub(crate) fn inventory_exit_plan(
     position: f64,
     max_position: f64,
     trigger_pct: f64,
@@ -221,7 +221,7 @@ pub fn round_to_decimals(value: f64, decimals: u32) -> f64 {
 }
 
 /// Round DOWN to `decimals` decimal places (used for buy prices).
-pub fn floor_to_decimals(value: f64, decimals: u32) -> f64 {
+pub(crate) fn floor_to_decimals(value: f64, decimals: u32) -> f64 {
     let factor = 10f64.powi(decimals as i32);
     // Nudge by a hair to avoid f64 representation artifacts like
     // 99.90 * 100 = 9989.999999... flooring to 99.89.
@@ -229,7 +229,7 @@ pub fn floor_to_decimals(value: f64, decimals: u32) -> f64 {
 }
 
 /// Round UP to `decimals` decimal places (used for sell prices).
-pub fn ceil_to_decimals(value: f64, decimals: u32) -> f64 {
+pub(crate) fn ceil_to_decimals(value: f64, decimals: u32) -> f64 {
     let factor = 10f64.powi(decimals as i32);
     ((value * factor) - 1e-9).ceil() / factor
 }
@@ -267,7 +267,7 @@ pub fn mark_mid_divergence_bps(mark: f64, best_bid: f64, best_ask: f64) -> f64 {
 /// shift scales linearly with inventory and saturates at `skew_bps` when
 /// `|position| >= max_position`. Returns mark unchanged when skew is off or
 /// `max_position` is non-positive.
-pub fn skew_center(cfg: &MakerConfig, mark: f64, position: f64) -> f64 {
+pub(crate) fn skew_center(cfg: &MakerConfig, mark: f64, position: f64) -> f64 {
     if cfg.max_position <= 0.0 {
         return mark;
     }
@@ -875,7 +875,7 @@ impl AlertMonitor {
 /// min-qty filter, and max-position side suppression. Quotes that fail a guard
 /// are dropped; duplicate prices after clamping/rounding are collapsed (outer
 /// level wins nothing — the inner level is kept).
-pub fn compute_desired_quotes(
+pub(crate) fn compute_desired_quotes(
     cfg: &MakerConfig,
     mark: f64,
     best_bid: Option<f64>,
@@ -997,7 +997,7 @@ pub fn compute_desired_quotes(
 /// directional ladder independently. `reserved_slots` are considered first;
 /// callers use them for submitted-but-not-yet-visible orders, so transport
 /// delay cannot make a later level lose its exposure reservation.
-pub fn cap_desired_exposure(
+pub(crate) fn cap_desired_exposure(
     cfg: &MakerConfig,
     position: f64,
     desired: &[DesiredQuote],
@@ -1064,7 +1064,7 @@ pub fn resting_quotes_would_cross(
 /// Cancels before all Places so the executor frees margin before re-placing;
 /// Holds come last.
 #[allow(clippy::too_many_arguments)]
-pub fn reconcile(
+pub(crate) fn reconcile(
     cfg: &MakerConfig,
     mark: f64,
     position: f64,

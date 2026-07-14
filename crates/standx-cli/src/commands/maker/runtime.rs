@@ -1346,7 +1346,7 @@ pub(super) async fn run_maker(
                         }
                     };
                     let Some(connect_attempt) = connect_attempt else {
-                        runtime_state.handle(MakerEvent::CtrlC);
+                        runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
                         break 'main take_stop_effect(
                             &mut runtime_state,
                             MakerExit::PositionReconciliation,
@@ -1378,7 +1378,7 @@ pub(super) async fn run_maker(
                         tokio::select! {
                             biased;
                             _ = ctrl_c_latched(&mut ctrl_c_rx) => {
-                                runtime_state.handle(MakerEvent::CtrlC);
+                                runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
                                 break 'main take_stop_effect(
                                     &mut runtime_state,
                                     MakerExit::PositionReconciliation,
@@ -1699,7 +1699,8 @@ pub(super) async fn run_maker(
                         }
                         Err(error) => {
                             if error.downcast_ref::<ReconnectInterrupted>().is_some() {
-                                runtime_state.handle(MakerEvent::CtrlC);
+                                runtime_state
+                                    .handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
                                 break take_stop_effect(
                                     &mut runtime_state,
                                     MakerExit::OrderResponse,
@@ -2026,7 +2027,7 @@ pub(super) async fn run_maker(
                 tokio::select! {
                     biased;
                     _ = ctrl_c_latched(&mut ctrl_c_rx) => {
-                        runtime_state.handle(MakerEvent::CtrlC);
+                        runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
                         break 'main take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                     },
                     event = account_during_work => {
@@ -2698,7 +2699,7 @@ pub(super) async fn run_maker(
             };
             tokio::select! {
                 _ = ctrl_c_latched(&mut ctrl_c_rx) => {
-                    runtime_state.handle(MakerEvent::CtrlC);
+                    runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
                     break 'main take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 },
                 _ = tokio::time::sleep_until(deadline) => break,

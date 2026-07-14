@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 const MAX_CONSECUTIVE_CYCLE_ERRORS: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimePhase {
+pub(crate) enum RuntimePhase {
     Starting,
     Ready,
     Frozen { reason: String },
@@ -46,7 +46,7 @@ pub enum RuntimeStopReason {
 }
 
 impl RuntimeStopReason {
-    pub fn detail(&self) -> String {
+    fn detail(&self) -> String {
         match self {
             Self::CtrlC => "Ctrl+C".to_string(),
             Self::OrderResponse(reason)
@@ -93,7 +93,6 @@ pub enum MakerEvent {
         message: String,
     },
     StopRequested(RuntimeStopReason),
-    CtrlC,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,15 +135,18 @@ impl MakerState {
         }
     }
 
-    pub fn phase(&self) -> &RuntimePhase {
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> &RuntimePhase {
         &self.phase
     }
 
-    pub fn generation(&self) -> u64 {
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub fn is_frozen(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_frozen(&self) -> bool {
         matches!(self.phase, RuntimePhase::Frozen { .. })
     }
 
@@ -284,12 +286,14 @@ impl MakerState {
                 RecoveryTarget::OrderResponse,
             ),
             MakerEvent::StopRequested(reason) => self.stop(reason),
-            MakerEvent::CtrlC => self.stop(RuntimeStopReason::CtrlC),
         }
     }
 
     fn matches_in_flight(&self, token: WorkToken, kind: WorkKind) -> bool {
-        token.generation == self.generation && token.kind == kind && self.in_flight == Some(token)
+        // `in_flight` is only ever set with the current generation and is taken
+        // on every generation bump, so `self.in_flight == Some(token)` already
+        // implies the generation matches; only the kind still needs checking.
+        token.kind == kind && self.in_flight == Some(token)
     }
 
     fn request_cycle(&mut self) -> Vec<MakerEffect> {
@@ -528,7 +532,7 @@ mod tests {
         let mut state = MakerState::starting();
         state.handle(MakerEvent::StartupReady);
         let token = next_cycle(&mut state);
-        state.handle(MakerEvent::CtrlC);
+        state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
         assert_eq!(state.next_effect(), Some(MakerEffect::AbortInFlight(token)));
         assert_eq!(
             state.next_effect(),
