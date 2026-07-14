@@ -3,8 +3,9 @@ use standx_sdk::models::{Order, OrderSide, Position};
 
 /// Process exit code emitted when the maker performs an *intentional*
 /// fail-safe shutdown: the order-response stream was lost, three maker
-/// cycles failed in a row, position reconciliation failed, or residual
-/// maker-owned orders could not be cancelled on the way out.
+/// cycles failed in a row, position reconciliation or an internal accounting
+/// invariant failed, or residual maker-owned orders could not be cancelled on
+/// the way out.
 ///
 /// Supervisors must treat this as "stop, do NOT auto-restart, notify a
 /// human" (systemd `RestartPreventExitStatus=`). It is deliberately
@@ -37,6 +38,7 @@ pub(super) enum MakerExit {
     OrderResponse(String),
     ConsecutiveErrors(String),
     PositionReconciliation(String),
+    AccountingInvariant(String),
     StopLoss(String),
 }
 
@@ -52,6 +54,9 @@ impl MakerExit {
             }
             Self::PositionReconciliation(error) => {
                 format!("fail-safe: position reconciliation failed: {error}")
+            }
+            Self::AccountingInvariant(detail) => {
+                format!("fail-safe: accounting invariant failed: {detail}")
             }
             Self::StopLoss(detail) => {
                 format!("fail-safe: stop-loss breached: {detail}")
@@ -70,6 +75,9 @@ impl MakerExit {
             )),
             Self::PositionReconciliation(error) => Some(format!(
                 "maker stopped immediately (fail-safe): position reconciliation failed: {error}"
+            )),
+            Self::AccountingInvariant(detail) => Some(format!(
+                "maker stopped immediately (fail-safe): accounting invariant failed: {detail}"
             )),
             Self::StopLoss(detail) => Some(format!(
                 "maker stopped immediately (fail-safe): stop-loss breached: {detail}"

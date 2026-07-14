@@ -279,6 +279,18 @@ mod tests {
     }
 
     #[test]
+    fn accounting_invariant_exit_is_immediate() {
+        let exit = MakerExit::AccountingInvariant(
+            "stats position -0.20000000 differs from ledger expected +0.00000000".to_string(),
+        );
+        let lifecycle = exit.lifecycle_reason();
+        let terminal = exit.terminal_error().unwrap();
+        assert!(lifecycle.contains("accounting invariant failed"));
+        assert!(terminal.contains("stopped immediately"));
+        assert!(terminal.contains("ledger expected"));
+    }
+
+    #[test]
     fn stop_loss_exit_reports_the_breach_and_is_terminal() {
         let exit = MakerExit::StopLoss("session PnL -12.50 <= -10.00".to_string());
         let lifecycle = exit.lifecycle_reason();
