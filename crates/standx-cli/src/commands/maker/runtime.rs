@@ -258,7 +258,11 @@ fn accounting_position_mismatch(
     stats_position: f64,
     qty_tolerance: f64,
 ) -> bool {
-    (stats_position - expected_position).abs() > qty_tolerance
+    let delta = (stats_position - expected_position).abs();
+    // Fail closed: a non-finite delta (NaN from a poisoned position) would make
+    // a bare `>` comparison false and silently pass the invariant, so treat any
+    // non-finite value as a mismatch.
+    !delta.is_finite() || delta > qty_tolerance
 }
 
 async fn accounting_invariant_exit(
@@ -2600,6 +2604,14 @@ mod tests {
         assert!(accounting_position_mismatch(0.2, 0.20051, tolerance));
         assert!(!accounting_position_mismatch(-0.2, -0.20049, tolerance));
         assert!(accounting_position_mismatch(-0.2, -0.20051, tolerance));
+    }
+
+    #[test]
+    fn accounting_position_mismatch_fails_closed_on_non_finite() {
+        let tolerance = 0.0005;
+        assert!(accounting_position_mismatch(f64::NAN, 0.2, tolerance));
+        assert!(accounting_position_mismatch(0.2, f64::NAN, tolerance));
+        assert!(accounting_position_mismatch(f64::INFINITY, 0.2, tolerance));
     }
 
     #[tokio::test]
