@@ -82,6 +82,20 @@ fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason
         .unwrap_or_else(|error| MakerExit::PositionReconciliation(error.to_string()))
 }
 
+/// A buffered or queued order-response signals a genuine correlation failure
+/// only when it carried a `request_id` that matched no pending request. A
+/// matched response — even one processed while the runtime is already frozen
+/// for an unrelated reason such as an invalidating account event — leaves the
+/// order-response stream healthy and must not escalate into an order-response
+/// fail-closed. Keying the escalation off the pending effect instead would
+/// misread the `AbortInFlight` queued by *any* freeze (e.g. the
+/// position-reconciliation freeze from `CycleInvalidated`) as an
+/// order-response fault, marking a healthy stream unhealthy and colliding with
+/// the already-queued cleanup target.
+fn order_response_correlation_failed(matched: bool, request_id: Option<&str>) -> bool {
+    request_id.is_some() && !matched
+}
+
 pub(super) fn apply_order_responses(
     receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
     projection: &mut MakerAccountProjection,
@@ -110,19 +124,10 @@ pub(super) fn apply_order_responses(
             cycle,
             price_decimals,
         );
-        if let Some(request_id) = request_id {
-            if !matched {
+        if order_response_correlation_failed(matched, request_id.as_deref()) {
+            if let Some(request_id) = request_id {
                 runtime_state.handle(MakerEvent::OrderResponseUnmatched { request_id });
             }
-        }
-        if matches!(
-            runtime_state.pending_effect(),
-            Some(MakerEffect::AbortInFlight(_))
-                | Some(MakerEffect::Cleanup {
-                    target: RecoveryTarget::OrderResponse,
-                    ..
-                })
-        ) {
             return Err(anyhow::anyhow!("order-response correlation failed closed"));
         }
     }
@@ -2089,19 +2094,10 @@ pub(super) async fn run_maker(
                 cycle,
                 cfg.price_decimals,
             );
-            if let Some(request_id) = request_id {
-                if !matched {
+            if order_response_correlation_failed(matched, request_id.as_deref()) {
+                if let Some(request_id) = request_id {
                     runtime_state.handle(MakerEvent::OrderResponseUnmatched { request_id });
                 }
-            }
-            if matches!(
-                runtime_state.pending_effect(),
-                Some(MakerEffect::AbortInFlight(_))
-                    | Some(MakerEffect::Cleanup {
-                        target: RecoveryTarget::OrderResponse,
-                        ..
-                    })
-            ) {
                 if let Some(health) = order_response_health.as_ref() {
                     health.mark_unhealthy("order-response correlation failed closed");
                 }
@@ -2923,6 +2919,7 @@ mod tests {
     use super::*;
     use standx_maker::{OrderObservation, ProjectionPendingCancel, ProjectionPendingPlace};
     use standx_sdk::account_stream::{OrderUpdate, PositionUpdate};
+    use standx_sdk::order_response::OrderResponseHealth;
 
     fn pending_place(request_id: &str) -> ProjectionPendingPlace {
         ProjectionPendingPlace {
@@ -3036,6 +3033,94 @@ mod tests {
             "accepted placement stays pending"
         );
         assert_eq!(projection.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn order_response_correlation_failed_only_on_uncorrelated_request_ids() {
+        // A matched ack is never a correlation failure, even while the runtime
+        // is frozen for another reason.
+        assert!(!order_response_correlation_failed(true, Some("req-1")));
+        // A response whose request_id matches no pending request fails closed.
+        assert!(order_response_correlation_failed(false, Some("req-1")));
+        // A response without a request_id cannot be correlated or escalated.
+        assert!(!order_response_correlation_failed(false, None));
+    }
+
+    #[test]
+    fn account_invalidation_with_matched_buffered_ack_reconciles_without_order_response_stop() {
+        // Reproduces the shutdown that a plan-affecting account event (e.g. a
+        // fill) used to trigger when the cycle had already buffered one of its
+        // own order acks: the freeze targets position reconciliation, but the
+        // buffered ack was wrongly read as an order-response correlation
+        // failure, flipping a healthy stream unhealthy and colliding with the
+        // queued cleanup target.
+        let mut projection = projection_with_pending(&["req-1"]);
+
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let cycle_token = match next_runtime_effect(&mut runtime_state) {
+            Some(MakerEffect::RunCycle(token)) => token,
+            effect => panic!("expected cycle effect, got {effect:?}"),
+        };
+
+        // An invalidating account event freezes the in-flight cycle and queues
+        // AbortInFlight + Cleanup { PositionReconciliation }.
+        runtime_state.handle(MakerEvent::CycleInvalidated {
+            reason: "account state changed during maker cycle".to_string(),
+        });
+
+        // The cycle's own placement ack was buffered before the freeze and is
+        // now drained. It correlates with the pending request, so it matches.
+        let health = OrderResponseHealth::default();
+        let response = order_response(Some("req-1"), 0);
+        let request_id = response.request_id.clone();
+        let matched = apply_order_response(
+            response,
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        );
+        assert!(matched, "buffered ack correlates with the pending request");
+        if order_response_correlation_failed(matched, request_id.as_deref()) {
+            health.mark_unhealthy("order-response correlation failed closed");
+        }
+
+        // A matched ack must leave the order-response stream healthy; otherwise
+        // the top-of-loop health check would demand an OrderResponse cleanup.
+        assert!(
+            health.is_healthy(),
+            "a matched ack must not flip the order-response stream unhealthy"
+        );
+
+        // The queued cleanup targets position reconciliation, so the maker
+        // cleans up and can recover instead of stopping.
+        take_cleanup_effect(&mut runtime_state, RecoveryTarget::PositionReconciliation)
+            .expect("invalidation must drive a position-reconciliation cleanup, not a stop");
+
+        // Stale completion of the aborted cycle is ignored; the maker stays
+        // frozen awaiting recovery rather than resuming on stale work.
+        runtime_state.handle(MakerEvent::CycleCompleted(cycle_token));
+        assert!(runtime_state.pending_effect().is_none());
+    }
+
+    #[test]
+    fn order_response_cleanup_drain_rejects_position_reconciliation_target() {
+        // Regression witness for the collision the fix removes: had a buffered
+        // response been treated as an order-response fault while the runtime
+        // was frozen for position reconciliation, the top-of-loop
+        // order-response recovery would drain the queued cleanup with the wrong
+        // target and fail closed into a stop.
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let _ = next_runtime_effect(&mut runtime_state);
+        runtime_state.handle(MakerEvent::CycleInvalidated {
+            reason: "account state changed during maker cycle".to_string(),
+        });
+        let error = take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse)
+            .expect_err("position-reconciliation cleanup must not satisfy an order-response drain");
+        assert!(error.to_string().contains("expected OrderResponse cleanup"));
     }
 
     #[test]
