@@ -180,12 +180,13 @@ fn maker_panic_webhook(command: &Commands) -> Option<(String, AlertWebhookFormat
             alert_webhook: Some(url),
             alert_webhook_format,
             ..
-        }
-        | MakerCommands::WsCommandCanary {
-            alert_webhook: Some(url),
+        } => return Some((url.clone(), *alert_webhook_format)),
+        // The canary's webhook is required by clap, so it is always present.
+        MakerCommands::WsCommandCanary {
+            alert_webhook,
             alert_webhook_format,
             ..
-        } => return Some((url.clone(), *alert_webhook_format)),
+        } => return Some((alert_webhook.clone(), *alert_webhook_format)),
         _ => {}
     }
     None

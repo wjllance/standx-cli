@@ -407,6 +407,25 @@ mod tests {
     }
 
     #[test]
+    fn frozen_ignores_timer_and_market_changed() {
+        let mut state = MakerState::starting();
+        state.handle(MakerEvent::StartupReady);
+        let token = next_cycle(&mut state);
+        // Freeze on a position mismatch and drain the abort + cleanup it queues.
+        state.handle(MakerEvent::PositionMismatch);
+        assert!(state.is_frozen());
+        while state.next_effect().is_some() {}
+
+        // While frozen, market ticks must not schedule any new cycle work or
+        // arm a replan — the recovery flow owns the state until it completes.
+        state.handle(MakerEvent::Timer);
+        state.handle(MakerEvent::MarketChanged);
+        assert_eq!(state.next_effect(), None);
+        assert!(state.is_frozen());
+        let _ = token;
+    }
+
+    #[test]
     fn coalesced_timer_commits_then_replans() {
         let mut state = MakerState::starting();
         state.handle(MakerEvent::StartupReady);

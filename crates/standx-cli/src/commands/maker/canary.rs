@@ -8,7 +8,7 @@ use super::notify::MakerNotifier;
 use super::{FailSafeShutdown, LIVE_MAKER_ENV};
 use crate::cli::{AlertWebhookFormat, OutputFormat};
 use anyhow::Result;
-use standx_maker::round_to_decimals;
+use standx_maker::{format_decimals, round_to_decimals};
 use standx_sdk::auth::Credentials;
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::client::StandXClient;
@@ -226,22 +226,18 @@ pub(super) async fn run_ws_command_canary(
     size: Option<f64>,
     price_offset_bps: f64,
     timeout_secs: u64,
-    alert_webhook: Option<String>,
+    alert_webhook: String,
     alert_webhook_format: AlertWebhookFormat,
     output_format: OutputFormat,
 ) -> Result<()> {
+    // --timeout-secs (1..=30) and the required --alert-webhook are now enforced
+    // by clap, so --help documents them and they cannot reach here invalid.
     if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
         return Err(anyhow::anyhow!(
             "{}=1 is required for the WS command canary",
             LIVE_MAKER_ENV
         ));
     }
-    if !(1..=30).contains(&timeout_secs) {
-        return Err(anyhow::anyhow!("--timeout-secs must be between 1 and 30"));
-    }
-    let webhook = alert_webhook.ok_or_else(|| {
-        anyhow::anyhow!("WS command canary requires --alert-webhook for fail-safe delivery")
-    })?;
     let credentials = Credentials::load()?;
     if credentials.is_expired() || credentials.private_key.is_empty() {
         return Err(anyhow::anyhow!(
@@ -251,7 +247,7 @@ pub(super) async fn run_ws_command_canary(
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let client = StandXClient::new()?.with_session_id(session_id.clone());
-    let notifier = MakerNotifier::new(output_format, Some(webhook), alert_webhook_format);
+    let notifier = MakerNotifier::new(output_format, Some(alert_webhook), alert_webhook_format);
     let timeout = Duration::from_secs(timeout_secs);
     let infos = client.get_symbol_info().await?;
     let info = infos
@@ -296,14 +292,8 @@ pub(super) async fn run_ws_command_canary(
     let evidence = CanaryEvidence {
         symbol: &symbol,
         client_order_id: &client_order_id,
-        quantity: format!(
-            "{quantity:.precision$}",
-            precision = info.qty_tick_decimals as usize
-        ),
-        price: format!(
-            "{price:.precision$}",
-            precision = info.price_tick_decimals as usize
-        ),
+        quantity: format_decimals(quantity, info.qty_tick_decimals),
+        price: format_decimals(price, info.price_tick_decimals),
     };
     evidence.emit_position(CanaryStage::PreflightVerified, None, 0.0);
     let stream = OrderResponseStream::new(session_id)?;
@@ -391,11 +381,8 @@ async fn run_commands(
             cl_ord_id: Some(client_order_id.to_string()),
             side: OrderSide::Buy,
             order_type: OrderType::Limit,
-            quantity: format!("{quantity:.precision$}", precision = qty_decimals as usize),
-            price: Some(format!(
-                "{price:.precision$}",
-                precision = price_decimals as usize
-            )),
+            quantity: format_decimals(quantity, qty_decimals),
+            price: Some(format_decimals(price, price_decimals)),
             time_in_force: Some(TimeInForce::Alo),
             reduce_only: false,
             stop_price: None,
