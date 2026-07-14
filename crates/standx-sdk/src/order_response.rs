@@ -5,6 +5,7 @@ use crate::client::order::{cancel_order_body, create_order_body, CreateOrderPara
 use crate::error::{Error, Result};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -66,24 +67,65 @@ struct OutboundOrderCommand {
     written: oneshot::Sender<Result<()>>,
 }
 
+/// A signed order command whose response correlation ID is available before
+/// any asynchronous socket write begins.
+///
+/// Callers that maintain an order ledger should register [`Self::request_id`]
+/// before passing the command to [`OrderCommandSender::send_prepared`]. The
+/// wire payload stays private so exchange signing and envelope construction
+/// remain owned by the SDK.
+pub struct PreparedOrderCommand {
+    request_id: String,
+    text: String,
+}
+
+impl PreparedOrderCommand {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
+impl fmt::Debug for PreparedOrderCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedOrderCommand")
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OrderCommandSender {
     /// Submit a signed order creation request over the authenticated socket.
     pub async fn create_order(&self, params: &CreateOrderParams) -> Result<String> {
-        self.submit("order:new", create_order_body(params).to_string())
-            .await
+        let command = self.prepare_create_order(params)?;
+        let request_id = command.request_id.clone();
+        self.send_prepared(command).await?;
+        Ok(request_id)
     }
 
     /// Submit a signed cancellation request by exchange order ID.
     pub async fn cancel_order(&self, order_id: &str) -> Result<String> {
+        let command = self.prepare_cancel_order(order_id)?;
+        let request_id = command.request_id.clone();
+        self.send_prepared(command).await?;
+        Ok(request_id)
+    }
+
+    /// Prepare a signed order creation request without performing I/O.
+    pub fn prepare_create_order(&self, params: &CreateOrderParams) -> Result<PreparedOrderCommand> {
+        self.prepare("order:new", create_order_body(params).to_string())
+    }
+
+    /// Prepare a signed cancellation request without performing I/O.
+    pub fn prepare_cancel_order(&self, order_id: &str) -> Result<PreparedOrderCommand> {
         let order_id = order_id.parse::<i64>().map_err(|_| Error::Validation {
             field: "order_id".to_string(),
             message: format!("expected an integer order ID, got '{order_id}'"),
         })?;
-        self.submit("order:cancel", cancel_order_body(order_id).to_string())
-            .await
+        self.prepare("order:cancel", cancel_order_body(order_id).to_string())
     }
 
-    async fn submit(&self, method: &str, params: String) -> Result<String> {
+    fn prepare(&self, method: &str, params: String) -> Result<PreparedOrderCommand> {
         let request_id = uuid::Uuid::new_v4().to_string();
         // The WebSocket envelope request ID is the asynchronous response
         // correlation key. The signature carries its own request ID, just as
@@ -107,10 +149,18 @@ impl OrderCommandSender {
             "params": params,
         })
         .to_string();
+        Ok(PreparedOrderCommand { request_id, text })
+    }
+
+    /// Write a previously prepared command to the authenticated socket.
+    ///
+    /// Success means the complete frame reached the local WebSocket sink, not
+    /// that the venue accepted the request.
+    pub async fn send_prepared(&self, command: PreparedOrderCommand) -> Result<()> {
         let (written_tx, written_rx) = oneshot::channel();
         self.commands
             .send(OutboundOrderCommand {
-                text,
+                text: command.text,
                 written: written_tx,
             })
             .await
@@ -120,7 +170,7 @@ impl OrderCommandSender {
         written_rx.await.map_err(|_| Error::WebSocket {
             message: "order-command stream stopped before writing request".to_string(),
         })??;
-        Ok(request_id)
+        Ok(())
     }
 }
 
@@ -706,8 +756,8 @@ mod tests {
         let stream =
             OrderResponseStream::with_url_token_and_signer(url, "jwt", "maker-session", signer);
         let (commands, mut responses, _health, handle) = stream.connect().await.unwrap();
-        let request_id = commands
-            .create_order(&CreateOrderParams {
+        let command = commands
+            .prepare_create_order(&CreateOrderParams {
                 symbol: "BTC-USD".to_string(),
                 cl_ord_id: Some("sxmk-test".to_string()),
                 side: OrderSide::Buy,
@@ -720,8 +770,11 @@ mod tests {
                 sl_price: None,
                 tp_price: None,
             })
-            .await
             .unwrap();
+        // The correlation key is available before the first await so a caller
+        // can register it before cancellable runtime work begins.
+        let request_id = command.request_id().to_string();
+        commands.send_prepared(command).await.unwrap();
         let response = tokio::time::timeout(Duration::from_secs(1), responses.recv())
             .await
             .unwrap()

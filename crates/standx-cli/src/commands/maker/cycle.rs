@@ -424,33 +424,30 @@ pub(super) async fn maker_cycle(
                     ensure_live_streams_healthy(account_stream_health, order_response_health)?;
                     if let Some(id) = order_id {
                         ensure_request_registry_capacity(account_projection.as_deref())?;
-                        match live_order_commands(order_commands)?.cancel_order(id).await {
-                            Ok(request_id) => {
-                                let order_id = id.parse::<u64>().map_err(|_| {
-                                    anyhow::anyhow!(
-                                        "projected maker order has non-integer exchange ID '{id}'"
-                                    )
-                                })?;
-                                let projection = account_projection.as_deref_mut().expect(
-                                    "live maker cycles require initialized account projection",
-                                );
-                                apply_request_submission(
-                                    projection,
-                                    AccountProjectionEvent::CancelSubmitted(
-                                        ProjectionPendingCancel {
-                                            request_id,
-                                            order_id,
-                                            side: *side,
-                                            level: *level,
-                                            price: *price,
-                                            cycle,
-                                        },
-                                    ),
-                                )?;
-                                cancels += 1;
-                            }
-                            Err(e) => return Err(e.into()),
-                        }
+                        let order_id = id.parse::<u64>().map_err(|_| {
+                            anyhow::anyhow!(
+                                "projected maker order has non-integer exchange ID '{id}'"
+                            )
+                        })?;
+                        let commands = live_order_commands(order_commands)?;
+                        let command = commands.prepare_cancel_order(id)?;
+                        let request_id = command.request_id().to_string();
+                        let projection = account_projection
+                            .as_deref_mut()
+                            .expect("live maker cycles require initialized account projection");
+                        apply_request_submission(
+                            projection,
+                            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                                request_id,
+                                order_id,
+                                side: *side,
+                                level: *level,
+                                price: *price,
+                                cycle,
+                            }),
+                        )?;
+                        commands.send_prepared(command).await?;
+                        cancels += 1;
                     }
                 } else {
                     resting.retain(|r| !(r.side == *side && r.level == *level));
@@ -463,23 +460,23 @@ pub(super) async fn maker_cycle(
                     ensure_request_registry_capacity(account_projection.as_deref())?;
                     let cl_ord_id =
                         maker::quote_client_order_id(run_order_prefix, cycle, q.side, q.level);
-                    let request_id = live_order_commands(order_commands)?
-                        .create_order(&CreateOrderParams {
-                            symbol: symbol.to_string(),
-                            cl_ord_id: Some(cl_ord_id.clone()),
-                            side: q.side,
-                            order_type: OrderType::Limit,
-                            quantity: format_decimals(q.qty, cfg.qty_decimals),
-                            price: Some(format_decimals(q.price, cfg.price_decimals)),
-                            // Post-only: reject instead of taking if the
-                            // price would cross by arrival time.
-                            time_in_force: Some(TimeInForce::Alo),
-                            reduce_only: false,
-                            stop_price: None,
-                            sl_price: None,
-                            tp_price: None,
-                        })
-                        .await?;
+                    let commands = live_order_commands(order_commands)?;
+                    let command = commands.prepare_create_order(&CreateOrderParams {
+                        symbol: symbol.to_string(),
+                        cl_ord_id: Some(cl_ord_id.clone()),
+                        side: q.side,
+                        order_type: OrderType::Limit,
+                        quantity: format_decimals(q.qty, cfg.qty_decimals),
+                        price: Some(format_decimals(q.price, cfg.price_decimals)),
+                        // Post-only: reject instead of taking if the
+                        // price would cross by arrival time.
+                        time_in_force: Some(TimeInForce::Alo),
+                        reduce_only: false,
+                        stop_price: None,
+                        sl_price: None,
+                        tp_price: None,
+                    })?;
+                    let request_id = command.request_id().to_string();
                     let projection = account_projection
                         .as_deref_mut()
                         .expect("live maker cycles require initialized account projection");
@@ -496,6 +493,7 @@ pub(super) async fn maker_cycle(
                             cycle,
                         }),
                     )?;
+                    commands.send_prepared(command).await?;
                     places += 1;
                 } else {
                     resting.push(RestingQuote {
@@ -527,21 +525,21 @@ pub(super) async fn maker_cycle(
             ensure_live_streams_healthy(account_stream_health, order_response_health)?;
             ensure_request_registry_capacity(account_projection.as_deref())?;
             let cl_ord_id = maker::exit_client_order_id(run_order_prefix, cycle);
-            let request_id = live_order_commands(order_commands)?
-                .create_order(&CreateOrderParams {
-                    symbol: symbol.to_string(),
-                    cl_ord_id: Some(cl_ord_id.clone()),
-                    side: exit.side,
-                    order_type: OrderType::Market,
-                    quantity: format_decimals(exit.qty, cfg.qty_decimals),
-                    price: None,
-                    time_in_force: None,
-                    reduce_only: true,
-                    stop_price: None,
-                    sl_price: None,
-                    tp_price: None,
-                })
-                .await?;
+            let commands = live_order_commands(order_commands)?;
+            let command = commands.prepare_create_order(&CreateOrderParams {
+                symbol: symbol.to_string(),
+                cl_ord_id: Some(cl_ord_id.clone()),
+                side: exit.side,
+                order_type: OrderType::Market,
+                quantity: format_decimals(exit.qty, cfg.qty_decimals),
+                price: None,
+                time_in_force: None,
+                reduce_only: true,
+                stop_price: None,
+                sl_price: None,
+                tp_price: None,
+            })?;
+            let request_id = command.request_id().to_string();
             // Register the exit submission so its asynchronous ack correlates
             // to a pending entry instead of counting as an unmatched response.
             // The sentinel level keeps it out of quote-slot reservation; a
@@ -563,6 +561,7 @@ pub(super) async fn maker_cycle(
                     cycle,
                 }),
             )?;
+            commands.send_prepared(command).await?;
             *inventory_exit_pending = true;
             log_maker_event(MakerLogEvent {
                 output_format,

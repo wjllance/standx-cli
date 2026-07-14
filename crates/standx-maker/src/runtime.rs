@@ -64,16 +64,34 @@ pub enum MakerEvent {
     Timer,
     MarketChanged,
     CycleCompleted(WorkToken),
-    CycleInvalidated { reason: String },
-    CycleFailed { token: WorkToken, reason: String },
+    CycleInvalidated {
+        reason: String,
+    },
+    CycleFailed {
+        token: WorkToken,
+        reason: String,
+    },
     AccountStreamDisconnected(String),
     OrderResponseDisconnected(String),
     PositionMismatch,
     CleanupCompleted(WorkToken),
-    CleanupFailed { token: WorkToken, reason: String },
+    CleanupFailed {
+        token: WorkToken,
+        reason: String,
+    },
     RecoverySucceeded(WorkToken),
-    RecoveryFailed { token: WorkToken, reason: String },
-    OrderResponseUnmatched { request_id: String },
+    RecoveryFailed {
+        token: WorkToken,
+        reason: String,
+    },
+    OrderResponseUnmatched {
+        request_id: String,
+    },
+    OrderCancelRejected {
+        request_id: String,
+        code: i64,
+        message: String,
+    },
     StopRequested(RuntimeStopReason),
     CtrlC,
 }
@@ -257,6 +275,14 @@ impl MakerState {
                 format!("unexpected order-response request ID {request_id}"),
                 RecoveryTarget::OrderResponse,
             ),
+            MakerEvent::OrderCancelRejected {
+                request_id,
+                code,
+                message,
+            } => self.freeze(
+                order_cancel_rejection_reason(&request_id, code, &message),
+                RecoveryTarget::OrderResponse,
+            ),
             MakerEvent::StopRequested(reason) => self.stop(reason),
             MakerEvent::CtrlC => self.stop(RuntimeStopReason::CtrlC),
         }
@@ -320,6 +346,12 @@ impl MakerState {
             .into_iter()
             .collect()
     }
+}
+
+pub fn order_cancel_rejection_reason(request_id: &str, code: i64, message: &str) -> String {
+    format!(
+        "order-response cancel rejected for request {request_id}: code={code} message={message:?}; refusing further live orders"
+    )
 }
 
 #[cfg(test)]
@@ -513,6 +545,33 @@ mod tests {
             request_id: "unknown".to_string(),
         });
         assert!(state.is_frozen());
+        assert!(matches!(
+            state.next_effect(),
+            Some(MakerEffect::AbortInFlight(_))
+        ));
+        assert!(matches!(
+            state.next_effect(),
+            Some(MakerEffect::Cleanup {
+                target: RecoveryTarget::OrderResponse,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejected_cancel_fails_closed_through_order_response_recovery() {
+        let mut state = MakerState::starting();
+        state.handle(MakerEvent::StartupReady);
+        let _ = next_cycle(&mut state);
+        state.handle(MakerEvent::OrderCancelRejected {
+            request_id: "cancel-1".to_string(),
+            code: 400,
+            message: "rejected".to_string(),
+        });
+        assert!(matches!(
+            state.phase(),
+            RuntimePhase::Frozen { reason } if reason.contains("cancel-1") && reason.contains("code=400")
+        ));
         assert!(matches!(
             state.next_effect(),
             Some(MakerEffect::AbortInFlight(_))

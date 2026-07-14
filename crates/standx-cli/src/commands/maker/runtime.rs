@@ -81,16 +81,50 @@ fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason
 
 /// A buffered or queued order-response signals a genuine correlation failure
 /// only when it carried a `request_id` that matched no pending request. A
-/// matched response — even one processed while the runtime is already frozen
-/// for an unrelated reason such as an invalidating account event — leaves the
-/// order-response stream healthy and must not escalate into an order-response
-/// fail-closed. Keying the escalation off the pending effect instead would
-/// misread the `AbortInFlight` queued by *any* freeze (e.g. the
-/// position-reconciliation freeze from `CycleInvalidated`) as an
-/// order-response fault, marking a healthy stream unhealthy and colliding with
-/// the already-queued cleanup target.
+/// matched accepted placement/cancel or rejected placement remains correlated,
+/// even when processed while the runtime is already frozen for an unrelated
+/// account event. A matched rejected cancellation is classified separately and
+/// fails closed because the maker cannot assume the order is gone.
 fn order_response_correlation_failed(matched: bool, request_id: Option<&str>) -> bool {
     request_id.is_some() && !matched
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CancelRejection {
+    request_id: String,
+    code: i64,
+    message: String,
+}
+
+fn order_response_failure(
+    outcome: &std::result::Result<bool, CancelRejection>,
+    request_id: Option<&str>,
+    runtime_state: &mut MakerState,
+) -> Option<String> {
+    match outcome {
+        Ok(matched) if order_response_correlation_failed(*matched, request_id) => {
+            runtime_state.handle(MakerEvent::OrderResponseUnmatched {
+                request_id: request_id
+                    .expect("correlation failure requires request ID")
+                    .to_string(),
+            });
+            Some("order-response correlation failed closed".to_string())
+        }
+        Err(rejection) => {
+            let detail = maker::order_cancel_rejection_reason(
+                &rejection.request_id,
+                rejection.code,
+                &rejection.message,
+            );
+            runtime_state.handle(MakerEvent::OrderCancelRejected {
+                request_id: rejection.request_id.clone(),
+                code: rejection.code,
+                message: rejection.message.clone(),
+            });
+            Some(detail)
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn apply_order_responses(
@@ -113,7 +147,7 @@ pub(super) fn apply_order_responses(
             }
         };
         let request_id = response.request_id.clone();
-        let matched = apply_order_response(
+        let outcome = apply_order_response(
             response,
             projection,
             output_format,
@@ -121,11 +155,9 @@ pub(super) fn apply_order_responses(
             cycle,
             price_decimals,
         );
-        if order_response_correlation_failed(matched, request_id.as_deref()) {
-            if let Some(request_id) = request_id {
-                runtime_state.handle(MakerEvent::OrderResponseUnmatched { request_id });
-            }
-            return Err(anyhow::anyhow!("order-response correlation failed closed"));
+        if let Some(error) = order_response_failure(&outcome, request_id.as_deref(), runtime_state)
+        {
+            return Err(anyhow::anyhow!(error));
         }
     }
 }
@@ -137,38 +169,29 @@ fn apply_order_response(
     symbol: &str,
     cycle: u64,
     price_decimals: u32,
-) -> bool {
+) -> std::result::Result<bool, CancelRejection> {
     let Some(request_id) = response.request_id.as_deref() else {
-        return false;
+        return Ok(false);
     };
     let Some(pending) = projection.pending_request(request_id).cloned() else {
-        return false;
+        return Ok(false);
     };
     let generation = projection.generation();
     match pending {
-        ProjectionPendingRequest::Cancel(cancelled) => {
+        ProjectionPendingRequest::Cancel(_) => {
+            if !response.accepted() {
+                return Err(CancelRejection {
+                    request_id: request_id.to_string(),
+                    code: response.code,
+                    message: response.message,
+                });
+            }
             projection.apply(
                 generation,
                 AccountProjectionEvent::CancelResolved {
                     request_id: request_id.to_string(),
                 },
             );
-            // A cancellation rejected because the order is already gone is an
-            // acceptable terminal outcome. The next venue snapshot remains the
-            // authority for whether the order actually disappeared.
-            if !response.accepted() {
-                output::log_maker_event(output::MakerLogEvent {
-                    output_format,
-                    symbol,
-                    cycle,
-                    action: "cancel_noop",
-                    side: cancelled.side,
-                    level: cancelled.level,
-                    price: cancelled.price,
-                    price_decimals,
-                    detail: "order already gone",
-                });
-            }
         }
         ProjectionPendingRequest::Place(place) => {
             if response.accepted() {
@@ -199,7 +222,7 @@ fn apply_order_response(
             }
         }
     }
-    true
+    Ok(true)
 }
 
 struct AccountEventContext<'a> {
@@ -2051,7 +2074,7 @@ pub(super) async fn run_maker(
         // before account events to mirror the top-of-loop drain.
         for response in buffered_orders {
             let request_id = response.request_id.clone();
-            let matched = apply_order_response(
+            let outcome = apply_order_response(
                 response,
                 account_projection
                     .as_mut()
@@ -2061,12 +2084,11 @@ pub(super) async fn run_maker(
                 cycle,
                 cfg.price_decimals,
             );
-            if order_response_correlation_failed(matched, request_id.as_deref()) {
-                if let Some(request_id) = request_id {
-                    runtime_state.handle(MakerEvent::OrderResponseUnmatched { request_id });
-                }
+            if let Some(reason) =
+                order_response_failure(&outcome, request_id.as_deref(), &mut runtime_state)
+            {
                 if let Some(health) = order_response_health.as_ref() {
-                    health.mark_unhealthy("order-response correlation failed closed");
+                    health.mark_unhealthy(reason);
                 }
             }
         }
@@ -3074,7 +3096,8 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        );
+        )
+        .unwrap();
         assert!(matched);
         assert_eq!(
             projection.pending_places().len(),
@@ -3130,7 +3153,8 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        );
+        )
+        .unwrap();
         assert!(matched, "buffered ack correlates with the pending request");
         if order_response_correlation_failed(matched, request_id.as_deref()) {
             health.mark_unhealthy("order-response correlation failed closed");
@@ -3182,7 +3206,8 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        );
+        )
+        .unwrap();
         assert!(matched);
         assert!(
             projection.pending_places().is_empty(),
@@ -3212,12 +3237,13 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        ));
+        )
+        .unwrap());
         assert!(projection.pending_cancels().is_empty());
     }
 
     #[test]
-    fn apply_order_response_matches_rejected_cancel_acknowledgement() {
+    fn apply_order_response_fails_closed_on_rejected_cancel_acknowledgement() {
         let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         projection.apply(
             1,
@@ -3231,16 +3257,23 @@ mod tests {
             }),
         );
 
-        assert!(apply_order_response(
-            order_response(Some("cancel-1"), 400),
-            &mut projection,
-            OutputFormat::Quiet,
-            "BTC-USD",
-            1,
-            2,
-        ));
-        assert!(projection.pending_cancels().is_empty());
-        assert_eq!(projection.pending_request_count(), 0);
+        assert_eq!(
+            apply_order_response(
+                order_response(Some("cancel-1"), 400),
+                &mut projection,
+                OutputFormat::Quiet,
+                "BTC-USD",
+                1,
+                2,
+            ),
+            Err(CancelRejection {
+                request_id: "cancel-1".to_string(),
+                code: 400,
+                message: String::new(),
+            })
+        );
+        assert_eq!(projection.pending_cancels().len(), 1);
+        assert_eq!(projection.pending_request_count(), 1);
     }
 
     #[test]
@@ -3280,7 +3313,8 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        ));
+        )
+        .unwrap());
         assert_eq!(projection.pending_request_count(), 0);
     }
 
@@ -3294,7 +3328,8 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        ));
+        )
+        .unwrap());
         assert!(!apply_order_response(
             order_response(None, 0),
             &mut projection,
@@ -3302,7 +3337,8 @@ mod tests {
             "BTC-USD",
             1,
             2,
-        ));
+        )
+        .unwrap());
         assert_eq!(projection.pending_places().len(), 1);
     }
 
@@ -3365,6 +3401,53 @@ mod tests {
             runtime_state.pending_effect(),
             Some(MakerEffect::AbortInFlight(_))
         ));
+    }
+
+    #[test]
+    fn apply_order_responses_rejected_cancel_fails_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
+        projection.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "cancel-1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 1,
+            }),
+        );
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        assert!(matches!(
+            runtime_state.next_effect(),
+            Some(MakerEffect::RunCycle(_))
+        ));
+
+        tx.try_send(OrderResponse {
+            code: 400,
+            message: "cancel rejected".to_string(),
+            request_id: Some("cancel-1".to_string()),
+        })
+        .unwrap();
+        let error = apply_order_responses(
+            &mut rx,
+            &mut projection,
+            &mut runtime_state,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cancel rejected"));
+        assert!(matches!(
+            runtime_state.pending_effect(),
+            Some(MakerEffect::AbortInFlight(_))
+        ));
+        assert_eq!(projection.pending_cancels().len(), 1);
     }
 
     #[test]
