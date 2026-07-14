@@ -1261,7 +1261,7 @@ pub(super) async fn run_maker(
                 }
                 resting.clear();
                 if let Some(projection) = account_projection.as_mut() {
-                    projection.clear_orders_and_pending();
+                    projection.clear_orders_preserving_pending_acks();
                 }
                 inventory_exit_pending = false;
                 if let Some(handle) = account_stream_handle.take() {
@@ -2428,7 +2428,7 @@ pub(super) async fn run_maker(
                     }
                     resting.clear();
                     if let Some(projection) = account_projection.as_mut() {
-                        projection.clear_orders_and_pending();
+                        projection.clear_orders_preserving_pending_acks();
                     }
                     inventory_exit_pending = false;
                     runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));

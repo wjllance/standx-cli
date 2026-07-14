@@ -307,6 +307,19 @@ impl MakerAccountProjection {
         self.pending.clear();
     }
 
+    /// Clear executable quote state while retaining acknowledgements that the
+    /// order-response stream has not delivered yet. A fill or account update
+    /// can arrive before its correlated order response; a reconciliation
+    /// freeze must therefore close the quote slots without turning that later,
+    /// valid response into an unknown request ID.
+    pub fn clear_orders_preserving_pending_acks(&mut self) {
+        self.orders.clear();
+        for entry in &mut self.pending {
+            entry.slot_open = false;
+        }
+        self.drop_settled();
+    }
+
     pub fn observed_position(&self) -> f64 {
         self.observed_position
     }
@@ -836,6 +849,57 @@ mod tests {
             },
         );
         assert!(outcome.applied);
+        assert_eq!(state.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn freeze_closes_quote_slots_but_preserves_unacked_response_registry() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 1,
+            }),
+        );
+
+        state.clear_orders_preserving_pending_acks();
+        assert!(state.pending_places().is_empty());
+        assert!(state.pending_cancels().is_empty());
+        assert!(matches!(
+            state.pending_request("p1"),
+            Some(ProjectionPendingRequest::Place(_))
+        ));
+        assert!(matches!(
+            state.pending_request("c1"),
+            Some(ProjectionPendingRequest::Cancel(_))
+        ));
+
+        assert!(
+            state
+                .apply(
+                    1,
+                    AccountProjectionEvent::PlaceAccepted {
+                        request_id: "p1".to_string(),
+                    },
+                )
+                .applied
+        );
+        assert!(
+            state
+                .apply(
+                    1,
+                    AccountProjectionEvent::CancelResolved {
+                        request_id: "c1".to_string(),
+                    },
+                )
+                .applied
+        );
         assert_eq!(state.pending_request_count(), 0);
     }
 
