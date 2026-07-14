@@ -1381,7 +1381,10 @@ pub(super) async fn run_maker(
                 let projection = account_projection
                     .as_mut()
                     .expect("live account reconnect requires initialized projection");
-                projection.reset(account_stream_epoch, ledger.expected_position);
+                projection.reset_after_cleanup_preserving_pending_acks(
+                    account_stream_epoch,
+                    ledger.expected_position,
+                );
 
                 let reconnect_outcome = match apply_account_events(
                     &mut events,
