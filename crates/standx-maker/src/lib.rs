@@ -24,10 +24,9 @@ pub mod risk;
 pub mod runtime;
 
 pub use account_projection::{
-    AccountProjectionEvent, MakerAccountProjection, OrderObservation, ProjectedBalance,
-    ProjectedOrder, ProjectionMismatch, ProjectionOutcome, ProjectionPendingCancel,
-    ProjectionPendingPlace, ProjectionPendingRequest, ProjectionRegistryError,
-    MAX_PENDING_ORDER_REQUESTS,
+    AccountProjectionEvent, MakerAccountProjection, OrderObservation, ProjectedOrder,
+    ProjectionMismatch, ProjectionOutcome, ProjectionPendingCancel, ProjectionPendingPlace,
+    ProjectionPendingRequest, ProjectionRegistryError, MAX_PENDING_ORDER_REQUESTS,
 };
 pub use ledger::{LedgerError, LedgerTrade, MakerFill, MakerLedger, TradeSource};
 pub use ownership::{

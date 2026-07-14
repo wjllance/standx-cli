@@ -104,17 +104,6 @@ impl ProjectedOrder {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProjectedBalance {
-    pub account_type: String,
-    pub token: String,
-    pub free: String,
-    pub total: String,
-    pub locked: String,
-    pub occupied: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct OrderObservation {
     pub order_id: u64,
     pub client_order_id: Option<String>,
@@ -135,7 +124,6 @@ pub enum AccountProjectionEvent {
     OrderObserved(OrderObservation),
     TradeApplied { order_id: u64, qty: f64 },
     PositionObserved { position: f64 },
-    BalanceObserved(ProjectedBalance),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -189,16 +177,107 @@ impl fmt::Display for ProjectionMismatch {
 
 impl std::error::Error for ProjectionMismatch {}
 
+/// One in-flight place/cancel request, tracked in a single registry.
+///
+/// A request has two independent lifecycles that used to live in two parallel
+/// collections:
+///
+/// - `ack_pending`: still awaiting the command-stream ack (`PlaceAccepted` /
+///   `PlaceRejected` / `CancelResolved`). Counts toward the registry capacity
+///   and request-id dedup.
+/// - `slot_open`: still an unmatched pending place/cancel — visible in the
+///   `pending_places()` / `pending_cancels()` views and eligible for order
+///   adoption. Cleared once the order is observed, rejected, resolved, or
+///   expired.
+///
+/// The two clear independently: a place can be adopted from the account stream
+/// (slot closes) before its command-stream ack arrives, or observed terminal
+/// while a late ack is still outstanding. An entry is dropped only once both
+/// are false — see [`MakerAccountProjection::drop_settled`].
+#[derive(Debug, Clone, PartialEq)]
+struct PendingEntry {
+    request: ProjectionPendingRequest,
+    ack_pending: bool,
+    slot_open: bool,
+}
+
+impl PendingEntry {
+    fn request_id(&self) -> &str {
+        self.request.request_id()
+    }
+
+    fn place(&self) -> Option<&ProjectionPendingPlace> {
+        match &self.request {
+            ProjectionPendingRequest::Place(place) => Some(place),
+            ProjectionPendingRequest::Cancel(_) => None,
+        }
+    }
+
+    fn cancel(&self) -> Option<&ProjectionPendingCancel> {
+        match &self.request {
+            ProjectionPendingRequest::Cancel(cancel) => Some(cancel),
+            ProjectionPendingRequest::Place(_) => None,
+        }
+    }
+
+    fn cycle(&self) -> u64 {
+        match &self.request {
+            ProjectionPendingRequest::Place(place) => place.cycle,
+            ProjectionPendingRequest::Cancel(cancel) => cancel.cycle,
+        }
+    }
+
+    fn is_settled(&self) -> bool {
+        !self.ack_pending && !self.slot_open
+    }
+}
+
+/// Level assigned to a current-run order adopted with neither a matching
+/// pending place nor a prior projection (e.g. one observed after a reconnect).
+/// It is deliberately outside the maker's real level range so `reconcile`
+/// treats it as `Stale` and cancels it, rather than mistaking it for a live
+/// quote slot the strategy would try to hold.
+const UNKNOWN_ADOPTED_LEVEL: u32 = u32::MAX;
+
+/// The slot metadata adopted for an observed order: where it sits in the quote
+/// ladder and how much of it has already filled.
+struct AdoptedSlot {
+    level: u32,
+    ref_center: f64,
+    placed_at_cycle: u64,
+    total_qty: f64,
+    ledger_filled_qty: f64,
+}
+
+impl AdoptedSlot {
+    fn from_existing(order: &ProjectedOrder) -> Self {
+        Self {
+            level: order.level,
+            ref_center: order.ref_center,
+            placed_at_cycle: order.placed_at_cycle,
+            total_qty: order.total_qty,
+            ledger_filled_qty: order.ledger_filled_qty,
+        }
+    }
+
+    fn unknown(observation: &OrderObservation) -> Self {
+        Self {
+            level: UNKNOWN_ADOPTED_LEVEL,
+            ref_center: observation.price,
+            placed_at_cycle: 0,
+            total_qty: observation.open_qty,
+            ledger_filled_qty: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MakerAccountProjection {
     generation: u64,
     run_order_prefix: String,
     orders: HashMap<u64, ProjectedOrder>,
-    pending_places: Vec<ProjectionPendingPlace>,
-    pending_cancels: Vec<ProjectionPendingCancel>,
-    pending_requests: Vec<ProjectionPendingRequest>,
+    pending: Vec<PendingEntry>,
     observed_position: f64,
-    raw_balances: HashMap<(String, String), ProjectedBalance>,
 }
 
 impl MakerAccountProjection {
@@ -207,11 +286,8 @@ impl MakerAccountProjection {
             generation,
             run_order_prefix: run_order_prefix.into(),
             orders: HashMap::new(),
-            pending_places: Vec::new(),
-            pending_cancels: Vec::new(),
-            pending_requests: Vec::new(),
+            pending: Vec::new(),
             observed_position: position,
-            raw_balances: HashMap::new(),
         }
     }
 
@@ -222,18 +298,13 @@ impl MakerAccountProjection {
     pub fn reset(&mut self, generation: u64, position: f64) {
         self.generation = generation;
         self.orders.clear();
-        self.pending_places.clear();
-        self.pending_cancels.clear();
-        self.pending_requests.clear();
+        self.pending.clear();
         self.observed_position = position;
-        self.raw_balances.clear();
     }
 
     pub fn clear_orders_and_pending(&mut self) {
         self.orders.clear();
-        self.pending_places.clear();
-        self.pending_cancels.clear();
-        self.pending_requests.clear();
+        self.pending.clear();
     }
 
     pub fn observed_position(&self) -> f64 {
@@ -249,27 +320,37 @@ impl MakerAccountProjection {
             .collect()
     }
 
-    pub fn pending_places(&self) -> &[ProjectionPendingPlace] {
-        &self.pending_places
+    /// Open pending places, derived from the registry. Cheap to rebuild — the
+    /// set is bounded by the maker's level count and is only ever iterated.
+    pub fn pending_places(&self) -> Vec<ProjectionPendingPlace> {
+        self.pending
+            .iter()
+            .filter(|entry| entry.slot_open)
+            .filter_map(|entry| entry.place().cloned())
+            .collect()
     }
 
-    pub fn pending_cancels(&self) -> &[ProjectionPendingCancel] {
-        &self.pending_cancels
+    /// Open pending cancels, derived from the registry.
+    pub fn pending_cancels(&self) -> Vec<ProjectionPendingCancel> {
+        self.pending
+            .iter()
+            .filter(|entry| entry.slot_open)
+            .filter_map(|entry| entry.cancel().cloned())
+            .collect()
     }
 
     pub fn pending_request(&self, request_id: &str) -> Option<&ProjectionPendingRequest> {
-        self.pending_requests
+        self.pending
             .iter()
-            .find(|pending| pending.request_id() == request_id)
+            .find(|entry| entry.ack_pending && entry.request_id() == request_id)
+            .map(|entry| &entry.request)
     }
 
     pub fn pending_request_count(&self) -> usize {
-        self.pending_requests.len()
-    }
-
-    pub fn raw_balance(&self, account_type: &str, token: &str) -> Option<&ProjectedBalance> {
-        self.raw_balances
-            .get(&(account_type.to_owned(), token.to_owned()))
+        self.pending
+            .iter()
+            .filter(|entry| entry.ack_pending)
+            .count()
     }
 
     pub fn apply(&mut self, generation: u64, event: AccountProjectionEvent) -> ProjectionOutcome {
@@ -278,61 +359,78 @@ impl MakerAccountProjection {
         }
         match event {
             AccountProjectionEvent::AdvanceCycle { cycle } => {
-                self.pending_places
-                    .retain(|pending| cycle.saturating_sub(pending.cycle) <= 2);
-                self.pending_cancels
-                    .retain(|pending| cycle.saturating_sub(pending.cycle) <= 2);
+                // Expiry closes the pending *slot* but leaves a still-unacked
+                // registry entry in place (its ack may yet arrive); the entry
+                // is dropped only once it is fully settled.
+                for entry in &mut self.pending {
+                    if entry.slot_open && cycle.saturating_sub(entry.cycle()) > 2 {
+                        entry.slot_open = false;
+                    }
+                }
+                self.drop_settled();
                 ProjectionOutcome {
                     applied: true,
                     ..ProjectionOutcome::default()
                 }
             }
             AccountProjectionEvent::PlaceSubmitted(pending) => {
-                if let Err(error) =
-                    self.register_request(ProjectionPendingRequest::Place(pending.clone()))
+                if let Err(error) = self.register_request(ProjectionPendingRequest::Place(pending))
                 {
                     return ProjectionOutcome {
                         request_registry_error: Some(error),
                         ..ProjectionOutcome::default()
                     };
                 }
-                self.pending_places.push(pending);
                 ProjectionOutcome {
                     applied: true,
                     ..ProjectionOutcome::default()
                 }
             }
-            AccountProjectionEvent::PlaceAccepted { request_id } => ProjectionOutcome {
-                applied: matches!(
-                    self.resolve_request(&request_id),
-                    Some(ProjectionPendingRequest::Place(_))
-                ),
-                ..ProjectionOutcome::default()
-            },
-            AccountProjectionEvent::PlaceRejected { request_id } => {
-                let resolved = matches!(
-                    self.resolve_request(&request_id),
-                    Some(ProjectionPendingRequest::Place(_))
-                );
-                let before = self.pending_places.len();
-                self.pending_places
-                    .retain(|pending| pending.request_id != request_id);
+            AccountProjectionEvent::PlaceAccepted { request_id } => {
+                // The venue accepted the place: it is no longer ack-pending.
+                // The slot stays open until the order is observed.
+                let mut applied = false;
+                for entry in &mut self.pending {
+                    if entry.ack_pending
+                        && entry.request_id() == request_id
+                        && entry.place().is_some()
+                    {
+                        entry.ack_pending = false;
+                        applied = true;
+                    }
+                }
+                self.drop_settled();
                 ProjectionOutcome {
-                    applied: resolved || before != self.pending_places.len(),
+                    applied,
+                    ..ProjectionOutcome::default()
+                }
+            }
+            AccountProjectionEvent::PlaceRejected { request_id } => {
+                // A reject is terminal: it clears both the ack and the slot.
+                let mut applied = false;
+                for entry in &mut self.pending {
+                    if entry.request_id() == request_id && entry.place().is_some() {
+                        entry.ack_pending = false;
+                        entry.slot_open = false;
+                        applied = true;
+                    }
+                }
+                self.drop_settled();
+                ProjectionOutcome {
+                    applied,
                     ..ProjectionOutcome::default()
                 }
             }
             AccountProjectionEvent::CancelSubmitted(pending) => {
-                if let Err(error) =
-                    self.register_request(ProjectionPendingRequest::Cancel(pending.clone()))
+                let order_id = pending.order_id;
+                if let Err(error) = self.register_request(ProjectionPendingRequest::Cancel(pending))
                 {
                     return ProjectionOutcome {
                         request_registry_error: Some(error),
                         ..ProjectionOutcome::default()
                     };
                 }
-                self.orders.remove(&pending.order_id);
-                self.pending_cancels.push(pending);
+                self.orders.remove(&order_id);
                 ProjectionOutcome {
                     applied: true,
                     order_changed: true,
@@ -340,22 +438,22 @@ impl MakerAccountProjection {
                 }
             }
             AccountProjectionEvent::CancelResolved { request_id } => {
-                let resolved = matches!(
-                    self.resolve_request(&request_id),
-                    Some(ProjectionPendingRequest::Cancel(_))
-                );
-                let Some(index) = self
-                    .pending_cancels
+                let index = self
+                    .pending
                     .iter()
-                    .position(|pending| pending.request_id == request_id)
-                else {
-                    return ProjectionOutcome {
-                        applied: resolved,
-                        ..ProjectionOutcome::default()
-                    };
+                    .position(|entry| entry.request_id() == request_id && entry.cancel().is_some());
+                let Some(index) = index else {
+                    return ProjectionOutcome::default();
                 };
-                let pending = self.pending_cancels.remove(index);
-                let order_changed = self.orders.remove(&pending.order_id).is_some();
+                // Only a still-open cancel is holding an order out of the map;
+                // an already-expired one leaves the map untouched.
+                let order_changed = if self.pending[index].slot_open {
+                    let order_id = self.pending[index].cancel().expect("cancel entry").order_id;
+                    self.orders.remove(&order_id).is_some()
+                } else {
+                    false
+                };
+                self.pending.remove(index);
                 ProjectionOutcome {
                     applied: true,
                     order_changed,
@@ -392,41 +490,34 @@ impl MakerAccountProjection {
                     ..ProjectionOutcome::default()
                 }
             }
-            AccountProjectionEvent::BalanceObserved(balance) => {
-                let key = (balance.account_type.clone(), balance.token.clone());
-                self.raw_balances.insert(key, balance);
-                ProjectionOutcome {
-                    applied: true,
-                    ..ProjectionOutcome::default()
-                }
-            }
         }
     }
 
     fn register_request(
         &mut self,
-        pending: ProjectionPendingRequest,
+        request: ProjectionPendingRequest,
     ) -> Result<(), ProjectionRegistryError> {
-        if self.pending_request(pending.request_id()).is_some() {
+        if self.pending_request(request.request_id()).is_some() {
             return Err(ProjectionRegistryError::DuplicateRequestId {
-                request_id: pending.request_id().to_string(),
+                request_id: request.request_id().to_string(),
             });
         }
-        if self.pending_requests.len() >= MAX_PENDING_ORDER_REQUESTS {
+        if self.pending_request_count() >= MAX_PENDING_ORDER_REQUESTS {
             return Err(ProjectionRegistryError::Capacity {
                 limit: MAX_PENDING_ORDER_REQUESTS,
             });
         }
-        self.pending_requests.push(pending);
+        self.pending.push(PendingEntry {
+            request,
+            ack_pending: true,
+            slot_open: true,
+        });
         Ok(())
     }
 
-    fn resolve_request(&mut self, request_id: &str) -> Option<ProjectionPendingRequest> {
-        let index = self
-            .pending_requests
-            .iter()
-            .position(|pending| pending.request_id() == request_id)?;
-        Some(self.pending_requests.remove(index))
+    /// Drop registry entries whose ack and slot lifecycles have both completed.
+    fn drop_settled(&mut self) {
+        self.pending.retain(|entry| !entry.is_settled());
     }
 
     fn observe_order(&mut self, observation: OrderObservation) -> ProjectionOutcome {
@@ -437,62 +528,51 @@ impl MakerAccountProjection {
             return ProjectionOutcome::default();
         }
         if observation.terminal || observation.open_qty <= f64::EPSILON {
-            let changed = self.orders.remove(&observation.order_id).is_some();
-            if let Some(client_order_id) = observation.client_order_id.as_deref() {
-                self.pending_places
-                    .retain(|pending| pending.client_order_id != client_order_id);
-            }
-            return ProjectionOutcome {
-                applied: true,
-                order_changed: changed,
-                ..ProjectionOutcome::default()
-            };
+            self.handle_terminal_observation(&observation)
+        } else {
+            self.adopt_open_observation(observation)
         }
+    }
 
-        let pending_index = observation
-            .client_order_id
-            .as_deref()
-            .and_then(|client_order_id| {
-                self.pending_places
-                    .iter()
-                    .position(|pending| pending.client_order_id == client_order_id)
-            })
-            .or_else(|| {
-                self.pending_places.iter().position(|pending| {
-                    pending.side == observation.side
-                        && (pending.price - observation.price).abs() <= f64::EPSILON
-                        && open_qty_adopts(observation.open_qty, pending.qty)
-                })
-            });
-        let unknown = !self.orders.contains_key(&observation.order_id) && pending_index.is_none();
-        let (level, ref_center, placed_at_cycle, total_qty, ledger_filled_qty) = match pending_index
-        {
-            Some(index) => {
-                let pending = self.pending_places.remove(index);
-                (
-                    pending.level,
-                    pending.ref_center,
-                    pending.cycle,
-                    pending.qty,
-                    0.0,
-                )
+    /// A terminal (or zero-qty) observation removes the projected order and
+    /// closes the pending place slot for its client-order-id — the registry
+    /// entry lingers so a late place ack can still settle it.
+    fn handle_terminal_observation(&mut self, observation: &OrderObservation) -> ProjectionOutcome {
+        let changed = self.orders.remove(&observation.order_id).is_some();
+        if let Some(client_order_id) = observation.client_order_id.as_deref() {
+            for entry in &mut self.pending {
+                let matches = matches!(
+                    &entry.request,
+                    ProjectionPendingRequest::Place(place)
+                        if place.client_order_id == client_order_id
+                );
+                if matches {
+                    entry.slot_open = false;
+                }
             }
-            None => self
-                .orders
+            self.drop_settled();
+        }
+        ProjectionOutcome {
+            applied: true,
+            order_changed: changed,
+            ..ProjectionOutcome::default()
+        }
+    }
+
+    /// A live (non-terminal) observation adopts the order's slot: match it to a
+    /// pending place if possible, otherwise fall back to any existing
+    /// projection, then to an unknown-order slot, and reconcile open qty.
+    fn adopt_open_observation(&mut self, observation: OrderObservation) -> ProjectionOutcome {
+        let slot = self.match_pending_slot(&observation);
+        let known = slot.is_some() || self.orders.contains_key(&observation.order_id);
+        let slot = slot.unwrap_or_else(|| {
+            self.orders
                 .get(&observation.order_id)
-                .map(|order| {
-                    (
-                        order.level,
-                        order.ref_center,
-                        order.placed_at_cycle,
-                        order.total_qty,
-                        order.ledger_filled_qty,
-                    )
-                })
-                .unwrap_or((u32::MAX, observation.price, 0, observation.open_qty, 0.0)),
-        };
-        let stream_filled_qty = (total_qty - observation.open_qty).max(0.0);
-        let open_qty = (total_qty - stream_filled_qty.max(ledger_filled_qty)).max(0.0);
+                .map(AdoptedSlot::from_existing)
+                .unwrap_or_else(|| AdoptedSlot::unknown(&observation))
+        });
+        let stream_filled_qty = (slot.total_qty - observation.open_qty).max(0.0);
+        let open_qty = (slot.total_qty - stream_filled_qty.max(slot.ledger_filled_qty)).max(0.0);
         self.orders.insert(
             observation.order_id,
             ProjectedOrder {
@@ -501,20 +581,59 @@ impl MakerAccountProjection {
                 side: observation.side,
                 price: observation.price,
                 open_qty,
-                level,
-                ref_center,
-                placed_at_cycle,
-                total_qty,
+                level: slot.level,
+                ref_center: slot.ref_center,
+                placed_at_cycle: slot.placed_at_cycle,
+                total_qty: slot.total_qty,
                 stream_filled_qty,
-                ledger_filled_qty,
+                ledger_filled_qty: slot.ledger_filled_qty,
             },
         );
         ProjectionOutcome {
             applied: true,
             order_changed: true,
-            unknown_current_run_order: unknown,
+            unknown_current_run_order: !known,
             ..ProjectionOutcome::default()
         }
+    }
+
+    /// Find the open pending place this observation fills — by client-order-id,
+    /// else by a side/price/qty heuristic — close its slot, and return the slot
+    /// info to adopt. Returns `None` when no pending place matches.
+    fn match_pending_slot(&mut self, observation: &OrderObservation) -> Option<AdoptedSlot> {
+        let index = self
+            .pending
+            .iter()
+            .position(|entry| {
+                entry.slot_open
+                    && entry.place().is_some_and(|place| {
+                        Some(place.client_order_id.as_str())
+                            == observation.client_order_id.as_deref()
+                    })
+            })
+            .or_else(|| {
+                self.pending.iter().position(|entry| {
+                    entry.slot_open
+                        && entry.place().is_some_and(|place| {
+                            place.side == observation.side
+                                && (place.price - observation.price).abs() <= f64::EPSILON
+                                && open_qty_adopts(observation.open_qty, place.qty)
+                        })
+                })
+            })?;
+        let place = self.pending[index]
+            .place()
+            .expect("matched entry is a place")
+            .clone();
+        self.pending[index].slot_open = false;
+        self.drop_settled();
+        Some(AdoptedSlot {
+            level: place.level,
+            ref_center: place.ref_center,
+            placed_at_cycle: place.cycle,
+            total_qty: place.qty,
+            ledger_filled_qty: 0.0,
+        })
     }
 
     pub fn verify_rest_snapshot(
@@ -753,26 +872,14 @@ mod tests {
     }
 
     #[test]
-    fn position_and_balance_project_independently_of_ordering() {
+    fn position_projects_independently_of_ordering() {
         let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
-        state.apply(
+        let outcome = state.apply(
             1,
             AccountProjectionEvent::PositionObserved { position: 0.2 },
         );
-        state.apply(
-            1,
-            AccountProjectionEvent::BalanceObserved(ProjectedBalance {
-                account_type: "perps".to_string(),
-                token: "DUSD".to_string(),
-                free: "90".to_string(),
-                total: "100".to_string(),
-                locked: "0".to_string(),
-                occupied: "10".to_string(),
-                updated_at: "now".to_string(),
-            }),
-        );
+        assert!(outcome.position_changed);
         assert_eq!(state.observed_position(), 0.2);
-        assert_eq!(state.raw_balance("perps", "DUSD").unwrap().free, "90");
     }
 
     #[test]
@@ -818,5 +925,73 @@ mod tests {
             Err(ProjectionMismatch::OrderSet { .. })
         ));
         assert_eq!(state.resting_quotes()[0].qty, 0.2);
+    }
+
+    #[test]
+    fn advance_cycle_expires_pending_slot_but_keeps_unacked_registry_entry() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        assert_eq!(state.pending_places().len(), 1);
+
+        // Within two cycles of submission the slot survives.
+        state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle: 3 });
+        assert_eq!(state.pending_places().len(), 1);
+
+        // Beyond two cycles the pending slot expires, but the entry is still
+        // awaiting its command-stream ack so it lingers in the registry (it
+        // still counts toward capacity and dedup).
+        state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle: 4 });
+        assert!(state.pending_places().is_empty());
+        assert_eq!(state.pending_request_count(), 1);
+        assert!(matches!(
+            state.pending_request("p1"),
+            Some(ProjectionPendingRequest::Place(_))
+        ));
+
+        // The late ack then settles it fully.
+        state.apply(
+            1,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_string(),
+            },
+        );
+        assert_eq!(state.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn open_observation_adopts_pending_by_price_qty_heuristic() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+
+        // A different (but still current-run) client-order-id that matches the
+        // pending place on side/price/qty is adopted via the heuristic branch.
+        let mut observation = order(0.2, false);
+        observation.order_id = 42;
+        observation.client_order_id = Some(format!("{PREFIX}q00000009z9"));
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(observation));
+
+        assert!(outcome.applied && outcome.order_changed);
+        assert!(
+            !outcome.unknown_current_run_order,
+            "a heuristic pending match is not an unknown order"
+        );
+        let resting = state.resting_quotes();
+        assert_eq!(resting.len(), 1);
+        assert_eq!(resting[0].level, 0, "adopts the pending place's level");
+        assert!(state.pending_places().is_empty(), "the slot is consumed");
+    }
+
+    #[test]
+    fn unknown_current_run_order_adopts_with_sentinel_level() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+
+        // A current-run order with no pending place and no prior projection is
+        // adopted at the out-of-range sentinel level so reconcile cancels it.
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        assert!(outcome.applied);
+        assert!(outcome.unknown_current_run_order);
+        let resting = state.resting_quotes();
+        assert_eq!(resting.len(), 1);
+        assert_eq!(resting[0].level, UNKNOWN_ADOPTED_LEVEL);
     }
 }

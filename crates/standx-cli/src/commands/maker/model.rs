@@ -1,4 +1,4 @@
-use standx_sdk::account_stream::{BalanceUpdate, OrderUpdate};
+use standx_sdk::account_stream::OrderUpdate;
 #[cfg(test)]
 use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide, OrderStatus, Position};
@@ -207,18 +207,6 @@ pub(super) fn stream_order_observation(
         open_qty,
         terminal,
     })
-}
-
-pub(super) fn projected_balance(update: BalanceUpdate) -> standx_maker::ProjectedBalance {
-    standx_maker::ProjectedBalance {
-        account_type: update.account_type,
-        token: update.token,
-        free: update.free,
-        total: update.total,
-        locked: update.locked,
-        occupied: update.occupied,
-        updated_at: update.updated_at,
-    }
 }
 
 pub(super) fn is_current_run_order(order: &Order, run_order_prefix: &str) -> bool {

@@ -371,7 +371,7 @@ pub(super) async fn maker_cycle(
     let pending_slots = account_projection
         .as_deref()
         .map(|projection| projection.pending_places())
-        .unwrap_or(&[])
+        .unwrap_or_default()
         .iter()
         .map(|place| (place.side, place.level))
         .collect::<Vec<_>>();
