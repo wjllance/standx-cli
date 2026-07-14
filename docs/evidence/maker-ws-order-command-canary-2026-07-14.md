@@ -53,3 +53,22 @@ path. A future canary must retain an in-flight order snapshot and correlated
 acceptance response, then obtain a bounded normal cancellation (or use a
 reviewed deterministic venue-safe cancellation harness) before repeating the
 empty-order and empty-position post-check.
+
+## Harness hardening after this record
+
+The hidden `maker ws-command-canary` harness now emits a structured JSON chain
+with `action=ws_command_canary` for preflight, create submission and correlated
+acceptance/rejection, REST order visibility, cancel submission and correlated
+acceptance/rejection, REST absence, and final flat-position verification. Each
+applicable event carries the client-order ID, request ID, venue order ID,
+response code, quantity, price, and preflight/post-check position. This evidence
+is printed in every output mode so a supervised run can be retained without
+depending on terminal prose.
+
+If any step fails, the harness records the start and result of compensating
+HTTP cleanup and exits fail-safe. A non-zero final position is recorded as a
+position mismatch; the harness does not flatten it automatically.
+
+This is an implementation and offline-test update only. No additional
+production command, cancellation, disconnect, or position change was executed,
+so the pending limitation and locked decision above remain unchanged.

@@ -19,6 +19,101 @@ use tokio::sync::mpsc;
 
 const CANARY_PREFIX: &str = "sxmk-canary-";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanaryStage {
+    PreflightVerified,
+    CreateSubmitted,
+    CreateAccepted,
+    CreateRejected,
+    OrderVisible,
+    CancelSubmitted,
+    CancelAccepted,
+    CancelRejected,
+    AbsenceVerified,
+    PositionVerified,
+    PositionMismatch,
+    CleanupStarted,
+    CleanupVerified,
+    CleanupFailed,
+}
+
+impl CanaryStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PreflightVerified => "preflight_verified",
+            Self::CreateSubmitted => "create_submitted",
+            Self::CreateAccepted => "create_accepted",
+            Self::CreateRejected => "create_rejected",
+            Self::OrderVisible => "order_visible",
+            Self::CancelSubmitted => "cancel_submitted",
+            Self::CancelAccepted => "cancel_accepted",
+            Self::CancelRejected => "cancel_rejected",
+            Self::AbsenceVerified => "absence_verified",
+            Self::PositionVerified => "position_verified",
+            Self::PositionMismatch => "position_mismatch",
+            Self::CleanupStarted => "cleanup_started",
+            Self::CleanupVerified => "cleanup_verified",
+            Self::CleanupFailed => "cleanup_failed",
+        }
+    }
+}
+
+struct CanaryEvidence<'a> {
+    symbol: &'a str,
+    client_order_id: &'a str,
+    quantity: String,
+    price: String,
+}
+
+impl CanaryEvidence<'_> {
+    fn value_at(
+        &self,
+        timestamp: &str,
+        stage: CanaryStage,
+        request_id: Option<&str>,
+        order_id: Option<&str>,
+        response: Option<&OrderResponse>,
+        position: Option<f64>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ts": timestamp,
+            "action": "ws_command_canary",
+            "event": stage.as_str(),
+            "symbol": self.symbol,
+            "client_order_id": self.client_order_id,
+            "request_id": request_id,
+            "order_id": order_id,
+            "response_code": response.map(|response| response.code),
+            "response_message": response.map(|response| response.message.as_str()),
+            "quantity": self.quantity,
+            "price": self.price,
+            "position": position,
+        })
+    }
+
+    fn emit(
+        &self,
+        stage: CanaryStage,
+        request_id: Option<&str>,
+        order_id: Option<&str>,
+        response: Option<&OrderResponse>,
+    ) {
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        println!(
+            "{}",
+            self.value_at(&timestamp, stage, request_id, order_id, response, None)
+        );
+    }
+
+    fn emit_position(&self, stage: CanaryStage, order_id: Option<&str>, position: f64) {
+        let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        println!(
+            "{}",
+            self.value_at(&timestamp, stage, None, order_id, None, Some(position))
+        );
+    }
+}
+
 fn canary_price(mark: f64, offset_bps: f64, decimals: u32) -> Result<f64> {
     if !mark.is_finite() || mark <= 0.0 {
         return Err(anyhow::anyhow!("venue returned an invalid mark price"));
@@ -112,16 +207,18 @@ async fn cleanup_current_order(
     symbol: &str,
     client_order_id: &str,
     timeout: Duration,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let orders = client.get_open_orders(Some(symbol)).await?;
     if let Some(order) = orders
         .into_iter()
         .find(|order| order.cl_ord_id.as_deref() == Some(client_order_id))
     {
+        let order_id = order.id.clone();
         client.cancel_order(symbol, &order.id).await?;
         wait_until_absent(client, symbol, client_order_id, timeout).await?;
+        return Ok(Some(order_id));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub(super) async fn run_ws_command_canary(
@@ -196,6 +293,19 @@ pub(super) async fn run_ws_command_canary(
     let price = canary_price(mark, price_offset_bps, info.price_tick_decimals)?;
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let client_order_id = format!("{}{}", CANARY_PREFIX, &run_id[..12]);
+    let evidence = CanaryEvidence {
+        symbol: &symbol,
+        client_order_id: &client_order_id,
+        quantity: format!(
+            "{quantity:.precision$}",
+            precision = info.qty_tick_decimals as usize
+        ),
+        price: format!(
+            "{price:.precision$}",
+            precision = info.price_tick_decimals as usize
+        ),
+    };
+    evidence.emit_position(CanaryStage::PreflightVerified, None, 0.0);
     let stream = OrderResponseStream::new(session_id)?;
     let (commands, mut responses, _health, handle) = stream.connect().await?;
     notifier
@@ -218,6 +328,7 @@ pub(super) async fn run_ws_command_canary(
         info.qty_tick_decimals,
         info.price_tick_decimals,
         timeout,
+        &evidence,
     )
     .await;
     handle.abort();
@@ -226,7 +337,7 @@ pub(super) async fn run_ws_command_canary(
             notifier
                 .lifecycle(
                     "completed",
-                    "WS command canary completed: acknowledged create/cancel and HTTP absence verified",
+                    "WS command canary completed: acknowledged create/cancel, HTTP absence, and flat position verified",
                     &symbol,
                     true,
                 )
@@ -234,11 +345,25 @@ pub(super) async fn run_ws_command_canary(
             Ok(())
         }
         Err(error) => {
-            let message = match cleanup_current_order(&client, &symbol, &client_order_id, timeout).await {
-                Ok(()) => format!("WS command canary failed safe: {error}"),
-                Err(cleanup_error) => format!(
-                    "WS command canary failed safe: {error}; HTTP cleanup could not verify absence: {cleanup_error}"
-                ),
+            evidence.emit(CanaryStage::CleanupStarted, None, None, None);
+            let message = match cleanup_current_order(&client, &symbol, &client_order_id, timeout)
+                .await
+            {
+                Ok(order_id) => {
+                    evidence.emit(
+                        CanaryStage::CleanupVerified,
+                        None,
+                        order_id.as_deref(),
+                        None,
+                    );
+                    format!("WS command canary failed safe: {error}")
+                }
+                Err(cleanup_error) => {
+                    evidence.emit(CanaryStage::CleanupFailed, None, None, None);
+                    format!(
+                        "WS command canary failed safe: {error}; HTTP cleanup could not verify absence: {cleanup_error}"
+                    )
+                }
             };
             notifier.lifecycle("failed", &message, &symbol, true).await;
             Err(anyhow::Error::new(FailSafeShutdown { message }))
@@ -258,6 +383,7 @@ async fn run_commands(
     qty_decimals: u32,
     price_decimals: u32,
     timeout: Duration,
+    evidence: &CanaryEvidence<'_>,
 ) -> Result<()> {
     let create_request_id = commands
         .create_order(&CreateOrderParams {
@@ -277,33 +403,169 @@ async fn run_commands(
             tp_price: None,
         })
         .await?;
+    evidence.emit(
+        CanaryStage::CreateSubmitted,
+        Some(&create_request_id),
+        None,
+        None,
+    );
     let create_response = await_response(responses, &create_request_id, timeout).await?;
     if !create_response.accepted() {
+        evidence.emit(
+            CanaryStage::CreateRejected,
+            Some(&create_request_id),
+            None,
+            Some(&create_response),
+        );
         return Err(anyhow::anyhow!(
             "venue rejected canary order:new: {}",
             create_response.message
         ));
     }
+    evidence.emit(
+        CanaryStage::CreateAccepted,
+        Some(&create_request_id),
+        None,
+        Some(&create_response),
+    );
     let order = wait_for_order(client, symbol, client_order_id, timeout).await?;
+    evidence.emit(CanaryStage::OrderVisible, None, Some(&order.id), None);
     let cancel_request_id = commands.cancel_order(&order.id).await?;
+    evidence.emit(
+        CanaryStage::CancelSubmitted,
+        Some(&cancel_request_id),
+        Some(&order.id),
+        None,
+    );
     let cancel_response = await_response(responses, &cancel_request_id, timeout).await?;
     if !cancel_response.accepted() {
+        evidence.emit(
+            CanaryStage::CancelRejected,
+            Some(&cancel_request_id),
+            Some(&order.id),
+            Some(&cancel_response),
+        );
         return Err(anyhow::anyhow!(
             "venue rejected canary order:cancel: {}",
             cancel_response.message
         ));
     }
-    wait_until_absent(client, symbol, client_order_id, timeout).await
+    evidence.emit(
+        CanaryStage::CancelAccepted,
+        Some(&cancel_request_id),
+        Some(&order.id),
+        Some(&cancel_response),
+    );
+    wait_until_absent(client, symbol, client_order_id, timeout).await?;
+    evidence.emit(CanaryStage::AbsenceVerified, None, Some(&order.id), None);
+    let position = position_for_symbol(&client.get_positions(Some(symbol)).await?, symbol)?;
+    if position != 0.0 {
+        evidence.emit_position(CanaryStage::PositionMismatch, Some(&order.id), position);
+        return Err(anyhow::anyhow!(
+            "canary post-check found non-zero {} position {position:+.8}",
+            symbol
+        ));
+    }
+    evidence.emit_position(CanaryStage::PositionVerified, Some(&order.id), position);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn price_is_bounded_below_mark_and_rounded_to_tick() {
         assert_eq!(canary_price(100.0, 100.0, 2).unwrap(), 99.0);
         assert!(canary_price(100.0, 0.0, 2).is_err());
         assert!(canary_price(0.0, 100.0, 2).is_err());
+    }
+
+    #[test]
+    fn evidence_value_has_stable_correlation_fields() {
+        let evidence = CanaryEvidence {
+            symbol: "BTC-USD",
+            client_order_id: "sxmk-canary-test",
+            quantity: "0.001".to_string(),
+            price: "99.50".to_string(),
+        };
+        let response = OrderResponse {
+            code: 0,
+            message: "accepted".to_string(),
+            request_id: Some("request-1".to_string()),
+        };
+
+        assert_eq!(
+            evidence.value_at(
+                "2026-07-14T00:00:00.000Z",
+                CanaryStage::CancelAccepted,
+                Some("request-1"),
+                Some("42"),
+                Some(&response),
+                None,
+            ),
+            json!({
+                "ts": "2026-07-14T00:00:00.000Z",
+                "action": "ws_command_canary",
+                "event": "cancel_accepted",
+                "symbol": "BTC-USD",
+                "client_order_id": "sxmk-canary-test",
+                "request_id": "request-1",
+                "order_id": "42",
+                "response_code": 0,
+                "response_message": "accepted",
+                "quantity": "0.001",
+                "price": "99.50",
+                "position": null,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn await_response_accepts_only_the_expected_request_id() {
+        let (tx, mut responses) = mpsc::channel(1);
+        tx.send(OrderResponse {
+            code: 0,
+            message: "accepted".to_string(),
+            request_id: Some("request-1".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let response = await_response(&mut responses, "request-1", Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(response.accepted());
+
+        let (tx, mut responses) = mpsc::channel(1);
+        tx.send(OrderResponse {
+            code: 0,
+            message: "accepted".to_string(),
+            request_id: Some("other-request".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let error = await_response(&mut responses, "request-1", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("uncorrelated"));
+    }
+
+    #[tokio::test]
+    async fn await_response_fails_when_stream_closes_or_times_out() {
+        let (tx, mut responses) = mpsc::channel(1);
+        drop(tx);
+        let error = await_response(&mut responses, "request-1", Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stream closed"));
+
+        let (_tx, mut responses) = mpsc::channel(1);
+        let error = await_response(&mut responses, "request-1", Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
     }
 }

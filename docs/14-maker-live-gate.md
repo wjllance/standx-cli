@@ -29,7 +29,13 @@ maker by itself.
 
 - A named operator is present with venue access and a documented emergency cancel procedure.
 - Start with one symbol, minimum valid size, one level, and a max position no larger than one exit chunk.
-- Observe startup, order response, fills, cancellations, alerts, and shutdown; retain timestamps and order/trade IDs.
+- For a changed WS command path, retain one correlation chain containing the
+  create `request_id` and accepted response, the REST-visible venue order ID
+  and client-order ID, the cancel `request_id` and accepted response, REST
+  absence, and a final position equal to the flat preflight baseline.
+- Observe startup, order response, fills, cancellations, alerts, and shutdown;
+  retain timestamps and order/trade IDs. The hidden `ws-command-canary` emits
+  these checks as `action=ws_command_canary` JSON events in every output mode.
 - Stop immediately on residual maker orders, uncorrelated fills, stream disconnect, unexpected position change, failed cleanup, or breached risk limit.
 
 ## Unlock decision
