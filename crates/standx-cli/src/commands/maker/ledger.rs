@@ -236,4 +236,29 @@ mod tests {
 
         assert!(error.to_string().contains("non-finite fill_qty"));
     }
+
+    #[test]
+    fn partial_fill_then_cancelled_keeps_ledger_and_stats_positions_aligned() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut fills = Vec::new();
+        let mut update = order_update(OrderSide::Buy, "0.10");
+        update.status = OrderStatus::Canceled;
+
+        apply_order_update(
+            &mut ledger,
+            &update,
+            "BTC-USD",
+            "sxmk-run-",
+            100.0,
+            &mut stats,
+            &mut fills,
+        )
+        .unwrap();
+
+        assert_eq!(fills.len(), 1);
+        assert!((ledger.expected_position - 0.10).abs() < 1e-9);
+        assert!((stats.position() - ledger.expected_position).abs() < 1e-9);
+        assert!(stats.pnl(ledger.expected_position, 100.0).abs() < 1e-9);
+    }
 }

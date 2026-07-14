@@ -341,11 +341,17 @@ impl MakerStats {
         }
     }
 
+    /// Synchronize the cached telemetry position with the authoritative
+    /// current-run ledger without closing another maker cycle.
+    pub(crate) fn observe_position(&mut self, position: f64) {
+        self.last_position = position;
+        self.max_abs_position = self.max_abs_position.max(position.abs());
+    }
+
     /// Close out a cycle after the caller has recorded exact venue fills.
     /// `two_sided` is whether both a bid and an ask were resting this cycle.
     pub fn end_cycle(&mut self, position: f64, two_sided: bool) {
-        self.last_position = position;
-        self.max_abs_position = self.max_abs_position.max(position.abs());
+        self.observe_position(position);
         self.cycles += 1;
         if two_sided {
             self.two_sided_cycles += 1;

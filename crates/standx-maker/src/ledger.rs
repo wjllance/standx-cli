@@ -149,6 +149,7 @@ impl MakerLedger {
             OrderSide::Buy => qty,
             OrderSide::Sell => -qty,
         };
+        stats.observe_position(self.expected_position);
         self.accounted.insert(
             fill.order_id,
             FillTotals {
@@ -250,5 +251,130 @@ mod tests {
             .is_none());
         assert_eq!(stats.fills(), 1);
         assert!((ledger.expected_position - 0.2).abs() < 1e-12);
+        assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rest_then_ws_fill_updates_cash_and_position_once() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001b0"), "sxmk-run-"));
+
+        assert!(ledger
+            .record_rest_fill(
+                RestFill {
+                    trade_id: 1,
+                    order_id: 7,
+                    side: OrderSide::Sell,
+                    price: 100.0,
+                    qty: 0.2,
+                    mark: 100.0,
+                    trade_ts: "2026-07-13T00:00:00Z",
+                },
+                &mut stats,
+            )
+            .unwrap()
+            .is_some());
+        assert!(ledger
+            .record_cumulative_fill(
+                CumulativeFill {
+                    order_id: 7,
+                    side: OrderSide::Sell,
+                    qty: 0.2,
+                    notional: 20.0,
+                    mark: 100.0,
+                    origin: "current_run_ws_order",
+                    trade_id: None,
+                    trade_ts: Some("2026-07-13T00:00:00Z"),
+                },
+                &mut stats,
+            )
+            .unwrap()
+            .is_none());
+
+        assert_eq!(stats.fills(), 1);
+        assert!((stats.cash - 20.0).abs() < 1e-12);
+        assert!((ledger.expected_position + 0.2).abs() < 1e-12);
+        assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
+    }
+
+    #[test]
+    fn buffered_inventory_exit_fill_keeps_round_trip_pnl_flat_to_notional() {
+        for (sell_price, buy_price, expected_pnl) in
+            [(57.78, 57.84, -0.012), (58.02, 58.10, -0.016)]
+        {
+            let mut ledger = MakerLedger::new(0.0);
+            let mut stats = MakerStats::default();
+            assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001a0"), "sxmk-run-"));
+            assert!(ledger.adopt_order(8, Some("sxmk-run-x00000002b0"), "sxmk-run-"));
+
+            ledger
+                .record_cumulative_fill(
+                    CumulativeFill {
+                        order_id: 7,
+                        side: OrderSide::Sell,
+                        qty: 0.2,
+                        notional: sell_price * 0.2,
+                        mark: sell_price,
+                        origin: "current_run_ws_order",
+                        trade_id: None,
+                        trade_ts: Some("2026-07-13T14:22:01Z"),
+                    },
+                    &mut stats,
+                )
+                .unwrap();
+            stats.end_cycle(ledger.expected_position, false);
+
+            ledger
+                .record_cumulative_fill(
+                    CumulativeFill {
+                        order_id: 8,
+                        side: OrderSide::Buy,
+                        qty: 0.2,
+                        notional: buy_price * 0.2,
+                        mark: buy_price,
+                        origin: "current_run_ws_order",
+                        trade_id: None,
+                        trade_ts: Some("2026-07-13T14:22:05Z"),
+                    },
+                    &mut stats,
+                )
+                .unwrap();
+
+            assert!(ledger.expected_position.abs() < 1e-12);
+            assert!(stats.position().abs() < 1e-12);
+            assert!((stats.pnl(ledger.expected_position, buy_price) - expected_pnl).abs() < 1e-12);
+            assert!(stats.pnl(ledger.expected_position, buy_price) > -4.0);
+        }
+    }
+
+    #[test]
+    fn partial_cumulative_fills_update_position_once_per_delta() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001b0"), "sxmk-run-"));
+
+        for (qty, notional) in [(0.1, 10.0), (0.2, 20.0), (0.2, 20.0)] {
+            ledger
+                .record_cumulative_fill(
+                    CumulativeFill {
+                        order_id: 7,
+                        side: OrderSide::Buy,
+                        qty,
+                        notional,
+                        mark: 100.0,
+                        origin: "current_run_ws_order",
+                        trade_id: None,
+                        trade_ts: Some("2026-07-13T00:00:00Z"),
+                    },
+                    &mut stats,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(stats.fills(), 2);
+        assert!((stats.cash + 20.0).abs() < 1e-12);
+        assert!((ledger.expected_position - 0.2).abs() < 1e-12);
+        assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
     }
 }

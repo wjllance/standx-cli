@@ -341,6 +341,52 @@ fn emit_stop_loss_triggered(
     }
 }
 
+fn accounting_position_mismatch(
+    expected_position: f64,
+    stats_position: f64,
+    qty_tolerance: f64,
+) -> bool {
+    let delta = (stats_position - expected_position).abs();
+    // Fail closed: a non-finite delta (NaN from a poisoned position) would make
+    // a bare `>` comparison false and silently pass the invariant, so treat any
+    // non-finite value as a mismatch.
+    !delta.is_finite() || delta > qty_tolerance
+}
+
+async fn accounting_invariant_exit(
+    notifier: &MakerNotifier,
+    symbol: &str,
+    cycle: u64,
+    expected_position: f64,
+    stats_position: f64,
+    qty_tolerance: f64,
+) -> Option<MakerExit> {
+    if !accounting_position_mismatch(expected_position, stats_position, qty_tolerance) {
+        return None;
+    }
+    let detail = format!(
+        "stats position {stats_position:+.8} differs from ledger expected {expected_position:+.8} beyond tolerance {qty_tolerance:.8}"
+    );
+    notifier
+        .risk(
+            RiskNotice {
+                kind: "accounting_invariant",
+                severity: "critical",
+                event: "mismatch",
+                message: &detail,
+                symbol,
+                cycle,
+                position_before: None,
+                position_after: Some(expected_position),
+                expected: Some(expected_position),
+                observed: Some(stats_position),
+            },
+            true,
+        )
+        .await;
+    Some(MakerExit::AccountingInvariant(detail))
+}
+
 fn emit_reconciliation_snapshot_error(
     output_format: OutputFormat,
     symbol: &str,
@@ -1010,6 +1056,7 @@ pub(super) async fn run_maker(
     } else {
         MakerStats::default()
     };
+    let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
     let mut breaker = VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut alerts =
         AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
@@ -1665,7 +1712,7 @@ pub(super) async fn run_maker(
                                     expected: ledger.expected_position,
                                     max_position: cfg.max_position,
                                     inventory_exit_pct: args.inventory_exit_pct,
-                                    qty_tolerance: 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
+                                    qty_tolerance,
                                     symbol: &symbol,
                                     cycle,
                                 },
@@ -1673,8 +1720,7 @@ pub(super) async fn run_maker(
                             .await;
                     }
                     if let Some(position) = position.filter(|position| {
-                        (*position - ledger.expected_position).abs()
-                            > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+                        (*position - ledger.expected_position).abs() > qty_tolerance
                     }) {
                         account_position_mismatch = Some(position);
                     }
@@ -1691,11 +1737,24 @@ pub(super) async fn run_maker(
                 }
             }
         }
-        if account_position_mismatch.is_some_and(|position| {
-            (position - ledger.expected_position).abs()
-                <= 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
-        }) {
+        if account_position_mismatch
+            .is_some_and(|position| (position - ledger.expected_position).abs() <= qty_tolerance)
+        {
             account_position_mismatch = None;
+        }
+        if args.live {
+            if let Some(exit) = accounting_invariant_exit(
+                &notifier,
+                &symbol,
+                cycle,
+                ledger.expected_position,
+                stats.position(),
+                qty_tolerance,
+            )
+            .await
+            {
+                break 'main exit;
+            }
         }
 
         // Work phase raced against Ctrl+C so a slow API call can be
@@ -1888,15 +1947,13 @@ pub(super) async fn run_maker(
                                     expected: ledger.expected_position,
                                     max_position: cfg.max_position,
                                     inventory_exit_pct: args.inventory_exit_pct,
-                                    qty_tolerance: 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
+                                    qty_tolerance,
                                     symbol: &symbol,
                                     cycle,
                                 },
                             )
                             .await;
-                        if (position - ledger.expected_position).abs()
-                            > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
-                        {
+                        if (position - ledger.expected_position).abs() > qty_tolerance {
                             account_position_mismatch = Some(position);
                         } else {
                             account_position_mismatch = None;
@@ -1909,6 +1966,20 @@ pub(super) async fn run_maker(
                         health.mark_unhealthy(error.to_string());
                     }
                 }
+            }
+        }
+        if args.live {
+            if let Some(exit) = accounting_invariant_exit(
+                &notifier,
+                &symbol,
+                cycle,
+                ledger.expected_position,
+                stats.position(),
+                qty_tolerance,
+            )
+            .await
+            {
+                break 'main exit;
             }
         }
 
@@ -2028,9 +2099,14 @@ pub(super) async fn run_maker(
                 }
                 // Risk alerts: evaluate over the just-updated stats and
                 // deliver any state changes (stderr always; webhook if set).
+                let session_position = if args.live {
+                    ledger.expected_position
+                } else {
+                    stats.position()
+                };
                 if alerts.enabled() {
                     let fired =
-                        alerts.evaluate(&stats, stats.position(), mark, cfg.max_position, cycle);
+                        alerts.evaluate(&stats, session_position, mark, cfg.max_position, cycle);
                     for alert in fired {
                         // Await firing alerts so a breach raised on the final
                         // cycle before shutdown is not dropped with its task.
@@ -2058,7 +2134,7 @@ pub(super) async fn run_maker(
                 // book, await the critical webhook, exit) — the same path the
                 // other MakerExit variants use.
                 if args.stop_loss > 0.0 {
-                    let pnl = stats.pnl(stats.position(), mark);
+                    let pnl = stats.pnl(session_position, mark);
                     if pnl <= -args.stop_loss {
                         emit_stop_loss_triggered(
                             output_format,
@@ -2485,13 +2561,21 @@ pub(super) async fn run_maker(
     if let Some(handle) = account_stream_handle {
         handle.abort();
     }
+    let final_position = if args.live {
+        ledger.expected_position
+    } else {
+        stats.position()
+    };
     if output_format == OutputFormat::Table {
         println!(
             "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
             cycle, total_places, total_cancels, total_holds
         );
         let pnl_note = match last_mark {
-            Some(m) => format!(" | PnL {:+.2} (mark-to-market)", stats.mark_to_market(m)),
+            Some(m) => format!(
+                " | PnL {:+.2} (mark-to-market)",
+                stats.pnl(final_position, m)
+            ),
             None => String::new(),
         };
         println!(
@@ -2529,7 +2613,7 @@ pub(super) async fn run_maker(
     // before the process exits.
     let reason = exit.lifecycle_reason();
     let pnl_str = last_mark
-        .map(|m| format!("{:+.2}", stats.mark_to_market(m)))
+        .map(|m| format!("{:+.2}", stats.pnl(final_position, m)))
         .unwrap_or_else(|| "n/a".to_string());
     let cleanup_note = cleanup_error.as_ref().map_or_else(String::new, |error| {
         format!(" | ⚠️ cleanup failed: {error}")
@@ -2885,6 +2969,43 @@ mod tests {
         assert_eq!(
             latest, None,
             "position updates for other symbols are ignored"
+        );
+    }
+
+    #[test]
+    fn accounting_position_mismatch_respects_half_tick_tolerance() {
+        let tolerance = 0.0005;
+        assert!(!accounting_position_mismatch(0.2, 0.20049, tolerance));
+        assert!(accounting_position_mismatch(0.2, 0.20051, tolerance));
+        assert!(!accounting_position_mismatch(-0.2, -0.20049, tolerance));
+        assert!(accounting_position_mismatch(-0.2, -0.20051, tolerance));
+    }
+
+    #[test]
+    fn accounting_position_mismatch_fails_closed_on_non_finite() {
+        let tolerance = 0.0005;
+        assert!(accounting_position_mismatch(f64::NAN, 0.2, tolerance));
+        assert!(accounting_position_mismatch(0.2, f64::NAN, tolerance));
+        assert!(accounting_position_mismatch(f64::INFINITY, 0.2, tolerance));
+    }
+
+    #[tokio::test]
+    async fn accounting_invariant_mismatch_becomes_fail_safe_exit() {
+        let notifier = MakerNotifier::new(
+            OutputFormat::Quiet,
+            None,
+            crate::cli::AlertWebhookFormat::Raw,
+        );
+
+        assert!(
+            accounting_invariant_exit(&notifier, "XAG-USD", 1396, 0.0, -0.2, 0.0005,)
+                .await
+                .is_some_and(|exit| matches!(exit, MakerExit::AccountingInvariant(_)))
+        );
+        assert!(
+            accounting_invariant_exit(&notifier, "XAG-USD", 1396, 0.0, 0.00049, 0.0005,)
+                .await
+                .is_none()
         );
     }
 }

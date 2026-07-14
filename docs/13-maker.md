@@ -183,9 +183,11 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 三种输出格式：
 
 - **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。Live 模式还会打印 `ACCOUNT balance= equity= available= upnl=`，数据来自该轮交易所账户快照；这里的账户 `upnl` 与机器人本次会话的 `pnl` 是两个不同口径。
-- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`starting_position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live fill 还包含 `trade_id`、`order_id`、`trade_ts` 与 `origin=current_run`。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`starting_position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live session PnL 使用 current-run ledger 的权威仓位；每个去重后的增量成交会原子更新现金流与统计仓位。live fill 还包含 `trade_id`、`order_id`、`trade_ts` 与 `origin=current_run`。
 
 live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order + position + trade-shadow` account stream 和 Order Response Stream。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。order 回调和 REST trade 以订单累计成交量双向去重。account stream 断开或仓位不一致时立即冻结 placements、撤净 maker 订单，并在约 0.5s、1.5s、3.0s 结合 WS 与 REST 核对；恢复后从空 maker book 继续，3 秒仍不一致则 fail-safe 停机。
+
+内部统计仓位与 current-run ledger 仓位也必须保持在半个数量 tick 的容差内；超出容差会输出 `risk_notification(kind=accounting_invariant, severity=critical)`，立即进入 fail-safe 清理并以退出码 75 停机，避免使用不一致的仓位计算告警或 stop-loss。
 
 运行时使用单一事件循环同时等待周期任务、account/order-response 回调、行情刷新和 Ctrl+C。关键账户事件会取消当前 REST/下单 future、递增 generation 并进入冻结清理；旧 generation 的工作结果不会重新开启挂单。普通行情刷新在已有工作执行时会合并为一次后续 replan，避免并发 cycle。
 

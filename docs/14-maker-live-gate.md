@@ -21,6 +21,7 @@ maker by itself.
 - Existing inventory at or below `max_position` is adopted at the startup mark with maker-session PnL zeroed; inventory above the limit rejects startup after maker-order cleanup.
 - A venue position change that cannot yet be explained by current-run order callbacks freezes placements immediately. WS order updates and REST snapshots are reconciled for at most three seconds; persistent mismatch triggers fail-safe cleanup and shutdown.
 - Account-order cumulative fills and REST trades are tested in both arrival orders and never double-count fills, expected position, or maker-session PnL.
+- Every accepted current-run fill atomically synchronizes ledger position and session telemetry position; an internal mismatch beyond half a quantity tick fails closed before further live placement or risk evaluation.
 - Position jumps, account-stream state changes, reconciliation, volatility breaker, inventory exit, residual cleanup, and final fail-safe emit `risk_notification` telemetry; critical shutdown/cleanup delivery is awaited with a timeout.
 - Inventory-exit configuration remains disabled unless a supervised test has approved its exact threshold and chunk; the recorded XAG-USD test approves only `max_position=0.8`, trigger `25%`, and chunk `0.2`.
 
