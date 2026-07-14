@@ -3,7 +3,7 @@ use super::ledger::apply_order_update;
 #[cfg(test)]
 use super::ledger::maker_trade_fill;
 use super::ledger::{adopt_order, apply_rest_trade};
-use super::model::{is_current_run_order, is_order_rejection, position_for_symbol, PendingPlace};
+use super::model::{is_current_run_order, position_for_symbol, PendingCancel, PendingPlace};
 use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
 use super::pipeline::{
     fetch_cycle_snapshot, fetch_history_trade_audit, CycleRequest, CycleResult, CycleState,
@@ -18,7 +18,7 @@ use standx_maker::{self as maker, MakerFill, MakerLedger, MakerStats, RestingQuo
 use standx_sdk::account_stream::OrderUpdate;
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
-use standx_sdk::order_response::OrderResponseHealth;
+use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
 use std::time::Duration;
 
 fn collect_current_run_fills(
@@ -48,6 +48,10 @@ fn unhealthy_order_response(health: Option<&OrderResponseHealth>) -> Option<Stri
     }
 }
 
+fn live_order_commands(commands: Option<&OrderCommandSender>) -> Result<&OrderCommandSender> {
+    commands.ok_or_else(|| anyhow::anyhow!("order-command stream is unavailable"))
+}
+
 /// One reconcile cycle over an already-acquired market snapshot.
 /// Returns (places, cancels, holds, fills) counts. `sim_position` carries the
 /// paper-mode simulated inventory across cycles (unused in live).
@@ -71,12 +75,14 @@ pub(super) async fn maker_cycle(
         run_order_prefix,
         starting_position,
         output_format,
+        order_commands,
         order_response_health,
     } = request;
     let CycleState {
         resting,
         adopted,
         pending,
+        pending_cancels,
         inventory_exit_pending,
         ledger,
         sim_position,
@@ -333,6 +339,7 @@ pub(super) async fn maker_cycle(
         // Places older than 2 cycles never showed up as open orders —
         // likely rejected (e.g. ALO would-cross) or fully filled on arrival.
         pending.retain(|p| cycle.saturating_sub(p.cycle) <= 2);
+        pending_cancels.retain(|pending| cycle.saturating_sub(pending.cycle) <= 2);
         adopted.retain(|id, _| resting.iter().any(|r| r.order_id.as_deref() == Some(id)));
     } else {
         // Paper mode: simulate fills against the touch so inventory (and thus
@@ -436,9 +443,9 @@ pub(super) async fn maker_cycle(
     // The pure planner provides the anti-flicker anchor for new placements.
     let ref_center = plan.ref_center;
 
-    // 4. Execute. Business rejections (post-only would-cross, order already
-    //    gone) are expected and logged inline; only transient failures
-    //    propagate as cycle errors toward the fail-safe.
+    // 4. Execute. A socket-write failure propagates toward the fail-safe;
+    // business acceptance/rejection is handled later through the correlated
+    // order-response stream.
     let mut places: u64 = 0;
     let mut cancels: u64 = 0;
     let mut holds: u64 = 0;
@@ -453,29 +460,18 @@ pub(super) async fn maker_cycle(
             } => {
                 if live {
                     if let Some(id) = order_id {
-                        match client.cancel_order(symbol, id).await {
-                            Ok(()) => {
-                                adopted.remove(id);
-                                cancels += 1;
-                            }
-                            Err(e) if is_order_rejection(&e) => {
-                                // Order already gone (filled or cancelled
-                                // out from under us) — that IS the goal.
-                                adopted.remove(id);
-                                cancels += 1;
-                                log_maker_event(MakerLogEvent {
-                                    output_format,
-                                    symbol,
-                                    cycle,
-                                    action: "cancel_noop",
+                        match live_order_commands(order_commands)?.cancel_order(id).await {
+                            Ok(request_id) => {
+                                pending_cancels.push(PendingCancel {
+                                    request_id,
                                     side: *side,
                                     level: *level,
                                     price: *price,
-                                    price_decimals: cfg.price_decimals,
-                                    detail: "order already gone",
+                                    cycle,
                                 });
+                                adopted.remove(id);
+                                cancels += 1;
                             }
-                            // Transient (network / 5xx) → fail-safe path.
                             Err(e) => return Err(e.into()),
                         }
                     }
@@ -491,8 +487,8 @@ pub(super) async fn maker_cycle(
                     }
                     let cl_ord_id =
                         maker::quote_client_order_id(run_order_prefix, cycle, q.side, q.level);
-                    match client
-                        .create_order(CreateOrderParams {
+                    let request_id = live_order_commands(order_commands)?
+                        .create_order(&CreateOrderParams {
                             symbol: symbol.to_string(),
                             cl_ord_id: Some(cl_ord_id.clone()),
                             side: q.side,
@@ -507,38 +503,18 @@ pub(super) async fn maker_cycle(
                             sl_price: None,
                             tp_price: None,
                         })
-                        .await
-                    {
-                        Ok(submission) => {
-                            pending.push(PendingPlace {
-                                request_id: submission.id,
-                                cl_ord_id,
-                                side: q.side,
-                                price: q.price,
-                                qty: q.qty,
-                                level: q.level,
-                                ref_center,
-                                cycle,
-                            });
-                            places += 1;
-                        }
-                        Err(e) if is_order_rejection(&e) => {
-                            // Post-only would-cross etc. — expected in fast
-                            // markets. Re-quote next cycle, don't fail-safe.
-                            log_maker_event(MakerLogEvent {
-                                output_format,
-                                symbol,
-                                cycle,
-                                action: "place_rejected",
-                                side: q.side,
-                                level: q.level,
-                                price: q.price,
-                                price_decimals: cfg.price_decimals,
-                                detail: "post-only rejected",
-                            });
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
+                        .await?;
+                    pending.push(PendingPlace {
+                        request_id,
+                        cl_ord_id,
+                        side: q.side,
+                        price: q.price,
+                        qty: q.qty,
+                        level: q.level,
+                        ref_center,
+                        cycle,
+                    });
+                    places += 1;
                 } else {
                     resting.push(RestingQuote {
                         order_id: None,
@@ -560,13 +536,13 @@ pub(super) async fn maker_cycle(
         // Do not race a reduce-only market order against quote cancellations.
         // The next cycle must observe an empty maker book before the single
         // exit request can be submitted.
-        if resting.is_empty() && pending.is_empty() {
+        if resting.is_empty() && pending.is_empty() && pending_cancels.is_empty() {
             if let Some(reason) = unhealthy_order_response(order_response_health) {
                 return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
             }
             let cl_ord_id = maker::exit_client_order_id(run_order_prefix, cycle);
-            let submission = client
-                .create_order(CreateOrderParams {
+            let request_id = live_order_commands(order_commands)?
+                .create_order(&CreateOrderParams {
                     symbol: symbol.to_string(),
                     cl_ord_id: Some(cl_ord_id.clone()),
                     side: exit.side,
@@ -586,7 +562,7 @@ pub(super) async fn maker_cycle(
             // reduce-only market order never rests, so reconciliation drops it
             // when `pending` ages out.
             pending.push(PendingPlace {
-                request_id: submission.id,
+                request_id,
                 cl_ord_id,
                 side: exit.side,
                 price: mark,

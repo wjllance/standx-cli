@@ -7,7 +7,9 @@ use anyhow::Result;
 use standx_maker::{MakerFill, MakerLedger, MakerStats};
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Order, Position, Trade};
-use standx_sdk::order_response::{OrderResponse, OrderResponseHealth, OrderResponseStream};
+use standx_sdk::order_response::{
+    OrderCommandSender, OrderResponse, OrderResponseHealth, OrderResponseStream,
+};
 use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
@@ -271,6 +273,7 @@ pub(super) struct ReconnectSnapshot {
 
 pub(super) struct ReconnectedOrderResponse {
     pub(super) client: StandXClient,
+    pub(super) commands: OrderCommandSender,
     pub(super) responses: tokio::sync::mpsc::Receiver<OrderResponse>,
     pub(super) health: OrderResponseHealth,
     pub(super) handle: tokio::task::JoinHandle<()>,
@@ -472,7 +475,7 @@ pub(super) async fn reconnect_order_response(
             let candidate_client = StandXClient::new()?.with_session_id(&session_id);
             let stream = OrderResponseStream::new(&session_id)?;
             match tokio::time::timeout(Duration::from_secs(15), stream.connect()).await {
-                Ok(Ok((responses, health, handle))) => {
+                Ok(Ok((commands, responses, health, handle))) => {
                     match query_reconnect_snapshot(
                         &candidate_client,
                         symbol,
@@ -517,6 +520,7 @@ pub(super) async fn reconnect_order_response(
                                 return Ok((
                                     ReconnectedOrderResponse {
                                         client: candidate_client,
+                                        commands,
                                         responses,
                                         health,
                                         handle,

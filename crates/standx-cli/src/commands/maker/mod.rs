@@ -26,7 +26,7 @@ mod pipeline;
 mod recovery;
 mod runtime;
 #[cfg(test)]
-use runtime::apply_order_responses;
+use runtime::{apply_order_responses, PendingOrderCommands};
 
 use cycle::maker_cycle;
 use feed::{market_snapshot, spawn_market_feed};
@@ -650,6 +650,7 @@ mod tests {
             cycle: 1,
         };
         let mut pending = vec![pending_place("request-1"), pending_place("request-2")];
+        let mut pending_cancels = Vec::new();
         let mut runtime_state = MakerState::starting();
         sender
             .try_send(OrderResponse {
@@ -661,7 +662,10 @@ mod tests {
 
         apply_order_responses(
             &mut receiver,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -687,6 +691,7 @@ mod tests {
             ref_center: 100.0,
             cycle: 1,
         }];
+        let mut pending_cancels = Vec::new();
         let mut runtime_state = MakerState::starting();
         sender
             .try_send(OrderResponse {
@@ -698,7 +703,10 @@ mod tests {
 
         apply_order_responses(
             &mut receiver,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -715,11 +723,15 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
         let mut pending = Vec::new();
+        let mut pending_cancels = Vec::new();
         let mut runtime_state = MakerState::starting();
 
         let error = apply_order_responses(
             &mut receiver,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -736,11 +748,15 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
         let mut pending = Vec::new();
+        let mut pending_cancels = Vec::new();
         let mut runtime_state = MakerState::starting();
 
         let error = apply_order_responses(
             &mut receiver,
-            &mut pending,
+            PendingOrderCommands {
+                places: &mut pending,
+                cancels: &mut pending_cancels,
+            },
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
