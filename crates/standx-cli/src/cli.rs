@@ -561,9 +561,11 @@ pub enum MakerCommands {
             env = "STANDX_SUPERVISOR_WEBHOOK_FORMAT"
         )]
         alert_webhook_format: AlertWebhookFormat,
-        /// Disable the WebSocket market feed and poll REST every cycle
-        #[arg(long)]
-        no_ws: bool,
+        /// Disable the WebSocket market feed and poll REST every cycle.
+        /// `--no-ws` enables REST polling; `--no-ws=false` forces the WS feed
+        /// back on even when a config file sets `no_ws = true`.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        no_ws: Option<bool>,
         /// Place real orders (without this flag the bot runs in paper mode:
         /// full loop, prints intended actions, no orders placed)
         #[arg(long)]
@@ -605,12 +607,12 @@ pub enum MakerCommands {
         /// Put the post-only buy this many bps below the mark to avoid taking
         #[arg(long, default_value_t = 100.0)]
         price_offset_bps: f64,
-        /// Bound each response and REST visibility check
-        #[arg(long, default_value_t = 10)]
+        /// Bound each response and REST visibility check (1..=30 seconds)
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=30))]
         timeout_secs: u64,
         /// Required push channel for start, failure, and completion events
-        #[arg(long, env = "STANDX_SUPERVISOR_WEBHOOK")]
-        alert_webhook: Option<String>,
+        #[arg(long, env = "STANDX_SUPERVISOR_WEBHOOK", required = true)]
+        alert_webhook: String,
         /// Webhook payload format for the target chat platform
         #[arg(
             long,

@@ -96,6 +96,14 @@ pub async fn handle_maker(
     output_format: OutputFormat,
     verbose: bool,
 ) -> Result<()> {
+    // Maker output is emitted as JSON lines or a human table; there is no CSV
+    // renderer, so `--output csv` would silently fall back to the table. Reject
+    // it up front rather than surprising a pipeline that asked for CSV.
+    if output_format == OutputFormat::Csv {
+        return Err(anyhow::anyhow!(
+            "maker does not support --output csv; use json (machine-readable) or table (human)"
+        ));
+    }
     match command {
         MakerCommands::Run {
             symbol,
@@ -162,7 +170,7 @@ pub async fn handle_maker(
                     alert_margin_below: choose(alert_margin_below, file.alert_margin_below, 0.0),
                     alert_webhook,
                     alert_webhook_format,
-                    no_ws: no_ws || file.no_ws.unwrap_or(false),
+                    no_ws: choose(no_ws, file.no_ws, false),
                     live,
                     order_response_reconnect_attempts: choose(
                         order_response_reconnect_attempts,
