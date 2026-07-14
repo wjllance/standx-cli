@@ -476,19 +476,13 @@ fn apply_account_event(
                 balance_changed: false,
             })
         }
-        // Raw wallet fields are projected independently. The derived unified
-        // margin snapshot used by existing output remains REST-backed.
-        AccountEvent::Balance(update) => {
-            let generation = state.projection.generation();
-            state.projection.apply(
-                generation,
-                AccountProjectionEvent::BalanceObserved(model::projected_balance(update)),
-            );
-            Ok(AccountEventOutcome {
-                balance_changed: true,
-                ..AccountEventOutcome::default()
-            })
-        }
+        // A balance update only signals that the REST-backed margin snapshot
+        // the alert floors read is now stale; flag a refresh. The raw wallet
+        // fields are not projected — nothing reads a projected balance.
+        AccountEvent::Balance(_update) => Ok(AccountEventOutcome {
+            balance_changed: true,
+            ..AccountEventOutcome::default()
+        }),
         AccountEvent::Disconnected { reason } | AccountEvent::Error { reason } => Err(
             anyhow::anyhow!("authenticated account stream unhealthy: {reason}"),
         ),
@@ -3582,8 +3576,9 @@ mod tests {
             .unwrap()
         };
         assert_eq!(outcome.fills, 0);
+        // A balance event requests a REST refresh but does not mutate the
+        // projection (raw wallet fields are not projected).
         assert!(outcome.balance_changed);
-        assert_eq!(projection.raw_balance("perps", "DUSD").unwrap().free, "90");
         assert_eq!(stats.fills(), 0);
     }
 

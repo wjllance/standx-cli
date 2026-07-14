@@ -445,4 +445,55 @@ mod tests {
             Err(LedgerError::MissingOrderId { trade_id: 1 })
         ));
     }
+
+    #[test]
+    fn buffered_trades_for_unknown_orders_are_strictly_bounded() {
+        // Trades whose owning order has not yet been adopted are buffered. That
+        // buffer must be capped so a flood of trades for foreign orders cannot
+        // grow it without bound.
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        for index in 0..MAX_PENDING_TRADES as u64 {
+            // Distinct trade and order ids so none dedupe or get owned.
+            let outcome = ledger
+                .record_trade(
+                    trade(
+                        index + 1,
+                        index + 1,
+                        OrderSide::Buy,
+                        0.1,
+                        TradeSource::AccountStream,
+                    ),
+                    &mut stats,
+                )
+                .unwrap();
+            assert!(outcome.is_none(), "unowned trade should buffer, not fill");
+        }
+
+        assert!(matches!(
+            ledger.record_trade(
+                trade(
+                    MAX_PENDING_TRADES as u64 + 1,
+                    MAX_PENDING_TRADES as u64 + 1,
+                    OrderSide::Buy,
+                    0.1,
+                    TradeSource::AccountStream,
+                ),
+                &mut stats,
+            ),
+            Err(LedgerError::PendingTradeOverflow {
+                limit: MAX_PENDING_TRADES
+            })
+        ));
+
+        // A duplicate of an already-buffered trade is still deduped, not an
+        // overflow — the cap only rejects genuinely new buffered trades.
+        assert!(ledger
+            .record_trade(
+                trade(1, 1, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+                &mut stats,
+            )
+            .unwrap()
+            .is_none());
+    }
 }
