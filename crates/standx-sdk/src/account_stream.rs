@@ -617,18 +617,28 @@ mod tests {
     #[test]
     fn seq_regression_is_rejected() {
         let health = AccountStreamHealth::new(1);
-        parse_account_event(r#"{"seq":9,"channel":"trade","data":{}}"#, &health).unwrap();
-        assert!(parse_account_event(r#"{"seq":8,"channel":"trade","data":{}}"#, &health,).is_err());
+        let latest = r#"{"seq":9,"channel":"trade","data":{"id":9,"order_id":7,"side":"buy","symbol":"BTC-USD","price":"100","qty":"0.1","time":"2026-07-14T00:00:00Z"}}"#;
+        let stale = r#"{"seq":8,"channel":"trade","data":{"id":8,"order_id":7,"side":"buy","symbol":"BTC-USD","price":"100","qty":"0.1","time":"2026-07-14T00:00:00Z"}}"#;
+        parse_account_event(latest, &health).unwrap();
+        assert!(parse_account_event(stale, &health).is_err());
         assert_eq!(health.last_seq(AccountChannel::Trade), 9);
     }
 
     #[test]
     fn seq_is_monotonic_per_channel_and_allows_gaps() {
         let health = AccountStreamHealth::new(1);
-        parse_account_event(r#"{"seq":100,"channel":"trade","data":{}}"#, &health).unwrap();
+        parse_account_event(
+            r#"{"seq":100,"channel":"trade","data":{"id":100,"order_id":7,"side":"buy","symbol":"BTC-USD","price":"100","qty":"0.1","time":"2026-07-14T00:00:00Z"}}"#,
+            &health,
+        )
+        .unwrap();
         let position = r#"{"seq":3,"channel":"position","data":{"symbol":"BTC-USD","qty":"0","entry_price":"0","realized_pnl":"0","status":"closed","updated_at":"now"}}"#;
         parse_account_event(position, &health).unwrap();
-        parse_account_event(r#"{"seq":900,"channel":"trade","data":{}}"#, &health).unwrap();
+        parse_account_event(
+            r#"{"seq":900,"channel":"trade","data":{"id":900,"order_id":7,"side":"buy","symbol":"BTC-USD","price":"100","qty":"0.1","time":"2026-07-14T00:00:00Z"}}"#,
+            &health,
+        )
+        .unwrap();
 
         assert_eq!(health.last_seq(AccountChannel::Trade), 900);
         assert_eq!(health.last_seq(AccountChannel::Position), 3);

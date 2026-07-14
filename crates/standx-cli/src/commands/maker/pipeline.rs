@@ -1,14 +1,14 @@
-use super::model::{PendingCancel, PendingPlace};
 use crate::cli::OutputFormat;
 use anyhow::Result;
-use standx_maker::{MakerConfig, MakerLedger, MakerStats, RestingQuote, VolBreaker};
+use standx_maker::{
+    MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, RestingQuote, VolBreaker,
+};
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, Order, Position, Trade};
 use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const HISTORY_TRADE_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
+const ACCOUNT_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
 const BALANCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const BALANCE_MAX_STALE: Duration = Duration::from_secs(60);
 const BALANCE_REFRESH_RETRY: Duration = Duration::from_secs(5);
@@ -35,9 +35,7 @@ pub(super) struct CycleRequest<'a> {
 
 pub(super) struct CycleState<'a> {
     pub(super) resting: &'a mut Vec<RestingQuote>,
-    pub(super) adopted: &'a mut HashMap<String, (u32, f64, u64)>,
-    pub(super) pending: &'a mut Vec<PendingPlace>,
-    pub(super) pending_cancels: &'a mut Vec<PendingCancel>,
+    pub(super) account_projection: Option<&'a mut MakerAccountProjection>,
     pub(super) inventory_exit_pending: &'a mut bool,
     pub(super) ledger: &'a mut MakerLedger,
     pub(super) sim_position: &'a mut f64,
@@ -58,23 +56,21 @@ pub(super) struct CycleResult {
     pub(super) balance: Option<Balance>,
 }
 
-pub(super) struct CycleVenueSnapshot {
+pub(super) struct AccountAudit {
     pub(super) open_orders: Vec<Order>,
     pub(super) positions: Vec<Position>,
-}
-
-pub(super) struct HistoryTradeAudit {
     pub(super) filled_orders: Vec<Order>,
     pub(super) trades: Vec<Trade>,
 }
 
-/// Cached, REST-derived account presentation plus the low-frequency audit
-/// cadence. Venue order and position state still refresh every live cycle.
+/// Cached, REST-derived account presentation plus the low-frequency full
+/// account audit cadence. Healthy maker cycles use the authenticated account
+/// stream projection and perform no account REST reads.
 pub(super) struct LiveAccountPollState {
     balance: Balance,
     balance_updated_at: Instant,
     next_balance_refresh_at: Instant,
-    next_history_trade_audit_at: Instant,
+    next_account_audit_at: Instant,
 }
 
 impl LiveAccountPollState {
@@ -83,7 +79,7 @@ impl LiveAccountPollState {
             balance,
             balance_updated_at: now,
             next_balance_refresh_at: now + BALANCE_REFRESH_INTERVAL,
-            next_history_trade_audit_at: now + HISTORY_TRADE_AUDIT_INTERVAL,
+            next_account_audit_at: now + ACCOUNT_AUDIT_INTERVAL,
         }
     }
 
@@ -95,8 +91,8 @@ impl LiveAccountPollState {
         now >= self.next_balance_refresh_at
     }
 
-    pub(super) fn history_trade_audit_due(&self, now: Instant) -> bool {
-        now >= self.next_history_trade_audit_at
+    pub(super) fn account_audit_due(&self, now: Instant) -> bool {
+        now >= self.next_account_audit_at
     }
 
     pub(super) fn balance_is_within_stale_limit(&self, now: Instant) -> bool {
@@ -113,36 +109,26 @@ impl LiveAccountPollState {
         self.next_balance_refresh_at = now + BALANCE_REFRESH_RETRY;
     }
 
-    pub(super) fn record_history_trade_audit(&mut self, now: Instant) {
-        self.next_history_trade_audit_at = now + HISTORY_TRADE_AUDIT_INTERVAL;
+    pub(super) fn record_account_audit(&mut self, now: Instant) {
+        self.next_account_audit_at = now + ACCOUNT_AUDIT_INTERVAL;
     }
 }
 
-pub(super) async fn fetch_cycle_snapshot(
-    client: &StandXClient,
-    symbol: &str,
-) -> Result<CycleVenueSnapshot> {
-    let (open_orders, positions) = tokio::join!(
-        client.get_open_orders(Some(symbol)),
-        client.get_positions(Some(symbol)),
-    );
-    Ok(CycleVenueSnapshot {
-        open_orders: open_orders?,
-        positions: positions?,
-    })
-}
-
-pub(super) async fn fetch_history_trade_audit(
+pub(super) async fn fetch_account_audit(
     client: &StandXClient,
     symbol: &str,
     session_started_at: i64,
     now: i64,
-) -> Result<HistoryTradeAudit> {
-    let (filled_orders, trades) = tokio::join!(
+) -> Result<AccountAudit> {
+    let (open_orders, positions, filled_orders, trades) = tokio::join!(
+        client.get_open_orders(Some(symbol)),
+        client.get_positions(Some(symbol)),
         client.get_order_history(Some(symbol), Some(100)),
         client.get_user_trades(symbol, session_started_at, now, Some(500)),
     );
-    Ok(HistoryTradeAudit {
+    Ok(AccountAudit {
+        open_orders: open_orders?,
+        positions: positions?,
         filled_orders: filled_orders?,
         trades: trades?,
     })
@@ -208,14 +194,14 @@ mod tests {
         let mut state = LiveAccountPollState::new(balance(), now);
         let due = now + Duration::from_secs(30);
 
-        assert!(!state.history_trade_audit_due(due - Duration::from_millis(1)));
+        assert!(!state.account_audit_due(due - Duration::from_millis(1)));
         assert!(!state.balance_refresh_due(due - Duration::from_millis(1)));
-        assert!(state.history_trade_audit_due(due));
+        assert!(state.account_audit_due(due));
         assert!(state.balance_refresh_due(due));
 
-        state.record_history_trade_audit(due);
+        state.record_account_audit(due);
         state.record_balance_refresh(balance(), due);
-        assert!(!state.history_trade_audit_due(due + Duration::from_secs(29)));
+        assert!(!state.account_audit_due(due + Duration::from_secs(29)));
         assert!(!state.balance_refresh_due(due + Duration::from_secs(29)));
     }
 
@@ -233,19 +219,19 @@ mod tests {
     }
 
     #[test]
-    fn failed_history_trade_audit_stays_due_until_a_successful_commit() {
+    fn failed_account_audit_stays_due_until_a_successful_commit() {
         let now = Instant::now();
         let state = LiveAccountPollState::new(balance(), now);
         let due = now + Duration::from_secs(30);
 
-        assert!(state.history_trade_audit_due(due));
+        assert!(state.account_audit_due(due));
         // An audit failure deliberately does not call
-        // `record_history_trade_audit`, so the next cycle must retry it.
-        assert!(state.history_trade_audit_due(due + Duration::from_secs(1)));
+        // `record_account_audit`, so the next cycle must retry it.
+        assert!(state.account_audit_due(due + Duration::from_secs(1)));
     }
 
     #[tokio::test]
-    async fn normal_cycles_only_read_orders_and_positions_until_audit_is_due() {
+    async fn normal_cycles_make_no_account_rest_reads_until_audit_is_due() {
         let _jwt = JwtGuard::set();
         let mut server = Server::new_async().await;
         let open_orders = server
@@ -254,7 +240,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"code":0,"message":"ok","result":[]}"#)
-            .expect(2)
+            .expect(1)
             .create_async()
             .await;
         let positions = server
@@ -263,7 +249,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body("[]")
-            .expect(2)
+            .expect(1)
             .create_async()
             .await;
         let filled_orders = server
@@ -296,23 +282,23 @@ mod tests {
         let now = Instant::now();
         let mut poll = LiveAccountPollState::new(balance(), now);
 
-        let first = fetch_cycle_snapshot(&client, "BTC-USD").await.unwrap();
-        assert!(first.open_orders.is_empty());
-        assert!(first.positions.is_empty());
-        assert!(!poll.history_trade_audit_due(now));
+        // A healthy cycle before the deadline does not invoke any of the
+        // mocks above; it reads the local projection instead.
+        assert!(!poll.account_audit_due(now));
         assert!(!poll.balance_refresh_due(now));
 
         let due = now + Duration::from_secs(30);
-        assert!(poll.history_trade_audit_due(due));
+        assert!(poll.account_audit_due(due));
         assert!(poll.balance_refresh_due(due));
-        let (second, audit, refreshed_balance) = tokio::join!(
-            fetch_cycle_snapshot(&client, "BTC-USD"),
-            fetch_history_trade_audit(&client, "BTC-USD", 1_784_304_000, 1_784_304_060),
+        let (audit, refreshed_balance) = tokio::join!(
+            fetch_account_audit(&client, "BTC-USD", 1_784_304_000, 1_784_304_060),
             client.get_balance(),
         );
-        assert!(second.unwrap().open_orders.is_empty());
-        assert!(audit.unwrap().trades.is_empty());
-        poll.record_history_trade_audit(due);
+        let audit = audit.unwrap();
+        assert!(audit.open_orders.is_empty());
+        assert!(audit.positions.is_empty());
+        assert!(audit.trades.is_empty());
+        poll.record_account_audit(due);
         poll.record_balance_refresh(refreshed_balance.unwrap(), due);
 
         open_orders.assert_async().await;
