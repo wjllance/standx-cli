@@ -9,10 +9,10 @@ use tokio::sync::{watch, RwLock};
 /// receipt so cycle reads are lock-and-go.
 #[derive(Default)]
 pub(super) struct FeedState {
-    pub(super) mark: Option<f64>,
+    mark: Option<f64>,
     mark_meta: Option<FeedMeta>,
-    pub(super) best_bid: Option<f64>,
-    pub(super) best_ask: Option<f64>,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
     book_meta: Option<FeedMeta>,
 }
 

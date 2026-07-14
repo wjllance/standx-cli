@@ -32,8 +32,6 @@ use runtime::apply_order_responses;
 
 use cycle::maker_cycle;
 use feed::{fresh_ws_snapshot, market_snapshot, spawn_market_feed};
-#[cfg(test)]
-use model::is_order_rejection;
 use model::{is_maker_order, position_for_symbol, MakerExit};
 pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 #[cfg(test)]
@@ -51,8 +49,6 @@ use recovery::{
 };
 #[cfg(test)]
 use standx_maker::ProjectionPendingPlace;
-#[cfg(test)]
-use standx_sdk::error::Error as StandxError;
 #[cfg(test)]
 use standx_sdk::models::{Order, OrderSide, Position, Trade};
 #[cfg(test)]
@@ -572,30 +568,6 @@ mod tests {
         assert_eq!(raw["kind"], "loss");
         assert_eq!(raw["firing"], true);
         assert_eq!(raw["symbol"], "BTC-USD");
-    }
-
-    #[test]
-    fn business_rejection_not_fail_safe() {
-        // Post-only would-cross / order-not-found: exchange said no.
-        assert!(is_order_rejection(&StandxError::Api {
-            code: 400,
-            message: "post-only would cross".into(),
-            endpoint: None,
-            retryable: false,
-        }));
-        // 5xx from the venue: transient → counts toward fail-safe.
-        assert!(!is_order_rejection(&StandxError::Api {
-            code: 502,
-            message: "bad gateway".into(),
-            endpoint: None,
-            retryable: true,
-        }));
-        // Network layer: transient → counts toward fail-safe.
-        assert!(!is_order_rejection(&StandxError::Http {
-            code: 0,
-            message: "connection reset".into(),
-            retryable: Some(true),
-        }));
     }
 
     #[test]

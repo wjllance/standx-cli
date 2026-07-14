@@ -1,6 +1,4 @@
 use standx_sdk::account_stream::OrderUpdate;
-#[cfg(test)]
-use standx_sdk::error::Error as StandxError;
 use standx_sdk::models::{Order, OrderSide, OrderStatus, Position};
 
 /// Process exit code emitted when the maker performs an *intentional*
@@ -241,15 +239,4 @@ pub(super) fn signed_position_quantity(
         Some(OrderSide::Buy) => qty.abs(),
         None => qty,
     })
-}
-
-#[cfg(test)]
-pub(super) fn is_order_rejection(error: &StandxError) -> bool {
-    matches!(
-        error,
-        StandxError::Api {
-            retryable: false,
-            ..
-        }
-    )
 }

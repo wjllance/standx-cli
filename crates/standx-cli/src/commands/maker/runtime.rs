@@ -408,7 +408,6 @@ fn apply_account_event(
                 &update,
                 context.symbol,
                 context.run_order_prefix,
-                context.mark,
                 state.stats,
                 &mut fills,
             )?;

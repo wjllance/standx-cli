@@ -51,7 +51,7 @@ pub(super) struct CycleState<'a> {
     pub(super) live_account_poll: Option<&'a mut LiveAccountPollState>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub(super) struct CycleResult {
     pub(super) places: u64,
     pub(super) cancels: u64,

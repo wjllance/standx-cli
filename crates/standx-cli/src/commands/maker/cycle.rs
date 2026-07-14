@@ -741,7 +741,6 @@ mod tests {
             &order_update("0.20", "59.50"),
             "BTC-USD",
             "sxmk-0123456789ab-",
-            59.50,
             &mut stats,
             &mut fills,
         )
