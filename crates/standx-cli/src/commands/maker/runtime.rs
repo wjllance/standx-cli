@@ -1,3 +1,7 @@
+use super::output::{
+    emit_ledger_sync, emit_live_fill, emit_reconciliation_snapshot_error,
+    emit_reconciliation_state, emit_startup_rejected, emit_stop_loss_triggered,
+};
 use super::*;
 use standx_sdk::order_response::OrderResponse;
 
@@ -40,17 +44,23 @@ fn take_recovery_effect(
     }
 }
 
-fn take_stop_effect(runtime_state: &mut MakerState) -> Result<MakerExit> {
+/// Drains queued `AbortInFlight` effects and returns the `Stop` exit the
+/// runtime is expected to have queued. The `fallback` names the `MakerExit`
+/// variant to use if the runtime is in an unexpected state — the CLI already
+/// knows which fault it is handling, so it supplies the variant rather than
+/// re-asserting it at each call site.
+fn take_stop_effect(
+    runtime_state: &mut MakerState,
+    fallback: fn(String) -> MakerExit,
+) -> MakerExit {
     loop {
         match runtime_state.next_effect() {
             Some(MakerEffect::AbortInFlight(_)) => {}
-            Some(MakerEffect::Stop(reason)) => return Ok(reason.into()),
+            Some(MakerEffect::Stop(reason)) => return reason.into(),
             Some(effect) => {
-                return Err(anyhow::anyhow!(
-                    "runtime expected stop effect, got {effect:?}"
-                ));
+                return fallback(format!("runtime expected stop effect, got {effect:?}"));
             }
-            None => return Err(anyhow::anyhow!("runtime did not emit stop effect")),
+            None => return fallback("runtime did not emit stop effect".to_string()),
         }
     }
 }
@@ -61,14 +71,12 @@ fn recovery_failed_exit(
     reason: String,
 ) -> MakerExit {
     runtime_state.handle(MakerEvent::RecoveryFailed { token, reason });
-    take_stop_effect(runtime_state)
-        .unwrap_or_else(|error| MakerExit::PositionReconciliation(error.to_string()))
+    take_stop_effect(runtime_state, MakerExit::PositionReconciliation)
 }
 
 fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason) -> MakerExit {
     runtime_state.handle(MakerEvent::StopRequested(reason));
-    take_stop_effect(runtime_state)
-        .unwrap_or_else(|error| MakerExit::PositionReconciliation(error.to_string()))
+    take_stop_effect(runtime_state, MakerExit::PositionReconciliation)
 }
 
 /// A buffered or queued order-response signals a genuine correlation failure
@@ -241,6 +249,55 @@ fn schedule_account_balance_refresh(
     true
 }
 
+/// Loop-carried state and context an account outcome feeds back into, borrowed
+/// for the duration of one [`absorb_account_outcome`] call.
+struct OutcomeSink<'a> {
+    total_fills: &'a mut u64,
+    balance_refresh_requested: &'a mut bool,
+    inventory_exit_pending: &'a mut bool,
+    notifier: &'a MakerNotifier,
+    position_alert_anchor: &'a mut PositionAlertAnchor,
+    expected_position: f64,
+    max_position: f64,
+    inventory_exit_pct: f64,
+    qty_tolerance: f64,
+    symbol: &'a str,
+    cycle: u64,
+}
+
+/// Fold one account-event outcome into the loop totals: accumulate fills, clear
+/// the pending inventory exit once its fill is observed, and emit a
+/// position-jump alert. Returns the latest observed position (if any) so the
+/// caller can apply its own mismatch bookkeeping — the one part that legitimately
+/// differs between the cycle, replan, and reconciliation paths.
+async fn absorb_account_outcome(
+    outcome: AccountEventOutcome,
+    sink: OutcomeSink<'_>,
+) -> Option<f64> {
+    *sink.total_fills += outcome.fills;
+    *sink.balance_refresh_requested |= outcome.balance_changed;
+    if outcome.exit_fill_observed {
+        *sink.inventory_exit_pending = false;
+    }
+    let position = outcome.latest_position;
+    if let Some(position) = position {
+        sink.notifier
+            .position_jump(
+                sink.position_alert_anchor,
+                PositionChange {
+                    observed: position,
+                    expected: sink.expected_position,
+                    max_position: sink.max_position,
+                    inventory_exit_pct: sink.inventory_exit_pct,
+                    qty_tolerance: sink.qty_tolerance,
+                    symbol: sink.symbol,
+                    cycle: sink.cycle,
+                },
+            )
+            .await;
+    }
+    position
+}
 fn apply_account_events(
     receiver: &mut tokio::sync::mpsc::Receiver<AccountEvent>,
     state: &mut AccountEventState<'_>,
@@ -421,89 +478,6 @@ fn apply_account_event(
     }
 }
 
-fn emit_live_fill(fill: &MakerFill, symbol: &str, cycle: u64, output_format: OutputFormat) {
-    match output_format {
-        OutputFormat::Json => println!(
-            "{}",
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "symbol": symbol,
-                "cycle": cycle,
-                "action": "fill",
-                "origin": fill.origin,
-                "order_id": fill.order_id,
-                "trade_id": fill.trade_id,
-                "trade_ts": fill.trade_ts,
-                "side": fill.side,
-                "price": fill.price,
-                "qty": fill.qty,
-            })
-        ),
-        _ => eprintln!(
-            "⚡ account fill {:?} {} @ {} (order {})",
-            fill.side,
-            fill.qty,
-            fill.price,
-            fill.order_id.unwrap_or_default()
-        ),
-    }
-}
-
-fn emit_reconciliation_state(
-    output_format: OutputFormat,
-    symbol: &str,
-    cycle: u64,
-    event: &str,
-    expected: f64,
-    observed: f64,
-) {
-    if output_format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "symbol": symbol,
-                "cycle": cycle,
-                "action": "position_reconciliation",
-                "event": event,
-                "expected_position": expected,
-                "observed_position": observed,
-            })
-        );
-    } else {
-        eprintln!(
-            "⚠️  position reconciliation {event}: expected {expected:+.8}, observed {observed:+.8}"
-        );
-    }
-}
-
-fn emit_stop_loss_triggered(
-    output_format: OutputFormat,
-    symbol: &str,
-    cycle: u64,
-    pnl: f64,
-    stop_loss: f64,
-) {
-    if output_format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "symbol": symbol,
-                "cycle": cycle,
-                "action": "stop_loss",
-                "event": "triggered",
-                "pnl": pnl,
-                "stop_loss": stop_loss,
-            })
-        );
-    } else {
-        eprintln!(
-            "🛑 stop-loss triggered: session PnL {pnl:+.2} breached -{stop_loss:.2}; shutting down"
-        );
-    }
-}
-
 fn accounting_position_mismatch(
     expected_position: f64,
     stats_position: f64,
@@ -548,109 +522,6 @@ async fn accounting_invariant_exit(
         )
         .await;
     Some(MakerExit::AccountingInvariant(detail))
-}
-
-fn emit_reconciliation_snapshot_error(
-    output_format: OutputFormat,
-    symbol: &str,
-    cycle: u64,
-    message: &str,
-) {
-    // Precursor signal: a failed reconciliation snapshot inside the freeze
-    // window is an early warning that the fail-safe may not converge. Surface
-    // it on stdout (JSON mode) so ingest uploads it rather than losing it to
-    // local stderr only.
-    if output_format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "symbol": symbol,
-                "cycle": cycle,
-                "action": "position_reconciliation",
-                "event": "snapshot_failed",
-                "severity": "warning",
-                "message": message,
-            })
-        );
-    } else {
-        eprintln!("⚠️  bounded position reconciliation snapshot failed: {message}");
-    }
-}
-
-fn emit_ledger_sync(
-    output_format: OutputFormat,
-    symbol: &str,
-    starting_position: f64,
-    baseline_mark: f64,
-    historical_orders: usize,
-    historical_trades: usize,
-) {
-    if output_format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "symbol": symbol,
-                "action": "ledger_sync",
-                "event": "complete",
-                "starting_position": starting_position,
-                "baseline_mark": baseline_mark,
-                "pnl_baseline": 0.0,
-                "historical_maker_orders": historical_orders,
-                "historical_maker_trades_ignored": historical_trades,
-                "history_window_seconds": 24 * 60 * 60,
-                "history_order_limit": 100,
-                "history_trade_limit": 500,
-                "current_run_fills": 0,
-            })
-        );
-        if starting_position.abs() > f64::EPSILON {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "symbol": symbol,
-                    "action": "inventory_adopted",
-                    "event": "complete",
-                    "starting_position": starting_position,
-                    "baseline_mark": baseline_mark,
-                    "pnl_baseline": 0.0,
-                })
-            );
-        }
-    } else {
-        eprintln!(
-            "✅ maker ledger synchronized: position={starting_position:+.8}, baseline mark={baseline_mark:.8}, ignored historical fills={historical_trades}"
-        );
-    }
-}
-
-fn emit_startup_rejected(
-    output_format: OutputFormat,
-    symbol: &str,
-    position: f64,
-    max_position: f64,
-) {
-    let message = format!(
-        "starting position {position:+.8} exceeds max_position {max_position:.8}; refusing live maker"
-    );
-    if output_format == OutputFormat::Json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                "symbol": symbol,
-                "action": "startup_rejected",
-                "event": "position_over_limit",
-                "position": position,
-                "max_position": max_position,
-                "message": message,
-            })
-        );
-    } else {
-        eprintln!("⚠️  {message}");
-    }
 }
 
 /// Reject alert thresholds that silently defeat the guard they configure.
@@ -1375,10 +1246,7 @@ pub(super) async fn run_maker(
                             "account stream disconnected ({detail}); freeze cleanup failed: {cleanup_error}"
                         ),
                     });
-                    break match take_stop_effect(&mut runtime_state) {
-                        Ok(exit) => exit,
-                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                    };
+                    break take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 }
                 resting.clear();
                 if let Some(projection) = account_projection.as_mut() {
@@ -1446,10 +1314,10 @@ pub(super) async fn run_maker(
                     };
                     let Some(connect_attempt) = connect_attempt else {
                         runtime_state.handle(MakerEvent::CtrlC);
-                        break 'main match take_stop_effect(&mut runtime_state) {
-                            Ok(exit) => exit,
-                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                        };
+                        break 'main take_stop_effect(
+                            &mut runtime_state,
+                            MakerExit::PositionReconciliation,
+                        );
                     };
                     match connect_attempt {
                         Ok(Ok(triple)) => {
@@ -1478,12 +1346,10 @@ pub(super) async fn run_maker(
                             biased;
                             _ = ctrl_c_latched(&mut ctrl_c_rx) => {
                                 runtime_state.handle(MakerEvent::CtrlC);
-                                break 'main match take_stop_effect(&mut runtime_state) {
-                                    Ok(exit) => exit,
-                                    Err(error) => {
-                                        MakerExit::PositionReconciliation(error.to_string())
-                                    }
-                                };
+                                break 'main take_stop_effect(
+                                    &mut runtime_state,
+                                    MakerExit::PositionReconciliation,
+                                );
                             }
                             _ = tokio::time::sleep(backoff) => {}
                         }
@@ -1499,10 +1365,7 @@ pub(super) async fn run_maker(
                                 .unwrap_or_else(|| "no attempts available".to_string())
                         ),
                     });
-                    break match take_stop_effect(&mut runtime_state) {
-                        Ok(exit) => exit,
-                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                    };
+                    break take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 };
 
                 let projection = account_projection
@@ -1724,10 +1587,7 @@ pub(super) async fn run_maker(
                         token: cleanup_token,
                         reason: format!("order-response freeze cleanup failed: {error}"),
                     });
-                    break match take_stop_effect(&mut runtime_state) {
-                        Ok(exit) => exit,
-                        Err(error) => MakerExit::OrderResponse(error.to_string()),
-                    };
+                    break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
                 }
                 resting.clear();
                 if let Some(projection) = account_projection.as_mut() {
@@ -1804,10 +1664,10 @@ pub(super) async fn run_maker(
                         Err(error) => {
                             if error.downcast_ref::<ReconnectInterrupted>().is_some() {
                                 runtime_state.handle(MakerEvent::CtrlC);
-                                break match take_stop_effect(&mut runtime_state) {
-                                    Ok(exit) => exit,
-                                    Err(error) => MakerExit::OrderResponse(error.to_string()),
-                                };
+                                break take_stop_effect(
+                                    &mut runtime_state,
+                                    MakerExit::OrderResponse,
+                                );
                             }
                             if let Some(reconciliation) =
                                 error.downcast_ref::<PositionReconciliationError>()
@@ -1850,12 +1710,10 @@ pub(super) async fn run_maker(
                                     token: recovery_token,
                                     reason: error.to_string(),
                                 });
-                                break match take_stop_effect(&mut runtime_state) {
-                                    Ok(exit) => exit,
-                                    Err(runtime_error) => {
-                                        MakerExit::PositionReconciliation(runtime_error.to_string())
-                                    }
-                                };
+                                break take_stop_effect(
+                                    &mut runtime_state,
+                                    MakerExit::PositionReconciliation,
+                                );
                             }
                             let reconnect_failed_message = format!(
                                 "{detail}; safe reconnect failed: {error}; refusing further live orders"
@@ -1881,10 +1739,7 @@ pub(super) async fn run_maker(
                                 token: recovery_token,
                                 reason: reconnect_failed_message,
                             });
-                            break match take_stop_effect(&mut runtime_state) {
-                                Ok(exit) => exit,
-                                Err(error) => MakerExit::OrderResponse(error.to_string()),
-                            };
+                            break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
                         }
                     }
                 }
@@ -1922,10 +1777,7 @@ pub(super) async fn run_maker(
                     token: recovery_token,
                     reason: refuse_message,
                 });
-                break match take_stop_effect(&mut runtime_state) {
-                    Ok(exit) => exit,
-                    Err(error) => MakerExit::OrderResponse(error.to_string()),
-                };
+                break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
             }
         }
         if let Some(receiver) = order_responses.as_mut() {
@@ -1970,28 +1822,23 @@ pub(super) async fn run_maker(
                 },
             ) {
                 Ok(outcome) => {
-                    total_fills += outcome.fills;
-                    account_balance_refresh_requested |= outcome.balance_changed;
-                    if outcome.exit_fill_observed {
-                        inventory_exit_pending = false;
-                    }
-                    let position = outcome.latest_position;
-                    if let Some(position) = position {
-                        notifier
-                            .position_jump(
-                                &mut position_alert_anchor,
-                                PositionChange {
-                                    observed: position,
-                                    expected: ledger.expected_position,
-                                    max_position: cfg.max_position,
-                                    inventory_exit_pct: args.inventory_exit_pct,
-                                    qty_tolerance,
-                                    symbol: &symbol,
-                                    cycle,
-                                },
-                            )
-                            .await;
-                    }
+                    let position = absorb_account_outcome(
+                        outcome,
+                        OutcomeSink {
+                            total_fills: &mut total_fills,
+                            balance_refresh_requested: &mut account_balance_refresh_requested,
+                            inventory_exit_pending: &mut inventory_exit_pending,
+                            notifier: &notifier,
+                            position_alert_anchor: &mut position_alert_anchor,
+                            expected_position: ledger.expected_position,
+                            max_position: cfg.max_position,
+                            inventory_exit_pct: args.inventory_exit_pct,
+                            qty_tolerance,
+                            symbol: &symbol,
+                            cycle,
+                        },
+                    )
+                    .await;
                     if let Some(position) = position.filter(|position| {
                         (*position - ledger.expected_position).abs() > qty_tolerance
                     }) {
@@ -2144,10 +1991,7 @@ pub(super) async fn run_maker(
                     biased;
                     _ = ctrl_c_latched(&mut ctrl_c_rx) => {
                         runtime_state.handle(MakerEvent::CtrlC);
-                        break 'main match take_stop_effect(&mut runtime_state) {
-                            Ok(exit) => exit,
-                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                        };
+                        break 'main take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                     },
                     event = account_during_work => {
                         let Some(event) = event else {
@@ -2232,27 +2076,24 @@ pub(super) async fn run_maker(
                 },
             ) {
                 Ok(outcome) => {
-                    total_fills += outcome.fills;
-                    account_balance_refresh_requested |= outcome.balance_changed;
-                    if outcome.exit_fill_observed {
-                        inventory_exit_pending = false;
-                    }
-                    let position = outcome.latest_position;
+                    let position = absorb_account_outcome(
+                        outcome,
+                        OutcomeSink {
+                            total_fills: &mut total_fills,
+                            balance_refresh_requested: &mut account_balance_refresh_requested,
+                            inventory_exit_pending: &mut inventory_exit_pending,
+                            notifier: &notifier,
+                            position_alert_anchor: &mut position_alert_anchor,
+                            expected_position: ledger.expected_position,
+                            max_position: cfg.max_position,
+                            inventory_exit_pct: args.inventory_exit_pct,
+                            qty_tolerance,
+                            symbol: &symbol,
+                            cycle,
+                        },
+                    )
+                    .await;
                     if let Some(position) = position {
-                        notifier
-                            .position_jump(
-                                &mut position_alert_anchor,
-                                PositionChange {
-                                    observed: position,
-                                    expected: ledger.expected_position,
-                                    max_position: cfg.max_position,
-                                    inventory_exit_pct: args.inventory_exit_pct,
-                                    qty_tolerance,
-                                    symbol: &symbol,
-                                    cycle,
-                                },
-                            )
-                            .await;
                         if (position - ledger.expected_position).abs() > qty_tolerance {
                             account_position_mismatch = Some(position);
                         } else {
@@ -2492,10 +2333,10 @@ pub(super) async fn run_maker(
                                 args.stop_loss
                             )),
                         ));
-                        break 'main match take_stop_effect(&mut runtime_state) {
-                            Ok(exit) => exit,
-                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                        };
+                        break 'main take_stop_effect(
+                            &mut runtime_state,
+                            MakerExit::PositionReconciliation,
+                        );
                     }
                 }
             }
@@ -2561,10 +2402,10 @@ pub(super) async fn run_maker(
                             token: cleanup_token,
                             reason: format!("freeze cleanup failed: {cleanup_error}"),
                         });
-                        break 'main match take_stop_effect(&mut runtime_state) {
-                            Ok(exit) => exit,
-                            Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                        };
+                        break 'main take_stop_effect(
+                            &mut runtime_state,
+                            MakerExit::PositionReconciliation,
+                        );
                     }
                     resting.clear();
                     if let Some(projection) = account_projection.as_mut() {
@@ -2608,27 +2449,25 @@ pub(super) async fn run_maker(
                                 },
                             ) {
                                 Ok(outcome) => {
-                                    total_fills += outcome.fills;
-                                    account_balance_refresh_requested |= outcome.balance_changed;
-                                    if outcome.exit_fill_observed {
-                                        inventory_exit_pending = false;
-                                    }
-                                    let position = outcome.latest_position;
-                                    if let Some(position) = position {
-                                        notifier
-                                            .position_jump(
-                                                &mut position_alert_anchor,
-                                                PositionChange {
-                                                    observed: position,
-                                                    expected: ledger.expected_position,
-                                                    max_position: cfg.max_position,
-                                                    inventory_exit_pct: args.inventory_exit_pct,
-                                                    qty_tolerance,
-                                                    symbol: &symbol,
-                                                    cycle,
-                                                },
-                                            )
-                                            .await;
+                                    if let Some(position) = absorb_account_outcome(
+                                        outcome,
+                                        OutcomeSink {
+                                            total_fills: &mut total_fills,
+                                            balance_refresh_requested:
+                                                &mut account_balance_refresh_requested,
+                                            inventory_exit_pending: &mut inventory_exit_pending,
+                                            notifier: &notifier,
+                                            position_alert_anchor: &mut position_alert_anchor,
+                                            expected_position: ledger.expected_position,
+                                            max_position: cfg.max_position,
+                                            inventory_exit_pct: args.inventory_exit_pct,
+                                            qty_tolerance,
+                                            symbol: &symbol,
+                                            cycle,
+                                        },
+                                    )
+                                    .await
+                                    {
                                         last_observed = position;
                                     }
                                 }
@@ -2743,10 +2582,10 @@ pub(super) async fn run_maker(
                             ledger.expected_position, last_observed
                         ),
                     });
-                    break 'main match take_stop_effect(&mut runtime_state) {
-                        Ok(exit) => exit,
-                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                    };
+                    break 'main take_stop_effect(
+                        &mut runtime_state,
+                        MakerExit::PositionReconciliation,
+                    );
                 }
                 if exit_pending_before {
                     let message = format!("inventory exit cycle failed: {e}");
@@ -2775,10 +2614,7 @@ pub(super) async fn run_maker(
                 consecutive_errors += 1;
                 eprintln!("⚠️  maker cycle failed ({}/3): {}", consecutive_errors, e);
                 if matches!(runtime_state.pending_effect(), Some(MakerEffect::Stop(_))) {
-                    break match take_stop_effect(&mut runtime_state) {
-                        Ok(exit) => exit,
-                        Err(error) => MakerExit::ConsecutiveErrors(error.to_string()),
-                    };
+                    break take_stop_effect(&mut runtime_state, MakerExit::ConsecutiveErrors);
                 }
             }
         }
@@ -2821,10 +2657,7 @@ pub(super) async fn run_maker(
             tokio::select! {
                 _ = ctrl_c_latched(&mut ctrl_c_rx) => {
                     runtime_state.handle(MakerEvent::CtrlC);
-                    break 'main match take_stop_effect(&mut runtime_state) {
-                        Ok(exit) => exit,
-                        Err(error) => MakerExit::PositionReconciliation(error.to_string()),
-                    };
+                    break 'main take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 },
                 _ = tokio::time::sleep_until(deadline) => break,
                 event = account_update => {
@@ -2852,33 +2685,25 @@ pub(super) async fn run_maker(
                         },
                     ) {
                         Ok(outcome) => {
-                            total_fills += outcome.fills;
-                            account_balance_refresh_requested |= outcome.balance_changed;
-                            if outcome.exit_fill_observed {
-                                inventory_exit_pending = false;
-                            }
-                            let position = outcome.latest_position;
-                            if let Some(position) = position {
-                                notifier
-                                    .position_jump(
-                                        &mut position_alert_anchor,
-                                        PositionChange {
-                                            observed: position,
-                                            expected: ledger.expected_position,
-                                            max_position: cfg.max_position,
-                                            inventory_exit_pct: args.inventory_exit_pct,
-                                            qty_tolerance: 10_f64
-                                                .powi(-(cfg.qty_decimals as i32))
-                                                / 2.0,
-                                            symbol: &symbol,
-                                            cycle,
-                                        },
-                                    )
-                                .await;
-                            }
+                            let position = absorb_account_outcome(
+                                outcome,
+                                OutcomeSink {
+                                    total_fills: &mut total_fills,
+                                    balance_refresh_requested: &mut account_balance_refresh_requested,
+                                    inventory_exit_pending: &mut inventory_exit_pending,
+                                    notifier: &notifier,
+                                    position_alert_anchor: &mut position_alert_anchor,
+                                    expected_position: ledger.expected_position,
+                                    max_position: cfg.max_position,
+                                    inventory_exit_pct: args.inventory_exit_pct,
+                                    qty_tolerance,
+                                    symbol: &symbol,
+                                    cycle,
+                                },
+                            )
+                            .await;
                             if let Some(position) = position.filter(|position| {
-                                (*position - ledger.expected_position).abs()
-                                    > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0
+                                (*position - ledger.expected_position).abs() > qty_tolerance
                             }) {
                                 account_position_mismatch = Some(position);
                             }

@@ -338,6 +338,197 @@ pub(super) fn log_maker_event(event: MakerLogEvent<'_>) {
     }
 }
 
+pub(super) fn emit_live_fill(
+    fill: &MakerFill,
+    symbol: &str,
+    cycle: u64,
+    output_format: OutputFormat,
+) {
+    match output_format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "fill",
+                "origin": fill.origin,
+                "order_id": fill.order_id,
+                "trade_id": fill.trade_id,
+                "trade_ts": fill.trade_ts,
+                "side": fill.side,
+                "price": fill.price,
+                "qty": fill.qty,
+            })
+        ),
+        _ => eprintln!(
+            "⚡ account fill {:?} {} @ {} (order {})",
+            fill.side,
+            fill.qty,
+            fill.price,
+            fill.order_id.unwrap_or_default()
+        ),
+    }
+}
+
+pub(super) fn emit_reconciliation_state(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    event: &str,
+    expected: f64,
+    observed: f64,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "position_reconciliation",
+                "event": event,
+                "expected_position": expected,
+                "observed_position": observed,
+            })
+        );
+    } else {
+        eprintln!(
+            "⚠️  position reconciliation {event}: expected {expected:+.8}, observed {observed:+.8}"
+        );
+    }
+}
+
+pub(super) fn emit_stop_loss_triggered(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    pnl: f64,
+    stop_loss: f64,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "stop_loss",
+                "event": "triggered",
+                "pnl": pnl,
+                "stop_loss": stop_loss,
+            })
+        );
+    } else {
+        eprintln!(
+            "🛑 stop-loss triggered: session PnL {pnl:+.2} breached -{stop_loss:.2}; shutting down"
+        );
+    }
+}
+
+pub(super) fn emit_reconciliation_snapshot_error(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    message: &str,
+) {
+    // Precursor signal: a failed reconciliation snapshot inside the freeze
+    // window is an early warning that the fail-safe may not converge. Surface
+    // it on stdout (JSON mode) so ingest uploads it rather than losing it to
+    // local stderr only.
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "cycle": cycle,
+                "action": "position_reconciliation",
+                "event": "snapshot_failed",
+                "severity": "warning",
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!("⚠️  bounded position reconciliation snapshot failed: {message}");
+    }
+}
+
+pub(super) fn emit_ledger_sync(
+    output_format: OutputFormat,
+    symbol: &str,
+    starting_position: f64,
+    baseline_mark: f64,
+    historical_orders: usize,
+    historical_trades: usize,
+) {
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "action": "ledger_sync",
+                "event": "complete",
+                "starting_position": starting_position,
+                "baseline_mark": baseline_mark,
+                "pnl_baseline": 0.0,
+                "historical_maker_orders": historical_orders,
+                "historical_maker_trades_ignored": historical_trades,
+                "history_window_seconds": 24 * 60 * 60,
+                "history_order_limit": 100,
+                "history_trade_limit": 500,
+                "current_run_fills": 0,
+            })
+        );
+        if starting_position.abs() > f64::EPSILON {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "symbol": symbol,
+                    "action": "inventory_adopted",
+                    "event": "complete",
+                    "starting_position": starting_position,
+                    "baseline_mark": baseline_mark,
+                    "pnl_baseline": 0.0,
+                })
+            );
+        }
+    } else {
+        eprintln!(
+            "✅ maker ledger synchronized: position={starting_position:+.8}, baseline mark={baseline_mark:.8}, ignored historical fills={historical_trades}"
+        );
+    }
+}
+
+pub(super) fn emit_startup_rejected(
+    output_format: OutputFormat,
+    symbol: &str,
+    position: f64,
+    max_position: f64,
+) {
+    let message = format!(
+        "starting position {position:+.8} exceeds max_position {max_position:.8}; refusing live maker"
+    );
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                "symbol": symbol,
+                "action": "startup_rejected",
+                "event": "position_over_limit",
+                "position": position,
+                "max_position": max_position,
+                "message": message,
+            })
+        );
+    } else {
+        eprintln!("⚠️  {message}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
