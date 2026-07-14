@@ -141,17 +141,13 @@ impl Config {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Serializes tests that mutate process environment variables.
-    /// Tests run in parallel threads within one binary, so concurrent
-    /// EnvGuards on the same variable race without this lock.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Helper struct to temporarily set environment variables
     /// Restores original value (or removes if not set) when dropped.
-    /// Holds the ENV_LOCK for its lifetime so env tests never overlap.
+    /// Holds the crate-wide [`crate::TEST_ENV_LOCK`] for its lifetime so env
+    /// tests never overlap — including across modules (telemetry, maker,
+    /// pipeline).
     struct EnvGuard {
         key: String,
         original_value: Option<String>,
@@ -160,7 +156,7 @@ mod tests {
 
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
-            let lock = ENV_LOCK
+            let lock = crate::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let original_value = std::env::var(key).ok();
@@ -336,19 +332,29 @@ mod tests {
 
     #[test]
     fn test_config_env_isolation() {
-        // Test that EnvGuard properly restores original values
-        // Set an initial value
+        // Verify the temporary-set-then-restore semantics EnvGuard relies on.
+        // Done inline under TEST_ENV_LOCK rather than via EnvGuard: EnvGuard
+        // holds that same (non-reentrant) lock for its lifetime, so nesting it
+        // under an already-held lock would deadlock. Holding the lock keeps
+        // every mutation here from racing the process-global environ against
+        // env reads in other tests. EnvGuard's own set/restore is covered by
+        // the env-override tests above.
+        let _lock = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         std::env::set_var("TEST_ISOLATION_VAR", "original");
+        let saved = std::env::var("TEST_ISOLATION_VAR").ok();
 
-        {
-            let _guard = EnvGuard::set("TEST_ISOLATION_VAR", "modified");
-            assert_eq!(std::env::var("TEST_ISOLATION_VAR").unwrap(), "modified");
+        std::env::set_var("TEST_ISOLATION_VAR", "modified");
+        assert_eq!(std::env::var("TEST_ISOLATION_VAR").unwrap(), "modified");
+
+        match saved {
+            Some(value) => std::env::set_var("TEST_ISOLATION_VAR", value),
+            None => std::env::remove_var("TEST_ISOLATION_VAR"),
         }
-
-        // After guard is dropped, should be restored
         assert_eq!(std::env::var("TEST_ISOLATION_VAR").unwrap(), "original");
 
-        // Cleanup
         std::env::remove_var("TEST_ISOLATION_VAR");
     }
 

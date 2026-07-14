@@ -152,9 +152,6 @@ pub(super) async fn fetch_history_trade_audit(
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct JwtGuard {
         original: Option<String>,
@@ -163,7 +160,11 @@ mod tests {
 
     impl JwtGuard {
         fn set() -> Self {
-            let lock = ENV_LOCK
+            // Share the crate-wide env lock so this STANDX_JWT mutation cannot
+            // run concurrently with env reads in other modules' tests (e.g. the
+            // maker cleanup test's Credentials::load). A per-module lock would
+            // not exclude those cross-module races. See crate::TEST_ENV_LOCK.
+            let lock = crate::TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let original = std::env::var("STANDX_JWT").ok();
