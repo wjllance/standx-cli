@@ -165,7 +165,12 @@ impl MakerLedger {
             return false;
         }
         self.maker_order_ids.insert(order_id);
-        if client_order_id.is_some_and(|id| id.starts_with(&format!("{run_order_prefix}x"))) {
+        // Exit orders carry the run prefix followed by an 'x' marker. Match
+        // without allocating a `format!("{run_order_prefix}x")` on every call.
+        if client_order_id.is_some_and(|id| {
+            id.strip_prefix(run_order_prefix)
+                .is_some_and(|rest| rest.starts_with('x'))
+        }) {
             self.exit_order_ids.insert(order_id);
         }
         true
