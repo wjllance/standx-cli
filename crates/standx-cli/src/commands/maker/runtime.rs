@@ -916,7 +916,7 @@ pub(super) async fn run_maker(
             client.get_balance(),
         );
         let positions = positions?;
-        let (mark, _, _, _) = startup_market?;
+        let (mark, _, _, _, _) = startup_market?;
         let filled_orders = filled_orders?;
         let historical_trades = historical_trades?;
         let balance = balance?;
@@ -2064,7 +2064,7 @@ pub(super) async fn run_maker(
                     observed,
                 }));
             }
-            let (mark, best_bid, best_ask, src) =
+            let (mark, best_bid, best_ask, src, market_fallback_reason) =
                 market_snapshot(&client, &symbol, feed.as_ref()).await?;
             let result = maker_cycle(
                 CycleRequest {
@@ -2076,6 +2076,8 @@ pub(super) async fn run_maker(
                     mark,
                     best_bid,
                     best_ask,
+                    market_source: src,
+                    market_fallback_reason,
                     max_divergence_bps: args.max_divergence_bps,
                     inventory_exit_pct: args.inventory_exit_pct,
                     inventory_exit_qty: args.inventory_exit_qty,
@@ -2106,6 +2108,7 @@ pub(super) async fn run_maker(
                 result.fills,
                 mark,
                 src,
+                market_fallback_reason,
                 breaker.halted(),
                 inventory_exit_pending,
                 result.balance,
@@ -2303,7 +2306,18 @@ pub(super) async fn run_maker(
         }
 
         match cycle_result {
-            Ok((places, cancels, holds, fills, mark, src, halted, exit_pending_after, balance)) => {
+            Ok((
+                places,
+                cancels,
+                holds,
+                fills,
+                mark,
+                src,
+                market_fallback_reason,
+                halted,
+                exit_pending_after,
+                balance,
+            )) => {
                 runtime_state.handle(MakerEvent::CycleCompleted(cycle_work_token));
                 if !matches!(
                     runtime_state.next_effect(),
@@ -2391,7 +2405,8 @@ pub(super) async fn run_maker(
                     match src {
                         "ws" => eprintln!("✅ market feed: websocket live"),
                         _ => eprintln!(
-                            "⚠️  market feed: REST fallback (websocket warming up or stale)"
+                            "⚠️  market feed: REST fallback (reason={})",
+                            market_fallback_reason.unwrap_or("ws_disabled")
                         ),
                     }
                     last_src = Some(src);

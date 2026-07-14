@@ -31,6 +31,34 @@ const WS_STALE_AFTER: Duration = Duration::from_secs(5);
 /// than this local or parsed venue-time skew is not a coherent quote input.
 const WS_SNAPSHOT_MAX_SKEW: Duration = Duration::from_secs(1);
 
+/// Why the latest public WebSocket cache cannot safely be used for a maker
+/// cycle. These stable labels are emitted with `cycle_summary` so a REST
+/// fallback can be diagnosed from the uploaded JSON logs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WsSnapshotIssue {
+    WarmingUp,
+    MarkStale,
+    BookStale,
+    MarkAndBookStale,
+    LocalSkew,
+    ServerTimeSkew,
+    InvalidSnapshot,
+}
+
+impl WsSnapshotIssue {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::WarmingUp => "ws_warming_up",
+            Self::MarkStale => "ws_mark_stale",
+            Self::BookStale => "ws_book_stale",
+            Self::MarkAndBookStale => "ws_mark_and_book_stale",
+            Self::LocalSkew => "ws_local_time_skew",
+            Self::ServerTimeSkew => "ws_server_time_skew",
+            Self::InvalidSnapshot => "ws_invalid_snapshot",
+        }
+    }
+}
+
 fn parse_server_time_millis(value: &str) -> Option<i64> {
     let value = value.trim();
     if let Ok(raw) = value.parse::<i64>() {
@@ -81,13 +109,20 @@ fn update_meta<T>(update: &WsMarketUpdate<T>) -> FeedMeta {
 fn coherent_ws_snapshot(
     state: &FeedState,
     now: Instant,
-) -> Option<(f64, Option<f64>, Option<f64>)> {
-    let mark_meta = state.mark_meta.as_ref()?;
-    let book_meta = state.book_meta.as_ref()?;
-    if now.saturating_duration_since(mark_meta.received_at) >= WS_STALE_AFTER
-        || now.saturating_duration_since(book_meta.received_at) >= WS_STALE_AFTER
-    {
-        return None;
+) -> std::result::Result<(f64, Option<f64>, Option<f64>), WsSnapshotIssue> {
+    let (Some(mark_meta), Some(book_meta)) = (state.mark_meta.as_ref(), state.book_meta.as_ref())
+    else {
+        return Err(WsSnapshotIssue::WarmingUp);
+    };
+    let mark_stale = now.saturating_duration_since(mark_meta.received_at) >= WS_STALE_AFTER;
+    let book_stale = now.saturating_duration_since(book_meta.received_at) >= WS_STALE_AFTER;
+    if mark_stale || book_stale {
+        return Err(match (mark_stale, book_stale) {
+            (true, true) => WsSnapshotIssue::MarkAndBookStale,
+            (true, false) => WsSnapshotIssue::MarkStale,
+            (false, true) => WsSnapshotIssue::BookStale,
+            (false, false) => unreachable!("at least one cache entry is stale"),
+        });
     }
     let local_skew = mark_meta
         .received_at
@@ -98,7 +133,7 @@ fn coherent_ws_snapshot(
                 .saturating_duration_since(mark_meta.received_at),
         );
     if local_skew > WS_SNAPSHOT_MAX_SKEW {
-        return None;
+        return Err(WsSnapshotIssue::LocalSkew);
     }
     if let (Some(mark_time), Some(book_time)) = (
         mark_meta
@@ -111,16 +146,17 @@ fn coherent_ws_snapshot(
             .and_then(parse_server_time_millis),
     ) {
         if mark_time.abs_diff(book_time) > WS_SNAPSHOT_MAX_SKEW.as_millis() as u64 {
-            return None;
+            return Err(WsSnapshotIssue::ServerTimeSkew);
         }
     }
-    let mark = state.mark?;
-    validated_snapshot(mark, state.best_bid, state.best_ask, "ws").ok()?;
-    Some((mark, state.best_bid, state.best_ask))
+    let mark = state.mark.ok_or(WsSnapshotIssue::WarmingUp)?;
+    validated_snapshot(mark, state.best_bid, state.best_ask, "ws")
+        .map(|(mark, best_bid, best_ask, _)| (mark, best_bid, best_ask))
+        .map_err(|_| WsSnapshotIssue::InvalidSnapshot)
 }
 
 pub(super) fn fresh_ws_snapshot(state: &FeedState) -> Option<(f64, Option<f64>, Option<f64>)> {
-    coherent_ws_snapshot(state, Instant::now())
+    coherent_ws_snapshot(state, Instant::now()).ok()
 }
 
 /// Spawn the resident market-feed task: one public WS connection carrying
@@ -214,11 +250,21 @@ pub(super) async fn market_snapshot(
     client: &StandXClient,
     symbol: &str,
     feed: Option<&Arc<RwLock<FeedState>>>,
-) -> Result<(f64, Option<f64>, Option<f64>, &'static str)> {
+) -> Result<(
+    f64,
+    Option<f64>,
+    Option<f64>,
+    &'static str,
+    Option<&'static str>,
+)> {
+    let mut ws_issue = None;
     if let Some(feed) = feed {
         let s = feed.read().await;
-        if let Some((mark, best_bid, best_ask)) = fresh_ws_snapshot(&s) {
-            return Ok((mark, best_bid, best_ask, "ws"));
+        match coherent_ws_snapshot(&s, Instant::now()) {
+            Ok((mark, best_bid, best_ask)) => {
+                return Ok((mark, best_bid, best_ask, "ws", None));
+            }
+            Err(issue) => ws_issue = Some(issue.as_str()),
         }
     }
 
@@ -235,6 +281,7 @@ pub(super) async fn market_snapshot(
     let best_bid: Option<f64> = depth.best_bid().and_then(|s| s.parse().ok());
     let best_ask: Option<f64> = depth.best_ask().and_then(|s| s.parse().ok());
     validated_snapshot(mark, best_bid, best_ask, "rest")
+        .map(|(mark, best_bid, best_ask, source)| (mark, best_bid, best_ask, source, ws_issue))
 }
 
 fn validated_snapshot(
@@ -310,19 +357,48 @@ mod tests {
             best_ask: Some(100.1),
             book_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
         };
-        assert!(coherent_ws_snapshot(&state, now).is_some());
+        assert!(coherent_ws_snapshot(&state, now).is_ok());
 
         state.book_meta = Some(meta(
             2,
             "2026-07-14T00:00:03Z",
             now + Duration::from_secs(3),
         ));
-        assert!(coherent_ws_snapshot(&state, now + Duration::from_secs(3)).is_none());
+        assert_eq!(
+            coherent_ws_snapshot(&state, now + Duration::from_secs(3)),
+            Err(WsSnapshotIssue::LocalSkew)
+        );
 
         state.book_meta = Some(meta(2, "2026-07-14T00:00:03Z", now));
-        assert!(coherent_ws_snapshot(&state, now).is_none());
+        assert_eq!(
+            coherent_ws_snapshot(&state, now),
+            Err(WsSnapshotIssue::ServerTimeSkew)
+        );
 
         state.book_meta = Some(meta(2, "2026-07-14T00:00:00Z", now - WS_STALE_AFTER));
-        assert!(coherent_ws_snapshot(&state, now).is_none());
+        assert_eq!(
+            coherent_ws_snapshot(&state, now),
+            Err(WsSnapshotIssue::BookStale)
+        );
+    }
+
+    #[test]
+    fn coherent_snapshot_reports_warmup_and_mark_staleness() {
+        let now = Instant::now();
+        let mut state = FeedState::default();
+        assert_eq!(
+            coherent_ws_snapshot(&state, now),
+            Err(WsSnapshotIssue::WarmingUp)
+        );
+
+        state.mark = Some(100.0);
+        state.mark_meta = Some(meta(1, "2026-07-14T00:00:00Z", now - WS_STALE_AFTER));
+        state.best_bid = Some(99.9);
+        state.best_ask = Some(100.1);
+        state.book_meta = Some(meta(1, "2026-07-14T00:00:00Z", now));
+        assert_eq!(
+            coherent_ws_snapshot(&state, now),
+            Err(WsSnapshotIssue::MarkStale)
+        );
     }
 }
