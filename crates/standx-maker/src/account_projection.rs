@@ -333,6 +333,10 @@ impl MakerAccountProjection {
     /// freeze must therefore close the quote slots without turning that later,
     /// valid response into an unknown request ID.
     pub fn clear_orders_preserving_pending_acks(&mut self) {
+        let order_ids = self.orders.keys().copied().collect::<Vec<_>>();
+        for order_id in order_ids {
+            self.remember_retired_order(order_id);
+        }
         self.orders.clear();
         for entry in &mut self.pending {
             entry.slot_open = false;
@@ -896,6 +900,25 @@ mod tests {
         // The order channel can replay an open state after the cancel command
         // was accepted. It is still ours, so project it as stale for another
         // cancellation instead of treating it as an external/unknown order.
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        assert!(outcome.applied && outcome.order_changed);
+        assert!(!outcome.unknown_current_run_order);
+        assert_eq!(state.resting_quotes()[0].level, UNKNOWN_ADOPTED_LEVEL);
+    }
+
+    #[test]
+    fn cleanup_marks_cleared_orders_as_retired_for_late_open_replays() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(
+            1,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_string(),
+            },
+        );
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+
+        state.clear_orders_preserving_pending_acks();
         let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
         assert!(outcome.applied && outcome.order_changed);
         assert!(!outcome.unknown_current_run_order);
