@@ -178,28 +178,40 @@ struct AccountEventState<'a> {
     stats: &'a mut MakerStats,
 }
 
+#[derive(Debug, Default)]
+struct AccountEventOutcome {
+    fills: u64,
+    latest_position: Option<f64>,
+    exit_fill_observed: bool,
+}
+
+impl AccountEventOutcome {
+    fn merge(&mut self, other: Self) {
+        self.fills += other.fills;
+        if other.latest_position.is_some() {
+            self.latest_position = other.latest_position;
+        }
+        self.exit_fill_observed |= other.exit_fill_observed;
+    }
+}
+
 fn apply_account_events(
     receiver: &mut tokio::sync::mpsc::Receiver<AccountEvent>,
     state: &mut AccountEventState<'_>,
     context: &AccountEventContext<'_>,
-) -> Result<(u64, Option<f64>)> {
-    let mut fills_total = 0;
-    let mut latest_position = None;
+) -> Result<AccountEventOutcome> {
+    let mut outcome = AccountEventOutcome::default();
     loop {
         let event = match receiver.try_recv() {
             Ok(event) => event,
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                return Ok((fills_total, latest_position));
+                return Ok(outcome);
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 return Err(anyhow::anyhow!("authenticated account stream disconnected"));
             }
         };
-        let (fills, position) = apply_account_event(event, state, context)?;
-        fills_total += fills;
-        if position.is_some() {
-            latest_position = position;
-        }
+        outcome.merge(apply_account_event(event, state, context)?);
     }
 }
 
@@ -207,12 +219,12 @@ fn apply_account_event(
     event: AccountEvent,
     state: &mut AccountEventState<'_>,
     context: &AccountEventContext<'_>,
-) -> Result<(u64, Option<f64>)> {
+) -> Result<AccountEventOutcome> {
     match event {
-        AccountEvent::Connected { .. } => Ok((0, None)),
+        AccountEvent::Connected { .. } => Ok(AccountEventOutcome::default()),
         AccountEvent::Order(update) => {
             let mut fills = Vec::new();
-            ledger::apply_order_update(
+            let exit_fill_observed = ledger::apply_order_update(
                 state.ledger,
                 &update,
                 context.symbol,
@@ -224,17 +236,25 @@ fn apply_account_event(
             for fill in &fills {
                 emit_live_fill(fill, context.symbol, context.cycle, context.output_format);
             }
-            Ok((fills.len() as u64, None))
+            Ok(AccountEventOutcome {
+                fills: fills.len() as u64,
+                latest_position: None,
+                exit_fill_observed,
+            })
         }
         AccountEvent::Position(update) => {
             if !update.symbol.eq_ignore_ascii_case(context.symbol) {
-                return Ok((0, None));
+                return Ok(AccountEventOutcome::default());
             }
             let qty =
                 model::signed_position_quantity(&update.qty, update.side).map_err(|error| {
                     anyhow::anyhow!("account position update has invalid qty: {error}")
                 })?;
-            Ok((0, Some(qty)))
+            Ok(AccountEventOutcome {
+                fills: 0,
+                latest_position: Some(qty),
+                exit_fill_observed: false,
+            })
         }
         AccountEvent::TradeShadow { seq, data } => {
             if context.output_format == OutputFormat::Json {
@@ -250,7 +270,7 @@ fn apply_account_event(
                     })
                 );
             }
-            Ok((0, None))
+            Ok(AccountEventOutcome::default())
         }
         AccountEvent::Disconnected { reason } | AccountEvent::Error { reason } => Err(
             anyhow::anyhow!("authenticated account stream unhealthy: {reason}"),
@@ -677,6 +697,7 @@ pub(super) async fn run_maker(
     let mut account_stream_health: Option<AccountStreamHealth> = None;
     let mut account_stream_handle = None;
     let mut account_stream_epoch = 1_u64;
+    let mut live_account_poll = None;
     if args.live {
         if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
             return Err(anyhow::anyhow!(
@@ -735,18 +756,24 @@ pub(super) async fn run_maker(
         // maker-session PnL starts at zero while account upnl remains intact.
         let history_to = chrono::Utc::now().timestamp();
         let history_from = history_to.saturating_sub(24 * 60 * 60);
-        let (positions, startup_market, filled_orders, historical_trades) = tokio::join!(
+        let (positions, startup_market, filled_orders, historical_trades, balance) = tokio::join!(
             client.get_positions(Some(&symbol)),
             market_snapshot(&client, &symbol, None),
             client.get_order_history(Some(&symbol), Some(100)),
             client.get_user_trades(&symbol, history_from, history_to, Some(500)),
+            client.get_balance(),
         );
         let positions = positions?;
         let (mark, _, _, _) = startup_market?;
         let filled_orders = filled_orders?;
         let historical_trades = historical_trades?;
+        let balance = balance?;
         starting_position = position_for_symbol(&positions, &symbol)?;
         baseline_mark = mark;
+        live_account_poll = Some(LiveAccountPollState::new(
+            balance,
+            std::time::Instant::now(),
+        ));
 
         let historical_order_ids = filled_orders
             .iter()
@@ -1288,7 +1315,7 @@ pub(super) async fn run_maker(
                         output_format,
                     },
                 ) {
-                    Ok((fills, _)) => fills,
+                    Ok(outcome) => outcome.fills,
                     Err(error) => {
                         handle.abort();
                         break recovery_failed_exit(
@@ -1343,7 +1370,7 @@ pub(super) async fn run_maker(
                                 output_format,
                             },
                         ) {
-                            Ok((fills, _)) => reconnect_fills += fills,
+                            Ok(outcome) => reconnect_fills += outcome.fills,
                             Err(error) => {
                                 handle.abort();
                                 break 'main recovery_failed_exit(
@@ -1701,8 +1728,12 @@ pub(super) async fn run_maker(
                     output_format,
                 },
             ) {
-                Ok((fills, position)) => {
-                    total_fills += fills;
+                Ok(outcome) => {
+                    total_fills += outcome.fills;
+                    if outcome.exit_fill_observed {
+                        inventory_exit_pending = false;
+                    }
+                    let position = outcome.latest_position;
                     if let Some(position) = position {
                         notifier
                             .position_jump(
@@ -1815,6 +1846,7 @@ pub(super) async fn run_maker(
                     sim_position: &mut sim_position,
                     stats: &mut stats,
                     breaker: &mut breaker,
+                    live_account_poll: live_account_poll.as_mut(),
                 },
             )
             .await?;
@@ -1936,8 +1968,12 @@ pub(super) async fn run_maker(
                     output_format,
                 },
             ) {
-                Ok((fills, position)) => {
-                    total_fills += fills;
+                Ok(outcome) => {
+                    total_fills += outcome.fills;
+                    if outcome.exit_fill_observed {
+                        inventory_exit_pending = false;
+                    }
+                    let position = outcome.latest_position;
                     if let Some(position) = position {
                         notifier
                             .position_jump(
@@ -2272,8 +2308,12 @@ pub(super) async fn run_maker(
                                     output_format,
                                 },
                             ) {
-                                Ok((fills, position)) => {
-                                    total_fills += fills;
+                                Ok(outcome) => {
+                                    total_fills += outcome.fills;
+                                    if outcome.exit_fill_observed {
+                                        inventory_exit_pending = false;
+                                    }
+                                    let position = outcome.latest_position;
                                     if let Some(position) = position {
                                         notifier
                                             .position_jump(
@@ -2492,8 +2532,12 @@ pub(super) async fn run_maker(
                             output_format,
                         },
                     ) {
-                        Ok((fills, position)) => {
-                            total_fills += fills;
+                        Ok(outcome) => {
+                            total_fills += outcome.fills;
+                            if outcome.exit_fill_observed {
+                                inventory_exit_pending = false;
+                            }
+                            let position = outcome.latest_position;
                             if let Some(position) = position {
                                 notifier
                                     .position_jump(
@@ -2694,7 +2738,7 @@ pub(super) async fn run_maker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use standx_sdk::account_stream::PositionUpdate;
+    use standx_sdk::account_stream::{OrderUpdate, PositionUpdate};
 
     fn pending_place(request_id: &str) -> PendingPlace {
         PendingPlace {
@@ -2903,7 +2947,7 @@ mod tests {
         assert!(runtime_state.pending_effect().is_none());
     }
 
-    fn drain_positions(events: Vec<AccountEvent>) -> (u64, Option<f64>) {
+    fn drain_positions(events: Vec<AccountEvent>) -> AccountEventOutcome {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         for event in events {
             tx.try_send(event).unwrap();
@@ -2926,26 +2970,30 @@ mod tests {
 
     #[test]
     fn apply_account_events_records_position_mismatch_with_sign() {
-        let (_, buy) = drain_positions(vec![AccountEvent::Position(position_update(
+        let buy = drain_positions(vec![AccountEvent::Position(position_update(
             "BTC-USD",
             Some(OrderSide::Buy),
             "0.5",
         ))]);
-        assert_eq!(buy, Some(0.5));
+        assert_eq!(buy.latest_position, Some(0.5));
 
-        let (_, sell) = drain_positions(vec![AccountEvent::Position(position_update(
+        let sell = drain_positions(vec![AccountEvent::Position(position_update(
             "BTC-USD",
             Some(OrderSide::Sell),
             "0.5",
         ))]);
-        assert_eq!(sell, Some(-0.5), "sell position is negative");
+        assert_eq!(
+            sell.latest_position,
+            Some(-0.5),
+            "sell position is negative"
+        );
     }
 
     #[test]
     fn apply_account_events_applies_buffered_events_in_order() {
         // The last position update in the buffer wins; benign Connected /
         // TradeShadow events are drained without contributing fills.
-        let (fills, latest) = drain_positions(vec![
+        let outcome = drain_positions(vec![
             AccountEvent::Connected { epoch: 1 },
             AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Buy), "0.2")),
             AccountEvent::TradeShadow {
@@ -2954,22 +3002,67 @@ mod tests {
             },
             AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Sell), "0.9")),
         ]);
-        assert_eq!(fills, 0);
-        assert_eq!(latest, Some(-0.9), "latest position reflects last update");
+        assert_eq!(outcome.fills, 0);
+        assert_eq!(
+            outcome.latest_position,
+            Some(-0.9),
+            "latest position reflects last update"
+        );
     }
 
     #[test]
     fn apply_account_events_ignores_other_symbols() {
-        let (fills, latest) = drain_positions(vec![AccountEvent::Position(position_update(
+        let outcome = drain_positions(vec![AccountEvent::Position(position_update(
             "ETH-USD",
             Some(OrderSide::Buy),
             "1.0",
         ))]);
-        assert_eq!(fills, 0);
+        assert_eq!(outcome.fills, 0);
         assert_eq!(
-            latest, None,
+            outcome.latest_position, None,
             "position updates for other symbols are ignored"
         );
+    }
+
+    #[test]
+    fn account_order_fill_reports_current_run_inventory_exit_once() {
+        let mut ledger = MakerLedger::new(0.2);
+        let mut stats = MakerStats::with_inventory_baseline(0.2, 100.0);
+        let mut state = AccountEventState {
+            ledger: &mut ledger,
+            stats: &mut stats,
+        };
+        let context = AccountEventContext {
+            symbol: "BTC-USD",
+            run_order_prefix: "sxmk-test-",
+            mark: 100.0,
+            cycle: 1,
+            output_format: OutputFormat::Quiet,
+        };
+        let update = OrderUpdate {
+            seq: 1,
+            order_id: 7,
+            cl_ord_id: Some("sxmk-test-x00000001".to_string()),
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Sell,
+            qty: "0.2".to_string(),
+            fill_qty: "0.2".to_string(),
+            fill_avg_price: "100".to_string(),
+            price: "100".to_string(),
+            status: standx_sdk::models::OrderStatus::Filled,
+            reduce_only: true,
+            updated_at: "2026-07-14T00:00:00Z".to_string(),
+        };
+
+        let first = apply_account_event(AccountEvent::Order(update.clone()), &mut state, &context)
+            .expect("exit fill is valid");
+        assert_eq!(first.fills, 1);
+        assert!(first.exit_fill_observed);
+
+        let duplicate = apply_account_event(AccountEvent::Order(update), &mut state, &context)
+            .expect("duplicate exit fill is valid");
+        assert_eq!(duplicate.fills, 0);
+        assert!(!duplicate.exit_fill_observed);
     }
 
     #[test]

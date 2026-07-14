@@ -5,7 +5,9 @@ use super::ledger::maker_trade_fill;
 use super::ledger::{adopt_order, apply_rest_trade};
 use super::model::{is_current_run_order, is_order_rejection, position_for_symbol, PendingPlace};
 use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
-use super::pipeline::{fetch_snapshot, CycleRequest, CycleResult, CycleState};
+use super::pipeline::{
+    fetch_cycle_snapshot, fetch_history_trade_audit, CycleRequest, CycleResult, CycleState,
+};
 use super::recovery::{
     recover_current_run_order_ids_for_reconciliation, PositionGap, PositionReconciliationError,
 };
@@ -80,6 +82,7 @@ pub(super) async fn maker_cycle(
         sim_position,
         stats,
         breaker,
+        live_account_poll,
     } = state;
     use maker::{
         format_decimals, paper_quote_filled, Action, CycleInput, CycleSkip, MarketSnapshot,
@@ -135,28 +138,75 @@ pub(super) async fn maker_cycle(
     let mut fills: Vec<MakerFill> = Vec::new();
     let mut exit_fill_observed = false;
     if live {
+        let poll =
+            live_account_poll.expect("live maker cycles require initialized account polling state");
+        let poll_now = std::time::Instant::now();
         let now = chrono::Utc::now().timestamp();
-        let snapshot = fetch_snapshot(client, symbol, session_started_at, now).await?;
+        let audit_due = poll.history_trade_audit_due(poll_now);
+        let balance_refresh_due = poll.balance_refresh_due(poll_now);
+        let snapshot_future = fetch_cycle_snapshot(client, symbol);
+        let audit_future = async {
+            if audit_due {
+                Some(fetch_history_trade_audit(client, symbol, session_started_at, now).await)
+            } else {
+                None
+            }
+        };
+        let balance_future = async {
+            if balance_refresh_due {
+                Some(client.get_balance().await)
+            } else {
+                None
+            }
+        };
+        let (snapshot, audit, refreshed_balance) =
+            tokio::join!(snapshot_future, audit_future, balance_future);
+        let snapshot = snapshot?;
+        // Resolve every due read before mutating the current-run ledger. A
+        // failed audit must leave this cycle's accounting exactly untouched.
+        let audit = match audit {
+            Some(audit) => Some(audit?),
+            None => None,
+        };
         let mut orders = snapshot.open_orders;
-        let filled_orders = snapshot.filled_orders;
-        let trades = snapshot.trades;
-        account_balance = Some(snapshot.balance);
 
-        // Open maker orders identify partial fills; historical maker orders
-        // identify a quote that fully filled between two polling cycles.
-        for order in orders.iter().chain(filled_orders.iter()) {
+        if let Some(refreshed_balance) = refreshed_balance {
+            match refreshed_balance {
+                Ok(balance) => poll.record_balance_refresh(balance, poll_now),
+                Err(error) => {
+                    poll.record_balance_refresh_failure(poll_now);
+                    if !poll.balance_is_within_stale_limit(poll_now) {
+                        return Err(error.into());
+                    }
+                    eprintln!(
+                        "⚠️  account balance refresh failed; reusing cached balance for up to 60s: {error}"
+                    );
+                }
+            }
+        }
+        account_balance = Some(poll.balance().clone());
+
+        // Open maker orders identify partial fills. Filled order history and
+        // trades are an intentionally low-frequency audit while the healthy
+        // account stream remains the prompt fill path.
+        for order in &orders {
             adopt_order(ledger, order, run_order_prefix)?;
         }
-
-        exit_fill_observed |= collect_current_run_fills(
-            trades,
-            ledger,
-            session_started_at,
-            now,
-            mark,
-            stats,
-            &mut fills,
-        )?;
+        if let Some(audit) = audit {
+            for order in &audit.filled_orders {
+                adopt_order(ledger, order, run_order_prefix)?;
+            }
+            exit_fill_observed |= collect_current_run_fills(
+                audit.trades,
+                ledger,
+                session_started_at,
+                now,
+                mark,
+                stats,
+                &mut fills,
+            )?;
+            poll.record_history_trade_audit(poll_now);
+        }
 
         let mut observed_position = position_for_symbol(&snapshot.positions, symbol)?;
         let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;

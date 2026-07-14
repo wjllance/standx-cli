@@ -37,7 +37,7 @@ pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 #[cfg(test)]
 use notify::webhook_body;
 use notify::{token_expiry_level, MakerNotifier, PositionChange, RiskNotice, TokenExpiryLevel};
-use pipeline::{CycleRequest, CycleState};
+use pipeline::{CycleRequest, CycleState, LiveAccountPollState};
 use recovery::{
     cancel_maker_orders_with_retry, order_response_reconnect_available, reconcile_ledger_snapshot,
     reconnect_order_response, PositionReconciliationError, ReconcileRequest, ReconnectRequest,
