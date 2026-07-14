@@ -36,8 +36,8 @@ pub use ownership::{
 };
 pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
 pub use runtime::{
-    MakerEffect, MakerEvent, MakerState, RecoveryTarget, RuntimePhase, RuntimeStopReason, WorkKind,
-    WorkToken,
+    order_cancel_rejection_reason, MakerEffect, MakerEvent, MakerState, RecoveryTarget,
+    RuntimePhase, RuntimeStopReason, WorkKind, WorkToken,
 };
 
 /// Static per-run configuration (CLI args + symbol metadata).
