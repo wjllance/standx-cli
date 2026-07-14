@@ -676,6 +676,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_sender_writes_signed_cancel_and_delivers_correlated_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_async(socket).await.unwrap();
+            let auth = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let auth: serde_json::Value = serde_json::from_str(&auth).unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "authenticated",
+                        "request_id": auth["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let command = websocket
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_text()
+                .unwrap();
+            let command: serde_json::Value = serde_json::from_str(&command).unwrap();
+            assert_eq!(command["session_id"], "maker-session");
+            assert_eq!(command["method"], "order:cancel");
+            assert_eq!(command["header"]["x-request-sign-version"], "v1");
+            assert!(command["header"]["x-request-id"].as_str().is_some());
+            assert!(command["header"]["x-request-timestamp"].as_str().is_some());
+            assert!(command["header"]["x-request-signature"].as_str().is_some());
+            let params: serde_json::Value =
+                serde_json::from_str(command["params"].as_str().unwrap()).unwrap();
+            assert_eq!(params, serde_json::json!({ "order_id": 42 }));
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "code": 0,
+                        "message": "accepted",
+                        "request_id": command["request_id"],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let private_key = bs58::encode(signing_key.to_bytes()).into_string();
+        let signer = StandXSigner::from_base58(&private_key).unwrap();
+        let stream =
+            OrderResponseStream::with_url_token_and_signer(url, "jwt", "maker-session", signer);
+        let (commands, mut responses, _health, handle) = stream.connect().await.unwrap();
+        let request_id = commands.cancel_order("42").await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), responses.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.request_id.as_deref(), Some(request_id.as_str()));
+        assert!(response.accepted());
+        server.await.unwrap();
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn authentication_rejection_prevents_connection_start() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
