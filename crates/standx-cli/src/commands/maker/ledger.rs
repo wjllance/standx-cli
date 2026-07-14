@@ -28,7 +28,6 @@ pub(super) fn apply_order_update(
     update: &OrderUpdate,
     symbol: &str,
     run_order_prefix: &str,
-    mark: f64,
     stats: &mut MakerStats,
     fills: &mut Vec<MakerFill>,
 ) -> Result<bool> {
@@ -48,8 +47,7 @@ pub(super) fn apply_order_update(
     fills.extend(buffered);
     // The cumulative fill fields in an order callback are deliberately not
     // booked here. Only a stable-ID TradeUpdate or REST trade may mutate PnL
-    // and expected position.
-    let _ = mark;
+    // and expected position, so the order update needs no mark.
     Ok(saw_exit_fill)
 }
 
@@ -226,7 +224,6 @@ mod tests {
             &order_update(OrderSide::Sell, "-0.20"),
             "BTC-USD",
             "sxmk-run-",
-            100.0,
             &mut stats,
             &mut fills,
         )
@@ -263,7 +260,6 @@ mod tests {
             &order_update(OrderSide::Sell, "NaN"),
             "BTC-USD",
             "sxmk-run-",
-            100.0,
             &mut stats,
             &mut fills,
         )
@@ -294,7 +290,6 @@ mod tests {
             &update,
             "BTC-USD",
             "sxmk-run-",
-            100.0,
             &mut stats,
             &mut fills,
         )
