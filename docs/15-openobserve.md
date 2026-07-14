@@ -146,6 +146,60 @@ ORDER BY events DESC;
 python3 scripts/openobserve_query.py --hours 24
 ```
 
+### 4.1 Maker WebSocket 事故排查手册
+
+先用 `run_id` 重建事件顺序，再判断是行情缓存新鲜度、账户流还是订单回报流问题；不要只
+根据一条 `REST fallback` 或 `websocket live` 日志判断 TCP 连接是否断开。`REST fallback`
+表示公共行情快照未满足本地新鲜度/时钟校验，也可能是某一侧的 mark 或 book 暂时没有更新。
+
+如果目标是远端 OpenObserve，`deploy/openobserve/.env` 中常常仍指向本机的
+`127.0.0.1:5080`。导入凭证后必须在同一条查询命令中显式覆盖 URL，避免误查本地历史数据：
+
+```bash
+set -a
+source deploy/openobserve/.env
+set +a
+
+OPENOBSERVE_URL=http://192.168.193.65:5080 \
+python3 scripts/openobserve_query.py --hours 2 --size 500 --sql '
+SELECT _timestamp, action, event, cycle, order_id, trade_id, request_id, message
+FROM "standx_maker"
+WHERE run_id = '\''<run_id>'\''
+  AND action IN ('\''lifecycle'\'', '\''order_response_reconnect'\'', '\''fill'\'', '\''position_reconciliation'\'')
+ORDER BY _timestamp ASC'
+```
+
+按以下顺序判断：
+
+1. `lifecycle/stopped` 中若出现 `safe reconnect budget exhausted (3/3)`，统计同一
+   `run_id` 的 `order_response_reconnect`。每次 `starting` 与 `complete` 成对且能完成
+   空簿/仓位对账，说明重连流程本身可用；停止是相关失败被重复触发并耗尽预算。
+2. 在每次相关失败前后对齐 `fill`、仓位对账和订单回报。账户成交可能合法地先于
+   `PlaceAccepted` 或 `CancelResolved` 到达；这不是订单回报断开或未知订单的证据。
+3. 若成交/账户事件触发 cycle invalidation，随后清理投影状态，再把延迟到达的 ACK 报为
+   `unknown request_id`，应检查清理是否删掉了未确认的 request registry。
+4. 只有在没有对应的未确认 current-run request，或 order-response stream 已确认故障时，
+   才把相关失败视为真实协议/连接故障并维持 fail-safe 停机。
+
+2026-07-14 的 XAG-USD 事故属于第 3 类：成交先抵达账户流，冻结清理把订单投影和未确认
+请求一起清空，随后正常的订单回报无法关联；每次安全重连都成功，但第三次后预算耗尽而停机。
+修复原则是：账户流或仓位对账冻结时清除可执行挂单和 quote slot，同时保留尚未确认的
+current-run request，允许迟到 ACK 完成关联；账户流重连切换 projection generation 时也必须
+保留这份 ACK registry，不能由通用 reset 再次清空。已提交撤单的订单还要保留有界的 retired
+ID：若账户流随后重放该订单的 open 状态，应把它作为 stale maker order 再次撤销，而不是误报
+外部未知订单。订单回报流已故障时的清理、换 session 和真正未知 request 仍必须清空并 fail
+closed，不能以此放宽实时下单安全边界。
+
+修复后，至少验证：
+
+- 单元测试覆盖“冻结后迟到的 `PlaceAccepted`/`CancelResolved` 可关联”；
+- 单元测试覆盖“撤单 ACK 后迟到的 open order 仍被识别为本 run 的 stale order”；
+- 单元测试覆盖“账户流重连 reset 后迟到 ACK 仍可关联”；
+- 一个 account/fill 在 ACK 之前到达的运行不会产生 `order-response correlation failed closed`；
+- 真正断开 order-response stream 时仍出现冻结、清理、有限重连，预算耗尽后停止；
+- 看板中 `order_response_reconnect` 与 `lifecycle/stopped` 按 `event_id` 去重后不再重复出现
+  无对应 stream 故障的相关失败。
+
 ## 5. 创建或刷新 maker Dashboard
 
 创建原生 `StandX Maker Overview` Dashboard；如果同名 Dashboard 已存在，则更新它：

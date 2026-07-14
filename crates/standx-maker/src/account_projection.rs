@@ -7,10 +7,16 @@
 
 use crate::{is_current_run_client_order_id, open_qty_adopts, RestingQuote};
 use standx_sdk::models::OrderSide;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 pub const MAX_PENDING_ORDER_REQUESTS: usize = 256;
+
+/// Recently cancelled current-run venue order IDs kept to recognize replayed
+/// account-stream updates after the cancel request has been accepted. This is
+/// deliberately bounded: older observations still fail closed rather than
+/// turning a long-lived maker session into an unbounded trust cache.
+const MAX_RETIRED_ORDER_IDS: usize = 512;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionPendingPlace {
@@ -277,6 +283,7 @@ pub struct MakerAccountProjection {
     run_order_prefix: String,
     orders: HashMap<u64, ProjectedOrder>,
     pending: Vec<PendingEntry>,
+    retired_order_ids: VecDeque<u64>,
     observed_position: f64,
 }
 
@@ -287,6 +294,7 @@ impl MakerAccountProjection {
             run_order_prefix: run_order_prefix.into(),
             orders: HashMap::new(),
             pending: Vec::new(),
+            retired_order_ids: VecDeque::new(),
             observed_position: position,
         }
     }
@@ -299,6 +307,18 @@ impl MakerAccountProjection {
         self.generation = generation;
         self.orders.clear();
         self.pending.clear();
+        self.retired_order_ids.clear();
+        self.observed_position = position;
+    }
+
+    /// Begin a new account-stream epoch after maker cleanup without dropping
+    /// acknowledgements that are still in flight on the independent
+    /// order-response stream. The cleanup has removed executable venue orders,
+    /// so quote slots are closed; only correlation metadata and bounded retired
+    /// order IDs survive the stream epoch change.
+    pub fn reset_after_cleanup_preserving_pending_acks(&mut self, generation: u64, position: f64) {
+        self.generation = generation;
+        self.clear_orders_preserving_pending_acks();
         self.observed_position = position;
     }
 
@@ -444,6 +464,7 @@ impl MakerAccountProjection {
                     };
                 }
                 self.orders.remove(&order_id);
+                self.remember_retired_order(order_id);
                 ProjectionOutcome {
                     applied: true,
                     order_changed: true,
@@ -533,6 +554,16 @@ impl MakerAccountProjection {
         self.pending.retain(|entry| !entry.is_settled());
     }
 
+    fn remember_retired_order(&mut self, order_id: u64) {
+        if self.retired_order_ids.contains(&order_id) {
+            return;
+        }
+        self.retired_order_ids.push_back(order_id);
+        if self.retired_order_ids.len() > MAX_RETIRED_ORDER_IDS {
+            self.retired_order_ids.pop_front();
+        }
+    }
+
     fn observe_order(&mut self, observation: OrderObservation) -> ProjectionOutcome {
         if !is_current_run_client_order_id(
             observation.client_order_id.as_deref(),
@@ -577,7 +608,9 @@ impl MakerAccountProjection {
     /// projection, then to an unknown-order slot, and reconcile open qty.
     fn adopt_open_observation(&mut self, observation: OrderObservation) -> ProjectionOutcome {
         let slot = self.match_pending_slot(&observation);
-        let known = slot.is_some() || self.orders.contains_key(&observation.order_id);
+        let known = slot.is_some()
+            || self.orders.contains_key(&observation.order_id)
+            || self.retired_order_ids.contains(&observation.order_id);
         let slot = slot.unwrap_or_else(|| {
             self.orders
                 .get(&observation.order_id)
@@ -829,6 +862,88 @@ mod tests {
                 .applied
         );
         assert!(state.resting_quotes().is_empty());
+    }
+
+    #[test]
+    fn late_open_after_cancel_ack_is_recognized_as_a_retired_current_run_order() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(
+            1,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_string(),
+            },
+        );
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 2,
+            }),
+        );
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelResolved {
+                request_id: "c1".to_string(),
+            },
+        );
+
+        // The order channel can replay an open state after the cancel command
+        // was accepted. It is still ours, so project it as stale for another
+        // cancellation instead of treating it as an external/unknown order.
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        assert!(outcome.applied && outcome.order_changed);
+        assert!(!outcome.unknown_current_run_order);
+        assert_eq!(state.resting_quotes()[0].level, UNKNOWN_ADOPTED_LEVEL);
+    }
+
+    #[test]
+    fn account_reconnect_reset_preserves_unacked_order_response_registry() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 1,
+            }),
+        );
+
+        state.reset_after_cleanup_preserving_pending_acks(2, 0.0);
+        assert_eq!(state.generation(), 2);
+        assert!(state.pending_places().is_empty());
+        assert!(state.pending_cancels().is_empty());
+        assert!(matches!(
+            state.pending_request("p1"),
+            Some(ProjectionPendingRequest::Place(_))
+        ));
+        assert!(matches!(
+            state.pending_request("c1"),
+            Some(ProjectionPendingRequest::Cancel(_))
+        ));
+
+        state.apply(
+            2,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_string(),
+            },
+        );
+        state.apply(
+            2,
+            AccountProjectionEvent::CancelResolved {
+                request_id: "c1".to_string(),
+            },
+        );
+        assert_eq!(state.pending_request_count(), 0);
     }
 
     #[test]
