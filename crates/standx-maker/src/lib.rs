@@ -29,7 +29,10 @@ pub use ownership::{
     MAKER_CL_ORD_ID_PREFIX,
 };
 pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
-pub use runtime::{MakerEffect, MakerEvent, MakerState, RuntimePhase, WorkKind, WorkToken};
+pub use runtime::{
+    MakerEffect, MakerEvent, MakerState, RecoveryTarget, RuntimePhase, RuntimeStopReason, WorkKind,
+    WorkToken,
+};
 
 /// Static per-run configuration (CLI args + symbol metadata).
 #[derive(Debug, Clone)]

@@ -86,6 +86,29 @@ impl MakerExit {
     }
 }
 
+impl From<standx_maker::RuntimeStopReason> for MakerExit {
+    fn from(reason: standx_maker::RuntimeStopReason) -> Self {
+        match reason {
+            standx_maker::RuntimeStopReason::CtrlC => Self::CtrlC,
+            standx_maker::RuntimeStopReason::OrderResponse(detail) => Self::OrderResponse(detail),
+            standx_maker::RuntimeStopReason::PositionReconciliation(detail) => {
+                Self::PositionReconciliation(detail)
+            }
+            standx_maker::RuntimeStopReason::CleanupFailure { target, reason } => match target {
+                standx_maker::RecoveryTarget::OrderResponse => Self::OrderResponse(reason),
+                standx_maker::RecoveryTarget::AccountStream
+                | standx_maker::RecoveryTarget::PositionReconciliation => {
+                    Self::PositionReconciliation(reason)
+                }
+            },
+            standx_maker::RuntimeStopReason::ConsecutiveCycleErrors(detail) => {
+                Self::ConsecutiveErrors(detail)
+            }
+            standx_maker::RuntimeStopReason::StopLoss(detail) => Self::StopLoss(detail),
+        }
+    }
+}
+
 pub(super) struct PendingPlace {
     pub(super) request_id: String,
     pub(super) cl_ord_id: String,
