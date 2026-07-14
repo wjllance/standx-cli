@@ -266,6 +266,31 @@ fn account_event_invalidates_cycle(event: &AccountEvent) -> bool {
     )
 }
 
+fn market_update_requires_replan(
+    previous_mark: f64,
+    mark: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    resting: &[RestingQuote],
+    refresh_bps: f64,
+    max_divergence_bps: f64,
+) -> bool {
+    if maker::bps_diff(mark, previous_mark) > refresh_bps {
+        return true;
+    }
+    if matches!((best_bid, best_ask), (Some(bid), Some(ask)) if bid >= ask) {
+        return true;
+    }
+    if maker::resting_quotes_would_cross(resting, best_bid, best_ask) {
+        return true;
+    }
+    matches!(
+        (best_bid, best_ask),
+        (Some(bid), Some(ask))
+            if maker::mark_mid_divergence_bps(mark, bid, ask) > max_divergence_bps
+    )
+}
+
 fn apply_account_event(
     event: AccountEvent,
     state: &mut AccountEventState<'_>,
@@ -2659,10 +2684,10 @@ pub(super) async fn run_maker(
             continue 'main;
         }
 
-        // Sleep until the next cycle, but wake early when the cached mark
-        // has already drifted beyond refresh_bps — the quotes would be
-        // re-quoted anyway, so reacting now shrinks the pick-off window
-        // without adding flicker. min-gap of 1s bounds the API rate.
+        // Sleep until the next cycle, but wake early when a coherent market
+        // update invalidates the prior decision: mark drift, a quote crossing
+        // the new touch, or mark/mid divergence. The one-second floor keeps
+        // this a bounded safety replan rather than a per-tick cancel loop.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(args.interval);
         let min_gap = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
@@ -2763,12 +2788,29 @@ pub(super) async fn run_maker(
                     let (Some(feed), Some(prev)) = (feed.as_ref(), last_mark) else {
                         continue;
                     };
-                    let drifted = {
-                        let s = feed.read().await;
-                        s.mark
-                            .is_some_and(|m| maker::bps_diff(m, prev) > cfg.refresh_bps)
+                    let resting_for_replan = if args.live {
+                        account_projection
+                            .as_ref()
+                            .map(|projection| projection.resting_quotes())
+                            .unwrap_or_default()
+                    } else {
+                        resting.clone()
                     };
-                    if drifted {
+                    let requires_replan = {
+                        let s = feed.read().await;
+                        fresh_ws_snapshot(&s).is_some_and(|(mark, best_bid, best_ask)| {
+                            market_update_requires_replan(
+                                prev,
+                                mark,
+                                best_bid,
+                                best_ask,
+                                &resting_for_replan,
+                                cfg.refresh_bps,
+                                args.max_divergence_bps,
+                            )
+                        })
+                    };
+                    if requires_replan {
                         runtime_state.handle(MakerEvent::MarketChanged);
                         break; // early re-quote cycle
                     }
@@ -3345,6 +3387,46 @@ mod tests {
         assert!(!account_event_invalidates_cycle(&AccountEvent::Connected {
             epoch: 1,
         }));
+    }
+
+    #[test]
+    fn touch_or_divergence_can_request_an_early_replan_without_mark_drift() {
+        let quote = RestingQuote {
+            order_id: Some("7".to_string()),
+            side: OrderSide::Buy,
+            level: 0,
+            price: 99.95,
+            qty: 0.1,
+            ref_center: 100.0,
+            placed_at_cycle: 1,
+        };
+        assert!(market_update_requires_replan(
+            100.0,
+            100.0,
+            Some(99.90),
+            Some(99.95),
+            std::slice::from_ref(&quote),
+            3.0,
+            25.0,
+        ));
+        assert!(market_update_requires_replan(
+            100.0,
+            100.0,
+            Some(90.0),
+            Some(90.1),
+            &[quote],
+            3.0,
+            25.0,
+        ));
+        assert!(!market_update_requires_replan(
+            100.0,
+            100.0,
+            Some(99.90),
+            Some(99.96),
+            &[],
+            3.0,
+            25.0,
+        ));
     }
 
     fn drain_positions(events: Vec<AccountEvent>) -> AccountEventOutcome {

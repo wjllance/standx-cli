@@ -490,6 +490,8 @@ pub struct MarketSnapshot {
 /// Why the strategy refused to make a decision for a market snapshot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CycleSkip {
+    /// The best bid is at or above the best ask, so no safe touch exists.
+    CrossedBook,
     /// Mark and book mid disagree enough that either source may be stale.
     MarkMidDivergence { divergence_bps: f64 },
     /// A live maker cannot safely enforce post-only pricing without both sides.
@@ -518,6 +520,12 @@ pub fn preflight_cycle(
 ) -> CyclePreflight {
     let halted = breaker.observe(market.mark);
     if let (Some(best_bid), Some(best_ask)) = (market.best_bid, market.best_ask) {
+        if best_bid >= best_ask {
+            return CyclePreflight {
+                halted,
+                skip: Some(CycleSkip::CrossedBook),
+            };
+        }
         let divergence_bps = mark_mid_divergence_bps(market.mark, best_bid, best_ask);
         if divergence_bps > max_divergence_bps {
             return CyclePreflight {
@@ -1006,6 +1014,17 @@ pub fn cap_desired_exposure(
 /// surviving resting counterpart yields a `Place`. The returned Vec orders all
 /// Cancels before all Places so the executor frees margin before re-placing;
 /// Holds come last.
+pub fn resting_quotes_would_cross(
+    resting: &[RestingQuote],
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+) -> bool {
+    resting.iter().any(|quote| match quote.side {
+        OrderSide::Buy => best_ask.is_some_and(|ask| quote.price >= ask),
+        OrderSide::Sell => best_bid.is_some_and(|bid| quote.price <= bid),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile(
     cfg: &MakerConfig,
@@ -1042,10 +1061,7 @@ pub fn reconcile(
             Some(CancelReason::Stale)
         } else if r.price < band_lo || r.price > band_hi {
             Some(CancelReason::OutsideBand)
-        } else if match r.side {
-            OrderSide::Buy => best_ask.map(|a| r.price >= a).unwrap_or(false),
-            OrderSide::Sell => best_bid.map(|b| r.price <= b).unwrap_or(false),
-        } {
+        } else if resting_quotes_would_cross(std::slice::from_ref(r), best_bid, best_ask) {
             Some(CancelReason::WouldCross)
         } else if bps_diff(center, r.ref_center) > cfg.refresh_bps {
             Some(CancelReason::MarkMovedBeyondRefresh)
@@ -1460,6 +1476,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detects_resting_quotes_that_would_cross_a_new_touch() {
+        let quotes = vec![resting(OrderSide::Buy, 0, 99.95, 100.0)];
+        assert!(resting_quotes_would_cross(
+            &quotes,
+            Some(99.90),
+            Some(99.95)
+        ));
+        assert!(!resting_quotes_would_cross(
+            &quotes,
+            Some(99.90),
+            Some(99.96)
+        ));
+    }
+
     // 12. Level removed from config -> Stale.
     #[test]
     fn reconcile_stale_level() {
@@ -1845,8 +1876,20 @@ mod tests {
     }
 
     #[test]
-    fn preflight_skips_divergent_or_incomplete_live_books() {
+    fn preflight_skips_crossed_divergent_or_incomplete_live_books() {
         let mut breaker = VolBreaker::new(3, 0.0);
+        let crossed = preflight_cycle(
+            &mut breaker,
+            MarketSnapshot {
+                mark: 100.0,
+                best_bid: Some(100.1),
+                best_ask: Some(100.0),
+            },
+            10.0,
+            true,
+        );
+        assert_eq!(crossed.skip, Some(CycleSkip::CrossedBook));
+
         let divergent = preflight_cycle(
             &mut breaker,
             MarketSnapshot {
