@@ -152,6 +152,29 @@ pub(super) async fn maker_cycle(
     };
     let preflight = maker::preflight_cycle(breaker, market, max_divergence_bps, live);
     let halted = match preflight.skip {
+        Some(CycleSkip::CrossedBook) => {
+            let live_str = if live { "live" } else { "paper" };
+            match output_format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                            "cycle": cycle, "mode": live_str, "symbol": symbol,
+                            "action": "skip", "reason": "crossed_book",
+                            "mark": format_decimals(mark, cfg.price_decimals),
+                        })
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "⚠️  #{} crossed order book on {}; skipping cycle (no actions)",
+                        cycle, symbol
+                    );
+                }
+            }
+            return Ok(CycleResult::default());
+        }
         Some(CycleSkip::MarkMidDivergence { divergence_bps }) => {
             let live_str = if live { "live" } else { "paper" };
             match output_format {

@@ -4,7 +4,9 @@ use crate::auth::Credentials;
 use crate::error::{Error, Result};
 use crate::models::*;
 use futures::{SinkExt, StreamExt};
+use serde::de::DeserializeOwned;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -27,8 +29,8 @@ pub enum WsState {
 pub enum WsMessage {
     Connected,
     Disconnected,
-    Price(PriceData),
-    Depth(OrderBook),
+    Price(WsMarketUpdate<PriceData>),
+    Depth(WsMarketUpdate<OrderBook>),
     Trade(Trade),
     Position(Position),
     Balance(Balance),
@@ -37,6 +39,55 @@ pub enum WsMessage {
     AccountUpdate(String),
     Error(String),
     Heartbeat,
+}
+
+/// Public-market payload together with the envelope metadata needed to decide
+/// whether two independently-published channels can form one safe snapshot.
+#[derive(Debug, Clone)]
+pub struct WsMarketUpdate<T> {
+    pub data: T,
+    /// Exchange sequence when the venue included one in the envelope or data.
+    pub seq: Option<u64>,
+    /// Venue timestamp copied without reinterpretation from the envelope/data.
+    pub server_time: Option<String>,
+    /// Local monotonic receipt time, assigned before forwarding the payload.
+    pub received_at: Instant,
+}
+
+fn scalar_to_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value.and_then(|value| match value {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn parse_market_update<T>(
+    envelope: &serde_json::Value,
+    received_at: Instant,
+) -> Option<WsMarketUpdate<T>>
+where
+    T: DeserializeOwned,
+{
+    let payload = envelope.get("data")?;
+    let data = serde_json::from_value(payload.clone()).ok()?;
+    let seq = envelope
+        .get("seq")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| payload.get("seq").and_then(serde_json::Value::as_u64));
+    let server_time = scalar_to_string(
+        envelope
+            .get("timestamp")
+            .or_else(|| envelope.get("time"))
+            .or_else(|| payload.get("timestamp"))
+            .or_else(|| payload.get("time")),
+    );
+    Some(WsMarketUpdate {
+        data,
+        seq,
+        server_time,
+        received_at,
+    })
 }
 
 /// StandX WebSocket client
@@ -386,32 +437,32 @@ async fn connect_and_run(
                         if verbose {
                             eprintln!("[WebSocket Debug] Message channel: {}", channel);
                         }
-                        if let Some(data_obj) = data.get("data") {
+                        if data.get("data").is_some() {
                             match channel {
                                 "price" => {
-                                    if let Ok(price) =
-                                        serde_json::from_value::<PriceData>(data_obj.clone())
+                                    if let Some(price) =
+                                        parse_market_update::<PriceData>(&data, Instant::now())
                                     {
                                         let _ = message_tx.send(WsMessage::Price(price)).await;
                                     }
                                 }
                                 "depth_book" => {
-                                    if let Ok(depth) =
-                                        serde_json::from_value::<OrderBook>(data_obj.clone())
+                                    if let Some(depth) =
+                                        parse_market_update::<OrderBook>(&data, Instant::now())
                                     {
                                         let _ = message_tx.send(WsMessage::Depth(depth)).await;
                                     }
                                 }
                                 "public_trade" => {
                                     if let Ok(trade) =
-                                        serde_json::from_value::<Trade>(data_obj.clone())
+                                        serde_json::from_value::<Trade>(data["data"].clone())
                                     {
                                         let _ = message_tx.send(WsMessage::Trade(trade)).await;
                                     }
                                 }
                                 "kline" => {
                                     // Kline data is an array, take first element
-                                    if let Some(kline_array) = data_obj.as_array() {
+                                    if let Some(kline_array) = data["data"].as_array() {
                                         if let Some(kline_item) = kline_array.first() {
                                             if let Ok(mut kline) = serde_json::from_value::<KlineData>(
                                                 kline_item.clone(),
@@ -508,5 +559,27 @@ mod tests {
     #[test]
     fn test_ws_state() {
         assert_ne!(WsState::Connected, WsState::Disconnected);
+    }
+
+    #[test]
+    fn market_update_preserves_exchange_and_local_metadata() {
+        let envelope = serde_json::json!({
+            "seq": 42,
+            "channel": "price",
+            "timestamp": "2026-07-14T00:00:00Z",
+            "data": {
+                "symbol": "BTC-USD",
+                "mark_price": "100",
+                "index_price": "100",
+                "last_price": "100",
+                "timestamp": "2026-07-14T00:00:00Z"
+            }
+        });
+        let received_at = Instant::now();
+        let update = parse_market_update::<PriceData>(&envelope, received_at).unwrap();
+        assert_eq!(update.data.symbol, "BTC-USD");
+        assert_eq!(update.seq, Some(42));
+        assert_eq!(update.server_time.as_deref(), Some("2026-07-14T00:00:00Z"));
+        assert_eq!(update.received_at, received_at);
     }
 }

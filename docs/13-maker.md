@@ -161,8 +161,8 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 
 ### 行情来源与守卫
 
-- **WebSocket feed**：价格与深度走同一条公共连接；缓存超过 5 秒未更新时自动回退到 REST（覆盖预热、断线、`--no-ws`）。
-- **早醒重报**：循环在 sleep 期间若发现 mark 已漂过 `--refresh-bps`，会提前进入下一轮，缩短暴露窗口而不增加闪撤（仅在本来就要重报时才早醒）。
+- **WebSocket feed**：价格与深度走同一条公共连接；每条行情保留交易所 `seq`、服务端时间与本地单调接收时间。各自超过 5 秒、序号/服务端时间回退，或 mark 与 touch 的本地/服务端时间相差超过 1 秒时，不把它们拼成 WS 快照，自动回退到 REST（覆盖预热、断线、`--no-ws`）；盘口交叉则直接 skip 本轮，不用不可信的 touch 继续报价。
+- **早醒重报**：循环在 sleep 期间若发现 mark 已漂过 `--refresh-bps`，或新的 touch 会使已有报价穿价、触发 mark/mid 背离守卫，会提前进入下一轮；最小间隔为 1 秒，避免形成逐 tick 的撤挂循环。
 - **mark/mid 背离守卫**：mark 价与盘口中价背离超过 `--max-divergence-bps` 时，本轮不做任何动作（不撤不挂），避免在数据源打架时误动作。
 
 ### 波动率熔断

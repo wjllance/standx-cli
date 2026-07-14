@@ -1,8 +1,8 @@
 use anyhow::Result;
 use standx_sdk::client::StandXClient;
-use standx_sdk::websocket::{StandXWebSocket, WsMessage};
+use standx_sdk::websocket::{StandXWebSocket, WsMarketUpdate, WsMessage};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{watch, RwLock};
 
 /// Latest market data from the WebSocket feed. Values are pre-parsed on
@@ -10,16 +10,118 @@ use tokio::sync::{watch, RwLock};
 #[derive(Default)]
 pub(super) struct FeedState {
     pub(super) mark: Option<f64>,
-    pub(super) mark_at: Option<std::time::Instant>,
+    mark_meta: Option<FeedMeta>,
     pub(super) best_bid: Option<f64>,
     pub(super) best_ask: Option<f64>,
-    pub(super) book_at: Option<std::time::Instant>,
+    book_meta: Option<FeedMeta>,
+}
+
+#[derive(Clone)]
+struct FeedMeta {
+    exchange_seq: Option<u64>,
+    server_time: Option<String>,
+    received_at: Instant,
 }
 
 /// WS cache entries older than this fall back to REST for the cycle. REST
 /// polling refreshed data once per interval, so 5s keeps freshness at least
 /// as good as the old behavior while tolerating slow feed ticks.
 const WS_STALE_AFTER: Duration = Duration::from_secs(5);
+/// `price` and `depth_book` arrive on separate public channels. A pair older
+/// than this local or parsed venue-time skew is not a coherent quote input.
+const WS_SNAPSHOT_MAX_SKEW: Duration = Duration::from_secs(1);
+
+fn parse_server_time_millis(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if let Ok(raw) = value.parse::<i64>() {
+        return Some(if raw.unsigned_abs() < 100_000_000_000 {
+            raw.saturating_mul(1_000)
+        } else {
+            raw
+        });
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|time| time.timestamp_millis())
+}
+
+fn update_is_newer<T>(previous: Option<&FeedMeta>, update: &WsMarketUpdate<T>) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if matches!(
+        (previous.exchange_seq, update.seq),
+        (Some(previous), Some(next)) if next <= previous
+    ) {
+        return false;
+    }
+    !matches!(
+        (
+        previous
+            .server_time
+            .as_deref()
+            .and_then(parse_server_time_millis),
+        update
+            .server_time
+            .as_deref()
+            .and_then(parse_server_time_millis),
+    ),
+        (Some(previous), Some(next)) if next < previous
+    )
+}
+
+fn update_meta<T>(update: &WsMarketUpdate<T>) -> FeedMeta {
+    FeedMeta {
+        exchange_seq: update.seq,
+        server_time: update.server_time.clone(),
+        received_at: update.received_at,
+    }
+}
+
+fn coherent_ws_snapshot(
+    state: &FeedState,
+    now: Instant,
+) -> Option<(f64, Option<f64>, Option<f64>)> {
+    let mark_meta = state.mark_meta.as_ref()?;
+    let book_meta = state.book_meta.as_ref()?;
+    if now.saturating_duration_since(mark_meta.received_at) >= WS_STALE_AFTER
+        || now.saturating_duration_since(book_meta.received_at) >= WS_STALE_AFTER
+    {
+        return None;
+    }
+    let local_skew = mark_meta
+        .received_at
+        .saturating_duration_since(book_meta.received_at)
+        .max(
+            book_meta
+                .received_at
+                .saturating_duration_since(mark_meta.received_at),
+        );
+    if local_skew > WS_SNAPSHOT_MAX_SKEW {
+        return None;
+    }
+    if let (Some(mark_time), Some(book_time)) = (
+        mark_meta
+            .server_time
+            .as_deref()
+            .and_then(parse_server_time_millis),
+        book_meta
+            .server_time
+            .as_deref()
+            .and_then(parse_server_time_millis),
+    ) {
+        if mark_time.abs_diff(book_time) > WS_SNAPSHOT_MAX_SKEW.as_millis() as u64 {
+            return None;
+        }
+    }
+    let mark = state.mark?;
+    validated_snapshot(mark, state.best_bid, state.best_ask, "ws").ok()?;
+    Some((mark, state.best_bid, state.best_ask))
+}
+
+pub(super) fn fresh_ws_snapshot(state: &FeedState) -> Option<(f64, Option<f64>, Option<f64>)> {
+    coherent_ws_snapshot(state, Instant::now())
+}
 
 /// Spawn the resident market-feed task: one public WS connection carrying
 /// `price` + `depth_book`, written into a shared cache. The outer loop wraps
@@ -60,25 +162,42 @@ pub(super) fn spawn_market_feed(
                 }
             };
             while let Some(msg) = events.recv().await {
-                let now = std::time::Instant::now();
-                match msg {
-                    WsMessage::Price(p) if p.symbol.eq_ignore_ascii_case(&symbol) => {
-                        if let Ok(mark) = p.mark_price.parse::<f64>() {
+                let changed = match msg {
+                    WsMessage::Price(update)
+                        if update.data.symbol.eq_ignore_ascii_case(&symbol) =>
+                    {
+                        if let Ok(mark) = update.data.mark_price.parse::<f64>() {
                             let mut s = state_task.write().await;
-                            s.mark = Some(mark);
-                            s.mark_at = Some(now);
+                            if update_is_newer(s.mark_meta.as_ref(), &update) {
+                                s.mark = Some(mark);
+                                s.mark_meta = Some(update_meta(&update));
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
                     }
-                    WsMessage::Depth(d) if d.symbol.eq_ignore_ascii_case(&symbol) => {
+                    WsMessage::Depth(update)
+                        if update.data.symbol.eq_ignore_ascii_case(&symbol) =>
+                    {
                         let mut s = state_task.write().await;
-                        s.best_bid = d.best_bid().and_then(|v| v.parse().ok());
-                        s.best_ask = d.best_ask().and_then(|v| v.parse().ok());
-                        s.book_at = Some(now);
+                        if update_is_newer(s.book_meta.as_ref(), &update) {
+                            s.best_bid = update.data.best_bid().and_then(|v| v.parse().ok());
+                            s.best_ask = update.data.best_ask().and_then(|v| v.parse().ok());
+                            s.book_meta = Some(update_meta(&update));
+                            true
+                        } else {
+                            false
+                        }
                     }
-                    _ => continue,
+                    _ => false,
+                };
+                if changed {
+                    seq += 1;
+                    let _ = tx.send(seq);
                 }
-                seq += 1;
-                let _ = tx.send(seq);
             }
             // Stream ended: SDK reconnects exhausted or server closed.
             eprintln!("⚠️  market feed stream ended; rebuilding connection in 10s");
@@ -98,14 +217,8 @@ pub(super) async fn market_snapshot(
 ) -> Result<(f64, Option<f64>, Option<f64>, &'static str)> {
     if let Some(feed) = feed {
         let s = feed.read().await;
-        let fresh =
-            |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() < WS_STALE_AFTER);
-        if fresh(s.mark_at) && fresh(s.book_at) {
-            if let Some(mark) = s.mark {
-                if let Ok(snapshot) = validated_snapshot(mark, s.best_bid, s.best_ask, "ws") {
-                    return Ok(snapshot);
-                }
-            }
+        if let Some((mark, best_bid, best_ask)) = fresh_ws_snapshot(&s) {
+            return Ok((mark, best_bid, best_ask, "ws"));
         }
     }
 
@@ -139,14 +252,6 @@ fn validated_snapshot(
     if best_ask.is_some_and(|price| !price.is_finite() || price <= 0.0) {
         return Err(anyhow::anyhow!("invalid best ask from {source}"));
     }
-    if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
-        if bid >= ask {
-            return Err(anyhow::anyhow!(
-                "crossed order book from {source}: bid {bid} >= ask {ask}"
-            ));
-        }
-    }
-
     Ok((mark, best_bid, best_ask, source))
 }
 
@@ -161,9 +266,63 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_validation_rejects_non_finite_and_crossed_books() {
+    fn snapshot_validation_rejects_non_finite_values_but_preserves_crossed_book_for_preflight() {
         assert!(validated_snapshot(f64::NAN, Some(99.9), Some(100.1), "test").is_err());
         assert!(validated_snapshot(100.0, Some(f64::INFINITY), Some(100.1), "test").is_err());
-        assert!(validated_snapshot(100.0, Some(100.1), Some(100.1), "test").is_err());
+        assert!(validated_snapshot(100.0, Some(100.1), Some(100.1), "test").is_ok());
+    }
+
+    fn meta(seq: u64, server_time: &str, received_at: Instant) -> FeedMeta {
+        FeedMeta {
+            exchange_seq: Some(seq),
+            server_time: Some(server_time.to_string()),
+            received_at,
+        }
+    }
+
+    #[test]
+    fn regressed_sequence_or_server_time_does_not_replace_feed_state() {
+        let now = Instant::now();
+        let previous = meta(10, "2026-07-14T00:00:10Z", now);
+        let regressed_seq = WsMarketUpdate {
+            data: (),
+            seq: Some(9),
+            server_time: Some("2026-07-14T00:00:11Z".to_string()),
+            received_at: now,
+        };
+        assert!(!update_is_newer(Some(&previous), &regressed_seq));
+        let regressed_time = WsMarketUpdate {
+            data: (),
+            seq: Some(11),
+            server_time: Some("2026-07-14T00:00:09Z".to_string()),
+            received_at: now,
+        };
+        assert!(!update_is_newer(Some(&previous), &regressed_time));
+    }
+
+    #[test]
+    fn coherent_snapshot_rejects_stale_or_skewed_channels() {
+        let now = Instant::now();
+        let mut state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+        };
+        assert!(coherent_ws_snapshot(&state, now).is_some());
+
+        state.book_meta = Some(meta(
+            2,
+            "2026-07-14T00:00:03Z",
+            now + Duration::from_secs(3),
+        ));
+        assert!(coherent_ws_snapshot(&state, now + Duration::from_secs(3)).is_none());
+
+        state.book_meta = Some(meta(2, "2026-07-14T00:00:03Z", now));
+        assert!(coherent_ws_snapshot(&state, now).is_none());
+
+        state.book_meta = Some(meta(2, "2026-07-14T00:00:00Z", now - WS_STALE_AFTER));
+        assert!(coherent_ws_snapshot(&state, now).is_none());
     }
 }

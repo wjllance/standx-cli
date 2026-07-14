@@ -31,7 +31,7 @@ mod runtime;
 use runtime::apply_order_responses;
 
 use cycle::maker_cycle;
-use feed::{market_snapshot, spawn_market_feed};
+use feed::{fresh_ws_snapshot, market_snapshot, spawn_market_feed};
 #[cfg(test)]
 use model::is_order_rejection;
 use model::{is_maker_order, position_for_symbol, MakerExit};

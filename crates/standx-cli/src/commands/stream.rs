@@ -19,7 +19,10 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
                 if let WsMessage::Price(data) = msg {
                     println!(
                         "{} | Mark: {} | Index: {} | Last: {}",
-                        data.timestamp, data.mark_price, data.index_price, data.last_price
+                        data.data.timestamp,
+                        data.data.mark_price,
+                        data.data.index_price,
+                        data.data.last_price
                     );
                 }
             }
@@ -34,13 +37,13 @@ pub async fn handle_stream(command: StreamCommands, verbose: bool) -> Result<()>
 
             while let Some(msg) = rx.recv().await {
                 if let WsMessage::Depth(data) = msg {
-                    println!("\n=== Order Book: {} ===", data.symbol);
+                    println!("\n=== Order Book: {} ===", data.data.symbol);
                     println!("Asks:");
-                    for ask in data.asks.iter().take(levels) {
+                    for ask in data.data.asks.iter().take(levels) {
                         println!("  {}: {}", ask[0], ask[1]);
                     }
                     println!("Bids:");
-                    for bid in data.bids.iter().take(levels) {
+                    for bid in data.data.bids.iter().take(levels) {
                         println!("  {}: {}", bid[0], bid[1]);
                     }
                 }
