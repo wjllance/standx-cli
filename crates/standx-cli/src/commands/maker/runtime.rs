@@ -1105,6 +1105,8 @@ pub(super) async fn run_maker(
             account_stream_epoch,
             run_order_prefix.clone(),
             starting_position,
+            cfg.price_tick() / 2.0,
+            qty_tolerance,
         )
     });
     let mut inventory_exit_pending = false;
@@ -2953,7 +2955,7 @@ mod tests {
     }
 
     fn projection_with_pending(request_ids: &[&str]) -> MakerAccountProjection {
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         for request_id in request_ids {
             projection.apply(
                 1,
@@ -3190,7 +3192,7 @@ mod tests {
 
     #[test]
     fn apply_order_response_matches_cancel_acknowledgement() {
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         projection.apply(
             1,
             AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
@@ -3216,7 +3218,7 @@ mod tests {
 
     #[test]
     fn apply_order_response_matches_rejected_cancel_acknowledgement() {
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         projection.apply(
             1,
             AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
@@ -3243,7 +3245,7 @@ mod tests {
 
     #[test]
     fn apply_order_response_matches_late_ack_after_terminal_account_order() {
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         projection.apply(
             1,
             AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
@@ -3476,7 +3478,7 @@ mod tests {
         }
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         let mut state = AccountEventState {
             ledger: &mut ledger,
             stats: &mut stats,
@@ -3544,7 +3546,7 @@ mod tests {
     fn balance_event_updates_raw_projection_without_touching_fill_accounting() {
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         let context = AccountEventContext {
             symbol: "BTC-USD",
             run_order_prefix: "sxmk-test-",
@@ -3635,7 +3637,7 @@ mod tests {
     fn stable_trade_reports_current_run_inventory_exit_once() {
         let mut ledger = MakerLedger::new(0.2);
         let mut stats = MakerStats::with_inventory_baseline(0.2, 100.0);
-        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.2);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.2, 0.005, 0.00005);
         let mut state = AccountEventState {
             ledger: &mut ledger,
             stats: &mut stats,
