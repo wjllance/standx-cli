@@ -712,6 +712,9 @@ pub(super) async fn run_maker(
         args.alert_webhook_format,
     );
 
+    // Half a qty tick: the adoption/mismatch tolerance used throughout the run.
+    let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+
     // ---- Live gating & clean start ----
     let mut order_responses = None;
     let mut order_commands = None;
@@ -874,7 +877,6 @@ pub(super) async fn run_maker(
             .await?;
         let post_auth_positions = client.get_positions(Some(&symbol)).await?;
         let post_auth_position = position_for_symbol(&post_auth_positions, &symbol)?;
-        let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
         if (post_auth_position - starting_position).abs() > qty_tolerance {
             handle.abort();
             notifier
@@ -937,7 +939,7 @@ pub(super) async fn run_maker(
             historical_maker_orders,
             historical_maker_trades,
         );
-        if starting_position.abs() > 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0 {
+        if starting_position.abs() > qty_tolerance {
             let message = format!("adopted non-zero starting inventory {starting_position:+.8}");
             notifier
                 .risk(
@@ -1121,7 +1123,6 @@ pub(super) async fn run_maker(
     } else {
         MakerStats::default()
     };
-    let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
     let mut breaker = VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
     let mut alerts =
         AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
@@ -1277,7 +1278,6 @@ pub(super) async fn run_maker(
                         }
                     };
 
-                let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
                 if account_stream_reconnect_attempts_used >= args.account_stream_reconnect_attempts
                 {
                     break recovery_failed_exit(
@@ -1625,7 +1625,7 @@ pub(super) async fn run_maker(
                         session_started_at,
                         run_order_prefix: &run_order_prefix,
                         expected_position: ledger.expected_position,
-                        qty_tolerance: 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0,
+                        qty_tolerance,
                         output_format,
                         attempts_used: order_response_reconnect_attempts_used,
                         max_attempts: args.order_response_reconnect_attempts,
@@ -2441,7 +2441,6 @@ pub(super) async fn run_maker(
                             );
                         }
                     };
-                    let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
                     let mut recovered = false;
                     let mut last_observed = mismatch.observed;
                     for delay in [500_u64, 1_000, 1_500] {

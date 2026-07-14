@@ -2,10 +2,11 @@ use super::ledger::{adopt_order, apply_rest_trade};
 #[cfg(test)]
 use super::ledger::{apply_account_trade, apply_order_update, maker_trade_fill};
 use super::model::{position_for_symbol, rest_order_observation};
-use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
+use super::output::{
+    emit_cycle_skip, emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent,
+};
 use super::pipeline::{fetch_account_audit, CycleRequest, CycleResult, CycleState};
 use super::recovery::PositionReconciliationError;
-use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{
     self as maker, AccountProjectionEvent, MakerAccountProjection, MakerFill, MakerLedger,
@@ -140,9 +141,7 @@ pub(super) async fn maker_cycle(
         breaker,
         live_account_poll,
     } = state;
-    use maker::{
-        format_decimals, paper_quote_filled, Action, CycleInput, CycleSkip, MarketSnapshot,
-    };
+    use maker::{format_decimals, paper_quote_filled, Action, CycleInput, MarketSnapshot};
 
     // 0. Run all market-only guards before any account/order I/O. The pure
     // planner owns breaker observation and data-consistency policy; this
@@ -154,57 +153,17 @@ pub(super) async fn maker_cycle(
     };
     let preflight = maker::preflight_cycle(breaker, market, max_divergence_bps, live);
     let halted = match preflight.skip {
-        Some(CycleSkip::CrossedBook) => {
-            let live_str = if live { "live" } else { "paper" };
-            match output_format {
-                OutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "cycle": cycle, "mode": live_str, "symbol": symbol,
-                            "action": "skip", "reason": "crossed_book",
-                            "mark": format_decimals(mark, cfg.price_decimals),
-                        })
-                    );
-                }
-                _ => {
-                    eprintln!(
-                        "⚠️  #{} crossed order book on {}; skipping cycle (no actions)",
-                        cycle, symbol
-                    );
-                }
-            }
-            return Ok(CycleResult::default());
-        }
-        Some(CycleSkip::MarkMidDivergence { divergence_bps }) => {
-            let live_str = if live { "live" } else { "paper" };
-            match output_format {
-                OutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "cycle": cycle, "mode": live_str, "symbol": symbol,
-                            "action": "skip", "reason": "mark_mid_divergence",
-                            "mark": format_decimals(mark, cfg.price_decimals),
-                            "divergence_bps": (divergence_bps * 100.0).round() / 100.0,
-                            "max_divergence_bps": max_divergence_bps,
-                        })
-                    );
-                }
-                _ => {
-                    eprintln!(
-                        "⚠️  #{} mark/mid divergence {:.1}bps > {}bps — skipping cycle (no actions)",
-                        cycle, divergence_bps, max_divergence_bps
-                    );
-                }
-            }
-            return Ok(CycleResult::default());
-        }
-        Some(CycleSkip::MissingTouch) => {
-            // Fail-safe: without a touch we cannot guarantee no-cross pricing.
-            eprintln!("⚠️  empty order book on {}; skipping this cycle", symbol);
+        Some(skip) => {
+            emit_cycle_skip(
+                output_format,
+                cycle,
+                symbol,
+                live,
+                mark,
+                cfg.price_decimals,
+                max_divergence_bps,
+                skip,
+            );
             return Ok(CycleResult::default());
         }
         None => preflight.halted,
