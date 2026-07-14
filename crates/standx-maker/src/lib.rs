@@ -17,11 +17,17 @@
 
 use standx_sdk::models::OrderSide;
 
+pub mod account_projection;
 pub mod ledger;
 pub mod ownership;
 pub mod risk;
 pub mod runtime;
 
+pub use account_projection::{
+    AccountProjectionEvent, MakerAccountProjection, OrderObservation, ProjectedBalance,
+    ProjectedOrder, ProjectionMismatch, ProjectionOutcome, ProjectionPendingCancel,
+    ProjectionPendingPlace,
+};
 pub use ledger::{LedgerError, LedgerTrade, MakerFill, MakerLedger, TradeSource};
 pub use ownership::{
     exit_client_order_id, is_current_run_client_order_id, is_maker_client_order_id,
@@ -132,7 +138,7 @@ pub fn inventory_exit_plan(
 
 /// A quote currently resting (a real order in live mode, simulated in paper
 /// mode).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RestingQuote {
     /// Exchange order id (None in paper mode / before adoption).
     pub order_id: Option<String>,

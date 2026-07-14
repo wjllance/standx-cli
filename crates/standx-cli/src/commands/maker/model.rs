@@ -1,6 +1,7 @@
+use standx_sdk::account_stream::{BalanceUpdate, OrderUpdate};
 #[cfg(test)]
 use standx_sdk::error::Error as StandxError;
-use standx_sdk::models::{Order, OrderSide, Position};
+use standx_sdk::models::{Order, OrderSide, OrderStatus, Position};
 
 /// Process exit code emitted when the maker performs an *intentional*
 /// fail-safe shutdown: the order-response stream was lost, three maker
@@ -110,31 +111,114 @@ impl From<standx_maker::RuntimeStopReason> for MakerExit {
     }
 }
 
-pub(super) struct PendingPlace {
-    pub(super) request_id: String,
-    pub(super) cl_ord_id: String,
-    pub(super) side: OrderSide,
-    pub(super) price: f64,
-    pub(super) qty: f64,
-    pub(super) level: u32,
-    pub(super) ref_center: f64,
-    pub(super) cycle: u64,
-}
-
-/// A cancellation whose asynchronous order-response acknowledgement has not
-/// arrived yet. Cancellation state does not reserve a quote slot, but it must
-/// be correlated so a normal `order:cancel` response cannot look like an
-/// unknown response from a stale generation.
-pub(super) struct PendingCancel {
-    pub(super) request_id: String,
-    pub(super) side: OrderSide,
-    pub(super) level: u32,
-    pub(super) price: f64,
-    pub(super) cycle: u64,
-}
-
 pub(super) fn is_maker_order(order: &Order) -> bool {
     standx_maker::is_maker_client_order_id(order.cl_ord_id.as_deref())
+}
+
+fn terminal_order_status(status: OrderStatus) -> bool {
+    matches!(
+        status,
+        OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected | OrderStatus::Expired
+    )
+}
+
+pub(super) fn rest_order_observation(
+    order: &Order,
+) -> anyhow::Result<standx_maker::OrderObservation> {
+    let order_id = order
+        .id
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("order has non-integer exchange ID '{}'", order.id))?;
+    let price = order
+        .price
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("order {order_id} has invalid price '{}'", order.price))?;
+    let open_qty = order
+        .qty
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("order {order_id} has invalid qty '{}'", order.qty))?;
+    if !price.is_finite() || !open_qty.is_finite() || price <= 0.0 || open_qty < 0.0 {
+        return Err(anyhow::anyhow!(
+            "order {order_id} has invalid projection values price={price}, qty={open_qty}"
+        ));
+    }
+    Ok(standx_maker::OrderObservation {
+        order_id,
+        client_order_id: order.cl_ord_id.clone(),
+        side: order.side,
+        price,
+        open_qty,
+        terminal: terminal_order_status(order.status),
+    })
+}
+
+pub(super) fn stream_order_observation(
+    order: &OrderUpdate,
+) -> anyhow::Result<standx_maker::OrderObservation> {
+    let terminal = terminal_order_status(order.status);
+    let raw_price = if order.price.is_empty() || order.price == "0" {
+        &order.fill_avg_price
+    } else {
+        &order.price
+    };
+    let price = if raw_price.is_empty() {
+        0.0
+    } else {
+        raw_price.parse::<f64>().map_err(|_| {
+            anyhow::anyhow!(
+                "account order {} has invalid price '{}'",
+                order.order_id,
+                raw_price
+            )
+        })?
+    };
+    let qty = order.qty.parse::<f64>().map_err(|_| {
+        anyhow::anyhow!(
+            "account order {} has invalid qty '{}'",
+            order.order_id,
+            order.qty
+        )
+    })?;
+    let fill_qty = order.fill_qty.parse::<f64>().map_err(|_| {
+        anyhow::anyhow!(
+            "account order {} has invalid fill qty '{}'",
+            order.order_id,
+            order.fill_qty
+        )
+    })?;
+    let open_qty = (qty - fill_qty).max(0.0);
+    if !price.is_finite()
+        || !qty.is_finite()
+        || !fill_qty.is_finite()
+        || (!terminal && price <= 0.0)
+        || qty < 0.0
+        || fill_qty < 0.0
+    {
+        return Err(anyhow::anyhow!(
+            "account order {} has invalid projection values",
+            order.order_id
+        ));
+    }
+    Ok(standx_maker::OrderObservation {
+        order_id: order.order_id,
+        client_order_id: order.cl_ord_id.clone(),
+        side: order.side,
+        price,
+        open_qty,
+        terminal,
+    })
+}
+
+pub(super) fn projected_balance(update: BalanceUpdate) -> standx_maker::ProjectedBalance {
+    standx_maker::ProjectedBalance {
+        account_type: update.account_type,
+        token: update.token,
+        free: update.free,
+        total: update.total,
+        locked: update.locked,
+        occupied: update.occupied,
+        updated_at: update.updated_at,
+    }
 }
 
 pub(super) fn is_current_run_order(order: &Order, run_order_prefix: &str) -> bool {

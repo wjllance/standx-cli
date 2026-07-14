@@ -1,9 +1,9 @@
 use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{
-    self as maker, AlertMonitor, MakerConfig, MakerEffect, MakerEvent, MakerFill, MakerLedger,
-    MakerState, MakerStats, PositionAlertAnchor, RecoveryTarget, RestingQuote, RuntimeStopReason,
-    VolBreaker, WorkToken, MAKER_CL_ORD_ID_PREFIX,
+    self as maker, AccountProjectionEvent, AlertMonitor, MakerAccountProjection, MakerConfig,
+    MakerEffect, MakerEvent, MakerFill, MakerLedger, MakerState, MakerStats, PositionAlertAnchor,
+    RecoveryTarget, RestingQuote, RuntimeStopReason, VolBreaker, WorkToken, MAKER_CL_ORD_ID_PREFIX,
 };
 use standx_sdk::account_stream::{
     AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,
@@ -11,7 +11,7 @@ use standx_sdk::account_stream::{
 use standx_sdk::auth::Credentials;
 use standx_sdk::client::StandXClient;
 use standx_sdk::order_response::OrderResponseStream;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 use tokio::signal;
 
@@ -26,13 +26,13 @@ mod pipeline;
 mod recovery;
 mod runtime;
 #[cfg(test)]
-use runtime::{apply_order_responses, PendingOrderCommands};
+use runtime::apply_order_responses;
 
 use cycle::maker_cycle;
 use feed::{market_snapshot, spawn_market_feed};
 #[cfg(test)]
 use model::is_order_rejection;
-use model::{is_maker_order, position_for_symbol, MakerExit, PendingPlace};
+use model::{is_maker_order, position_for_symbol, MakerExit};
 pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 #[cfg(test)]
 use notify::webhook_body;
@@ -46,6 +46,8 @@ use recovery::{
 use recovery::{
     recover_current_run_order_ids_for_reconciliation, validate_reconnect_snapshot, PositionGap,
 };
+#[cfg(test)]
+use standx_maker::ProjectionPendingPlace;
 #[cfg(test)]
 use standx_sdk::error::Error as StandxError;
 #[cfg(test)]
@@ -590,9 +592,9 @@ mod tests {
 
     #[test]
     fn pending_order_reserves_its_quote_slot() {
-        let pending = [PendingPlace {
+        let pending = [ProjectionPendingPlace {
             request_id: "request-1".to_string(),
-            cl_ord_id: "sxmk-1".to_string(),
+            client_order_id: "sxmk-1".to_string(),
             side: OrderSide::Buy,
             price: 100.0,
             qty: 0.01,
@@ -637,9 +639,9 @@ mod tests {
     #[test]
     fn async_rejection_removes_only_matching_pending_place() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
-        let pending_place = |request_id: &str| PendingPlace {
+        let pending_place = |request_id: &str| ProjectionPendingPlace {
             request_id: request_id.to_string(),
-            cl_ord_id: format!("client-{request_id}"),
+            client_order_id: format!("client-{request_id}"),
             side: OrderSide::Buy,
             price: 100.0,
             qty: 0.01,
@@ -647,8 +649,10 @@ mod tests {
             ref_center: 100.0,
             cycle: 1,
         };
-        let mut pending = vec![pending_place("request-1"), pending_place("request-2")];
-        let mut pending_cancels = Vec::new();
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        for pending in [pending_place("request-1"), pending_place("request-2")] {
+            projection.apply(1, AccountProjectionEvent::PlaceSubmitted(pending));
+        }
         let mut runtime_state = MakerState::starting();
         sender
             .try_send(OrderResponse {
@@ -660,10 +664,7 @@ mod tests {
 
         apply_order_responses(
             &mut receiver,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -672,24 +673,25 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].request_id, "request-2");
+        assert_eq!(projection.pending_places().len(), 1);
+        assert_eq!(projection.pending_places()[0].request_id, "request-2");
     }
 
     #[test]
     fn async_acceptance_keeps_pending_until_exchange_order_is_visible() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
-        let mut pending = vec![PendingPlace {
+        let pending = ProjectionPendingPlace {
             request_id: "request-1".to_string(),
-            cl_ord_id: "client-1".to_string(),
+            client_order_id: "client-1".to_string(),
             side: OrderSide::Sell,
             price: 101.0,
             qty: 0.01,
             level: 0,
             ref_center: 100.0,
             cycle: 1,
-        }];
-        let mut pending_cancels = Vec::new();
+        };
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        projection.apply(1, AccountProjectionEvent::PlaceSubmitted(pending));
         let mut runtime_state = MakerState::starting();
         sender
             .try_send(OrderResponse {
@@ -701,10 +703,7 @@ mod tests {
 
         apply_order_responses(
             &mut receiver,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -713,23 +712,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(pending.len(), 1);
+        assert_eq!(projection.pending_places().len(), 1);
     }
 
     #[test]
     fn disconnected_order_response_stream_is_fail_closed() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
-        let mut pending = Vec::new();
-        let mut pending_cancels = Vec::new();
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
         let mut runtime_state = MakerState::starting();
 
         let error = apply_order_responses(
             &mut receiver,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -745,16 +740,12 @@ mod tests {
     async fn controlled_disconnect_fails_closed_then_cleans_only_maker_orders() {
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         drop(sender);
-        let mut pending = Vec::new();
-        let mut pending_cancels = Vec::new();
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
         let mut runtime_state = MakerState::starting();
 
         let error = apply_order_responses(
             &mut receiver,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",

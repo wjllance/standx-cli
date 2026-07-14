@@ -1,11 +1,5 @@
-use super::model::PendingCancel;
 use super::*;
 use standx_sdk::order_response::OrderResponse;
-
-pub(super) struct PendingOrderCommands<'a> {
-    pub(super) places: &'a mut Vec<PendingPlace>,
-    pub(super) cancels: &'a mut Vec<PendingCancel>,
-}
 
 fn next_runtime_effect(runtime_state: &mut MakerState) -> Option<MakerEffect> {
     runtime_state.next_effect().map(|effect| match effect {
@@ -90,7 +84,7 @@ fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason
 
 pub(super) fn apply_order_responses(
     receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
-    pending: PendingOrderCommands<'_>,
+    projection: &mut MakerAccountProjection,
     runtime_state: &mut MakerState,
     output_format: OutputFormat,
     symbol: &str,
@@ -110,8 +104,7 @@ pub(super) fn apply_order_responses(
         let request_id = response.request_id.clone();
         let matched = apply_order_response(
             response,
-            pending.places,
-            pending.cancels,
+            projection,
             output_format,
             symbol,
             cycle,
@@ -139,8 +132,7 @@ pub(super) fn apply_order_responses(
 
 fn apply_order_response(
     response: OrderResponse,
-    pending: &mut Vec<PendingPlace>,
-    pending_cancels: &mut Vec<PendingCancel>,
+    projection: &mut MakerAccountProjection,
     output_format: OutputFormat,
     symbol: &str,
     cycle: u64,
@@ -149,11 +141,19 @@ fn apply_order_response(
     let Some(request_id) = response.request_id.as_deref() else {
         return false;
     };
-    if let Some(index) = pending_cancels
+    if let Some(cancelled) = projection
+        .pending_cancels()
         .iter()
-        .position(|pending| pending.request_id == request_id)
+        .find(|pending| pending.request_id == request_id)
+        .cloned()
     {
-        let cancelled = pending_cancels.remove(index);
+        let generation = projection.generation();
+        projection.apply(
+            generation,
+            AccountProjectionEvent::CancelResolved {
+                request_id: request_id.to_string(),
+            },
+        );
         // A cancellation rejected because the order is already gone is an
         // acceptable terminal outcome. The next venue snapshot remains the
         // authority for whether the order actually disappeared.
@@ -172,24 +172,32 @@ fn apply_order_response(
         }
         return true;
     }
-    let Some(index) = pending
+    let Some(pending) = projection
+        .pending_places()
         .iter()
-        .position(|place| place.request_id == request_id)
+        .find(|place| place.request_id == request_id)
+        .cloned()
     else {
         return false;
     };
     if response.accepted() {
         return true;
     }
-    let rejected = pending.remove(index);
+    let generation = projection.generation();
+    projection.apply(
+        generation,
+        AccountProjectionEvent::PlaceRejected {
+            request_id: request_id.to_string(),
+        },
+    );
     output::log_maker_event(output::MakerLogEvent {
         output_format,
         symbol,
         cycle,
         action: "place_rejected_async",
-        side: rejected.side,
-        level: rejected.level,
-        price: rejected.price,
+        side: pending.side,
+        level: pending.level,
+        price: pending.price,
         price_decimals,
         detail: &response.message,
     });
@@ -207,6 +215,7 @@ struct AccountEventContext<'a> {
 struct AccountEventState<'a> {
     ledger: &'a mut MakerLedger,
     stats: &'a mut MakerStats,
+    projection: &'a mut MakerAccountProjection,
 }
 
 #[derive(Debug, Default)]
@@ -252,9 +261,18 @@ fn apply_account_event(
     context: &AccountEventContext<'_>,
 ) -> Result<AccountEventOutcome> {
     match event {
-        AccountEvent::Connected { .. } => Ok(AccountEventOutcome::default()),
+        AccountEvent::Connected { epoch } => {
+            if epoch != state.projection.generation() {
+                return Err(anyhow::anyhow!(
+                    "stale account-stream generation {epoch}; current projection generation is {}",
+                    state.projection.generation()
+                ));
+            }
+            Ok(AccountEventOutcome::default())
+        }
         AccountEvent::Order(update) => {
             let mut fills = Vec::new();
+            let observation = model::stream_order_observation(&update)?;
             let exit_fill_observed = ledger::apply_order_update(
                 state.ledger,
                 &update,
@@ -264,7 +282,26 @@ fn apply_account_event(
                 state.stats,
                 &mut fills,
             )?;
+            let generation = state.projection.generation();
+            let projection_outcome = state.projection.apply(
+                generation,
+                AccountProjectionEvent::OrderObserved(observation),
+            );
+            if projection_outcome.unknown_current_run_order {
+                return Err(anyhow::anyhow!(
+                    "account stream reported an unknown current-run maker order"
+                ));
+            }
             for fill in &fills {
+                if let Some(order_id) = fill.order_id {
+                    state.projection.apply(
+                        generation,
+                        AccountProjectionEvent::TradeApplied {
+                            order_id,
+                            qty: fill.qty,
+                        },
+                    );
+                }
                 emit_live_fill(fill, context.symbol, context.cycle, context.output_format);
             }
             Ok(AccountEventOutcome {
@@ -281,6 +318,11 @@ fn apply_account_event(
                 model::signed_position_quantity(&update.qty, update.side).map_err(|error| {
                     anyhow::anyhow!("account position update has invalid qty: {error}")
                 })?;
+            let generation = state.projection.generation();
+            state.projection.apply(
+                generation,
+                AccountProjectionEvent::PositionObserved { position: qty },
+            );
             Ok(AccountEventOutcome {
                 fills: 0,
                 latest_position: Some(qty),
@@ -297,7 +339,17 @@ fn apply_account_event(
                 state.stats,
                 &mut fills,
             )?;
+            let generation = state.projection.generation();
             for fill in &fills {
+                if let Some(order_id) = fill.order_id {
+                    state.projection.apply(
+                        generation,
+                        AccountProjectionEvent::TradeApplied {
+                            order_id,
+                            qty: fill.qty,
+                        },
+                    );
+                }
                 emit_live_fill(fill, context.symbol, context.cycle, context.output_format);
             }
             Ok(AccountEventOutcome {
@@ -306,10 +358,16 @@ fn apply_account_event(
                 exit_fill_observed,
             })
         }
-        // Raw wallet updates are intentionally typed and subscribed here. The
-        // derived equity/available snapshot remains REST-backed until the
-        // later account-state/cache stage.
-        AccountEvent::Balance(_) => Ok(AccountEventOutcome::default()),
+        // Raw wallet fields are projected independently. The derived unified
+        // margin snapshot used by existing output remains REST-backed.
+        AccountEvent::Balance(update) => {
+            let generation = state.projection.generation();
+            state.projection.apply(
+                generation,
+                AccountProjectionEvent::BalanceObserved(model::projected_balance(update)),
+            );
+            Ok(AccountEventOutcome::default())
+        }
         AccountEvent::Disconnected { reason } | AccountEvent::Error { reason } => Err(
             anyhow::anyhow!("authenticated account stream unhealthy: {reason}"),
         ),
@@ -1106,9 +1164,13 @@ pub(super) async fn run_maker(
     // ---- Loop state ----
     let mut cycle: u64 = 0;
     let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
-    let mut adopted: HashMap<String, (u32, f64, u64)> = HashMap::new(); // id -> (level, ref_mark, cycle)
-    let mut pending: Vec<PendingPlace> = Vec::new();
-    let mut pending_cancels: Vec<PendingCancel> = Vec::new();
+    let mut account_projection = args.live.then(|| {
+        MakerAccountProjection::new(
+            account_stream_epoch,
+            run_order_prefix.clone(),
+            starting_position,
+        )
+    });
     let mut inventory_exit_pending = false;
     let mut ledger = MakerLedger::new(starting_position);
     let mut position_alert_anchor =
@@ -1247,9 +1309,9 @@ pub(super) async fn run_maker(
                     };
                 }
                 resting.clear();
-                adopted.clear();
-                pending.clear();
-                pending_cancels.clear();
+                if let Some(projection) = account_projection.as_mut() {
+                    projection.clear_orders_and_pending();
+                }
                 inventory_exit_pending = false;
                 if let Some(handle) = account_stream_handle.take() {
                     handle.abort();
@@ -1345,11 +1407,17 @@ pub(super) async fn run_maker(
                     };
                 };
 
+                let projection = account_projection
+                    .as_mut()
+                    .expect("live account reconnect requires initialized projection");
+                projection.reset(account_stream_epoch, ledger.expected_position);
+
                 let mut reconnect_fills = match apply_account_events(
                     &mut events,
                     &mut AccountEventState {
                         ledger: &mut ledger,
                         stats: &mut stats,
+                        projection,
                     },
                     &AccountEventContext {
                         symbol: &symbol,
@@ -1405,6 +1473,7 @@ pub(super) async fn run_maker(
                             &mut AccountEventState {
                                 ledger: &mut ledger,
                                 stats: &mut stats,
+                                projection,
                             },
                             &AccountEventContext {
                                 symbol: &symbol,
@@ -1472,6 +1541,13 @@ pub(super) async fn run_maker(
                 account_events = Some(events);
                 account_stream_health = Some(health);
                 account_stream_handle = Some(handle);
+                if let Some(projection) = account_projection.as_mut() {
+                    let generation = projection.generation();
+                    projection.apply(
+                        generation,
+                        AccountProjectionEvent::PositionObserved { position: observed },
+                    );
+                }
                 total_fills += reconnect_fills;
                 runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                 notifier
@@ -1551,9 +1627,9 @@ pub(super) async fn run_maker(
                     };
                 }
                 resting.clear();
-                adopted.clear();
-                pending.clear();
-                pending_cancels.clear();
+                if let Some(projection) = account_projection.as_mut() {
+                    projection.clear_orders_and_pending();
+                }
                 inventory_exit_pending = false;
                 runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
                 let recovery_token =
@@ -1597,9 +1673,9 @@ pub(super) async fn run_maker(
                             // Cleanup verified an empty maker book. The next
                             // cycle rebuilds exchange state before it may place.
                             resting.clear();
-                            adopted.clear();
-                            pending.clear();
-                            pending_cancels.clear();
+                            if let Some(projection) = account_projection.as_mut() {
+                                projection.clear_orders_and_pending();
+                            }
                             consecutive_errors = 0;
                             runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                             notifier
@@ -1742,12 +1818,12 @@ pub(super) async fn run_maker(
             }
         }
         if let Some(receiver) = order_responses.as_mut() {
+            let projection = account_projection
+                .as_mut()
+                .expect("live order responses require initialized account projection");
             if let Err(error) = apply_order_responses(
                 receiver,
-                PendingOrderCommands {
-                    places: &mut pending,
-                    cancels: &mut pending_cancels,
-                },
+                projection,
                 &mut runtime_state,
                 output_format,
                 &symbol,
@@ -1770,6 +1846,9 @@ pub(super) async fn run_maker(
                 &mut AccountEventState {
                     ledger: &mut ledger,
                     stats: &mut stats,
+                    projection: account_projection
+                        .as_mut()
+                        .expect("live account events require initialized projection"),
                 },
                 &AccountEventContext {
                     symbol: &symbol,
@@ -1891,9 +1970,7 @@ pub(super) async fn run_maker(
                 },
                 CycleState {
                     resting: &mut resting,
-                    adopted: &mut adopted,
-                    pending: &mut pending,
-                    pending_cancels: &mut pending_cancels,
+                    account_projection: account_projection.as_mut(),
                     inventory_exit_pending: &mut inventory_exit_pending,
                     ledger: &mut ledger,
                     sim_position: &mut sim_position,
@@ -1980,8 +2057,9 @@ pub(super) async fn run_maker(
             let request_id = response.request_id.clone();
             let matched = apply_order_response(
                 response,
-                &mut pending,
-                &mut pending_cancels,
+                account_projection
+                    .as_mut()
+                    .expect("live order responses require initialized projection"),
                 output_format,
                 &symbol,
                 cycle,
@@ -2013,6 +2091,9 @@ pub(super) async fn run_maker(
                 &mut AccountEventState {
                     ledger: &mut ledger,
                     stats: &mut stats,
+                    projection: account_projection
+                        .as_mut()
+                        .expect("live account events require initialized projection"),
                 },
                 &AccountEventContext {
                     symbol: &symbol,
@@ -2326,9 +2407,9 @@ pub(super) async fn run_maker(
                         };
                     }
                     resting.clear();
-                    adopted.clear();
-                    pending.clear();
-                    pending_cancels.clear();
+                    if let Some(projection) = account_projection.as_mut() {
+                        projection.clear_orders_and_pending();
+                    }
                     inventory_exit_pending = false;
                     runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
                     let recovery_token = match take_recovery_effect(
@@ -2354,6 +2435,9 @@ pub(super) async fn run_maker(
                                 &mut AccountEventState {
                                     ledger: &mut ledger,
                                     stats: &mut stats,
+                                    projection: account_projection.as_mut().expect(
+                                        "live account events require initialized projection",
+                                    ),
                                 },
                                 &AccountEventContext {
                                     symbol: &symbol,
@@ -2428,6 +2512,15 @@ pub(super) async fn run_maker(
                         }
                     }
                     if recovered {
+                        if let Some(projection) = account_projection.as_mut() {
+                            let generation = projection.generation();
+                            projection.apply(
+                                generation,
+                                AccountProjectionEvent::PositionObserved {
+                                    position: last_observed,
+                                },
+                            );
+                        }
                         emit_reconciliation_state(
                             output_format,
                             &symbol,
@@ -2578,6 +2671,9 @@ pub(super) async fn run_maker(
                         &mut AccountEventState {
                             ledger: &mut ledger,
                             stats: &mut stats,
+                            projection: account_projection
+                                .as_mut()
+                                .expect("live account events require initialized projection"),
                         },
                         &AccountEventContext {
                             symbol: &symbol,
@@ -2793,12 +2889,13 @@ pub(super) async fn run_maker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use standx_maker::{ProjectionPendingCancel, ProjectionPendingPlace};
     use standx_sdk::account_stream::{OrderUpdate, PositionUpdate};
 
-    fn pending_place(request_id: &str) -> PendingPlace {
-        PendingPlace {
+    fn pending_place(request_id: &str) -> ProjectionPendingPlace {
+        ProjectionPendingPlace {
             request_id: request_id.to_string(),
-            cl_ord_id: format!("cl-{request_id}"),
+            client_order_id: format!("cl-{request_id}"),
             side: OrderSide::Buy,
             price: 100.0,
             qty: 1.0,
@@ -2806,6 +2903,17 @@ mod tests {
             ref_center: 100.0,
             cycle: 1,
         }
+    }
+
+    fn projection_with_pending(request_ids: &[&str]) -> MakerAccountProjection {
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        for request_id in request_ids {
+            projection.apply(
+                1,
+                AccountProjectionEvent::PlaceSubmitted(pending_place(request_id)),
+            );
+        }
+        projection
     }
 
     fn order_response(request_id: Option<&str>, code: i64) -> OrderResponse {
@@ -2880,69 +2988,73 @@ mod tests {
 
     #[test]
     fn apply_order_response_keeps_accepted_placement() {
-        let mut pending = vec![pending_place("req-1")];
-        let mut pending_cancels = Vec::new();
+        let mut projection = projection_with_pending(&["req-1"]);
         let matched = apply_order_response(
             order_response(Some("req-1"), 0),
-            &mut pending,
-            &mut pending_cancels,
+            &mut projection,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
             2,
         );
         assert!(matched);
-        assert_eq!(pending.len(), 1, "accepted placement stays pending");
+        assert_eq!(
+            projection.pending_places().len(),
+            1,
+            "accepted placement stays pending"
+        );
     }
 
     #[test]
     fn apply_order_response_drops_rejected_placement() {
-        let mut pending = vec![pending_place("req-1")];
-        let mut pending_cancels = Vec::new();
+        let mut projection = projection_with_pending(&["req-1"]);
         let matched = apply_order_response(
             order_response(Some("req-1"), 1),
-            &mut pending,
-            &mut pending_cancels,
+            &mut projection,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
             2,
         );
         assert!(matched);
-        assert!(pending.is_empty(), "rejected placement is removed");
+        assert!(
+            projection.pending_places().is_empty(),
+            "rejected placement is removed"
+        );
     }
 
     #[test]
     fn apply_order_response_matches_cancel_acknowledgement() {
-        let mut pending = Vec::new();
-        let mut pending_cancels = vec![PendingCancel {
-            request_id: "cancel-1".to_string(),
-            side: OrderSide::Buy,
-            level: 0,
-            price: 100.0,
-            cycle: 1,
-        }];
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        projection.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "cancel-1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 1,
+            }),
+        );
 
         assert!(apply_order_response(
             order_response(Some("cancel-1"), 0),
-            &mut pending,
-            &mut pending_cancels,
+            &mut projection,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
             2,
         ));
-        assert!(pending_cancels.is_empty());
+        assert!(projection.pending_cancels().is_empty());
     }
 
     #[test]
     fn apply_order_response_reports_unmatched_ids() {
-        let mut pending = vec![pending_place("req-1")];
-        let mut pending_cancels = Vec::new();
+        let mut projection = projection_with_pending(&["req-1"]);
         assert!(!apply_order_response(
             order_response(Some("other"), 0),
-            &mut pending,
-            &mut pending_cancels,
+            &mut projection,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
@@ -2950,21 +3062,19 @@ mod tests {
         ));
         assert!(!apply_order_response(
             order_response(None, 0),
-            &mut pending,
-            &mut pending_cancels,
+            &mut projection,
             OutputFormat::Quiet,
             "BTC-USD",
             1,
             2,
         ));
-        assert_eq!(pending.len(), 1);
+        assert_eq!(projection.pending_places().len(), 1);
     }
 
     #[test]
     fn apply_order_responses_matched_acks_do_not_grow_unmatched_buffer() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let mut pending = vec![pending_place("req-1"), pending_place("req-2")];
-        let mut pending_cancels = Vec::new();
+        let mut projection = projection_with_pending(&["req-1", "req-2"]);
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
         assert!(matches!(
@@ -2978,10 +3088,7 @@ mod tests {
 
         apply_order_responses(
             &mut rx,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -2992,14 +3099,13 @@ mod tests {
 
         assert!(runtime_state.pending_effect().is_none());
         // Accepted placements remain pending; the matched arm keeps them.
-        assert_eq!(pending.len(), 2);
+        assert_eq!(projection.pending_places().len(), 2);
     }
 
     #[test]
     fn apply_order_responses_matched_clears_prior_unmatched_entry() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
-        let mut pending = Vec::new();
-        let mut pending_cancels = Vec::new();
+        let mut projection = projection_with_pending(&[]);
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
         assert!(matches!(
@@ -3011,10 +3117,7 @@ mod tests {
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
         apply_order_responses(
             &mut rx,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -3025,14 +3128,14 @@ mod tests {
         assert!(runtime_state.pending_effect().is_none());
 
         // The matching placement arrives later; a matched ack clears the buffer entry.
-        pending.push(pending_place("req-1"));
+        projection.apply(
+            1,
+            AccountProjectionEvent::PlaceSubmitted(pending_place("req-1")),
+        );
         tx.try_send(order_response(Some("req-1"), 0)).unwrap();
         apply_order_responses(
             &mut rx,
-            PendingOrderCommands {
-                places: &mut pending,
-                cancels: &mut pending_cancels,
-            },
+            &mut projection,
             &mut runtime_state,
             OutputFormat::Quiet,
             "BTC-USD",
@@ -3050,9 +3153,11 @@ mod tests {
         }
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
         let mut state = AccountEventState {
             ledger: &mut ledger,
             stats: &mut stats,
+            projection: &mut projection,
         };
         let context = AccountEventContext {
             symbol: "BTC-USD",
@@ -3113,6 +3218,45 @@ mod tests {
     }
 
     #[test]
+    fn balance_event_updates_raw_projection_without_touching_fill_accounting() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0);
+        let context = AccountEventContext {
+            symbol: "BTC-USD",
+            run_order_prefix: "sxmk-test-",
+            mark: 100.0,
+            cycle: 1,
+            output_format: OutputFormat::Quiet,
+        };
+        let outcome = {
+            let mut state = AccountEventState {
+                ledger: &mut ledger,
+                stats: &mut stats,
+                projection: &mut projection,
+            };
+            apply_account_event(
+                AccountEvent::Balance(standx_sdk::account_stream::BalanceUpdate {
+                    seq: 1,
+                    account_type: "perps".to_string(),
+                    token: "DUSD".to_string(),
+                    free: "90".to_string(),
+                    total: "100".to_string(),
+                    locked: "0".to_string(),
+                    occupied: "10".to_string(),
+                    updated_at: "2026-07-14T00:00:00Z".to_string(),
+                }),
+                &mut state,
+                &context,
+            )
+            .unwrap()
+        };
+        assert_eq!(outcome.fills, 0);
+        assert_eq!(projection.raw_balance("perps", "DUSD").unwrap().free, "90");
+        assert_eq!(stats.fills(), 0);
+    }
+
+    #[test]
     fn typed_trade_event_is_booked_once_after_order_ownership() {
         let order = standx_sdk::account_stream::OrderUpdate {
             seq: 1,
@@ -3166,9 +3310,11 @@ mod tests {
     fn stable_trade_reports_current_run_inventory_exit_once() {
         let mut ledger = MakerLedger::new(0.2);
         let mut stats = MakerStats::with_inventory_baseline(0.2, 100.0);
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.2);
         let mut state = AccountEventState {
             ledger: &mut ledger,
             stats: &mut stats,
+            projection: &mut projection,
         };
         let context = AccountEventContext {
             symbol: "BTC-USD",

@@ -1,17 +1,16 @@
 use super::ledger::{adopt_order, apply_rest_trade};
 #[cfg(test)]
 use super::ledger::{apply_account_trade, apply_order_update, maker_trade_fill};
-use super::model::{is_current_run_order, position_for_symbol, PendingCancel, PendingPlace};
+use super::model::{position_for_symbol, rest_order_observation};
 use super::output::{emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent};
-use super::pipeline::{
-    fetch_cycle_snapshot, fetch_history_trade_audit, CycleRequest, CycleResult, CycleState,
-};
-use super::recovery::{
-    recover_current_run_order_ids_for_reconciliation, PositionGap, PositionReconciliationError,
-};
+use super::pipeline::{fetch_account_audit, CycleRequest, CycleResult, CycleState};
+use super::recovery::PositionReconciliationError;
 use crate::cli::*;
 use anyhow::Result;
-use standx_maker::{self as maker, MakerFill, MakerLedger, MakerStats, RestingQuote};
+use standx_maker::{
+    self as maker, AccountProjectionEvent, MakerFill, MakerLedger, MakerStats,
+    ProjectionPendingCancel, ProjectionPendingPlace, RestingQuote,
+};
 #[cfg(test)]
 use standx_sdk::account_stream::{OrderUpdate, TradeUpdate};
 use standx_sdk::client::order::CreateOrderParams;
@@ -78,9 +77,7 @@ pub(super) async fn maker_cycle(
     } = request;
     let CycleState {
         resting,
-        adopted,
-        pending,
-        pending_cancels,
+        mut account_projection,
         inventory_exit_pending,
         ledger,
         sim_position,
@@ -135,23 +132,28 @@ pub(super) async fn maker_cycle(
         None => preflight.halted,
     };
 
-    // 2. Rebuild resting + position from the exchange (live) or keep the
-    //    simulated book (paper).
+    // 2. Use the authenticated account-stream projection in live mode or the
+    //    simulated in-memory book in paper mode. REST is only a periodic audit.
     let position: f64;
+    let mut projected_resting = Vec::new();
     let mut account_balance: Option<Balance> = None;
     let mut fills: Vec<MakerFill> = Vec::new();
     let mut exit_fill_observed = false;
     if live {
+        let projection = account_projection
+            .as_deref_mut()
+            .expect("live maker cycles require initialized account projection");
+        let generation = projection.generation();
+        projection.apply(generation, AccountProjectionEvent::AdvanceCycle { cycle });
         let poll =
             live_account_poll.expect("live maker cycles require initialized account polling state");
         let poll_now = std::time::Instant::now();
         let now = chrono::Utc::now().timestamp();
-        let audit_due = poll.history_trade_audit_due(poll_now);
+        let audit_due = poll.account_audit_due(poll_now);
         let balance_refresh_due = poll.balance_refresh_due(poll_now);
-        let snapshot_future = fetch_cycle_snapshot(client, symbol);
         let audit_future = async {
             if audit_due {
-                Some(fetch_history_trade_audit(client, symbol, session_started_at, now).await)
+                Some(fetch_account_audit(client, symbol, session_started_at, now).await)
             } else {
                 None
             }
@@ -163,17 +165,13 @@ pub(super) async fn maker_cycle(
                 None
             }
         };
-        let (snapshot, audit, refreshed_balance) =
-            tokio::join!(snapshot_future, audit_future, balance_future);
-        let snapshot = snapshot?;
+        let (audit, refreshed_balance) = tokio::join!(audit_future, balance_future);
         // Resolve every due read before mutating the current-run ledger. A
         // failed audit must leave this cycle's accounting exactly untouched.
         let audit = match audit {
             Some(audit) => Some(audit?),
             None => None,
         };
-        let mut orders = snapshot.open_orders;
-
         if let Some(refreshed_balance) = refreshed_balance {
             match refreshed_balance {
                 Ok(balance) => poll.record_balance_refresh(balance, poll_now),
@@ -190,16 +188,11 @@ pub(super) async fn maker_cycle(
         }
         account_balance = Some(poll.balance().clone());
 
-        // Open maker orders identify partial fills. Filled order history and
-        // trades are an intentionally low-frequency audit while the healthy
-        // account stream remains the prompt fill path.
-        for order in &orders {
-            adopt_order(ledger, order, run_order_prefix)?;
-        }
         if let Some(audit) = audit {
-            for order in &audit.filled_orders {
+            for order in audit.open_orders.iter().chain(audit.filled_orders.iter()) {
                 adopt_order(ledger, order, run_order_prefix)?;
             }
+            let fill_start = fills.len();
             exit_fill_observed |= collect_current_run_fills(
                 audit.trades,
                 ledger,
@@ -209,136 +202,58 @@ pub(super) async fn maker_cycle(
                 stats,
                 &mut fills,
             )?;
-            poll.record_history_trade_audit(poll_now);
-        }
-
-        let mut observed_position = position_for_symbol(&snapshot.positions, symbol)?;
-        let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
-        if (observed_position - ledger.expected_position).abs() > qty_tolerance {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let retry_now = chrono::Utc::now().timestamp();
-            let (retry_orders, retry_filled_orders, retry_trades) = tokio::join!(
-                client.get_open_orders(Some(symbol)),
-                client.get_order_history(Some(symbol), Some(100)),
-                client.get_user_trades(symbol, session_started_at, retry_now, Some(500)),
-            );
-            orders = retry_orders?;
-            let retry_filled_orders = retry_filled_orders?;
-            for order in orders.iter().chain(retry_filled_orders.iter()) {
-                adopt_order(ledger, order, run_order_prefix)?;
-            }
-            let retry_trades = retry_trades?;
-            recover_current_run_order_ids_for_reconciliation(
-                client,
-                &retry_trades,
-                PositionGap {
-                    expected: ledger.expected_position,
-                    observed: observed_position,
-                    qty_tolerance,
-                    run_order_prefix,
-                },
-                ledger,
-            )
-            .await;
-            exit_fill_observed |= collect_current_run_fills(
-                retry_trades,
-                ledger,
-                session_started_at,
-                retry_now,
-                mark,
-                stats,
-                &mut fills,
-            )?;
-            let retry_positions = client.get_positions(Some(symbol)).await?;
-            observed_position = position_for_symbol(&retry_positions, symbol)?;
-            if (observed_position - ledger.expected_position).abs() > qty_tolerance {
-                if output_format == OutputFormat::Json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                            "symbol": symbol,
-                            "cycle": cycle,
-                            "action": "position_reconciliation",
-                            "event": "failed",
-                            "expected_position": ledger.expected_position,
-                            "observed_position": observed_position,
-                            "message": "venue position cannot be explained by current-run maker fills",
-                        })
-                    );
-                } else {
-                    eprintln!(
-                        "⚠️  position reconciliation failed: expected {:+.8}, observed {:+.8}",
-                        ledger.expected_position, observed_position
+            for fill in &fills[fill_start..] {
+                if let Some(order_id) = fill.order_id {
+                    projection.apply(
+                        generation,
+                        AccountProjectionEvent::TradeApplied {
+                            order_id,
+                            qty: fill.qty,
+                        },
                     );
                 }
+            }
+            let observed_position = position_for_symbol(&audit.positions, symbol)?;
+            let observations = audit
+                .open_orders
+                .iter()
+                .map(rest_order_observation)
+                .collect::<Result<Vec<_>>>()?;
+            let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+            if (observed_position - ledger.expected_position).abs() > qty_tolerance {
+                // Preserve the prior bounded anomaly window. The normal path
+                // performs no REST read; this sleep is reached only by a
+                // periodic audit that found an unexplained position gap.
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 return Err(anyhow::Error::new(PositionReconciliationError {
                     expected: ledger.expected_position,
                     observed: observed_position,
                 }));
             }
+            if let Err(error) = projection.verify_rest_snapshot(
+                generation,
+                observed_position,
+                &observations,
+                qty_tolerance,
+            ) {
+                eprintln!("⚠️  account projection audit failed: {error}");
+                // Reuse the runtime's immediate reconciliation/freeze path;
+                // the detailed order/projection mismatch is emitted above.
+                return Err(anyhow::Error::new(PositionReconciliationError {
+                    expected: ledger.expected_position,
+                    observed: observed_position,
+                }));
+            }
+            projection.apply(
+                generation,
+                AccountProjectionEvent::PositionObserved {
+                    position: observed_position,
+                },
+            );
+            poll.record_account_audit(poll_now);
         }
-        position = observed_position;
-
-        let tick = cfg.price_tick();
-        *resting = orders
-            .into_iter()
-            .filter(|order| is_current_run_order(order, run_order_prefix))
-            .map(|o| {
-                let price: f64 = o.price.parse().unwrap_or(0.0);
-                let qty: f64 = o.qty.parse().unwrap_or(0.0);
-                let (level, ref_center, placed_at_cycle) = match adopted.get(&o.id) {
-                    Some(&meta) => meta,
-                    None => {
-                        // Try to adopt from a recent place by side + price,
-                        // tolerating a shrunk qty from a partial fill (see
-                        // open_qty_adopts).
-                        let matched = o
-                            .cl_ord_id
-                            .as_ref()
-                            .and_then(|cl_ord_id| {
-                                pending.iter().position(|p| p.cl_ord_id == *cl_ord_id)
-                            })
-                            .or_else(|| {
-                                // Backward-compatible fallback for orders
-                                // created before client IDs were enabled.
-                                pending.iter().position(|p| {
-                                    p.side == o.side
-                                        && (p.price - price).abs() < tick / 2.0
-                                        && maker::open_qty_adopts(qty, p.qty)
-                                })
-                            });
-                        let meta = match matched {
-                            Some(idx) => {
-                                let p = pending.remove(idx);
-                                (p.level, p.ref_center, p.cycle)
-                            }
-                            // An older maker order without in-memory state:
-                            // sentinel level makes reconciliation replace it.
-                            // Manual orders were filtered above and cannot
-                            // enter the strategy state.
-                            None => (u32::MAX, mark, cycle),
-                        };
-                        adopted.insert(o.id.clone(), meta);
-                        meta
-                    }
-                };
-                RestingQuote {
-                    order_id: Some(o.id),
-                    side: o.side,
-                    level,
-                    price,
-                    qty,
-                    ref_center,
-                    placed_at_cycle,
-                }
-            })
-            .collect();
-        // Places older than 2 cycles never showed up as open orders —
-        // likely rejected (e.g. ALO would-cross) or fully filled on arrival.
-        pending.retain(|p| cycle.saturating_sub(p.cycle) <= 2);
-        pending_cancels.retain(|pending| cycle.saturating_sub(pending.cycle) <= 2);
-        adopted.retain(|id, _| resting.iter().any(|r| r.order_id.as_deref() == Some(id)));
+        position = ledger.expected_position;
+        projected_resting = projection.resting_quotes();
     } else {
         // Paper mode: simulate fills against the touch so inventory (and thus
         // skew) is observable without going live. A crossed resting quote is
@@ -370,7 +285,15 @@ pub(super) async fn maker_cycle(
     }
 
     // 3. Build the pure quote/exit plan from the synchronized state.
-    let pending_slots = pending
+    let active_resting = if live {
+        projected_resting.as_slice()
+    } else {
+        resting.as_slice()
+    };
+    let pending_slots = account_projection
+        .as_deref()
+        .map(|projection| projection.pending_places())
+        .unwrap_or(&[])
         .iter()
         .map(|place| (place.side, place.level))
         .collect::<Vec<_>>();
@@ -380,7 +303,7 @@ pub(super) async fn maker_cycle(
             cycle,
             market,
             position,
-            resting,
+            resting: active_resting,
             pending_slots: &pending_slots,
             active_exit_enabled: live,
             inventory_exit_pct,
@@ -413,10 +336,14 @@ pub(super) async fn maker_cycle(
             Action::Place(q)
                 if live
                     && maker::pending_covers_slot(
-                        pending.iter().map(|place| maker::QuoteSlot {
-                            side: place.side,
-                            level: place.level,
-                        }),
+                        account_projection
+                            .as_deref()
+                            .into_iter()
+                            .flat_map(|projection| projection.pending_places())
+                            .map(|place| maker::QuoteSlot {
+                                side: place.side,
+                                level: place.level,
+                            }),
                         q.side,
                         q.level,
                     ) =>
@@ -460,14 +387,28 @@ pub(super) async fn maker_cycle(
                     if let Some(id) = order_id {
                         match live_order_commands(order_commands)?.cancel_order(id).await {
                             Ok(request_id) => {
-                                pending_cancels.push(PendingCancel {
-                                    request_id,
-                                    side: *side,
-                                    level: *level,
-                                    price: *price,
-                                    cycle,
-                                });
-                                adopted.remove(id);
+                                let order_id = id.parse::<u64>().map_err(|_| {
+                                    anyhow::anyhow!(
+                                        "projected maker order has non-integer exchange ID '{id}'"
+                                    )
+                                })?;
+                                let projection = account_projection.as_deref_mut().expect(
+                                    "live maker cycles require initialized account projection",
+                                );
+                                let generation = projection.generation();
+                                projection.apply(
+                                    generation,
+                                    AccountProjectionEvent::CancelSubmitted(
+                                        ProjectionPendingCancel {
+                                            request_id,
+                                            order_id,
+                                            side: *side,
+                                            level: *level,
+                                            price: *price,
+                                            cycle,
+                                        },
+                                    ),
+                                );
                                 cancels += 1;
                             }
                             Err(e) => return Err(e.into()),
@@ -502,16 +443,23 @@ pub(super) async fn maker_cycle(
                             tp_price: None,
                         })
                         .await?;
-                    pending.push(PendingPlace {
-                        request_id,
-                        cl_ord_id,
-                        side: q.side,
-                        price: q.price,
-                        qty: q.qty,
-                        level: q.level,
-                        ref_center,
-                        cycle,
-                    });
+                    let projection = account_projection
+                        .as_deref_mut()
+                        .expect("live maker cycles require initialized account projection");
+                    let generation = projection.generation();
+                    projection.apply(
+                        generation,
+                        AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
+                            request_id,
+                            client_order_id: cl_ord_id,
+                            side: q.side,
+                            price: q.price,
+                            qty: q.qty,
+                            level: q.level,
+                            ref_center,
+                            cycle,
+                        }),
+                    );
                     places += 1;
                 } else {
                     resting.push(RestingQuote {
@@ -534,7 +482,12 @@ pub(super) async fn maker_cycle(
         // Do not race a reduce-only market order against quote cancellations.
         // The next cycle must observe an empty maker book before the single
         // exit request can be submitted.
-        if resting.is_empty() && pending.is_empty() && pending_cancels.is_empty() {
+        let account_clear = account_projection.as_deref().is_some_and(|projection| {
+            projection.resting_quotes().is_empty()
+                && projection.pending_places().is_empty()
+                && projection.pending_cancels().is_empty()
+        });
+        if account_clear {
             if let Some(reason) = unhealthy_order_response(order_response_health) {
                 return Err(anyhow::anyhow!("{reason}; refusing inventory exit"));
             }
@@ -559,16 +512,23 @@ pub(super) async fn maker_cycle(
             // The sentinel level keeps it out of quote-slot reservation; a
             // reduce-only market order never rests, so reconciliation drops it
             // when `pending` ages out.
-            pending.push(PendingPlace {
-                request_id,
-                cl_ord_id,
-                side: exit.side,
-                price: mark,
-                qty: exit.qty,
-                level: u32::MAX,
-                ref_center: mark,
-                cycle,
-            });
+            let projection = account_projection
+                .as_deref_mut()
+                .expect("live inventory exits require initialized account projection");
+            let generation = projection.generation();
+            projection.apply(
+                generation,
+                AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
+                    request_id,
+                    client_order_id: cl_ord_id,
+                    side: exit.side,
+                    price: mark,
+                    qty: exit.qty,
+                    level: u32::MAX,
+                    ref_center: mark,
+                    cycle,
+                }),
+            );
             *inventory_exit_pending = true;
             log_maker_event(MakerLogEvent {
                 output_format,
@@ -586,8 +546,16 @@ pub(super) async fn maker_cycle(
 
     // 5. Telemetry uses exact ledger fills in live mode and simulated fills
     // in paper mode; never infer a fill from a position delta.
-    let two_sided = resting.iter().any(|r| r.side == OrderSide::Buy)
-        && resting.iter().any(|r| r.side == OrderSide::Sell);
+    let final_resting = if live {
+        account_projection
+            .as_deref()
+            .map(|projection| projection.resting_quotes())
+            .unwrap_or_default()
+    } else {
+        resting.clone()
+    };
+    let two_sided = final_resting.iter().any(|r| r.side == OrderSide::Buy)
+        && final_resting.iter().any(|r| r.side == OrderSide::Sell);
     stats.end_cycle(position, two_sided);
 
     // 6. Emit.
