@@ -1,7 +1,6 @@
 use super::ledger::{adopt_order, apply_rest_trade};
-use super::model::{
-    is_current_run_order, is_maker_order, position_for_symbol, signed_position_quantity,
-};
+use super::model::{is_current_run_order, is_maker_order, position_for_symbol};
+use super::pipeline::{fetch_account_audit, AccountAudit};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{MakerFill, MakerLedger, MakerStats};
@@ -134,19 +133,18 @@ pub(super) async fn reconcile_ledger_snapshot(
     stats: &mut MakerStats,
 ) -> Result<(f64, Vec<MakerFill>)> {
     let now = chrono::Utc::now().timestamp();
-    let (orders, filled_orders, trades, positions) = tokio::join!(
-        client.get_open_orders(Some(request.symbol)),
-        client.get_order_history(Some(request.symbol), Some(100)),
-        client.get_user_trades(request.symbol, request.session_started_at, now, Some(500)),
-        client.get_positions(Some(request.symbol)),
-    );
-    let orders = orders?;
-    let filled_orders = filled_orders?;
-    for order in orders.iter().chain(filled_orders.iter()) {
+    let audit =
+        fetch_account_audit(client, request.symbol, request.session_started_at, now).await?;
+    let AccountAudit {
+        open_orders,
+        positions,
+        filled_orders,
+        trades,
+    } = audit;
+    for order in open_orders.iter().chain(filled_orders.iter()) {
         adopt_order(ledger, order, request.run_order_prefix)?;
     }
-    let trades = trades?;
-    let observed = position_for_symbol(&positions?, request.symbol)?;
+    let observed = position_for_symbol(&positions, request.symbol)?;
     recover_current_run_order_ids_for_reconciliation(
         client,
         &trades,
@@ -356,17 +354,9 @@ pub(super) fn validate_reconnect_snapshot(
         ));
     }
 
-    let mut position = 0.0;
-    for item in positions
-        .iter()
-        .filter(|position| position.symbol.eq_ignore_ascii_case(symbol))
-    {
-        position += signed_position_quantity(&item.qty, item.side).map_err(|error| {
-            anyhow::anyhow!(
-                "reconnect reconciliation found invalid position qty on {symbol}: {error}"
-            )
-        })?;
-    }
+    let position = position_for_symbol(positions, symbol).map_err(|error| {
+        anyhow::anyhow!("reconnect reconciliation found invalid position on {symbol}: {error}")
+    })?;
 
     let maker_filled_order_ids = filled_orders
         .iter()
@@ -413,19 +403,14 @@ async fn query_reconnect_snapshot(
     run_order_prefix: &str,
 ) -> Result<ReconnectSnapshot> {
     let now = chrono::Utc::now().timestamp();
-    let (open_orders, positions, filled_orders, trades) = tokio::join!(
-        client.get_open_orders(Some(symbol)),
-        client.get_positions(Some(symbol)),
-        client.get_order_history(Some(symbol), Some(100)),
-        client.get_user_trades(symbol, session_started_at, now, Some(500)),
-    );
+    let audit = fetch_account_audit(client, symbol, session_started_at, now).await?;
     validate_reconnect_snapshot(
         symbol,
         run_order_prefix,
-        &open_orders?,
-        &positions?,
-        &filled_orders?,
-        &trades?,
+        &audit.open_orders,
+        &audit.positions,
+        &audit.filled_orders,
+        &audit.trades,
     )
 }
 

@@ -79,6 +79,15 @@ pub fn panic_webhook_body(format: AlertWebhookFormat, text: &str) -> serde_json:
 /// locked until it has been supervised-tested against production.
 const LIVE_MAKER_ENV: &str = "STANDX_ENABLE_LIVE_MAKER";
 
+/// REST history depth for ledger sync and reconciliation snapshots. Shared by
+/// every account-audit fan-out and the ledger-sync telemetry so the reported
+/// limits cannot drift from the ones actually queried.
+const ORDER_HISTORY_LIMIT: u32 = 100;
+const TRADE_LOOKBACK_LIMIT: u32 = 500;
+/// Look-back window for the startup ledger baseline (adopts existing inventory
+/// at the session boundary).
+const LEDGER_HISTORY_WINDOW_SECS: i64 = 24 * 60 * 60;
+
 /// Warn when the JWT has under 2h of life left; escalate under 15m. Token
 /// lifetime caps run duration (there is no renewal endpoint), so an operator
 /// needs lead time to re-authenticate before the bot halts.

@@ -354,20 +354,12 @@ fn market_update_requires_replan(
     refresh_bps: f64,
     max_divergence_bps: f64,
 ) -> bool {
-    if maker::bps_diff(mark, previous_mark) > refresh_bps {
-        return true;
-    }
-    if matches!((best_bid, best_ask), (Some(bid), Some(ask)) if bid >= ask) {
-        return true;
-    }
-    if maker::resting_quotes_would_cross(resting, best_bid, best_ask) {
-        return true;
-    }
-    matches!(
-        (best_bid, best_ask),
-        (Some(bid), Some(ask))
-            if maker::mark_mid_divergence_bps(mark, bid, ask) > max_divergence_bps
-    )
+    // Crossed book and mark/mid divergence share the exact skip rules the
+    // strategy applies in preflight_cycle; route through the same predicate so
+    // the replan trigger cannot drift from it.
+    maker::bps_diff(mark, previous_mark) > refresh_bps
+        || maker::touch_skip(mark, best_bid, best_ask, max_divergence_bps).is_some()
+        || maker::resting_quotes_would_cross(resting, best_bid, best_ask)
 }
 
 fn apply_account_event(
@@ -789,12 +781,17 @@ pub(super) async fn run_maker(
         // submitted. Existing inventory is adopted at the current mark, so
         // maker-session PnL starts at zero while account upnl remains intact.
         let history_to = chrono::Utc::now().timestamp();
-        let history_from = history_to.saturating_sub(24 * 60 * 60);
+        let history_from = history_to.saturating_sub(LEDGER_HISTORY_WINDOW_SECS);
         let (positions, startup_market, filled_orders, historical_trades, balance) = tokio::join!(
             client.get_positions(Some(&symbol)),
             market_snapshot(&client, &symbol, None),
-            client.get_order_history(Some(&symbol), Some(100)),
-            client.get_user_trades(&symbol, history_from, history_to, Some(500)),
+            client.get_order_history(Some(&symbol), Some(ORDER_HISTORY_LIMIT)),
+            client.get_user_trades(
+                &symbol,
+                history_from,
+                history_to,
+                Some(TRADE_LOOKBACK_LIMIT)
+            ),
             client.get_balance(),
         );
         let positions = positions?;
