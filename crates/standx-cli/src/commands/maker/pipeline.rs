@@ -3,6 +3,7 @@ use anyhow::Result;
 use standx_maker::{
     MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, RestingQuote, VolBreaker,
 };
+use standx_sdk::account_stream::AccountStreamHealth;
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, Order, Position, Trade};
 use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
@@ -31,6 +32,7 @@ pub(super) struct CycleRequest<'a> {
     pub(super) output_format: OutputFormat,
     pub(super) order_commands: Option<&'a OrderCommandSender>,
     pub(super) order_response_health: Option<&'a OrderResponseHealth>,
+    pub(super) account_stream_health: Option<&'a AccountStreamHealth>,
 }
 
 pub(super) struct CycleState<'a> {

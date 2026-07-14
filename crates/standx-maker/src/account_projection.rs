@@ -10,6 +10,8 @@ use standx_sdk::models::OrderSide;
 use std::collections::HashMap;
 use std::fmt;
 
+pub const MAX_PENDING_ORDER_REQUESTS: usize = 256;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectionPendingPlace {
     pub request_id: String,
@@ -31,6 +33,46 @@ pub struct ProjectionPendingCancel {
     pub price: f64,
     pub cycle: u64,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectionPendingRequest {
+    Place(ProjectionPendingPlace),
+    Cancel(ProjectionPendingCancel),
+}
+
+impl ProjectionPendingRequest {
+    pub fn request_id(&self) -> &str {
+        match self {
+            Self::Place(pending) => &pending.request_id,
+            Self::Cancel(pending) => &pending.request_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionRegistryError {
+    Capacity { limit: usize },
+    DuplicateRequestId { request_id: String },
+}
+
+impl fmt::Display for ProjectionRegistryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Capacity { limit } => write!(
+                formatter,
+                "order-response request registry reached its limit of {limit}"
+            ),
+            Self::DuplicateRequestId { request_id } => {
+                write!(
+                    formatter,
+                    "duplicate order-response request ID {request_id}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProjectionRegistryError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectedOrder {
@@ -86,6 +128,7 @@ pub struct OrderObservation {
 pub enum AccountProjectionEvent {
     AdvanceCycle { cycle: u64 },
     PlaceSubmitted(ProjectionPendingPlace),
+    PlaceAccepted { request_id: String },
     PlaceRejected { request_id: String },
     CancelSubmitted(ProjectionPendingCancel),
     CancelResolved { request_id: String },
@@ -95,12 +138,13 @@ pub enum AccountProjectionEvent {
     BalanceObserved(ProjectedBalance),
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectionOutcome {
     pub applied: bool,
     pub order_changed: bool,
     pub position_changed: bool,
     pub unknown_current_run_order: bool,
+    pub request_registry_error: Option<ProjectionRegistryError>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -152,6 +196,7 @@ pub struct MakerAccountProjection {
     orders: HashMap<u64, ProjectedOrder>,
     pending_places: Vec<ProjectionPendingPlace>,
     pending_cancels: Vec<ProjectionPendingCancel>,
+    pending_requests: Vec<ProjectionPendingRequest>,
     observed_position: f64,
     raw_balances: HashMap<(String, String), ProjectedBalance>,
 }
@@ -164,6 +209,7 @@ impl MakerAccountProjection {
             orders: HashMap::new(),
             pending_places: Vec::new(),
             pending_cancels: Vec::new(),
+            pending_requests: Vec::new(),
             observed_position: position,
             raw_balances: HashMap::new(),
         }
@@ -178,6 +224,7 @@ impl MakerAccountProjection {
         self.orders.clear();
         self.pending_places.clear();
         self.pending_cancels.clear();
+        self.pending_requests.clear();
         self.observed_position = position;
         self.raw_balances.clear();
     }
@@ -186,6 +233,7 @@ impl MakerAccountProjection {
         self.orders.clear();
         self.pending_places.clear();
         self.pending_cancels.clear();
+        self.pending_requests.clear();
     }
 
     pub fn observed_position(&self) -> f64 {
@@ -209,6 +257,16 @@ impl MakerAccountProjection {
         &self.pending_cancels
     }
 
+    pub fn pending_request(&self, request_id: &str) -> Option<&ProjectionPendingRequest> {
+        self.pending_requests
+            .iter()
+            .find(|pending| pending.request_id() == request_id)
+    }
+
+    pub fn pending_request_count(&self) -> usize {
+        self.pending_requests.len()
+    }
+
     pub fn raw_balance(&self, account_type: &str, token: &str) -> Option<&ProjectedBalance> {
         self.raw_balances
             .get(&(account_type.to_owned(), token.to_owned()))
@@ -230,22 +288,49 @@ impl MakerAccountProjection {
                 }
             }
             AccountProjectionEvent::PlaceSubmitted(pending) => {
+                if let Err(error) =
+                    self.register_request(ProjectionPendingRequest::Place(pending.clone()))
+                {
+                    return ProjectionOutcome {
+                        request_registry_error: Some(error),
+                        ..ProjectionOutcome::default()
+                    };
+                }
                 self.pending_places.push(pending);
                 ProjectionOutcome {
                     applied: true,
                     ..ProjectionOutcome::default()
                 }
             }
+            AccountProjectionEvent::PlaceAccepted { request_id } => ProjectionOutcome {
+                applied: matches!(
+                    self.resolve_request(&request_id),
+                    Some(ProjectionPendingRequest::Place(_))
+                ),
+                ..ProjectionOutcome::default()
+            },
             AccountProjectionEvent::PlaceRejected { request_id } => {
+                let resolved = matches!(
+                    self.resolve_request(&request_id),
+                    Some(ProjectionPendingRequest::Place(_))
+                );
                 let before = self.pending_places.len();
                 self.pending_places
                     .retain(|pending| pending.request_id != request_id);
                 ProjectionOutcome {
-                    applied: before != self.pending_places.len(),
+                    applied: resolved || before != self.pending_places.len(),
                     ..ProjectionOutcome::default()
                 }
             }
             AccountProjectionEvent::CancelSubmitted(pending) => {
+                if let Err(error) =
+                    self.register_request(ProjectionPendingRequest::Cancel(pending.clone()))
+                {
+                    return ProjectionOutcome {
+                        request_registry_error: Some(error),
+                        ..ProjectionOutcome::default()
+                    };
+                }
                 self.orders.remove(&pending.order_id);
                 self.pending_cancels.push(pending);
                 ProjectionOutcome {
@@ -255,12 +340,19 @@ impl MakerAccountProjection {
                 }
             }
             AccountProjectionEvent::CancelResolved { request_id } => {
+                let resolved = matches!(
+                    self.resolve_request(&request_id),
+                    Some(ProjectionPendingRequest::Cancel(_))
+                );
                 let Some(index) = self
                     .pending_cancels
                     .iter()
                     .position(|pending| pending.request_id == request_id)
                 else {
-                    return ProjectionOutcome::default();
+                    return ProjectionOutcome {
+                        applied: resolved,
+                        ..ProjectionOutcome::default()
+                    };
                 };
                 let pending = self.pending_cancels.remove(index);
                 let order_changed = self.orders.remove(&pending.order_id).is_some();
@@ -309,6 +401,32 @@ impl MakerAccountProjection {
                 }
             }
         }
+    }
+
+    fn register_request(
+        &mut self,
+        pending: ProjectionPendingRequest,
+    ) -> Result<(), ProjectionRegistryError> {
+        if self.pending_request(pending.request_id()).is_some() {
+            return Err(ProjectionRegistryError::DuplicateRequestId {
+                request_id: pending.request_id().to_string(),
+            });
+        }
+        if self.pending_requests.len() >= MAX_PENDING_ORDER_REQUESTS {
+            return Err(ProjectionRegistryError::Capacity {
+                limit: MAX_PENDING_ORDER_REQUESTS,
+            });
+        }
+        self.pending_requests.push(pending);
+        Ok(())
+    }
+
+    fn resolve_request(&mut self, request_id: &str) -> Option<ProjectionPendingRequest> {
+        let index = self
+            .pending_requests
+            .iter()
+            .position(|pending| pending.request_id() == request_id)?;
+        Some(self.pending_requests.remove(index))
     }
 
     fn observe_order(&mut self, observation: OrderObservation) -> ProjectionOutcome {
@@ -579,6 +697,59 @@ mod tests {
                 .applied
         );
         assert!(state.resting_quotes().is_empty());
+    }
+
+    #[test]
+    fn late_place_ack_matches_after_account_order_is_already_terminal() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.0, true)));
+        assert!(state.pending_places().is_empty());
+        assert!(matches!(
+            state.pending_request("p1"),
+            Some(ProjectionPendingRequest::Place(_))
+        ));
+
+        let outcome = state.apply(
+            1,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_string(),
+            },
+        );
+        assert!(outcome.applied);
+        assert_eq!(state.pending_request_count(), 0);
+    }
+
+    #[test]
+    fn request_registry_is_strictly_bounded_and_rejects_duplicates() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0);
+        for index in 0..MAX_PENDING_ORDER_REQUESTS {
+            let outcome = state.apply(
+                1,
+                AccountProjectionEvent::PlaceSubmitted(pending(&format!("p{index}"))),
+            );
+            assert!(outcome.request_registry_error.is_none());
+        }
+        assert_eq!(state.pending_request_count(), MAX_PENDING_ORDER_REQUESTS);
+
+        let overflow = state.apply(
+            1,
+            AccountProjectionEvent::PlaceSubmitted(pending("overflow")),
+        );
+        assert!(matches!(
+            overflow.request_registry_error,
+            Some(ProjectionRegistryError::Capacity {
+                limit: MAX_PENDING_ORDER_REQUESTS
+            })
+        ));
+
+        let mut duplicate = MakerAccountProjection::new(1, PREFIX, 0.0);
+        duplicate.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("same")));
+        let outcome = duplicate.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("same")));
+        assert!(matches!(
+            outcome.request_registry_error,
+            Some(ProjectionRegistryError::DuplicateRequestId { .. })
+        ));
     }
 
     #[test]

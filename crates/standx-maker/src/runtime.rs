@@ -2,10 +2,6 @@
 
 use std::collections::VecDeque;
 
-const MAX_UNMATCHED_ORDER_RESPONSES: usize = 256;
-// Benign cancel/exit/late placement acknowledgements age out by cycle; only a
-// sustained burst of genuinely uncorrelated responses may overflow and freeze.
-const UNMATCHED_ORDER_RESPONSE_TTL_CYCLES: u64 = 8;
 const MAX_CONSECUTIVE_CYCLE_ERRORS: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +64,7 @@ pub enum MakerEvent {
     Timer,
     MarketChanged,
     CycleCompleted(WorkToken),
+    CycleInvalidated { reason: String },
     CycleFailed { token: WorkToken, reason: String },
     AccountStreamDisconnected(String),
     OrderResponseDisconnected(String),
@@ -76,8 +73,7 @@ pub enum MakerEvent {
     CleanupFailed { token: WorkToken, reason: String },
     RecoverySucceeded(WorkToken),
     RecoveryFailed { token: WorkToken, reason: String },
-    OrderResponseUnmatched { request_id: String, cycle: u64 },
-    OrderResponseMatched(String),
+    OrderResponseUnmatched { request_id: String },
     StopRequested(RuntimeStopReason),
     CtrlC,
 }
@@ -106,7 +102,6 @@ pub struct MakerState {
     recovery_target: Option<RecoveryTarget>,
     replan_requested: bool,
     consecutive_cycle_errors: u32,
-    unmatched_order_responses: VecDeque<(u64, String)>,
     effects: VecDeque<MakerEffect>,
 }
 
@@ -119,7 +114,6 @@ impl MakerState {
             recovery_target: None,
             replan_requested: false,
             consecutive_cycle_errors: 0,
-            unmatched_order_responses: VecDeque::new(),
             effects: VecDeque::new(),
         }
     }
@@ -184,6 +178,9 @@ impl MakerState {
                 }
                 effects
             }
+            MakerEvent::CycleInvalidated { reason } => {
+                self.freeze(reason, RecoveryTarget::PositionReconciliation)
+            }
             MakerEvent::CycleFailed { token, reason } => {
                 if !self.matches_in_flight(token, WorkKind::Cycle) {
                     return Vec::new();
@@ -241,7 +238,6 @@ impl MakerState {
                 }
                 self.in_flight = None;
                 self.recovery_target = None;
-                self.unmatched_order_responses.clear();
                 self.consecutive_cycle_errors = 0;
                 self.phase = RuntimePhase::Ready;
                 self.request_cycle()
@@ -257,31 +253,10 @@ impl MakerState {
                 };
                 self.stop(stop)
             }
-            MakerEvent::OrderResponseUnmatched { request_id, cycle } => {
-                self.unmatched_order_responses
-                    .push_back((cycle, request_id));
-                self.unmatched_order_responses.retain(|(seen, _)| {
-                    cycle.saturating_sub(*seen) <= UNMATCHED_ORDER_RESPONSE_TTL_CYCLES
-                });
-                if self.unmatched_order_responses.len() > MAX_UNMATCHED_ORDER_RESPONSES {
-                    self.freeze(
-                        "unmatched order-response buffer overflow".to_string(),
-                        RecoveryTarget::OrderResponse,
-                    )
-                } else {
-                    Vec::new()
-                }
-            }
-            MakerEvent::OrderResponseMatched(request_id) => {
-                if let Some(index) = self
-                    .unmatched_order_responses
-                    .iter()
-                    .position(|(_, candidate)| candidate == &request_id)
-                {
-                    self.unmatched_order_responses.remove(index);
-                }
-                Vec::new()
-            }
+            MakerEvent::OrderResponseUnmatched { request_id } => self.freeze(
+                format!("unexpected order-response request ID {request_id}"),
+                RecoveryTarget::OrderResponse,
+            ),
             MakerEvent::StopRequested(reason) => self.stop(reason),
             MakerEvent::CtrlC => self.stop(RuntimeStopReason::CtrlC),
         }
@@ -310,7 +285,6 @@ impl MakerState {
         self.effects.clear();
         self.generation = self.generation.saturating_add(1);
         self.replan_requested = false;
-        self.unmatched_order_responses.clear();
         let mut effects = self.abort_effect();
         self.phase = RuntimePhase::Frozen { reason };
         self.recovery_target = Some(target);
@@ -531,16 +505,13 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_response_overflow_fails_closed() {
+    fn unmatched_response_fails_closed_immediately() {
         let mut state = MakerState::starting();
         state.handle(MakerEvent::StartupReady);
         let _ = next_cycle(&mut state);
-        for index in 0..=MAX_UNMATCHED_ORDER_RESPONSES {
-            state.handle(MakerEvent::OrderResponseUnmatched {
-                request_id: index.to_string(),
-                cycle: 0,
-            });
-        }
+        state.handle(MakerEvent::OrderResponseUnmatched {
+            request_id: "unknown".to_string(),
+        });
         assert!(state.is_frozen());
         assert!(matches!(
             state.next_effect(),
@@ -556,19 +527,26 @@ mod tests {
     }
 
     #[test]
-    fn benign_unmatched_responses_decay_over_a_long_session() {
+    fn invalidated_cycle_aborts_cleans_up_and_rejects_stale_completion() {
         let mut state = MakerState::starting();
         state.handle(MakerEvent::StartupReady);
-        let _ = next_cycle(&mut state);
-        for cycle in 0..10_000u64 {
-            for seq in 0..4 {
-                state.handle(MakerEvent::OrderResponseUnmatched {
-                    request_id: format!("cycle-{cycle}-{seq}"),
-                    cycle,
-                });
-            }
-            assert!(!state.is_frozen(), "froze at cycle {cycle}");
-        }
-        assert!(state.unmatched_order_responses.len() <= MAX_UNMATCHED_ORDER_RESPONSES);
+        let token = next_cycle(&mut state);
+        state.handle(MakerEvent::CycleInvalidated {
+            reason: "account state changed during cycle".to_string(),
+        });
+        assert_eq!(state.generation(), token.generation + 1);
+        assert_eq!(state.next_effect(), Some(MakerEffect::AbortInFlight(token)));
+        assert!(matches!(
+            state.next_effect(),
+            Some(MakerEffect::Cleanup {
+                target: RecoveryTarget::PositionReconciliation,
+                ..
+            })
+        ));
+        assert_eq!(state.consecutive_cycle_errors, 0);
+
+        state.handle(MakerEvent::CycleCompleted(token));
+        assert!(state.next_effect().is_none());
+        assert!(matches!(state.phase(), RuntimePhase::Frozen { .. }));
     }
 }
