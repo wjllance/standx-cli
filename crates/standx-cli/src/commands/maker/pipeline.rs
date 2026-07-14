@@ -1,3 +1,4 @@
+use super::{ORDER_HISTORY_LIMIT, TRADE_LOOKBACK_LIMIT};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{
@@ -138,8 +139,8 @@ pub(super) async fn fetch_account_audit(
     let (open_orders, positions, filled_orders, trades) = tokio::join!(
         client.get_open_orders(Some(symbol)),
         client.get_positions(Some(symbol)),
-        client.get_order_history(Some(symbol), Some(100)),
-        client.get_user_trades(symbol, session_started_at, now, Some(500)),
+        client.get_order_history(Some(symbol), Some(ORDER_HISTORY_LIMIT)),
+        client.get_user_trades(symbol, session_started_at, now, Some(TRADE_LOOKBACK_LIMIT)),
     );
     Ok(AccountAudit {
         open_orders: open_orders?,

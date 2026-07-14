@@ -475,9 +475,9 @@ pub(super) fn emit_ledger_sync(
                 "pnl_baseline": 0.0,
                 "historical_maker_orders": historical_orders,
                 "historical_maker_trades_ignored": historical_trades,
-                "history_window_seconds": 24 * 60 * 60,
-                "history_order_limit": 100,
-                "history_trade_limit": 500,
+                "history_window_seconds": LEDGER_HISTORY_WINDOW_SECS,
+                "history_order_limit": ORDER_HISTORY_LIMIT,
+                "history_trade_limit": TRADE_LOOKBACK_LIMIT,
                 "current_run_fills": 0,
             })
         );

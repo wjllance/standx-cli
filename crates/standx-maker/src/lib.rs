@@ -501,6 +501,29 @@ pub struct CyclePreflight {
     pub skip: Option<CycleSkip>,
 }
 
+/// The touch-level reason a two-sided book cannot be quoted, if any: a crossed
+/// book (`best_bid >= best_ask`) or mark/mid divergence beyond the limit.
+///
+/// Returns `None` for a healthy book or a one-sided/missing touch — the caller
+/// decides how to treat a missing side. Shared by [`preflight_cycle`] (which
+/// maps it to a skip) and the CLI's replan trigger so the two cannot drift.
+pub fn touch_skip(
+    mark: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
+    max_divergence_bps: f64,
+) -> Option<CycleSkip> {
+    let (best_bid, best_ask) = (best_bid?, best_ask?);
+    if best_bid >= best_ask {
+        return Some(CycleSkip::CrossedBook);
+    }
+    let divergence_bps = mark_mid_divergence_bps(mark, best_bid, best_ask);
+    if divergence_bps > max_divergence_bps {
+        return Some(CycleSkip::MarkMidDivergence { divergence_bps });
+    }
+    None
+}
+
 /// Observe volatility and validate a snapshot before account/order I/O.
 ///
 /// A skipped cycle deliberately leaves resting quotes untouched. This mirrors
@@ -513,20 +536,16 @@ pub fn preflight_cycle(
     require_full_touch: bool,
 ) -> CyclePreflight {
     let halted = breaker.observe(market.mark);
-    if let (Some(best_bid), Some(best_ask)) = (market.best_bid, market.best_ask) {
-        if best_bid >= best_ask {
-            return CyclePreflight {
-                halted,
-                skip: Some(CycleSkip::CrossedBook),
-            };
-        }
-        let divergence_bps = mark_mid_divergence_bps(market.mark, best_bid, best_ask);
-        if divergence_bps > max_divergence_bps {
-            return CyclePreflight {
-                halted,
-                skip: Some(CycleSkip::MarkMidDivergence { divergence_bps }),
-            };
-        }
+    if let Some(skip) = touch_skip(
+        market.mark,
+        market.best_bid,
+        market.best_ask,
+        max_divergence_bps,
+    ) {
+        return CyclePreflight {
+            halted,
+            skip: Some(skip),
+        };
     }
     if require_full_touch && (market.best_bid.is_none() || market.best_ask.is_none()) {
         return CyclePreflight {
