@@ -454,8 +454,11 @@ fn summary_json(trace: &ParsedTrace, result: &ReplayResult) -> serde_json::Value
         "cycles": result.cycles.len(),
         "passive_fills": performance.passive_fills,
         "passive_qty": performance.passive_qty,
+        "passive_cashflow_quote": performance.passive_cashflow_quote,
+        "passive_capture_bps": performance.passive_capture_bps,
         "exit_fills": performance.exit_fills,
         "exit_qty": performance.exit_qty,
+        "exit_cashflow_quote": performance.exit_cashflow_quote,
         "gross_spread_quote": performance.gross_spread_quote,
         "fee_quote": performance.fee_quote,
         "rebate_quote": performance.rebate_quote,
@@ -472,6 +475,10 @@ fn summary_json(trace: &ParsedTrace, result: &ReplayResult) -> serde_json::Value
         "eligible_bid_qty_ms": performance.quote_time.eligible_bid_qty_ms,
         "eligible_ask_qty_ms": performance.quote_time.eligible_ask_qty_ms,
         "eligible_total_qty_ms": performance.quote_time.eligible_total_qty_ms,
+        "inventory_observed_ms": performance.inventory_time.observed_ms,
+        "inventory_nonzero_ms": performance.inventory_time.nonzero_ms,
+        "inventory_abs_qty_ms": performance.inventory_time.abs_qty_ms,
+        "inventory_avg_abs_qty": performance.inventory_time.avg_abs_qty,
     })
 }
 

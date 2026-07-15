@@ -441,6 +441,7 @@ GROUP BY event ORDER BY events DESC''',
             query(
                 stream,
                 f'''SELECT _timestamp, passive_fills, passive_qty, exit_fills, exit_qty,
+       passive_cashflow_quote, passive_capture_bps, exit_cashflow_quote,
        gross_spread_quote, inventory_mtm_change_quote, rebate_quote, fee_quote,
        funding_quote, exit_cost_quote, net_pnl_quote, execution_costs_unavailable
 FROM "{stream}" WHERE action = 'performance_summary' AND {selected}
@@ -488,7 +489,8 @@ ORDER BY _timestamp DESC LIMIT 1''',
             query(
                 stream,
                 f'''SELECT _timestamp, time_weighted_uptime_pct, eligible_bid_qty_ms,
-       eligible_ask_qty_ms, eligible_total_qty_ms
+       eligible_ask_qty_ms, eligible_total_qty_ms, inventory_observed_ms,
+       inventory_nonzero_ms, inventory_abs_qty_ms, inventory_avg_abs_qty
 FROM "{stream}" WHERE action = 'performance_summary' AND {selected}
 ORDER BY _timestamp DESC LIMIT 1''',
                 [axis("_timestamp", "Time")],
@@ -497,6 +499,8 @@ ORDER BY _timestamp DESC LIMIT 1''',
                     axis("eligible_bid_qty_ms", "Bid qty-ms"),
                     axis("eligible_ask_qty_ms", "Ask qty-ms"),
                     axis("eligible_total_qty_ms", "Total qty-ms"),
+                    axis("inventory_nonzero_ms", "Inventory nonzero ms"),
+                    axis("inventory_abs_qty_ms", "Abs inventory qty-ms"),
                 ],
             ),
             (96, 8, 96, 8, 3),
@@ -513,7 +517,8 @@ ORDER BY _timestamp DESC LIMIT 1''',
        invalidated, process_ended, pending, reject_rate, timeout_rate,
        write_p50_ms, write_p95_ms, write_p99_ms,
        ack_p50_ms, ack_p95_ms, ack_p99_ms,
-       effective_latency_p50_ms, effective_latency_p95_ms, effective_latency_p99_ms
+       effective_latency_p50_ms, effective_latency_p95_ms, effective_latency_p99_ms,
+       fill_after_cancel_p50_ms, fill_after_cancel_p95_ms, fill_after_cancel_p99_ms
 FROM "{stream}" WHERE action = 'order_latency_summary' AND {selected}
 ORDER BY kind, _timestamp DESC LIMIT 10''',
                 [axis("kind", "Kind"), axis("_timestamp", "Time")],
