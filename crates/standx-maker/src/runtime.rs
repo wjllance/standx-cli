@@ -32,6 +32,40 @@ pub enum RecoveryTarget {
     PositionReconciliation,
 }
 
+impl RecoveryTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AccountStream => "account_stream",
+            Self::OrderResponse => "order_response",
+            Self::PositionReconciliation => "position_reconciliation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestTimeoutPhase {
+    Acknowledgement,
+    AccountOrder,
+}
+
+impl RequestTimeoutPhase {
+    /// Pure safety policy: recover the stream responsible for the missing
+    /// half of the request lifecycle.
+    pub fn recovery_target(self) -> RecoveryTarget {
+        match self {
+            Self::Acknowledgement => RecoveryTarget::OrderResponse,
+            Self::AccountOrder => RecoveryTarget::AccountStream,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Acknowledgement => "acknowledgement",
+            Self::AccountOrder => "account_order",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeStopReason {
     CtrlC,
@@ -484,6 +518,18 @@ mod tests {
             ));
             assert!(matches!(state.phase(), RuntimePhase::Ready));
         }
+    }
+
+    #[test]
+    fn request_timeout_phase_selects_the_responsible_stream() {
+        assert_eq!(
+            RequestTimeoutPhase::Acknowledgement.recovery_target(),
+            RecoveryTarget::OrderResponse
+        );
+        assert_eq!(
+            RequestTimeoutPhase::AccountOrder.recovery_target(),
+            RecoveryTarget::AccountStream
+        );
     }
 
     #[test]

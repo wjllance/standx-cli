@@ -4,6 +4,7 @@
 //! process-local origin. UTC milliseconds are retained only for correlation;
 //! durations never use wall-clock time.
 
+use crate::runtime::RequestTimeoutPhase;
 use standx_sdk::models::OrderSide;
 use std::collections::HashMap;
 use std::fmt;
@@ -46,6 +47,9 @@ pub struct LatencyRequest {
     pub written_ms: Option<u64>,
     pub ack_ms: Option<u64>,
     pub effective_ms: Option<u64>,
+    pub timeout_phase: Option<RequestTimeoutPhase>,
+    /// Monotonic duration from intent to timeout, not a wall-clock timestamp.
+    pub timeout_ms: Option<u64>,
     pub outcome: Option<LatencyRequestOutcome>,
     pub fill_after_cancel_ms: Vec<u64>,
 }
@@ -173,6 +177,8 @@ impl OrderLatencyTracker {
                 written_ms: None,
                 ack_ms: None,
                 effective_ms: None,
+                timeout_phase: None,
+                timeout_ms: None,
                 outcome: None,
                 fill_after_cancel_ms: Vec::new(),
             },
@@ -221,7 +227,16 @@ impl OrderLatencyTracker {
                     detail: "rejection observed after request became effective",
                 });
             }
-            request.outcome = Some(LatencyRequestOutcome::Rejected);
+            if !matches!(
+                request.outcome,
+                Some(
+                    LatencyRequestOutcome::Timeout
+                        | LatencyRequestOutcome::Invalidated
+                        | LatencyRequestOutcome::ProcessEnded
+                )
+            ) {
+                request.outcome = Some(LatencyRequestOutcome::Rejected);
+            }
         }
         request.ack_ms = Some(at_ms);
         Ok(())
@@ -260,7 +275,63 @@ impl OrderLatencyTracker {
     }
 
     pub fn mark_timeout(&mut self, request_id: &str, at_ms: u64) -> Result<(), LatencyError> {
-        self.mark_terminal(request_id, at_ms, LatencyRequestOutcome::Timeout)
+        let phase = {
+            let request = self.request_mut(request_id, at_ms)?;
+            if request.ack_ms.is_none() {
+                RequestTimeoutPhase::Acknowledgement
+            } else {
+                RequestTimeoutPhase::AccountOrder
+            }
+        };
+        self.mark_timeout_phase(request_id, phase, at_ms)
+    }
+
+    /// Record the exact missing lifecycle stage before recovery invalidates
+    /// the request generation. A missing acknowledgement remains a timeout
+    /// even if account effectiveness arrived first; late stages stay
+    /// attachable without rewriting the timeout outcome.
+    pub fn mark_timeout_phase(
+        &mut self,
+        request_id: &str,
+        phase: RequestTimeoutPhase,
+        at_ms: u64,
+    ) -> Result<(), LatencyError> {
+        let request = self.request_mut(request_id, at_ms)?;
+        if request.timeout_phase.is_some() {
+            return Err(duplicate_stage(request_id, "timeout"));
+        }
+        match phase {
+            RequestTimeoutPhase::Acknowledgement if request.ack_ms.is_some() => {
+                return Err(LatencyError::InvalidTransition {
+                    request_id: request_id.to_string(),
+                    detail: "acknowledgement timeout requires a missing ack",
+                });
+            }
+            RequestTimeoutPhase::AccountOrder if request.effective_ms.is_some() => {
+                return Err(LatencyError::InvalidTransition {
+                    request_id: request_id.to_string(),
+                    detail: "account-order timeout requires missing effectiveness",
+                });
+            }
+            _ => {}
+        }
+        if matches!(
+            request.outcome,
+            Some(
+                LatencyRequestOutcome::Rejected
+                    | LatencyRequestOutcome::Invalidated
+                    | LatencyRequestOutcome::ProcessEnded
+            )
+        ) {
+            return Err(LatencyError::InvalidTransition {
+                request_id: request_id.to_string(),
+                detail: "request already has an incompatible terminal outcome",
+            });
+        }
+        request.timeout_phase = Some(phase);
+        request.timeout_ms = Some(at_ms - request.context.intent_ms);
+        request.outcome = Some(LatencyRequestOutcome::Timeout);
+        Ok(())
     }
 
     pub fn mark_invalidated(&mut self, request_id: &str, at_ms: u64) -> Result<(), LatencyError> {
@@ -660,6 +731,51 @@ mod tests {
                 ("recent", None),
             ]
         );
+        let old = tracker
+            .requests()
+            .find(|request| request.context.request_id == "old")
+            .unwrap();
+        assert_eq!(old.timeout_phase, Some(RequestTimeoutPhase::AccountOrder));
+        assert_eq!(old.timeout_ms, Some(100));
+    }
+
+    #[test]
+    fn ack_timeout_overrides_effective_outcome_but_preserves_late_stages() {
+        let mut tracker = OrderLatencyTracker::default();
+        tracker
+            .register(context("account-first", LatencyRequestKind::Place, 100))
+            .unwrap();
+        tracker.mark_written("account-first", 110).unwrap();
+        tracker.mark_effective("account-first", 125).unwrap();
+
+        tracker
+            .mark_timeout_phase("account-first", RequestTimeoutPhase::Acknowledgement, 200)
+            .unwrap();
+        tracker.mark_ack("account-first", 220, true).unwrap();
+
+        let request = tracker.requests().next().unwrap();
+        assert_eq!(request.outcome, Some(LatencyRequestOutcome::Timeout));
+        assert_eq!(
+            request.timeout_phase,
+            Some(RequestTimeoutPhase::Acknowledgement)
+        );
+        assert_eq!(request.timeout_ms, Some(100));
+        assert_eq!(request.effective_ms, Some(125));
+        assert_eq!(request.ack_ms, Some(220));
+    }
+
+    #[test]
+    fn account_order_timeout_requires_missing_effectiveness() {
+        let mut tracker = OrderLatencyTracker::default();
+        tracker
+            .register(context("effective", LatencyRequestKind::Place, 100))
+            .unwrap();
+        tracker.mark_effective("effective", 125).unwrap();
+
+        assert!(matches!(
+            tracker.mark_timeout_phase("effective", RequestTimeoutPhase::AccountOrder, 200,),
+            Err(LatencyError::InvalidTransition { .. })
+        ));
     }
 
     #[test]

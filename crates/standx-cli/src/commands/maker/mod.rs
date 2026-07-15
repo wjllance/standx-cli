@@ -41,7 +41,10 @@ use model::{is_maker_order, position_for_symbol, MakerExit};
 pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 #[cfg(test)]
 use notify::webhook_body;
-use notify::{token_expiry_level, MakerNotifier, PositionChange, RiskNotice, TokenExpiryLevel};
+use notify::{
+    token_expiry_level, MakerNotifier, PositionChange, RequestTimeoutNotice, RiskNotice,
+    TokenExpiryLevel,
+};
 use pipeline::{
     CycleRequest, CycleState, LiveAccountPollState, OrderRequestDeadlines, TimedOutOrderRequest,
 };

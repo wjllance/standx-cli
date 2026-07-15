@@ -3,7 +3,7 @@ use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{
     MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, OrderLatencyTracker,
-    RestingQuote, VolBreaker,
+    RequestTimeoutPhase, RestingQuote, VolBreaker,
 };
 use standx_sdk::account_stream::AccountStreamHealth;
 use standx_sdk::client::StandXClient;
@@ -34,21 +34,6 @@ impl OrderRequestKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum OrderRequestTimeoutPhase {
-    Acknowledgement,
-    AccountOrder,
-}
-
-impl OrderRequestTimeoutPhase {
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Self::Acknowledgement => "acknowledgement",
-            Self::AccountOrder => "account_order",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct TrackedOrderRequest {
     kind: OrderRequestKind,
@@ -59,7 +44,7 @@ struct TrackedOrderRequest {
 pub(super) struct TimedOutOrderRequest {
     pub(super) request_id: String,
     pub(super) kind: OrderRequestKind,
-    pub(super) phase: OrderRequestTimeoutPhase,
+    pub(super) phase: RequestTimeoutPhase,
     pub(super) age: Duration,
 }
 
@@ -114,9 +99,9 @@ impl OrderRequestDeadlines {
                 request_id: request_id.clone(),
                 kind: request.kind,
                 phase: if projection.pending_request(request_id).is_some() {
-                    OrderRequestTimeoutPhase::Acknowledgement
+                    RequestTimeoutPhase::Acknowledgement
                 } else {
-                    OrderRequestTimeoutPhase::AccountOrder
+                    RequestTimeoutPhase::AccountOrder
                 },
                 age,
             })
@@ -384,7 +369,7 @@ mod tests {
                 .timed_out(&projection, submitted_at + timeout, timeout)
                 .unwrap()
                 .phase,
-            OrderRequestTimeoutPhase::Acknowledgement
+            RequestTimeoutPhase::Acknowledgement
         );
 
         projection.apply(
@@ -398,7 +383,7 @@ mod tests {
                 .timed_out(&projection, submitted_at + timeout, timeout)
                 .unwrap()
                 .phase,
-            OrderRequestTimeoutPhase::AccountOrder
+            RequestTimeoutPhase::AccountOrder
         );
 
         projection.apply(1, AccountProjectionEvent::OrderObserved(observed_order()));
@@ -424,7 +409,7 @@ mod tests {
             .timed_out(&projection, submitted_at + timeout, timeout)
             .unwrap();
         assert_eq!(timed_out.kind, OrderRequestKind::Place);
-        assert_eq!(timed_out.phase, OrderRequestTimeoutPhase::Acknowledgement);
+        assert_eq!(timed_out.phase, RequestTimeoutPhase::Acknowledgement);
     }
 
     #[test]

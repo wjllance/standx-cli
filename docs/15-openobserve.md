@@ -174,6 +174,22 @@ ORDER BY events DESC;
 python3 scripts/openobserve_query.py --hours 24
 ```
 
+订单请求超时可以按 request 直接关联冻结告警、恢复目标和停机延迟记录：
+
+```sql
+SELECT _timestamp, action, event, request_id, request_kind, timeout_phase,
+       age_ms, timeout_ms, recovery_target, outcome, message
+FROM "standx_maker"
+WHERE run_id = '<run_id>'
+  AND ((action = 'risk_notification' AND kind = 'order_request_timeout')
+       OR action = 'order_latency')
+ORDER BY _timestamp ASC;
+```
+
+`timeout_phase=acknowledgement` 应选择 `recovery_target=order_response`；
+`timeout_phase=account_order` 应选择 `recovery_target=account_stream`。两者都必须先出现冻结/清理，
+通过空簿与仓位对账后才能恢复 placement。
+
 ### 4.1 Maker WebSocket 事故排查手册
 
 先用 `run_id` 重建事件顺序，再判断是行情缓存新鲜度、账户流还是订单回报流问题；不要只

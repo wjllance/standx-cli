@@ -380,6 +380,7 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
             query(
                 stream,
                 f'''SELECT _timestamp, action, kind, severity, event, side, price, qty,
+       request_id, request_kind, timeout_phase, recovery_target, age_ms, timeout_ms,
        position_delta, expected_position, observed_position, reason, message
 FROM "{stream}" WHERE {selected}
   AND action IN ('fill', 'cancel', 'alert', 'risk_notification', 'maker_cleanup', 'inventory_exit',
@@ -388,8 +389,8 @@ FROM "{stream}" WHERE {selected}
                  'startup_rejected', 'lifecycle', 'performance_summary',
                  'order_latency', 'order_latency_summary')
 ORDER BY _timestamp DESC LIMIT 200''',
-                [axis("_timestamp", "Time"), axis("action", "Action"), axis("kind", "Kind"), axis("severity", "Severity"), axis("event", "Event"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
-                [axis("price", "Price"), axis("qty", "Qty"), axis("position_delta", "Position Delta"), axis("expected_position", "Expected Position"), axis("observed_position", "Observed Position")],
+                [axis("_timestamp", "Time"), axis("action", "Action"), axis("kind", "Kind"), axis("severity", "Severity"), axis("event", "Event"), axis("request_id", "Request"), axis("request_kind", "Request Kind"), axis("timeout_phase", "Timeout Phase"), axis("recovery_target", "Recovery Target"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
+                [axis("price", "Price"), axis("qty", "Qty"), axis("age_ms", "Age"), axis("timeout_ms", "Timeout"), axis("position_delta", "Position Delta"), axis("expected_position", "Expected Position"), axis("observed_position", "Observed Position")],
             ),
             (0, 15, 192, 12, 5),
             decimals=None,
@@ -542,7 +543,7 @@ ORDER BY kind, _timestamp DESC LIMIT 10''',
             query(
                 stream,
                 f'''SELECT _timestamp, request_id, kind, generation, cycle, symbol, side, level,
-       market_source, recovery, outcome, place_write_ms, place_ack_ms,
+       market_source, recovery, outcome, timeout_phase, timeout_ms, place_write_ms, place_ack_ms,
        place_effective_ms, cancel_write_ms, cancel_ack_ms, cancel_effective_ms,
        fill_after_cancel_ms
 FROM "{stream}" WHERE action = 'order_latency' AND {selected}
@@ -552,8 +553,10 @@ ORDER BY _timestamp DESC LIMIT 200''',
                     axis("request_id", "Request"),
                     axis("kind", "Kind"),
                     axis("outcome", "Outcome"),
+                    axis("timeout_phase", "Timeout Phase"),
                 ],
                 [
+                    axis("timeout_ms", "Timeout"),
                     axis("place_ack_ms", "Place ack"),
                     axis("place_effective_ms", "Place effective"),
                     axis("cancel_ack_ms", "Cancel ack"),
@@ -660,7 +663,7 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC, kind LIMIT 100''',
     ]
 
     return {
-        "version": 9,
+        "version": 10,
         "dashboardId": "",
         "title": DASHBOARD_TITLE,
         "description": "Maker paper/live validation: uptime, fills, maker-session PnL, authenticated account-stream health, position jumps, reconciliation, cleanup, volatility breaker, and inventory exit evidence.",
