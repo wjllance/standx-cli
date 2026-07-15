@@ -4,6 +4,9 @@ use super::pipeline::{fetch_account_audit, AccountAudit};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{MakerFill, MakerLedger, MakerStats};
+use standx_sdk::account_stream::{
+    AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,
+};
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Order, Position, Trade};
 use standx_sdk::order_response::{
@@ -411,6 +414,88 @@ async fn query_reconnect_snapshot(
         &audit.positions,
         &audit.filled_orders,
         &audit.trades,
+    )
+}
+
+/// The live halves of a freshly authenticated account stream.
+pub(super) type AccountStreamConnection = (
+    tokio::sync::mpsc::Receiver<AccountEvent>,
+    AccountStreamHealth,
+    tokio::task::JoinHandle<()>,
+);
+
+/// Terminal outcome of the account-stream reconnect loop, mirroring the
+/// order-response reconnect: either a live connection, an operator Ctrl+C, or
+/// the attempt budget exhausted.
+pub(super) enum AccountStreamReconnect {
+    Connected(AccountStreamConnection),
+    Interrupted,
+    Exhausted(String),
+}
+
+/// Reconnect the authenticated account stream with bounded attempts and
+/// exponential backoff, both interruptible by Ctrl+C. Bumps `epoch` and
+/// `attempts_used` in place so the caller's projection reset and budget stay in
+/// sync. The maker book is already cancelled by the completed cleanup, so
+/// aborting the waits on Ctrl+C is safe. Symmetric with
+/// [`reconnect_order_response`]; the caller owns the post-connect event
+/// application and REST reconciliation (account-stream-specific).
+pub(super) async fn reconnect_account_stream(
+    epoch: &mut u64,
+    attempts_used: &mut u32,
+    max_attempts: u32,
+    backoff_secs: u64,
+    ctrl_c: &mut tokio::sync::watch::Receiver<bool>,
+) -> AccountStreamReconnect {
+    let mut last_connect_error: Option<String> = None;
+    while *attempts_used < max_attempts {
+        *attempts_used += 1;
+        let attempt = *attempts_used;
+        *epoch = epoch.saturating_add(1);
+        let connect_epoch = *epoch;
+        let reconnect = async {
+            let stream = AccountStream::new(connect_epoch)?;
+            stream
+                .connect(&[
+                    AccountChannel::Order,
+                    AccountChannel::Position,
+                    AccountChannel::Trade,
+                    AccountChannel::Balance,
+                ])
+                .await
+                .map_err(anyhow::Error::from)
+        };
+        let connect_attempt = tokio::select! {
+            biased;
+            _ = ctrl_c_latched(ctrl_c) => None,
+            result = tokio::time::timeout(Duration::from_secs(15), reconnect) => Some(result),
+        };
+        let Some(connect_attempt) = connect_attempt else {
+            return AccountStreamReconnect::Interrupted;
+        };
+        match connect_attempt {
+            Ok(Ok(triple)) => return AccountStreamReconnect::Connected(triple),
+            Ok(Err(error)) => last_connect_error = Some(format!("connect failed: {error}")),
+            Err(_) => last_connect_error = Some("connect timed out after 15 seconds".to_string()),
+        }
+        eprintln!(
+            "⚠️  account stream reconnect attempt {}/{} failed: {}",
+            attempt,
+            max_attempts,
+            last_connect_error.as_deref().unwrap_or("unknown error")
+        );
+        if attempt < max_attempts {
+            let multiplier = 1_u32 << attempt.saturating_sub(1).min(4);
+            let backoff = Duration::from_secs(backoff_secs).saturating_mul(multiplier);
+            tokio::select! {
+                biased;
+                _ = ctrl_c_latched(ctrl_c) => return AccountStreamReconnect::Interrupted,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+        }
+    }
+    AccountStreamReconnect::Exhausted(
+        last_connect_error.unwrap_or_else(|| "no attempts available".to_string()),
     )
 }
 
