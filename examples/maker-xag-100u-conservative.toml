@@ -34,7 +34,7 @@ vol_window = 20
 
 # Supervised active inventory exit (production-tested tuple, do not scale
 # without re-validation)
-inventory_exit_pct = 25.0
+inventory_exit_pct = 50.0
 inventory_exit_qty = 0.2
 
 # Financial brakes: alert at 2% of the account, hard-stop at 4%. stop_loss
