@@ -1079,4 +1079,201 @@ mod tests {
         assert_eq!(ledger.expected_position, 0.0);
         assert!((snapshot.position - ledger.expected_position).abs() > 0.0005);
     }
+
+    struct JwtGuard {
+        original: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl JwtGuard {
+        fn set() -> Self {
+            // Share the crate-wide env lock so this STANDX_JWT mutation cannot
+            // race env reads in other modules' tests. See crate::TEST_ENV_LOCK.
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var("STANDX_JWT").ok();
+            std::env::set_var("STANDX_JWT", "recovery-test-jwt");
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for JwtGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var("STANDX_JWT", value),
+                None => std::env::remove_var("STANDX_JWT"),
+            }
+        }
+    }
+
+    /// Mocks the four REST reads behind `fetch_account_audit` with the given
+    /// audit content and returns the server (kept alive by the caller).
+    async fn mock_audit_endpoints(
+        open_orders: &[Order],
+        positions: &[Position],
+        filled_orders: &[Order],
+        trades: &[Trade],
+    ) -> (mockito::ServerGuard, StandXClient) {
+        use mockito::{Matcher, Server};
+        let mut server = Server::new_async().await;
+        let wrapped = |items: String| format!(r#"{{"code":0,"message":"ok","result":{items}}}"#);
+        server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(wrapped(serde_json::to_string(open_orders).unwrap()))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/query_positions")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(positions).unwrap())
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/query_orders")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(wrapped(serde_json::to_string(filled_orders).unwrap()))
+            .create_async()
+            .await;
+        server
+            .mock("GET", "/api/query_trades")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(wrapped(serde_json::to_string(trades).unwrap()))
+            .create_async()
+            .await;
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        (server, client)
+    }
+
+    /// Invariant: one probe iteration backfills the cancel-race fill exactly
+    /// once, counts it into the caller's sink, and reports convergence when
+    /// the REST trades explain the whole position gap.
+    #[tokio::test]
+    async fn probe_backfills_trades_into_the_sink_and_converges() {
+        let _jwt = JwtGuard::set();
+        let now = chrono::Utc::now().timestamp();
+        let (_server, client) = mock_audit_endpoints(
+            &[],
+            &[short_position()],
+            &[filled_sell_order()],
+            &[sell_trade(now)],
+        )
+        .await;
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::with_inventory_baseline(0.0, 58.20);
+        let mut fills_sink = 0_u64;
+
+        let probe = probe_position_convergence(
+            &client,
+            ReconcileRequest {
+                symbol: SYMBOL,
+                session_started_at: now - 60,
+                run_order_prefix: RUN_PREFIX,
+                qty_tolerance: 0.0005,
+                mark: 58.20,
+            },
+            &mut ledger,
+            &mut stats,
+            &mut fills_sink,
+            7,
+            OutputFormat::Quiet,
+        )
+        .await;
+
+        assert!(
+            matches!(probe, ConvergenceProbe::Converged { observed } if observed == -0.2),
+            "REST-explained gap must converge"
+        );
+        assert_eq!(fills_sink, 1, "the backfilled fill must be counted once");
+        assert_eq!(ledger.expected_position, -0.2);
+    }
+
+    /// Invariant: an unexplained gap stays pending — the probe must not
+    /// invent convergence, and the sink must stay untouched.
+    #[tokio::test]
+    async fn probe_reports_unexplained_gap_as_pending() {
+        let _jwt = JwtGuard::set();
+        let now = chrono::Utc::now().timestamp();
+        let (_server, client) = mock_audit_endpoints(&[], &[short_position()], &[], &[]).await;
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::with_inventory_baseline(0.0, 58.20);
+        let mut fills_sink = 0_u64;
+
+        let probe = probe_position_convergence(
+            &client,
+            ReconcileRequest {
+                symbol: SYMBOL,
+                session_started_at: now - 60,
+                run_order_prefix: RUN_PREFIX,
+                qty_tolerance: 0.0005,
+                mark: 58.20,
+            },
+            &mut ledger,
+            &mut stats,
+            &mut fills_sink,
+            7,
+            OutputFormat::Quiet,
+        )
+        .await;
+
+        assert!(
+            matches!(probe, ConvergenceProbe::Pending { observed } if observed == -0.2),
+            "an unexplained gap must stay pending"
+        );
+        assert_eq!(fills_sink, 0);
+        assert_eq!(ledger.expected_position, 0.0);
+    }
+
+    /// Invariant: a failed REST snapshot is reported as such — the caller
+    /// keeps its previous observation and its own error reporting.
+    #[tokio::test]
+    async fn probe_surfaces_snapshot_failures() {
+        use mockito::{Matcher, Server};
+        let _jwt = JwtGuard::set();
+        let now = chrono::Utc::now().timestamp();
+        let mut server = Server::new_async().await;
+        server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::Any)
+            .with_status(500)
+            .with_body("venue unavailable")
+            .create_async()
+            .await;
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::with_inventory_baseline(0.0, 58.20);
+        let mut fills_sink = 0_u64;
+
+        let probe = probe_position_convergence(
+            &client,
+            ReconcileRequest {
+                symbol: SYMBOL,
+                session_started_at: now - 60,
+                run_order_prefix: RUN_PREFIX,
+                qty_tolerance: 0.0005,
+                mark: 58.20,
+            },
+            &mut ledger,
+            &mut stats,
+            &mut fills_sink,
+            7,
+            OutputFormat::Quiet,
+        )
+        .await;
+
+        assert!(matches!(probe, ConvergenceProbe::SnapshotFailed(_)));
+        assert_eq!(fills_sink, 0);
+    }
 }

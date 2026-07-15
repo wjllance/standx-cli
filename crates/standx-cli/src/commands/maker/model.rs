@@ -33,6 +33,7 @@ impl std::fmt::Display for FailSafeShutdown {
 
 impl std::error::Error for FailSafeShutdown {}
 
+#[derive(Debug)]
 pub(super) enum MakerExit {
     CtrlC,
     OrderResponse(String),
