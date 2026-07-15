@@ -76,9 +76,13 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--max-divergence-bps` | `25` | 当 mark 价与盘口中价背离超过此值时跳过该轮（不动挂单） |
 | `--vol-pause-bps` | `0` | 波动率熔断：mark 在 `--vol-window` 轮内的极差达到此值（bps）即撤掉全部报价暂停，回落到一半以下才恢复。0 关闭。见 [13.3](#波动率熔断) |
 | `--vol-window` | `12` | 波动率熔断测量极差的窗口（最近 N 轮） |
+| `--stop-loss` | `0` | 会话 PnL 跌到负阈值时 fail-safe：冻结、撤销 maker 单、等待 critical webhook 后停机；不会自动平仓。0 关闭 |
 | `--alert-loss` | `0` | 风险告警：mark-to-market PnL 跌到 −此值（计价单位）时告警。0 关闭 |
 | `--alert-inventory-pct` | `0` | 风险告警：\|仓位\| 达到 `--max-position` 的此百分比时告警。0 关闭 |
+| `--alert-position-change-pct` | `0` | 实际仓位相对通知锚点累计变化达到 `--max-position` 的此百分比时告警。0 关闭 |
 | `--alert-uptime` | `0` | 风险告警：双边 uptime 跌破此百分比时告警（过预热期后）。0 关闭 |
+| `--alert-equity-below` | `0` | 账户 equity 低于此绝对值时告警；仅 live、需要账户快照。0 关闭 |
+| `--alert-margin-below` | `0` | cross available margin 低于此绝对值时告警；仅 live。0 关闭 |
 | `--alert-webhook` | 无 | 除 stderr/JSON 外，把告警 POST 到此 URL |
 | `--alert-webhook-format` | `slack` | webhook 报文格式：`slack` / `feishu` / `telegram` / `raw` |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
@@ -221,13 +225,20 @@ live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order +
 
 ### 风险告警
 
-遥测默认只**展示**指标；风险告警把它变成**主动通知**。三个阈值各自 opt-in（0 关闭）：
+遥测默认只**展示**指标；`alert_*` 把它变成**主动通知**。所有阈值各自 opt-in（0 关闭）：
 
 - `--alert-loss <X>`：mark-to-market PnL 跌到 −X 时告警（回升到 −X/2 以上解除）。
 - `--alert-inventory-pct <P>`：\|仓位\| 达到 `--max-position` 的 P% 时告警（跌回 0.9×P% 以下解除）——趋势市里最先亮的灯。
+- `--alert-position-change-pct <P>`：实际仓位相对上次通知锚点累计变化达到 `--max-position` 的 P% 时告警。
 - `--alert-uptime <U>`：双边 uptime 跌破 U% 时告警（前 20 轮预热期不判）。
+- `--alert-equity-below <X>`：live 账户 equity 低于 X 时告警，恢复到 1.1×X 以上解除。
+- `--alert-margin-below <X>`：live 账户 cross available margin 低于 X 时告警，恢复到 1.1×X 以上解除。
 
 告警是**边沿触发**的：进入异常态时响一次、恢复时响一次，不会每轮刷屏。输出到 stderr（`🚨 ALERT` / `✅ RESOLVED`）与 JSON（`action:"alert"`）；若设了 `--alert-webhook <url>`，还会 POST 一条 JSON（fire-and-forget，慢/坏的端点不会拖住报价循环）。
+
+`--stop-loss` 不是告警阈值，也不是止盈/自动平仓：它在会话 PnL 触线后执行 fail-safe
+停机，撤销 maker 自有挂单并交接残余仓位。`--inventory-exit-pct/qty` 才是正常运行中的
+reduce-only 主动库存退出，而且只在 live 生效；两者不能互相替代。
 
 `--alert-webhook-format` 按目标平台组织报文:
 

@@ -60,6 +60,9 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 ## 阶段 0：基线与证据校准
 
+当前执行记录：
+[maker-strategy-stage-0-baseline-2026-07-15.md](evidence/maker-strategy-stage-0-baseline-2026-07-15.md)。
+
 ### 目标
 
 在不改变交易行为的前提下，建立后续 A/B 比较的唯一基线，消除配置、注释和 live 证据之间
@@ -73,14 +76,27 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 - 盘点已有 paper/live 日志，登记可用于回放的数据字段和缺口。
 - 保持通用 `examples/maker.toml` 的主动库存退出默认关闭。
 
+### Trace 分类口径
+
+阶段 0 的市场分类只用于组织数据集，不改变策略阈值。可比较窗口至少包含 300 个连续
+`cycle_summary` 且覆盖 600 秒；不足时只能作为身份/采集校准 run。分类按以下优先级执行：
+
+1. 快速波动/压力：`max_vol_bps >= 50`，或存在 halted cycle 且窗口 range ≥ 50bps；
+2. 趋势：`|net_move_bps| >= 75`、`|net_move_bps| / range_bps >= 0.7` 且无 halted cycle；
+3. 平静：range ≤ 10bps 且 `|net_move_bps| <= 5`；
+4. 其余或必需字段缺失：`unclassified`。
+
+其中 range 使用 `(max_mark - min_mark) / min_mark`，net move 使用
+`(end_mark / start_mark - 1)`。分类结果必须连同原始值记录，不能只保存标签。
+
 ### 验收标准
 
-- [ ] 每个用于比较的基线 run 都能追溯到 `git_sha + config_hash + symbol + time range`。
-- [ ] 同一配置值在 TOML 注释、maker 文档和 live-gate evidence 中不存在冲突。
-- [ ] 已生产验证与未验证的 inventory-exit tuple 分开标注；未验证 tuple 不宣称可用于 live。
-- [ ] 文档明确说明 `alert_*` 只通知，`stop_loss` 会 fail-safe 停机但不会自动平仓。
-- [ ] 形成至少一份平静、一份趋势和一份快速波动 trace 清单；缺失字段有显式记录。
-- [ ] 不改变报价、退出、PnL、风控和 JSON 行为；标准离线验证全部通过。
+- [x] 每个用于比较的基线 run 都能追溯到 `git_sha + config_hash + symbol + time range`。
+- [x] 同一配置值在 TOML 注释、maker 文档和 live-gate evidence 中不存在冲突。
+- [x] 已生产验证与未验证的 inventory-exit tuple 分开标注；未验证 tuple 不宣称可用于 live。
+- [x] 文档明确说明 `alert_*` 只通知，`stop_loss` 会 fail-safe 停机但不会自动平仓。
+- [x] 形成至少一份平静、一份趋势和一份快速波动 trace 清单；缺失字段有显式记录。
+- [x] 不改变报价、退出、PnL、风控和 JSON 行为；标准离线验证全部通过。
 
 ## 阶段 1：绩效账本与确定性回放
 

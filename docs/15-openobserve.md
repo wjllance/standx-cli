@@ -49,9 +49,37 @@ scripts/run_maker_observed.sh \
 1. 为每次运行生成唯一 `run_id`。
 2. 将 stdout 写入 `var/standx/<run_id>.ndjson`。
 3. 将 stderr 写入 `var/standx/<run_id>.stderr.log`，同时保留终端显示。
-4. 转发 Ctrl+C/TERM 给 maker，并等待 lifecycle/cleanup 日志写完。
-5. 若 `OPENOBSERVE_AUTO_UPLOAD=1`，启动时验证 OpenObserve 连接，运行期间持续增量上传。
-6. maker 退出后等待 lifecycle/cleanup 落盘，再做最终补传。
+4. 将基线身份和结束完整性写入 `var/standx/<run_id>.manifest.json`，不修改 maker JSON。
+5. 转发 Ctrl+C/TERM 给 maker，并等待 lifecycle/cleanup 日志写完。
+6. 若 `OPENOBSERVE_AUTO_UPLOAD=1`，启动时验证 OpenObserve 连接，运行期间持续增量上传。
+7. maker 退出后等待 lifecycle/cleanup 落盘，再做最终补传。
+
+sidecar manifest 包含完整 `git_sha`、整仓 dirty paths、策略/运行时 source dirty paths、实际
+执行程序 SHA-256、采集脚本 SHA-256、配置内容哈希、非敏感 CLI 策略覆盖、symbol、UTC
+时间窗、日志 SHA-256、cycle 缺口、lifecycle 完整性和统一 regime 摘要。摘要包括首末/
+极值 mark、净移动/range bps、directionality、halt/fallback、最大 `vol_bps`、fills 和
+平均 uptime；包装器不会记录 webhook、凭据或完整原始命令。若要把 run 晋级为阶段 0
+baseline，还需在启动前从权威 symbol metadata 填入：
+
+```bash
+export STANDX_BASELINE_PRICE_TICK_DECIMALS=2
+export STANDX_BASELINE_QTY_TICK_DECIMALS=4
+export STANDX_BASELINE_MIN_ORDER_QTY=0.0001
+```
+
+`standx-maker/standx-sdk/standx-cli`、Cargo 锁定文件和本次使用的通用 maker 配置必须相对
+`git_sha` clean；文档或采集脚本本身可以处于待提交状态，但完整 dirty paths 会保留，实际
+参与采集的脚本还会记录 collector SHA-256。策略源码不 clean、缺少身份字段、存在非法 JSON/缺 cycle、缺
+`started/stopped` lifecycle 或进程非零退出时，manifest 会令
+`validation.baseline_eligible=false`，不会静默纳入比较基线。
+
+采集后重新核对 manifest 判定和原始日志哈希：
+
+```bash
+python3 scripts/maker_run_manifest.py validate \
+  --manifest var/standx/<run_id>.manifest.json \
+  --repo-root .
+```
 
 终端看到以下信息表示启动检查和实时上传正常：
 
