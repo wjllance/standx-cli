@@ -161,6 +161,9 @@ pub struct ProjectionOutcome {
     pub order_changed: bool,
     pub position_changed: bool,
     pub unknown_current_run_order: bool,
+    /// Request whose venue-visible order state became effective. This may be
+    /// observed before its independent command acknowledgement.
+    pub effective_request_id: Option<String>,
     pub request_registry_error: Option<ProjectionRegistryError>,
 }
 
@@ -247,6 +250,16 @@ impl CompletedRequest {
                 ProjectionPendingRequest::Place(place),
                 ProjectionRequestResolution::PlaceAccepted,
             ) => Some(place),
+            _ => None,
+        }
+    }
+
+    fn resolved_cancel(&self) -> Option<&ProjectionPendingCancel> {
+        match (&self.request, self.resolution) {
+            (
+                ProjectionPendingRequest::Cancel(cancel),
+                ProjectionRequestResolution::CancelResolved,
+            ) => Some(cancel),
             _ => None,
         }
     }
@@ -714,6 +727,36 @@ impl MakerAccountProjection {
     fn handle_terminal_observation(&mut self, observation: &OrderObservation) -> ProjectionOutcome {
         let known = self.order_observation_is_known(observation);
         let changed = self.orders.remove(&observation.order_id).is_some();
+        let effective_request_id = self
+            .pending
+            .iter()
+            .find(|entry| {
+                entry.slot_open
+                    && entry
+                        .cancel()
+                        .is_some_and(|cancel| cancel.order_id == observation.order_id)
+            })
+            .map(|entry| entry.request_id().to_string())
+            .or_else(|| {
+                self.completed.iter().rev().find_map(|entry| {
+                    entry
+                        .resolved_cancel()
+                        .filter(|cancel| cancel.order_id == observation.order_id)
+                        .map(|_| entry.request_id().to_string())
+                })
+            })
+            .or_else(|| {
+                let client_order_id = observation.client_order_id.as_deref()?;
+                self.pending
+                    .iter()
+                    .find(|entry| {
+                        entry.slot_open
+                            && entry
+                                .place()
+                                .is_some_and(|place| place.client_order_id == client_order_id)
+                    })
+                    .map(|entry| entry.request_id().to_string())
+            });
         for entry in &mut self.pending {
             let matches = match &entry.request {
                 ProjectionPendingRequest::Place(place) => observation
@@ -733,6 +776,7 @@ impl MakerAccountProjection {
         ProjectionOutcome {
             applied: true,
             order_changed: changed,
+            effective_request_id,
             ..ProjectionOutcome::default()
         }
     }
@@ -745,12 +789,23 @@ impl MakerAccountProjection {
         // A replay of an order already cancelled/cleared must remain stale so
         // reconcile cancels it again; completed place metadata must not turn
         // it back into a quote the strategy is willing to hold.
-        let slot = if retired {
+        let pending_match = if retired {
             None
         } else {
             self.match_pending_slot(&observation)
-                .or_else(|| self.completed_place_slot(&observation))
         };
+        let completed_match = if retired || pending_match.is_some() {
+            None
+        } else {
+            self.completed_place_slot(&observation)
+        };
+        let effective_request_id = pending_match
+            .as_ref()
+            .or(completed_match.as_ref())
+            .map(|(_, request_id)| request_id.clone());
+        let slot = pending_match
+            .map(|(slot, _)| slot)
+            .or_else(|| completed_match.map(|(slot, _)| slot));
         let known = slot.is_some() || self.orders.contains_key(&observation.order_id) || retired;
         let slot = slot.unwrap_or_else(|| {
             self.orders
@@ -780,6 +835,7 @@ impl MakerAccountProjection {
             applied: true,
             order_changed: true,
             unknown_current_run_order: !known,
+            effective_request_id,
             ..ProjectionOutcome::default()
         }
     }
@@ -787,7 +843,10 @@ impl MakerAccountProjection {
     /// Find the open pending place this observation fills — by client-order-id,
     /// else by a side/price/qty heuristic — close its slot, and return the slot
     /// info to adopt. Returns `None` when no pending place matches.
-    fn match_pending_slot(&mut self, observation: &OrderObservation) -> Option<AdoptedSlot> {
+    fn match_pending_slot(
+        &mut self,
+        observation: &OrderObservation,
+    ) -> Option<(AdoptedSlot, String)> {
         let price_tolerance = self.price_tolerance;
         let index = self
             .pending
@@ -813,18 +872,27 @@ impl MakerAccountProjection {
             .place()
             .expect("matched entry is a place")
             .clone();
+        let request_id = self.pending[index].request_id().to_string();
         self.pending[index].slot_open = false;
         self.drop_settled();
-        Some(AdoptedSlot::from_place(&place))
+        Some((AdoptedSlot::from_place(&place), request_id))
     }
 
-    fn completed_place_slot(&self, observation: &OrderObservation) -> Option<AdoptedSlot> {
+    fn completed_place_slot(
+        &self,
+        observation: &OrderObservation,
+    ) -> Option<(AdoptedSlot, String)> {
         let client_order_id = observation.client_order_id.as_deref()?;
         self.completed.iter().rev().find_map(|entry| {
             entry
                 .accepted_place()
                 .filter(|place| place.client_order_id == client_order_id)
-                .map(AdoptedSlot::from_place)
+                .map(|place| {
+                    (
+                        AdoptedSlot::from_place(place),
+                        entry.request_id().to_string(),
+                    )
+                })
         })
     }
 
@@ -927,6 +995,65 @@ mod tests {
             open_qty,
             terminal,
         }
+    }
+
+    #[test]
+    fn account_order_reports_place_effective_before_ack() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        assert_eq!(outcome.effective_request_id.as_deref(), Some("p1"));
+        assert_eq!(
+            state.pending_request("p1"),
+            Some(&ProjectionPendingRequest::Place(pending("p1")))
+        );
+    }
+
+    #[test]
+    fn terminal_account_order_reports_cancel_effective() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 2,
+            }),
+        );
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.0, true)));
+        assert_eq!(outcome.effective_request_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn terminal_account_order_reports_cancel_effective_after_ack() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 2,
+            }),
+        );
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelResolved {
+                request_id: "c1".to_string(),
+            },
+        );
+
+        let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(order(0.0, true)));
+        assert_eq!(outcome.effective_request_id.as_deref(), Some("c1"));
     }
 
     #[test]
@@ -1386,6 +1513,7 @@ mod tests {
             "a delayed account update must retain the accepted place identity"
         );
         assert!(state.pending_places().is_empty());
+        assert_eq!(outcome.effective_request_id.as_deref(), Some("p1"));
         assert_eq!(state.resting_quotes()[0].level, 0);
     }
 

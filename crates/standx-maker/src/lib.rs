@@ -18,9 +18,12 @@
 use standx_sdk::models::OrderSide;
 
 pub mod account_projection;
+pub mod latency;
 pub mod ledger;
 pub mod ownership;
+pub mod performance;
 pub mod recovery;
+pub mod replay;
 pub mod risk;
 pub mod runtime;
 
@@ -30,13 +33,25 @@ pub use account_projection::{
     ProjectionPendingRequest, ProjectionRegistryError, ProjectionRequestResolution,
     MAX_PENDING_ORDER_REQUESTS,
 };
+pub use latency::{
+    LatencyError, LatencyMetricSummary, LatencyRequest, LatencyRequestContext, LatencyRequestKind,
+    LatencyRequestOutcome, LatencySummary, OrderLatencyTracker,
+};
 pub use ledger::{LedgerError, LedgerTrade, MakerFill, MakerLedger, TradeSource};
 pub use ownership::{
     exit_client_order_id, is_current_run_client_order_id, is_maker_client_order_id,
     open_qty_adopts, pending_covers_slot, position_within_limit, quote_client_order_id, QuoteSlot,
     MAKER_CL_ORD_ID_PREFIX,
 };
+pub use performance::{
+    ExecutionCosts, FillRole, MarkoutSummary, PerformanceError, PerformanceFill, PerformanceLedger,
+    PerformanceSummary, QuoteQualityInterval, QuoteTimeSummary, MARKOUT_WINDOWS_MS,
+};
 pub use recovery::{RecoveryAdmission, RecoveryCircuitBreaker, RecoveryTrigger};
+pub use replay::{
+    run_replay, ReplayCycle, ReplayCycleOutcome, ReplayError, ReplayEvent, ReplayResult,
+    ReplaySettings,
+};
 pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
 pub use runtime::{
     order_cancel_rejection_reason, MakerEffect, MakerEvent, MakerState, RecoveryTarget,

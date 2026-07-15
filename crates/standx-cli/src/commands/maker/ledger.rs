@@ -1,7 +1,7 @@
 //! SDK payload adapter for the pure maker ledger.
 
 use anyhow::Result;
-use standx_maker::{LedgerTrade, MakerFill, MakerLedger, MakerStats, TradeSource};
+use standx_maker::{ExecutionCosts, LedgerTrade, MakerFill, MakerLedger, MakerStats, TradeSource};
 use standx_sdk::account_stream::{OrderUpdate, TradeUpdate};
 use standx_sdk::models::{Order, OrderSide, Trade};
 
@@ -63,6 +63,7 @@ pub(super) fn apply_account_trade(
         return Ok(false);
     }
     let (price, qty) = trade_values(trade.trade_id, &trade.price, &trade.qty)?;
+    let event_time_ms = trade_time_ms(trade.trade_id, &trade.trade_ts)?;
     apply_ledger_trade(
         ledger,
         LedgerTrade {
@@ -73,6 +74,8 @@ pub(super) fn apply_account_trade(
             qty,
             mark,
             trade_ts: &trade.trade_ts,
+            event_time_ms,
+            costs: None,
             source: TradeSource::AccountStream,
         },
         stats,
@@ -105,6 +108,8 @@ pub(super) fn apply_rest_trade(
         ));
     }
     let (side, price, qty) = maker_trade_fill(&trade)?;
+    let event_time_ms = trade_time_ms(trade.id, &trade.time)?;
+    let costs = rest_execution_costs(&trade)?;
     apply_ledger_trade(
         ledger,
         LedgerTrade {
@@ -115,6 +120,8 @@ pub(super) fn apply_rest_trade(
             qty,
             mark,
             trade_ts: &trade.time,
+            event_time_ms,
+            costs,
             source: TradeSource::RestBackfill,
         },
         stats,
@@ -176,6 +183,58 @@ fn trade_values(trade_id: u64, price: &str, qty: &str) -> Result<(f64, f64)> {
         ));
     }
     Ok((price, qty))
+}
+
+fn trade_time_ms(trade_id: u64, value: &str) -> Result<i64> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.timestamp_millis());
+    }
+    let raw = value
+        .parse::<i64>()
+        .map_err(|_| anyhow::anyhow!("maker trade {trade_id} has invalid timestamp '{value}'"))?;
+    Ok(if raw.abs() < 1_000_000_000_000 {
+        raw.saturating_mul(1_000)
+    } else {
+        raw
+    })
+}
+
+/// REST is currently the only fill source carrying fee fields. Convert only
+/// the symbol's quote asset (including StandX's D-prefixed settlement asset);
+/// all other assets remain unavailable for an explicit later conversion.
+fn rest_execution_costs(trade: &Trade) -> Result<Option<ExecutionCosts>> {
+    let Some(raw_qty) = trade.fee_qty.as_deref() else {
+        return Ok(None);
+    };
+    let fee = raw_qty
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("maker trade {} has invalid fee qty '{raw_qty}'", trade.id))?;
+    if !fee.is_finite() {
+        return Err(anyhow::anyhow!(
+            "maker trade {} has non-finite fee qty",
+            trade.id
+        ));
+    }
+    let (Some(asset), Some(symbol)) = (trade.fee_asset.as_deref(), trade.symbol.as_deref()) else {
+        return Ok(None);
+    };
+    let Some((_, quote)) = symbol.rsplit_once('-') else {
+        return Ok(None);
+    };
+    if !asset.eq_ignore_ascii_case(quote) && !asset.eq_ignore_ascii_case(&format!("D{quote}")) {
+        return Ok(None);
+    }
+    Ok(Some(if fee >= 0.0 {
+        ExecutionCosts {
+            fee_quote: fee,
+            rebate_quote: 0.0,
+        }
+    } else {
+        ExecutionCosts {
+            fee_quote: 0.0,
+            rebate_quote: -fee,
+        }
+    }))
 }
 
 #[cfg(test)]

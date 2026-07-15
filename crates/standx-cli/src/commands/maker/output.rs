@@ -1,6 +1,177 @@
 use super::*;
 use standx_maker::{self as maker, Action, MakerConfig, MakerStats};
+use standx_sdk::account_stream::AccountEvent;
 use standx_sdk::models::{Balance, OrderSide};
+
+pub(super) fn emit_account_event_lag(
+    output_format: OutputFormat,
+    event: &AccountEvent,
+    symbol: &str,
+    cycle: u64,
+) {
+    if output_format != OutputFormat::Json {
+        return;
+    }
+    let (channel, seq, event_time) = match event {
+        AccountEvent::Order(update) if update.symbol.eq_ignore_ascii_case(symbol) => {
+            ("order", update.seq, update.updated_at.as_str())
+        }
+        AccountEvent::Position(update) if update.symbol.eq_ignore_ascii_case(symbol) => {
+            ("position", update.seq, update.updated_at.as_str())
+        }
+        AccountEvent::Trade(update) if update.symbol.eq_ignore_ascii_case(symbol) => {
+            ("trade", update.seq, update.trade_ts.as_str())
+        }
+        AccountEvent::Balance(update) => ("balance", update.seq, update.updated_at.as_str()),
+        _ => return,
+    };
+    let received = chrono::Utc::now();
+    let event_time_ms = parse_event_time_ms(event_time);
+    println!(
+        "{}",
+        serde_json::json!({
+            "action": "account_event_lag",
+            "symbol": symbol,
+            "cycle": cycle,
+            "channel": channel,
+            "seq": seq,
+            "event_time": event_time,
+            "event_time_ms": event_time_ms,
+            "received_utc_ms": received.timestamp_millis(),
+            "account_event_lag_ms": event_time_ms.map(|event_time_ms| {
+                received.timestamp_millis().saturating_sub(event_time_ms)
+            }),
+            "available": event_time_ms.is_some(),
+        })
+    );
+}
+
+fn parse_event_time_ms(value: &str) -> Option<i64> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(timestamp.timestamp_millis());
+    }
+    let raw = value.parse::<i64>().ok()?;
+    Some(if raw.abs() < 1_000_000_000_000 {
+        raw.saturating_mul(1_000)
+    } else {
+        raw
+    })
+}
+
+pub(super) fn emit_order_latency(
+    output_format: OutputFormat,
+    tracker: &standx_maker::OrderLatencyTracker,
+) {
+    use standx_maker::{LatencyRequestKind, LatencyRequestOutcome};
+
+    if output_format == OutputFormat::Json {
+        for request in tracker.requests() {
+            let context = &request.context;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "action": "order_latency",
+                    "request_id": context.request_id,
+                    "kind": latency_kind(context.kind),
+                    "generation": context.generation,
+                    "cycle": context.cycle,
+                    "symbol": context.symbol,
+                    "side": context.side,
+                    "level": context.level,
+                    "order_id": context.order_id,
+                    "market_source": context.market_source,
+                    "recovery": context.recovery,
+                    "intent_utc_ms": context.intent_utc_ms,
+                    "place_write_ms": (context.kind == LatencyRequestKind::Place)
+                        .then(|| request.written_ms.map(|at| at - context.intent_ms)).flatten(),
+                    "place_ack_ms": (context.kind == LatencyRequestKind::Place)
+                        .then(|| request.ack_ms.map(|at| at - request.written_ms.unwrap_or(context.intent_ms))).flatten(),
+                    "place_effective_ms": (context.kind == LatencyRequestKind::Place)
+                        .then(|| request.effective_ms.map(|at| at - context.intent_ms)).flatten(),
+                    "cancel_write_ms": (context.kind == LatencyRequestKind::Cancel)
+                        .then(|| request.written_ms.map(|at| at - context.intent_ms)).flatten(),
+                    "cancel_ack_ms": (context.kind == LatencyRequestKind::Cancel)
+                        .then(|| request.ack_ms.map(|at| at - request.written_ms.unwrap_or(context.intent_ms))).flatten(),
+                    "cancel_effective_ms": (context.kind == LatencyRequestKind::Cancel)
+                        .then(|| request.effective_ms.map(|at| at - context.intent_ms)).flatten(),
+                    "fill_after_cancel_ms": request.fill_after_cancel_ms,
+                    "outcome": request.outcome.map(latency_outcome),
+                })
+            );
+        }
+        for kind in [LatencyRequestKind::Place, LatencyRequestKind::Cancel] {
+            let summary = tracker.summary(kind);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "action": "order_latency_summary",
+                    "kind": latency_kind(kind),
+                    "requests": summary.requests,
+                    "accepted": summary.accepted,
+                    "rejected": summary.rejected,
+                    "effective": summary.effective,
+                    "timeout": summary.timeout,
+                    "invalidated": summary.invalidated,
+                    "process_ended": summary.process_ended,
+                    "pending": summary.pending,
+                    "reject_rate": summary.reject_rate,
+                    "timeout_rate": summary.timeout_rate,
+                    "write": latency_metric_json(summary.write),
+                    "ack": latency_metric_json(summary.ack),
+                    "effective_latency": latency_metric_json(summary.effective_latency),
+                    "fill_after_cancel": latency_metric_json(summary.fill_after_cancel),
+                })
+            );
+        }
+    } else if output_format != OutputFormat::Quiet {
+        for kind in [LatencyRequestKind::Place, LatencyRequestKind::Cancel] {
+            let summary = tracker.summary(kind);
+            if summary.requests > 0 {
+                println!(
+                    "{} latency: requests={} effective={} rejected={} timeout={} p95_ack={} p95_effective={}",
+                    latency_kind(kind),
+                    summary.requests,
+                    summary.effective,
+                    summary.rejected,
+                    summary.timeout,
+                    optional_ms(summary.ack.p95_ms),
+                    optional_ms(summary.effective_latency.p95_ms),
+                );
+            }
+        }
+    }
+
+    fn latency_outcome(outcome: LatencyRequestOutcome) -> &'static str {
+        match outcome {
+            LatencyRequestOutcome::Accepted => "accepted",
+            LatencyRequestOutcome::Rejected => "rejected",
+            LatencyRequestOutcome::Effective => "effective",
+            LatencyRequestOutcome::Timeout => "timeout",
+            LatencyRequestOutcome::Invalidated => "invalidated",
+            LatencyRequestOutcome::ProcessEnded => "process_ended",
+        }
+    }
+}
+
+fn latency_kind(kind: standx_maker::LatencyRequestKind) -> &'static str {
+    match kind {
+        standx_maker::LatencyRequestKind::Place => "place",
+        standx_maker::LatencyRequestKind::Cancel => "cancel",
+    }
+}
+
+fn latency_metric_json(metric: standx_maker::LatencyMetricSummary) -> serde_json::Value {
+    serde_json::json!({
+        "samples": metric.samples,
+        "p50_ms": metric.p50_ms,
+        "p95_ms": metric.p95_ms,
+        "p99_ms": metric.p99_ms,
+    })
+}
+
+fn optional_ms(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| format!("{value}ms"))
+}
 
 /// Per-cycle output: one human line + indented actions, or JSON lines.
 pub(super) struct CycleOutput<'a> {
@@ -21,6 +192,7 @@ pub(super) struct CycleOutput<'a> {
     pub(super) stats: &'a MakerStats,
     pub(super) halt_vol_bps: Option<f64>,
     pub(super) cfg: &'a MakerConfig,
+    pub(super) performance: Option<&'a maker::PerformanceSummary>,
 }
 
 pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
@@ -42,6 +214,7 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
         stats,
         halt_vol_bps,
         cfg,
+        performance,
     } = output;
     use maker::format_decimals;
 
@@ -73,6 +246,12 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
                         "order_id": fill.order_id,
                         "trade_ts": fill.trade_ts,
                         "origin": fill.origin,
+                        "role": match fill.role {
+                            maker::FillRole::PassiveMaker => "passive_maker",
+                            maker::FillRole::InventoryExit => "inventory_exit",
+                        },
+                        "fee_quote": fill.costs.map(|costs| costs.fee_quote),
+                        "rebate_quote": fill.costs.map(|costs| costs.rebate_quote),
                     })
                 );
             }
@@ -133,6 +312,7 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
                     "fills_total": stats.fills(),
                     "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
                     "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
+                    "performance": performance.map(performance_json),
                     "halted": halt_vol_bps.is_some(),
                     "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
                 })
@@ -257,6 +437,59 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
                 }
             }
         }
+    }
+}
+
+fn performance_json(summary: &maker::PerformanceSummary) -> serde_json::Value {
+    serde_json::json!({
+        "passive_fills": summary.passive_fills,
+        "passive_qty": summary.passive_qty,
+        "exit_fills": summary.exit_fills,
+        "exit_qty": summary.exit_qty,
+        "gross_spread_quote": summary.gross_spread_quote,
+        "fee_quote": summary.fee_quote,
+        "rebate_quote": summary.rebate_quote,
+        "execution_costs_unavailable": summary.execution_costs_unavailable,
+        "funding_quote": summary.funding_quote,
+        "exit_cost_quote": summary.exit_cost_quote,
+        "inventory_mtm_change_quote": summary.inventory_mtm_change_quote,
+        "net_pnl_quote": summary.net_pnl_quote,
+        "markout_1s_bps": summary.markouts[0].avg_bps,
+        "markout_5s_bps": summary.markouts[1].avg_bps,
+        "markout_30s_bps": summary.markouts[2].avg_bps,
+        "markout_1s_unavailable": summary.markouts[0].unavailable,
+        "markout_5s_unavailable": summary.markouts[1].unavailable,
+        "markout_30s_unavailable": summary.markouts[2].unavailable,
+        "time_weighted_uptime_pct": summary.quote_time.two_sided_uptime_pct,
+        "eligible_bid_qty_ms": summary.quote_time.eligible_bid_qty_ms,
+        "eligible_ask_qty_ms": summary.quote_time.eligible_ask_qty_ms,
+        "eligible_total_qty_ms": summary.quote_time.eligible_total_qty_ms,
+    })
+}
+
+pub(super) fn emit_performance_summary(
+    output_format: OutputFormat,
+    symbol: &str,
+    summary: &maker::PerformanceSummary,
+) {
+    if output_format == OutputFormat::Json {
+        let mut value = performance_json(summary);
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                "action".to_string(),
+                serde_json::json!("performance_summary"),
+            );
+            object.insert("symbol".to_string(), serde_json::json!(symbol));
+        }
+        println!("{value}");
+    } else if output_format != OutputFormat::Quiet {
+        println!(
+            "Performance: passive={} exit={} net_pnl={:.6} time-weighted uptime={:.2}%",
+            summary.passive_fills,
+            summary.exit_fills,
+            summary.net_pnl_quote,
+            summary.quote_time.two_sided_uptime_pct,
+        );
     }
 }
 

@@ -7,7 +7,10 @@
 //! affect accounting: they lack a stable trade ID and are only ownership/order
 //! state signals.
 
-use crate::{is_current_run_client_order_id, MakerStats};
+use crate::{
+    is_current_run_client_order_id, ExecutionCosts, FillRole, MakerStats, PerformanceError,
+    PerformanceFill, PerformanceLedger,
+};
 use standx_sdk::models::OrderSide;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
@@ -23,6 +26,8 @@ pub struct MakerFill {
     pub order_id: Option<u64>,
     pub trade_ts: Option<String>,
     pub origin: &'static str,
+    pub role: FillRole,
+    pub costs: Option<ExecutionCosts>,
 }
 
 /// Transport-independent source for a stable venue execution.
@@ -52,6 +57,10 @@ pub struct LedgerTrade<'a> {
     pub qty: f64,
     pub mark: f64,
     pub trade_ts: &'a str,
+    /// Exchange event time normalized by the CLI adapter.
+    pub event_time_ms: i64,
+    /// Quote-currency costs when the source exposes a convertible fee.
+    pub costs: Option<ExecutionCosts>,
     pub source: TradeSource,
 }
 
@@ -64,6 +73,8 @@ struct PendingTrade {
     qty: f64,
     mark: f64,
     trade_ts: String,
+    event_time_ms: i64,
+    costs: Option<ExecutionCosts>,
     source: TradeSource,
 }
 
@@ -77,6 +88,8 @@ impl<'a> From<LedgerTrade<'a>> for PendingTrade {
             qty: trade.qty,
             mark: trade.mark,
             trade_ts: trade.trade_ts.to_owned(),
+            event_time_ms: trade.event_time_ms,
+            costs: trade.costs,
             source: trade.source,
         }
     }
@@ -99,6 +112,7 @@ pub enum LedgerError {
     PendingTradeOverflow {
         limit: usize,
     },
+    Performance(PerformanceError),
 }
 
 impl fmt::Display for LedgerError {
@@ -126,6 +140,7 @@ impl fmt::Display for LedgerError {
                 formatter,
                 "unowned maker trade buffer exceeded its {limit} execution limit"
             ),
+            Self::Performance(error) => write!(formatter, "maker performance ledger: {error}"),
         }
     }
 }
@@ -140,6 +155,7 @@ pub struct MakerLedger {
     seen_trade_ids: HashSet<u64>,
     pending_trade_ids: HashSet<u64>,
     pending_trades: VecDeque<PendingTrade>,
+    performance: Option<PerformanceLedger>,
 }
 
 impl MakerLedger {
@@ -151,7 +167,30 @@ impl MakerLedger {
             seen_trade_ids: HashSet::new(),
             pending_trade_ids: HashSet::new(),
             pending_trades: VecDeque::new(),
+            performance: None,
         }
+    }
+
+    pub fn enable_performance(&mut self, starting_mark: f64) -> Result<(), PerformanceError> {
+        self.performance = Some(PerformanceLedger::new(
+            self.expected_position,
+            starting_mark,
+        )?);
+        Ok(())
+    }
+
+    pub fn performance(&self) -> Option<&PerformanceLedger> {
+        self.performance.as_ref()
+    }
+
+    pub fn performance_mut(&mut self) -> Option<&mut PerformanceLedger> {
+        self.performance.as_mut()
+    }
+
+    /// Stop optional phase-1 observation without changing the authoritative
+    /// fill ledger or strategy state.
+    pub fn disable_performance(&mut self) {
+        self.performance = None;
     }
 
     /// Adopt an order only when its client ID belongs to this run.
@@ -190,9 +229,33 @@ impl MakerLedger {
         stats: &mut MakerStats,
     ) -> Result<Option<MakerFill>, LedgerError> {
         self.validate_trade(trade)?;
-        if self.seen_trade_ids.contains(&trade.trade_id)
-            || self.pending_trade_ids.contains(&trade.trade_id)
-        {
+        if self.seen_trade_ids.contains(&trade.trade_id) {
+            if let (Some(performance), Some(costs)) = (&mut self.performance, trade.costs) {
+                performance
+                    .record_execution_costs(trade.trade_id, costs)
+                    .map_err(LedgerError::Performance)?;
+            }
+            return Ok(None);
+        }
+        if self.pending_trade_ids.contains(&trade.trade_id) {
+            if let Some(costs) = trade.costs {
+                let pending = self
+                    .pending_trades
+                    .iter_mut()
+                    .find(|pending| pending.trade_id == trade.trade_id)
+                    .expect("pending trade ID set and queue must agree");
+                match pending.costs {
+                    Some(previous) if previous != costs => {
+                        return Err(LedgerError::Performance(
+                            PerformanceError::ConflictingExecutionCosts {
+                                trade_id: trade.trade_id,
+                            },
+                        ));
+                    }
+                    None => pending.costs = Some(costs),
+                    Some(_) => {}
+                }
+            }
             return Ok(None);
         }
         if !self.maker_order_ids.contains(&trade.order_id) {
@@ -238,6 +301,8 @@ impl MakerLedger {
                     qty: pending.qty,
                     mark: pending.mark,
                     trade_ts: &pending.trade_ts,
+                    event_time_ms: pending.event_time_ms,
+                    costs: pending.costs,
                     source: pending.source,
                 },
                 stats,
@@ -281,9 +346,30 @@ impl MakerLedger {
         stats: &mut MakerStats,
     ) -> Result<Option<MakerFill>, LedgerError> {
         self.validate_trade(trade)?;
-        if !self.seen_trade_ids.insert(trade.trade_id) {
+        if self.seen_trade_ids.contains(&trade.trade_id) {
             return Ok(None);
         }
+        let role = if self.exit_order_ids.contains(&trade.order_id) {
+            FillRole::InventoryExit
+        } else {
+            FillRole::PassiveMaker
+        };
+        if let Some(performance) = &mut self.performance {
+            performance
+                .record_fill(PerformanceFill {
+                    trade_id: trade.trade_id,
+                    order_id: trade.order_id,
+                    role,
+                    side: trade.side,
+                    price: trade.price,
+                    qty: trade.qty,
+                    mark_at_fill: trade.mark,
+                    event_time_ms: trade.event_time_ms,
+                    costs: trade.costs,
+                })
+                .map_err(LedgerError::Performance)?;
+        }
+        self.seen_trade_ids.insert(trade.trade_id);
         stats.record_fill(trade.side, trade.price, trade.qty, trade.mark);
         self.expected_position += match trade.side {
             OrderSide::Buy => trade.qty,
@@ -298,6 +384,8 @@ impl MakerLedger {
             order_id: Some(trade.order_id),
             trade_ts: Some(trade.trade_ts.to_owned()),
             origin: trade.source.origin(),
+            role,
+            costs: trade.costs,
         }))
     }
 }
@@ -321,6 +409,8 @@ mod tests {
             qty,
             mark: 100.0,
             trade_ts: "2026-07-14T00:00:00Z",
+            event_time_ms: 1_752_451_200_000,
+            costs: None,
             source,
         }
     }
@@ -375,6 +465,58 @@ mod tests {
         assert_eq!(stats.fills(), 1);
         assert!((ledger.expected_position + 0.2).abs() < 1e-12);
         assert!((stats.position() - ledger.expected_position).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rest_duplicate_enriches_ws_fill_costs_without_rebooking_quantity() {
+        let (mut ledger, mut stats) = adopted_ledger();
+        ledger.enable_performance(100.0).unwrap();
+        ledger
+            .record_trade(
+                trade(1, 7, OrderSide::Buy, 0.2, TradeSource::AccountStream),
+                &mut stats,
+            )
+            .unwrap();
+        assert_eq!(
+            ledger
+                .performance()
+                .unwrap()
+                .summary(100.0)
+                .unwrap()
+                .execution_costs_unavailable,
+            1
+        );
+
+        let mut rest = trade(1, 7, OrderSide::Buy, 0.2, TradeSource::RestBackfill);
+        rest.costs = Some(ExecutionCosts {
+            fee_quote: 0.01,
+            rebate_quote: 0.0,
+        });
+        assert!(ledger.record_trade(rest, &mut stats).unwrap().is_none());
+        let summary = ledger.performance().unwrap().summary(100.0).unwrap();
+        assert_eq!(stats.fills(), 1);
+        assert!((ledger.expected_position - 0.2).abs() < 1e-12);
+        assert!((summary.fee_quote - 0.01).abs() < 1e-12);
+        assert_eq!(summary.execution_costs_unavailable, 0);
+    }
+
+    #[test]
+    fn exit_owned_order_is_attributed_separately() {
+        let mut ledger = MakerLedger::new(0.2);
+        ledger.enable_performance(100.0).unwrap();
+        assert!(ledger.adopt_order(8, Some("sxmk-run-x00000001a"), "sxmk-run-"));
+        let mut stats = MakerStats::with_inventory_baseline(0.2, 100.0);
+        let fill = ledger
+            .record_trade(
+                trade(1, 8, OrderSide::Sell, 0.2, TradeSource::AccountStream),
+                &mut stats,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(fill.role, FillRole::InventoryExit);
+        let summary = ledger.performance().unwrap().summary(100.0).unwrap();
+        assert_eq!(summary.passive_fills, 0);
+        assert_eq!(summary.exit_fills, 1);
     }
 
     #[test]

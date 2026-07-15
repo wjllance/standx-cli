@@ -603,6 +603,11 @@ pub enum MakerCommands {
         #[arg(long, hide = true)]
         controlled_disconnect_after: Option<u64>,
     },
+    /// Deterministically replay a normalized maker NDJSON trace (no network or order I/O)
+    Replay {
+        /// Normalized phase-1 trace file; use '-' to read stdin
+        trace: PathBuf,
+    },
     /// Supervised live-gate check for the WebSocket order:new/order:cancel path.
     #[command(hide = true)]
     WsCommandCanary {

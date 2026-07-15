@@ -2,7 +2,8 @@ use super::{ORDER_HISTORY_LIMIT, TRADE_LOOKBACK_LIMIT};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{
-    MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, RestingQuote, VolBreaker,
+    MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, OrderLatencyTracker,
+    RestingQuote, VolBreaker,
 };
 use standx_sdk::account_stream::AccountStreamHealth;
 use standx_sdk::client::StandXClient;
@@ -36,6 +37,9 @@ pub(super) struct CycleRequest<'a> {
     pub(super) order_commands: Option<&'a OrderCommandSender>,
     pub(super) order_response_health: Option<&'a OrderResponseHealth>,
     pub(super) account_stream_health: Option<&'a AccountStreamHealth>,
+    /// UTC-like epoch derived from a fixed wall-clock anchor plus monotonic
+    /// elapsed time; used only for observation and replay metrics.
+    pub(super) performance_time_ms: i64,
 }
 
 pub(super) struct CycleState<'a> {
@@ -49,6 +53,10 @@ pub(super) struct CycleState<'a> {
     /// Live-only REST polling state. It is deliberately a CLI concern: it
     /// controls I/O cadence and cached account presentation, not strategy.
     pub(super) live_account_poll: Option<&'a mut LiveAccountPollState>,
+    /// Observation-only command lifecycle tracker. It never feeds strategy or
+    /// safety decisions.
+    pub(super) order_latency: Option<&'a mut OrderLatencyTracker>,
+    pub(super) latency_started: Option<Instant>,
 }
 
 #[derive(Debug, Default)]

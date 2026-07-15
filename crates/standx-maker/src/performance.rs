@@ -1,0 +1,849 @@
+//! Deterministic maker performance attribution and time-weighted observations.
+//!
+//! The caller supplies normalized event timestamps and quote-currency cash
+//! flows. This module never reads a clock, parses exchange payloads, or does
+//! I/O, so the same trace can be replayed byte-for-byte in tests and offline
+//! tools. Existing strategy decisions do not depend on these observations.
+
+use standx_sdk::models::OrderSide;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+
+/// Post-fill horizons required by the strategy roadmap.
+pub const MARKOUT_WINDOWS_MS: [i64; 3] = [1_000, 5_000, 30_000];
+
+/// Why a current-run execution happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillRole {
+    /// A post-only quote owned by the maker session.
+    PassiveMaker,
+    /// A reduce-only active inventory exit owned by the maker session.
+    InventoryExit,
+}
+
+/// Quote-currency execution costs. Both values are positive; a zero-cost fill
+/// uses `Some(ExecutionCosts::default())`, while `None` means costs were not
+/// present or could not be converted and must remain visibly unavailable.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ExecutionCosts {
+    pub fee_quote: f64,
+    pub rebate_quote: f64,
+}
+
+/// One normalized, immutable execution accepted by the current-run ledger.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PerformanceFill {
+    pub trade_id: u64,
+    pub order_id: u64,
+    pub role: FillRole,
+    pub side: OrderSide,
+    pub price: f64,
+    pub qty: f64,
+    pub mark_at_fill: f64,
+    pub event_time_ms: i64,
+    pub costs: Option<ExecutionCosts>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PerformanceError {
+    InvalidStartingPoint {
+        position: f64,
+        mark: f64,
+    },
+    InvalidFill {
+        trade_id: u64,
+    },
+    UnknownExecutionCosts {
+        trade_id: u64,
+    },
+    ConflictingExecutionCosts {
+        trade_id: u64,
+    },
+    InvalidMarketObservation {
+        event_time_ms: i64,
+        mark: f64,
+    },
+    MarketTimeRegression {
+        previous_ms: i64,
+        next_ms: i64,
+    },
+    InvalidFunding {
+        event_time_ms: i64,
+        cashflow_quote: f64,
+    },
+    FundingTimeRegression {
+        previous_ms: i64,
+        next_ms: i64,
+    },
+    InvalidQuoteInterval {
+        event_time_ms: i64,
+        eligible_bid_qty: f64,
+        eligible_ask_qty: f64,
+    },
+    QuoteTimeRegression {
+        previous_ms: i64,
+        next_ms: i64,
+    },
+}
+
+impl fmt::Display for PerformanceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidStartingPoint { position, mark } => {
+                write!(formatter, "invalid performance baseline position={position}, mark={mark}")
+            }
+            Self::InvalidFill { trade_id } => {
+                write!(formatter, "invalid performance fill trade_id={trade_id}")
+            }
+            Self::UnknownExecutionCosts { trade_id } => write!(
+                formatter,
+                "execution costs reference unknown trade_id={trade_id}"
+            ),
+            Self::ConflictingExecutionCosts { trade_id } => write!(
+                formatter,
+                "execution costs conflict for trade_id={trade_id}"
+            ),
+            Self::InvalidMarketObservation {
+                event_time_ms,
+                mark,
+            } => write!(
+                formatter,
+                "invalid market observation time={event_time_ms}, mark={mark}"
+            ),
+            Self::MarketTimeRegression {
+                previous_ms,
+                next_ms,
+            } => write!(
+                formatter,
+                "market observation time regressed from {previous_ms} to {next_ms}"
+            ),
+            Self::InvalidFunding {
+                event_time_ms,
+                cashflow_quote,
+            } => write!(
+                formatter,
+                "invalid funding cashflow time={event_time_ms}, quote={cashflow_quote}"
+            ),
+            Self::FundingTimeRegression {
+                previous_ms,
+                next_ms,
+            } => write!(
+                formatter,
+                "funding event time regressed from {previous_ms} to {next_ms}"
+            ),
+            Self::InvalidQuoteInterval {
+                event_time_ms,
+                eligible_bid_qty,
+                eligible_ask_qty,
+            } => write!(
+                formatter,
+                "invalid quote interval time={event_time_ms}, bid_qty={eligible_bid_qty}, ask_qty={eligible_ask_qty}"
+            ),
+            Self::QuoteTimeRegression {
+                previous_ms,
+                next_ms,
+            } => write!(
+                formatter,
+                "quote interval time regressed from {previous_ms} to {next_ms}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PerformanceError {}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct MarkoutAccumulator {
+    qty: f64,
+    quote_pnl: f64,
+    bps_qty_sum: f64,
+    samples: u64,
+    unavailable: u64,
+}
+
+/// Quantity-weighted result for one post-fill horizon.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MarkoutSummary {
+    pub window_ms: i64,
+    pub samples: u64,
+    pub pending: u64,
+    pub unavailable: u64,
+    pub qty: f64,
+    pub quote_pnl: f64,
+    pub avg_bps: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PendingMarkout {
+    side: OrderSide,
+    price: f64,
+    qty: f64,
+    target_ms: i64,
+    window_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MarketObservation {
+    event_time_ms: i64,
+    mark: f64,
+}
+
+/// A snapshot of eligible resting quantity that remains in force until the
+/// next observation. Quantity is base units; its time integral is base-ms.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuoteQualityInterval {
+    pub event_time_ms: i64,
+    pub eligible_bid_qty: f64,
+    pub eligible_ask_qty: f64,
+}
+
+/// Time-weighted quote availability. The legacy cycle-based uptime remains a
+/// separate compatibility metric.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct QuoteTimeSummary {
+    pub observed_ms: i64,
+    pub two_sided_ms: i64,
+    pub two_sided_uptime_pct: f64,
+    pub eligible_bid_qty_ms: f64,
+    pub eligible_ask_qty_ms: f64,
+    pub eligible_total_qty_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct QuoteTimeTracker {
+    last: Option<QuoteQualityInterval>,
+    summary: QuoteTimeSummary,
+}
+
+impl QuoteTimeTracker {
+    fn observe(&mut self, next: QuoteQualityInterval) -> Result<(), PerformanceError> {
+        validate_quote_interval(next)?;
+        if let Some(previous) = self.last {
+            if next.event_time_ms < previous.event_time_ms {
+                return Err(PerformanceError::QuoteTimeRegression {
+                    previous_ms: previous.event_time_ms,
+                    next_ms: next.event_time_ms,
+                });
+            }
+            self.accrue(previous, next.event_time_ms - previous.event_time_ms);
+        }
+        self.last = Some(next);
+        Ok(())
+    }
+
+    fn finish(&mut self, end_time_ms: i64) -> Result<(), PerformanceError> {
+        if let Some(previous) = self.last {
+            if end_time_ms < previous.event_time_ms {
+                return Err(PerformanceError::QuoteTimeRegression {
+                    previous_ms: previous.event_time_ms,
+                    next_ms: end_time_ms,
+                });
+            }
+            self.accrue(previous, end_time_ms - previous.event_time_ms);
+            self.last = None;
+        }
+        Ok(())
+    }
+
+    fn accrue(&mut self, previous: QuoteQualityInterval, duration_ms: i64) {
+        self.summary.observed_ms += duration_ms;
+        if previous.eligible_bid_qty > 0.0 && previous.eligible_ask_qty > 0.0 {
+            self.summary.two_sided_ms += duration_ms;
+        }
+        let duration = duration_ms as f64;
+        self.summary.eligible_bid_qty_ms += previous.eligible_bid_qty * duration;
+        self.summary.eligible_ask_qty_ms += previous.eligible_ask_qty * duration;
+        self.summary.eligible_total_qty_ms =
+            self.summary.eligible_bid_qty_ms + self.summary.eligible_ask_qty_ms;
+        self.summary.two_sided_uptime_pct = if self.summary.observed_ms == 0 {
+            0.0
+        } else {
+            self.summary.two_sided_ms as f64 / self.summary.observed_ms as f64 * 100.0
+        };
+    }
+}
+
+fn validate_quote_interval(interval: QuoteQualityInterval) -> Result<(), PerformanceError> {
+    if !interval.eligible_bid_qty.is_finite()
+        || !interval.eligible_ask_qty.is_finite()
+        || interval.eligible_bid_qty < 0.0
+        || interval.eligible_ask_qty < 0.0
+    {
+        return Err(PerformanceError::InvalidQuoteInterval {
+            event_time_ms: interval.event_time_ms,
+            eligible_bid_qty: interval.eligible_bid_qty,
+            eligible_ask_qty: interval.eligible_ask_qty,
+        });
+    }
+    Ok(())
+}
+
+/// Immutable snapshot used by JSON output, dashboards, and replay assertions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PerformanceSummary {
+    pub passive_fills: u64,
+    pub passive_qty: f64,
+    pub exit_fills: u64,
+    pub exit_qty: f64,
+    pub gross_spread_quote: f64,
+    pub fee_quote: f64,
+    pub rebate_quote: f64,
+    pub execution_costs_unavailable: u64,
+    pub funding_quote: f64,
+    pub exit_cost_quote: f64,
+    pub inventory_mtm_change_quote: f64,
+    pub net_pnl_quote: f64,
+    pub position: f64,
+    pub markouts: [MarkoutSummary; 3],
+    pub quote_time: QuoteTimeSummary,
+}
+
+/// Current-run performance state. Trade IDs are deduplicated defensively even
+/// though the authoritative maker ledger should only forward accepted fills.
+#[derive(Clone, Debug)]
+pub struct PerformanceLedger {
+    starting_position: f64,
+    starting_mark: f64,
+    position: f64,
+    fill_cash: f64,
+    passive_fills: u64,
+    passive_qty: f64,
+    exit_fills: u64,
+    exit_qty: f64,
+    gross_spread_quote: f64,
+    fee_quote: f64,
+    rebate_quote: f64,
+    funding_quote: f64,
+    exit_cost_quote: f64,
+    seen_trade_ids: HashSet<u64>,
+    costs_by_trade_id: HashMap<u64, ExecutionCosts>,
+    markets: Vec<MarketObservation>,
+    pending_markouts: Vec<PendingMarkout>,
+    markouts: [MarkoutAccumulator; 3],
+    last_funding_time_ms: Option<i64>,
+    quote_time: QuoteTimeTracker,
+}
+
+impl PerformanceLedger {
+    pub fn new(starting_position: f64, starting_mark: f64) -> Result<Self, PerformanceError> {
+        if !starting_position.is_finite() || !starting_mark.is_finite() || starting_mark <= 0.0 {
+            return Err(PerformanceError::InvalidStartingPoint {
+                position: starting_position,
+                mark: starting_mark,
+            });
+        }
+        Ok(Self {
+            starting_position,
+            starting_mark,
+            position: starting_position,
+            fill_cash: 0.0,
+            passive_fills: 0,
+            passive_qty: 0.0,
+            exit_fills: 0,
+            exit_qty: 0.0,
+            gross_spread_quote: 0.0,
+            fee_quote: 0.0,
+            rebate_quote: 0.0,
+            funding_quote: 0.0,
+            exit_cost_quote: 0.0,
+            seen_trade_ids: HashSet::new(),
+            costs_by_trade_id: HashMap::new(),
+            markets: Vec::new(),
+            pending_markouts: Vec::new(),
+            markouts: [MarkoutAccumulator::default(); 3],
+            last_funding_time_ms: None,
+            quote_time: QuoteTimeTracker::default(),
+        })
+    }
+
+    /// Returns false for a duplicate stable trade ID.
+    pub fn record_fill(&mut self, fill: PerformanceFill) -> Result<bool, PerformanceError> {
+        if fill.trade_id == 0
+            || fill.order_id == 0
+            || !fill.price.is_finite()
+            || !fill.qty.is_finite()
+            || !fill.mark_at_fill.is_finite()
+            || fill.price <= 0.0
+            || fill.qty <= 0.0
+            || fill.mark_at_fill <= 0.0
+            || fill.costs.is_some_and(|costs| !valid_costs(costs))
+        {
+            return Err(PerformanceError::InvalidFill {
+                trade_id: fill.trade_id,
+            });
+        }
+        if !self.seen_trade_ids.insert(fill.trade_id) {
+            return Ok(false);
+        }
+
+        let direction = side_direction(fill.side);
+        self.position += direction * fill.qty;
+        self.fill_cash -= direction * fill.price * fill.qty;
+        if let Some(costs) = fill.costs {
+            self.apply_execution_costs(fill.trade_id, costs);
+        }
+        match fill.role {
+            FillRole::PassiveMaker => {
+                self.passive_fills += 1;
+                self.passive_qty += fill.qty;
+                self.gross_spread_quote += direction * (fill.mark_at_fill - fill.price) * fill.qty;
+            }
+            FillRole::InventoryExit => {
+                self.exit_fills += 1;
+                self.exit_qty += fill.qty;
+                self.exit_cost_quote += direction * (fill.price - fill.mark_at_fill) * fill.qty;
+            }
+        }
+
+        for (window_index, window_ms) in MARKOUT_WINDOWS_MS.into_iter().enumerate() {
+            let target_ms = fill.event_time_ms.saturating_add(window_ms);
+            if let Some(observation) = self
+                .markets
+                .iter()
+                .find(|market| market.event_time_ms >= target_ms)
+                .copied()
+            {
+                self.apply_markout(
+                    window_index,
+                    fill.side,
+                    fill.price,
+                    fill.qty,
+                    observation.mark,
+                );
+            } else {
+                self.pending_markouts.push(PendingMarkout {
+                    side: fill.side,
+                    price: fill.price,
+                    qty: fill.qty,
+                    target_ms,
+                    window_index,
+                });
+            }
+        }
+        Ok(true)
+    }
+
+    /// Enrich an existing execution when REST supplies costs after the account
+    /// stream trade. Exact duplicates are idempotent; conflicting values fail.
+    pub fn record_execution_costs(
+        &mut self,
+        trade_id: u64,
+        costs: ExecutionCosts,
+    ) -> Result<bool, PerformanceError> {
+        if !self.seen_trade_ids.contains(&trade_id) {
+            return Err(PerformanceError::UnknownExecutionCosts { trade_id });
+        }
+        if !valid_costs(costs) {
+            return Err(PerformanceError::InvalidFill { trade_id });
+        }
+        if let Some(previous) = self.costs_by_trade_id.get(&trade_id) {
+            if *previous == costs {
+                return Ok(false);
+            }
+            return Err(PerformanceError::ConflictingExecutionCosts { trade_id });
+        }
+        self.apply_execution_costs(trade_id, costs);
+        Ok(true)
+    }
+
+    /// Observe a normalized mark. Equal timestamps are allowed; regressions
+    /// are rejected so replay ordering mistakes cannot silently alter markout.
+    pub fn observe_market(
+        &mut self,
+        event_time_ms: i64,
+        mark: f64,
+    ) -> Result<(), PerformanceError> {
+        if !mark.is_finite() || mark <= 0.0 {
+            return Err(PerformanceError::InvalidMarketObservation {
+                event_time_ms,
+                mark,
+            });
+        }
+        if let Some(previous) = self.markets.last() {
+            if event_time_ms < previous.event_time_ms {
+                return Err(PerformanceError::MarketTimeRegression {
+                    previous_ms: previous.event_time_ms,
+                    next_ms: event_time_ms,
+                });
+            }
+        }
+        self.markets.push(MarketObservation {
+            event_time_ms,
+            mark,
+        });
+
+        let mut unresolved = Vec::with_capacity(self.pending_markouts.len());
+        for pending in std::mem::take(&mut self.pending_markouts) {
+            if event_time_ms >= pending.target_ms {
+                self.apply_markout(
+                    pending.window_index,
+                    pending.side,
+                    pending.price,
+                    pending.qty,
+                    mark,
+                );
+            } else {
+                unresolved.push(pending);
+            }
+        }
+        self.pending_markouts = unresolved;
+        Ok(())
+    }
+
+    /// Signed funding cashflow in quote currency: positive is received,
+    /// negative is paid.
+    pub fn record_funding(
+        &mut self,
+        event_time_ms: i64,
+        cashflow_quote: f64,
+    ) -> Result<(), PerformanceError> {
+        if !cashflow_quote.is_finite() {
+            return Err(PerformanceError::InvalidFunding {
+                event_time_ms,
+                cashflow_quote,
+            });
+        }
+        if let Some(previous_ms) = self.last_funding_time_ms {
+            if event_time_ms < previous_ms {
+                return Err(PerformanceError::FundingTimeRegression {
+                    previous_ms,
+                    next_ms: event_time_ms,
+                });
+            }
+        }
+        self.last_funding_time_ms = Some(event_time_ms);
+        self.funding_quote += cashflow_quote;
+        Ok(())
+    }
+
+    pub fn observe_quote_quality(
+        &mut self,
+        interval: QuoteQualityInterval,
+    ) -> Result<(), PerformanceError> {
+        self.quote_time.observe(interval)
+    }
+
+    /// Close time-weighted quote observation and censor every unresolved
+    /// markout. Censored windows are counted as unavailable, never substituted
+    /// with the latest mark.
+    pub fn finish(&mut self, end_time_ms: i64) -> Result<(), PerformanceError> {
+        self.quote_time.finish(end_time_ms)?;
+        for pending in self.pending_markouts.drain(..) {
+            self.markouts[pending.window_index].unavailable += 1;
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self, final_mark: f64) -> Result<PerformanceSummary, PerformanceError> {
+        if !final_mark.is_finite() || final_mark <= 0.0 {
+            return Err(PerformanceError::InvalidMarketObservation {
+                event_time_ms: self.markets.last().map_or(0, |market| market.event_time_ms),
+                mark: final_mark,
+            });
+        }
+        let net_pnl_quote = self.fill_cash + self.position * final_mark
+            - self.starting_position * self.starting_mark
+            + self.rebate_quote
+            - self.fee_quote
+            + self.funding_quote;
+        // This residual is the inventory revaluation component that makes the
+        // roadmap identity exact without double-counting active-exit slippage.
+        let inventory_mtm_change_quote =
+            net_pnl_quote - self.gross_spread_quote - self.rebate_quote + self.fee_quote
+                - self.funding_quote
+                + self.exit_cost_quote;
+
+        let markouts = std::array::from_fn(|index| {
+            let value = self.markouts[index];
+            MarkoutSummary {
+                window_ms: MARKOUT_WINDOWS_MS[index],
+                samples: value.samples,
+                pending: self
+                    .pending_markouts
+                    .iter()
+                    .filter(|pending| pending.window_index == index)
+                    .count() as u64,
+                unavailable: value.unavailable,
+                qty: value.qty,
+                quote_pnl: value.quote_pnl,
+                avg_bps: (value.qty > 0.0).then_some(value.bps_qty_sum / value.qty),
+            }
+        });
+        Ok(PerformanceSummary {
+            passive_fills: self.passive_fills,
+            passive_qty: self.passive_qty,
+            exit_fills: self.exit_fills,
+            exit_qty: self.exit_qty,
+            gross_spread_quote: self.gross_spread_quote,
+            fee_quote: self.fee_quote,
+            rebate_quote: self.rebate_quote,
+            execution_costs_unavailable: self
+                .seen_trade_ids
+                .len()
+                .saturating_sub(self.costs_by_trade_id.len())
+                as u64,
+            funding_quote: self.funding_quote,
+            exit_cost_quote: self.exit_cost_quote,
+            inventory_mtm_change_quote,
+            net_pnl_quote,
+            position: self.position,
+            markouts,
+            quote_time: self.quote_time.summary,
+        })
+    }
+
+    fn apply_markout(
+        &mut self,
+        window_index: usize,
+        side: OrderSide,
+        price: f64,
+        qty: f64,
+        future_mark: f64,
+    ) {
+        let direction = side_direction(side);
+        let quote_pnl = direction * (future_mark - price) * qty;
+        let bps = direction * (future_mark - price) / price * 10_000.0;
+        let accumulator = &mut self.markouts[window_index];
+        accumulator.qty += qty;
+        accumulator.quote_pnl += quote_pnl;
+        accumulator.bps_qty_sum += bps * qty;
+        accumulator.samples += 1;
+    }
+
+    fn apply_execution_costs(&mut self, trade_id: u64, costs: ExecutionCosts) {
+        self.costs_by_trade_id.insert(trade_id, costs);
+        self.fee_quote += costs.fee_quote;
+        self.rebate_quote += costs.rebate_quote;
+    }
+}
+
+fn valid_costs(costs: ExecutionCosts) -> bool {
+    costs.fee_quote.is_finite()
+        && costs.rebate_quote.is_finite()
+        && costs.fee_quote >= 0.0
+        && costs.rebate_quote >= 0.0
+}
+
+fn side_direction(side: OrderSide) -> f64 {
+    match side {
+        OrderSide::Buy => 1.0,
+        OrderSide::Sell => -1.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill(
+        trade_id: u64,
+        role: FillRole,
+        side: OrderSide,
+        price: f64,
+        qty: f64,
+        event_time_ms: i64,
+    ) -> PerformanceFill {
+        PerformanceFill {
+            trade_id,
+            order_id: trade_id + 100,
+            role,
+            side,
+            price,
+            qty,
+            mark_at_fill: 100.0,
+            event_time_ms,
+            costs: Some(ExecutionCosts::default()),
+        }
+    }
+
+    #[test]
+    fn attributes_passive_and_exit_fills_and_conserves_net_pnl() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        let mut passive = fill(1, FillRole::PassiveMaker, OrderSide::Buy, 99.0, 1.0, 0);
+        passive.costs = Some(ExecutionCosts {
+            fee_quote: 0.10,
+            rebate_quote: 0.02,
+        });
+        assert!(ledger.record_fill(passive).unwrap());
+        assert!(!ledger.record_fill(passive).unwrap(), "trade IDs dedupe");
+
+        let exit = fill(
+            2,
+            FillRole::InventoryExit,
+            OrderSide::Sell,
+            101.0,
+            1.0,
+            10_000,
+        );
+        ledger.record_fill(exit).unwrap();
+        ledger.record_funding(20_000, 0.25).unwrap();
+        let summary = ledger.summary(100.0).unwrap();
+
+        assert_eq!(summary.passive_fills, 1);
+        assert_eq!(summary.exit_fills, 1);
+        assert!((summary.gross_spread_quote - 1.0).abs() < 1e-12);
+        assert!((summary.exit_cost_quote + 1.0).abs() < 1e-12);
+        assert!((summary.net_pnl_quote - 2.17).abs() < 1e-12);
+        let recomposed =
+            summary.gross_spread_quote + summary.inventory_mtm_change_quote + summary.rebate_quote
+                - summary.fee_quote
+                + summary.funding_quote
+                - summary.exit_cost_quote;
+        assert!((recomposed - summary.net_pnl_quote).abs() < 1e-12);
+    }
+
+    #[test]
+    fn late_rest_costs_enrich_a_ws_fill_once_and_conflicts_fail() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        let mut ws_fill = fill(1, FillRole::PassiveMaker, OrderSide::Buy, 99.0, 1.0, 0);
+        ws_fill.costs = None;
+        ledger.record_fill(ws_fill).unwrap();
+        assert_eq!(
+            ledger.summary(100.0).unwrap().execution_costs_unavailable,
+            1
+        );
+
+        let costs = ExecutionCosts {
+            fee_quote: 0.10,
+            rebate_quote: 0.0,
+        };
+        assert!(ledger.record_execution_costs(1, costs).unwrap());
+        assert!(!ledger.record_execution_costs(1, costs).unwrap());
+        assert_eq!(
+            ledger.summary(100.0).unwrap().execution_costs_unavailable,
+            0
+        );
+        assert!(matches!(
+            ledger.record_execution_costs(
+                1,
+                ExecutionCosts {
+                    fee_quote: 0.20,
+                    rebate_quote: 0.0,
+                }
+            ),
+            Err(PerformanceError::ConflictingExecutionCosts { trade_id: 1 })
+        ));
+    }
+
+    #[test]
+    fn resolves_markout_with_first_mark_at_or_after_each_horizon() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger
+            .record_fill(fill(
+                1,
+                FillRole::PassiveMaker,
+                OrderSide::Buy,
+                100.0,
+                2.0,
+                1_000,
+            ))
+            .unwrap();
+        ledger.observe_market(1_500, 100.2).unwrap();
+        ledger.observe_market(2_000, 101.0).unwrap();
+        ledger.observe_market(6_100, 99.0).unwrap();
+        ledger.observe_market(31_000, 102.0).unwrap();
+        let summary = ledger.summary(102.0).unwrap();
+
+        assert_eq!(summary.markouts[0].samples, 1);
+        assert_eq!(summary.markouts[1].samples, 1);
+        assert_eq!(summary.markouts[2].samples, 1);
+        assert!((summary.markouts[0].avg_bps.unwrap() - 100.0).abs() < 1e-12);
+        assert!((summary.markouts[1].avg_bps.unwrap() + 100.0).abs() < 1e-12);
+        assert!((summary.markouts[2].avg_bps.unwrap() - 200.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn late_fill_uses_retained_market_history() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger.observe_market(2_000, 101.0).unwrap();
+        ledger.observe_market(6_000, 99.0).unwrap();
+        ledger
+            .record_fill(fill(
+                1,
+                FillRole::PassiveMaker,
+                OrderSide::Sell,
+                100.0,
+                1.0,
+                1_000,
+            ))
+            .unwrap();
+        let summary = ledger.summary(99.0).unwrap();
+        assert!((summary.markouts[0].avg_bps.unwrap() + 100.0).abs() < 1e-12);
+        assert!((summary.markouts[1].avg_bps.unwrap() - 100.0).abs() < 1e-12);
+        assert_eq!(summary.markouts[2].pending, 1);
+    }
+
+    #[test]
+    fn finish_marks_missing_horizons_unavailable_without_fabricating_marks() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger
+            .record_fill(fill(
+                1,
+                FillRole::PassiveMaker,
+                OrderSide::Buy,
+                100.0,
+                1.0,
+                0,
+            ))
+            .unwrap();
+        ledger.observe_market(1_000, 100.5).unwrap();
+        ledger.finish(2_000).unwrap();
+        let summary = ledger.summary(100.5).unwrap();
+        assert_eq!(summary.markouts[0].samples, 1);
+        assert_eq!(summary.markouts[1].unavailable, 1);
+        assert_eq!(summary.markouts[2].unavailable, 1);
+    }
+
+    #[test]
+    fn time_weights_two_sided_uptime_and_depth_integrals() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger
+            .observe_quote_quality(QuoteQualityInterval {
+                event_time_ms: 0,
+                eligible_bid_qty: 2.0,
+                eligible_ask_qty: 3.0,
+            })
+            .unwrap();
+        ledger
+            .observe_quote_quality(QuoteQualityInterval {
+                event_time_ms: 1_000,
+                eligible_bid_qty: 2.0,
+                eligible_ask_qty: 0.0,
+            })
+            .unwrap();
+        ledger.finish(3_000).unwrap();
+        let summary = ledger.summary(100.0).unwrap().quote_time;
+
+        assert_eq!(summary.observed_ms, 3_000);
+        assert_eq!(summary.two_sided_ms, 1_000);
+        assert!((summary.two_sided_uptime_pct - 100.0 / 3.0).abs() < 1e-12);
+        assert!((summary.eligible_bid_qty_ms - 6_000.0).abs() < 1e-12);
+        assert!((summary.eligible_ask_qty_ms - 3_000.0).abs() < 1e-12);
+        assert!((summary.eligible_total_qty_ms - 9_000.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejects_non_monotonic_typed_observations() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger.observe_market(2, 100.0).unwrap();
+        assert!(matches!(
+            ledger.observe_market(1, 100.0),
+            Err(PerformanceError::MarketTimeRegression { .. })
+        ));
+        ledger
+            .observe_quote_quality(QuoteQualityInterval {
+                event_time_ms: 2,
+                eligible_bid_qty: 1.0,
+                eligible_ask_qty: 1.0,
+            })
+            .unwrap();
+        assert!(matches!(
+            ledger.observe_quote_quality(QuoteQualityInterval {
+                event_time_ms: 1,
+                eligible_bid_qty: 1.0,
+                eligible_ask_qty: 1.0,
+            }),
+            Err(PerformanceError::QuoteTimeRegression { .. })
+        ));
+    }
+}

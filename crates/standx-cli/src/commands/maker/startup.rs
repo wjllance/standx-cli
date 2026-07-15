@@ -23,6 +23,8 @@ pub(super) struct LiveSession {
     pub(super) account_stream_epoch: u64,
     pub(super) projection: MakerAccountProjection,
     pub(super) account_poll: LiveAccountPollState,
+    pub(super) order_latency: maker::OrderLatencyTracker,
+    pub(super) latency_started: std::time::Instant,
 }
 
 pub(super) fn new_maker_rest_client() -> Result<StandXClient> {
@@ -466,6 +468,8 @@ pub(super) async fn run_startup(
                 qty_tolerance,
             ),
             account_poll,
+            order_latency: maker::OrderLatencyTracker::default(),
+            latency_started: std::time::Instant::now(),
         });
         emit_ledger_sync(
             output_format,

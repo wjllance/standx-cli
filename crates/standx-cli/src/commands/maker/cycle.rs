@@ -10,8 +10,8 @@ use super::recovery::PositionReconciliationError;
 use anyhow::Result;
 use standx_maker::{
     self as maker, AccountProjectionEvent, MakerAccountProjection, MakerFill, MakerLedger,
-    MakerStats, ProjectionPendingCancel, ProjectionPendingPlace, ProjectionRegistryError,
-    RestingQuote, MAX_PENDING_ORDER_REQUESTS,
+    MakerStats, OrderLatencyTracker, ProjectionPendingCancel, ProjectionPendingPlace,
+    ProjectionRegistryError, RestingQuote, MAX_PENDING_ORDER_REQUESTS,
 };
 use standx_sdk::account_stream::AccountStreamHealth;
 #[cfg(test)]
@@ -20,6 +20,83 @@ use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
 use std::time::Duration;
+use std::time::Instant;
+
+const ORDER_LATENCY_TIMEOUT_MS: u64 = 15_000;
+
+struct LatencyRegistration<'a> {
+    started: Option<Instant>,
+    request_id: &'a str,
+    kind: maker::LatencyRequestKind,
+    generation: u64,
+    cycle: u64,
+    symbol: &'a str,
+    side: OrderSide,
+    level: u32,
+    order_id: Option<u64>,
+    market_source: &'a str,
+}
+
+fn register_order_latency(
+    tracker: &mut Option<&mut OrderLatencyTracker>,
+    registration: LatencyRegistration<'_>,
+) {
+    let LatencyRegistration {
+        started,
+        request_id,
+        kind,
+        generation,
+        cycle,
+        symbol,
+        side,
+        level,
+        order_id,
+        market_source,
+    } = registration;
+    let (Some(tracker), Some(started)) = (tracker.as_deref_mut(), started) else {
+        return;
+    };
+    if let Err(error) = tracker.register(maker::LatencyRequestContext {
+        request_id: request_id.to_string(),
+        kind,
+        generation,
+        cycle,
+        symbol: symbol.to_string(),
+        side: Some(side),
+        level: Some(level),
+        order_id,
+        market_source: Some(market_source.to_string()),
+        recovery: false,
+        intent_ms: elapsed_ms(started),
+        intent_utc_ms: chrono::Utc::now().timestamp_millis(),
+    }) {
+        eprintln!("⚠️ order latency registration unavailable: {error}");
+    }
+}
+
+fn observe_order_write(
+    tracker: &mut Option<&mut OrderLatencyTracker>,
+    started: Option<Instant>,
+    request_id: &str,
+    sent: bool,
+) {
+    let (Some(tracker), Some(started)) = (tracker.as_deref_mut(), started) else {
+        return;
+    };
+    let at_ms = elapsed_ms(started);
+    let outcome = if sent {
+        tracker.mark_written(request_id, at_ms)
+    } else {
+        tracker.mark_invalidated(request_id, at_ms)
+    };
+    if let Err(error) = outcome {
+        eprintln!("⚠️ order latency write observation unavailable: {error}");
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
 fn collect_current_run_fills(
     trades: Vec<Trade>,
@@ -130,6 +207,7 @@ pub(super) async fn maker_cycle(
         order_commands,
         order_response_health,
         account_stream_health,
+        performance_time_ms,
     } = request;
     let CycleState {
         resting,
@@ -140,6 +218,8 @@ pub(super) async fn maker_cycle(
         stats,
         breaker,
         live_account_poll,
+        mut order_latency,
+        latency_started,
     } = state;
     use maker::{format_decimals, paper_quote_filled, Action, CycleInput, MarketSnapshot};
 
@@ -151,6 +231,27 @@ pub(super) async fn maker_cycle(
         best_bid,
         best_ask,
     };
+    if let Some(performance) = ledger.performance_mut() {
+        let observed_resting = account_projection
+            .as_deref()
+            .map(|projection| projection.resting_quotes())
+            .unwrap_or_else(|| resting.clone());
+        let (eligible_bid_qty, eligible_ask_qty) =
+            eligible_quote_qty(&observed_resting, mark, cfg.band_bps);
+        let observation = performance
+            .observe_market(performance_time_ms, mark)
+            .and_then(|()| {
+                performance.observe_quote_quality(maker::QuoteQualityInterval {
+                    event_time_ms: performance_time_ms,
+                    eligible_bid_qty,
+                    eligible_ask_qty,
+                })
+            });
+        if let Err(error) = observation {
+            eprintln!("⚠️ maker performance observation disabled: {error}");
+            ledger.disable_performance();
+        }
+    }
     let preflight = maker::preflight_cycle(breaker, market, max_divergence_bps, live);
     let halted = match preflight.skip {
         Some(skip) => {
@@ -182,6 +283,12 @@ pub(super) async fn maker_cycle(
             .expect("live maker cycles require initialized account projection");
         let generation = projection.generation();
         projection.apply(generation, AccountProjectionEvent::AdvanceCycle { cycle });
+        if let (Some(tracker), Some(started)) = (order_latency.as_deref_mut(), latency_started) {
+            let at_ms = elapsed_ms(started);
+            if let Err(error) = tracker.timeout_pending(at_ms, ORDER_LATENCY_TIMEOUT_MS) {
+                eprintln!("⚠️ order latency timeout observation unavailable: {error}");
+            }
+        }
         let poll =
             live_account_poll.expect("live maker cycles require initialized account polling state");
         let poll_now = std::time::Instant::now();
@@ -286,6 +393,17 @@ pub(super) async fn maker_cycle(
                     ),
                 ));
             }
+            if let (Some(tracker), Some(started)) = (order_latency.as_deref_mut(), latency_started)
+            {
+                let open_order_ids = observations
+                    .iter()
+                    .map(|observation| observation.order_id)
+                    .collect::<Vec<_>>();
+                let at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if let Err(error) = tracker.mark_absent_cancels_effective(&open_order_ids, at_ms) {
+                    eprintln!("⚠️ order latency REST-effective observation unavailable: {error}");
+                }
+            }
             projection.apply(
                 generation,
                 AccountProjectionEvent::PositionObserved {
@@ -310,6 +428,30 @@ pub(super) async fn maker_cycle(
                     OrderSide::Sell => -q.qty,
                 };
                 stats.record_fill(q.side, q.price, q.qty, mark);
+                let performance_fill = if let Some(performance) = ledger.performance_mut() {
+                    let side_bit = u64::from(q.side == OrderSide::Sell);
+                    let synthetic_id =
+                        (1_u64 << 63) | (cycle << 32) | (u64::from(q.level) << 1) | side_bit;
+                    performance.record_fill(maker::PerformanceFill {
+                        trade_id: synthetic_id,
+                        order_id: synthetic_id,
+                        role: maker::FillRole::PassiveMaker,
+                        side: q.side,
+                        price: q.price,
+                        qty: q.qty,
+                        mark_at_fill: mark,
+                        event_time_ms: performance_time_ms,
+                        // Paper simulation has no venue fee model. Preserve
+                        // that gap instead of silently assuming zero cost.
+                        costs: None,
+                    })
+                } else {
+                    Ok(false)
+                };
+                if let Err(error) = performance_fill {
+                    eprintln!("⚠️ maker performance observation disabled: {error}");
+                    ledger.disable_performance();
+                }
                 fills.push(MakerFill {
                     side: q.side,
                     price: q.price,
@@ -318,6 +460,8 @@ pub(super) async fn maker_cycle(
                     order_id: None,
                     trade_ts: None,
                     origin: "paper",
+                    role: maker::FillRole::PassiveMaker,
+                    costs: None,
                 });
             } else {
                 i += 1;
@@ -443,7 +587,7 @@ pub(super) async fn maker_cycle(
                         apply_request_submission(
                             projection,
                             AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
-                                request_id,
+                                request_id: request_id.clone(),
                                 order_id,
                                 side: *side,
                                 level: *level,
@@ -451,7 +595,29 @@ pub(super) async fn maker_cycle(
                                 cycle,
                             }),
                         )?;
-                        commands.send_prepared(command).await?;
+                        register_order_latency(
+                            &mut order_latency,
+                            LatencyRegistration {
+                                started: latency_started,
+                                request_id: &request_id,
+                                kind: maker::LatencyRequestKind::Cancel,
+                                generation: projection.generation(),
+                                cycle,
+                                symbol,
+                                side: *side,
+                                level: *level,
+                                order_id: Some(order_id),
+                                market_source,
+                            },
+                        );
+                        let sent = commands.send_prepared(command).await;
+                        observe_order_write(
+                            &mut order_latency,
+                            latency_started,
+                            &request_id,
+                            sent.is_ok(),
+                        );
+                        sent?;
                         cancels += 1;
                     }
                 } else {
@@ -488,7 +654,7 @@ pub(super) async fn maker_cycle(
                     apply_request_submission(
                         projection,
                         AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
-                            request_id,
+                            request_id: request_id.clone(),
                             client_order_id: cl_ord_id,
                             side: q.side,
                             price: q.price,
@@ -498,7 +664,29 @@ pub(super) async fn maker_cycle(
                             cycle,
                         }),
                     )?;
-                    commands.send_prepared(command).await?;
+                    register_order_latency(
+                        &mut order_latency,
+                        LatencyRegistration {
+                            started: latency_started,
+                            request_id: &request_id,
+                            kind: maker::LatencyRequestKind::Place,
+                            generation: projection.generation(),
+                            cycle,
+                            symbol,
+                            side: q.side,
+                            level: q.level,
+                            order_id: None,
+                            market_source,
+                        },
+                    );
+                    let sent = commands.send_prepared(command).await;
+                    observe_order_write(
+                        &mut order_latency,
+                        latency_started,
+                        &request_id,
+                        sent.is_ok(),
+                    );
+                    sent?;
                     places += 1;
                 } else {
                     resting.push(RestingQuote {
@@ -556,7 +744,7 @@ pub(super) async fn maker_cycle(
             apply_request_submission(
                 projection,
                 AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
-                    request_id,
+                    request_id: request_id.clone(),
                     client_order_id: cl_ord_id,
                     side: exit.side,
                     price: mark,
@@ -566,7 +754,29 @@ pub(super) async fn maker_cycle(
                     cycle,
                 }),
             )?;
-            commands.send_prepared(command).await?;
+            register_order_latency(
+                &mut order_latency,
+                LatencyRegistration {
+                    started: latency_started,
+                    request_id: &request_id,
+                    kind: maker::LatencyRequestKind::Place,
+                    generation: projection.generation(),
+                    cycle,
+                    symbol,
+                    side: exit.side,
+                    level: u32::MAX,
+                    order_id: None,
+                    market_source,
+                },
+            );
+            let sent = commands.send_prepared(command).await;
+            observe_order_write(
+                &mut order_latency,
+                latency_started,
+                &request_id,
+                sent.is_ok(),
+            );
+            sent?;
             *inventory_exit_pending = true;
             log_maker_event(MakerLogEvent {
                 output_format,
@@ -595,6 +805,33 @@ pub(super) async fn maker_cycle(
     let two_sided = final_resting.iter().any(|r| r.side == OrderSide::Buy)
         && final_resting.iter().any(|r| r.side == OrderSide::Sell);
     stats.end_cycle(position, two_sided);
+    let quote_observation = if let Some(performance) = ledger.performance_mut() {
+        let (eligible_bid_qty, eligible_ask_qty) =
+            eligible_quote_qty(&final_resting, mark, cfg.band_bps);
+        performance.observe_quote_quality(maker::QuoteQualityInterval {
+            event_time_ms: performance_time_ms,
+            eligible_bid_qty,
+            eligible_ask_qty,
+        })
+    } else {
+        Ok(())
+    };
+    if let Err(error) = quote_observation {
+        eprintln!("⚠️ maker performance observation disabled: {error}");
+        ledger.disable_performance();
+    }
+    let performance_summary = match ledger
+        .performance()
+        .map(|performance| performance.summary(mark))
+        .transpose()
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            eprintln!("⚠️ maker performance summary disabled: {error}");
+            ledger.disable_performance();
+            None
+        }
+    };
 
     // 6. Emit.
     emit_maker_cycle(CycleOutput {
@@ -615,6 +852,7 @@ pub(super) async fn maker_cycle(
         stats,
         halt_vol_bps: halted.then(|| breaker.vol_bps()),
         cfg,
+        performance: performance_summary.as_ref(),
     });
 
     Ok(CycleResult {
@@ -624,6 +862,20 @@ pub(super) async fn maker_cycle(
         fills: fills.len() as u64,
         balance: account_balance,
     })
+}
+
+fn eligible_quote_qty(resting: &[RestingQuote], mark: f64, band_bps: f64) -> (f64, f64) {
+    let band = mark * band_bps / 10_000.0;
+    resting
+        .iter()
+        .filter(|quote| (quote.price - mark).abs() <= band + f64::EPSILON)
+        .fold((0.0, 0.0), |mut qty, quote| {
+            match quote.side {
+                OrderSide::Buy => qty.0 += quote.qty,
+                OrderSide::Sell => qty.1 += quote.qty,
+            }
+            qty
+        })
 }
 
 #[cfg(test)]

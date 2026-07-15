@@ -128,6 +128,22 @@ fn order_response_failure(
     }
 }
 
+fn observe_order_ack(
+    tracker: Option<&mut maker::OrderLatencyTracker>,
+    started: Option<std::time::Instant>,
+    request_id: Option<&str>,
+    accepted: bool,
+) {
+    let (Some(tracker), Some(started), Some(request_id)) = (tracker, started, request_id) else {
+        return;
+    };
+    let at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Err(error) = tracker.mark_ack(request_id, at_ms, accepted) {
+        eprintln!("⚠️ order latency ack observation unavailable: {error}");
+    }
+}
+
+#[cfg(test)]
 pub(super) fn apply_order_responses(
     receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
     projection: &mut MakerAccountProjection,
@@ -136,6 +152,36 @@ pub(super) fn apply_order_responses(
     symbol: &str,
     cycle: u64,
     price_decimals: u32,
+) -> Result<()> {
+    apply_order_responses_observed(
+        receiver,
+        projection,
+        runtime_state,
+        OrderResponseObservation {
+            output_format,
+            symbol,
+            cycle,
+            price_decimals,
+            latency: None,
+            latency_started: None,
+        },
+    )
+}
+
+struct OrderResponseObservation<'a> {
+    output_format: OutputFormat,
+    symbol: &'a str,
+    cycle: u64,
+    price_decimals: u32,
+    latency: Option<&'a mut maker::OrderLatencyTracker>,
+    latency_started: Option<std::time::Instant>,
+}
+
+fn apply_order_responses_observed(
+    receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
+    projection: &mut MakerAccountProjection,
+    runtime_state: &mut MakerState,
+    mut observation: OrderResponseObservation<'_>,
 ) -> Result<()> {
     loop {
         let response = match receiver.try_recv() {
@@ -148,13 +194,19 @@ pub(super) fn apply_order_responses(
             }
         };
         let request_id = response.request_id.clone();
+        observe_order_ack(
+            observation.latency.as_deref_mut(),
+            observation.latency_started,
+            request_id.as_deref(),
+            response.accepted(),
+        );
         let outcome = apply_order_response(
             response,
             projection,
-            output_format,
-            symbol,
-            cycle,
-            price_decimals,
+            observation.output_format,
+            observation.symbol,
+            observation.cycle,
+            observation.price_decimals,
         );
         if let Some(error) = order_response_failure(&outcome, request_id.as_deref(), runtime_state)
         {
@@ -250,6 +302,8 @@ struct AccountEventOutcome {
     exit_fill_observed: bool,
     balance_changed: bool,
     requires_order_reconciliation: bool,
+    effective_request_ids: Vec<String>,
+    fill_order_ids: Vec<u64>,
 }
 
 impl AccountEventOutcome {
@@ -261,6 +315,9 @@ impl AccountEventOutcome {
         self.exit_fill_observed |= other.exit_fill_observed;
         self.balance_changed |= other.balance_changed;
         self.requires_order_reconciliation |= other.requires_order_reconciliation;
+        self.effective_request_ids
+            .extend(other.effective_request_ids);
+        self.fill_order_ids.extend(other.fill_order_ids);
     }
 }
 
@@ -291,6 +348,8 @@ struct OutcomeSink<'a> {
     qty_tolerance: f64,
     symbol: &'a str,
     cycle: u64,
+    order_latency: Option<&'a mut maker::OrderLatencyTracker>,
+    latency_started: Option<std::time::Instant>,
 }
 
 /// Fold one account-event outcome into the loop totals: accumulate fills, clear
@@ -300,8 +359,23 @@ struct OutcomeSink<'a> {
 /// differs between the cycle, replan, and reconciliation paths.
 async fn absorb_account_outcome(
     outcome: AccountEventOutcome,
-    sink: OutcomeSink<'_>,
+    mut sink: OutcomeSink<'_>,
 ) -> Option<f64> {
+    if let (Some(tracker), Some(started)) =
+        (sink.order_latency.as_deref_mut(), sink.latency_started)
+    {
+        let at_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        for order_id in &outcome.fill_order_ids {
+            if let Err(error) = tracker.record_fill_after_cancel_order(*order_id, at_ms) {
+                eprintln!("⚠️ fill-after-cancel observation unavailable: {error}");
+            }
+        }
+        for request_id in &outcome.effective_request_ids {
+            if let Err(error) = tracker.mark_effective(request_id, at_ms) {
+                eprintln!("⚠️ order latency effective observation unavailable: {error}");
+            }
+        }
+    }
     *sink.total_fills += outcome.fills;
     *sink.balance_refresh_requested |= outcome.balance_changed;
     if outcome.exit_fill_observed {
@@ -412,6 +486,7 @@ fn apply_account_event(
     state: &mut AccountEventState<'_>,
     context: &AccountEventContext<'_>,
 ) -> Result<AccountEventOutcome> {
+    output::emit_account_event_lag(context.output_format, &event, context.symbol, context.cycle);
     match event {
         AccountEvent::Connected { epoch } => {
             if epoch != state.projection.generation() {
@@ -457,6 +532,11 @@ fn apply_account_event(
                 exit_fill_observed,
                 balance_changed: false,
                 requires_order_reconciliation,
+                effective_request_ids: projection_outcome
+                    .effective_request_id
+                    .into_iter()
+                    .collect(),
+                fill_order_ids: fills.iter().filter_map(|fill| fill.order_id).collect(),
             })
         }
         AccountEvent::Position(update) => {
@@ -478,6 +558,8 @@ fn apply_account_event(
                 exit_fill_observed: false,
                 balance_changed: false,
                 requires_order_reconciliation: false,
+                effective_request_ids: Vec::new(),
+                fill_order_ids: Vec::new(),
             })
         }
         AccountEvent::Trade(trade) => {
@@ -509,6 +591,8 @@ fn apply_account_event(
                 exit_fill_observed,
                 balance_changed: false,
                 requires_order_reconciliation: false,
+                effective_request_ids: Vec::new(),
+                fill_order_ids: fills.iter().filter_map(|fill| fill.order_id).collect(),
             })
         }
         // A balance update only signals that the REST-backed margin snapshot
@@ -938,6 +1022,9 @@ pub(super) async fn run_maker(
     let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
     let mut inventory_exit_pending = false;
     let mut ledger = MakerLedger::new(starting_position);
+    ledger.enable_performance(baseline_mark)?;
+    let performance_started = std::time::Instant::now();
+    let performance_epoch_ms = chrono::Utc::now().timestamp_millis();
     let mut position_alert_anchor =
         PositionAlertAnchor::new(starting_position, args.alert_position_change_pct);
     let mut consecutive_errors: u32 = 0;
@@ -1584,14 +1671,18 @@ pub(super) async fn run_maker(
             }
         }
         if let Some(session) = live_session.as_mut() {
-            if let Err(error) = apply_order_responses(
+            if let Err(error) = apply_order_responses_observed(
                 &mut session.order_responses,
                 &mut session.projection,
                 &mut runtime_state,
-                output_format,
-                &symbol,
-                cycle,
-                cfg.price_decimals,
+                OrderResponseObservation {
+                    output_format,
+                    symbol: &symbol,
+                    cycle,
+                    price_decimals: cfg.price_decimals,
+                    latency: Some(&mut session.order_latency),
+                    latency_started: Some(session.latency_started),
+                },
             ) {
                 session
                     .order_response_health
@@ -1629,6 +1720,8 @@ pub(super) async fn run_maker(
                             qty_tolerance,
                             symbol: &symbol,
                             cycle,
+                            order_latency: Some(&mut session.order_latency),
+                            latency_started: Some(session.latency_started),
                         },
                     )
                     .await;
@@ -1708,6 +1801,8 @@ pub(super) async fn run_maker(
             cycle_account_stream_health,
             mut cycle_projection,
             mut cycle_account_poll,
+            mut cycle_order_latency,
+            cycle_latency_started,
         ) = match live_session.as_mut() {
             Some(LiveSession {
                 order_responses,
@@ -1717,6 +1812,8 @@ pub(super) async fn run_maker(
                 account_stream_health,
                 projection,
                 account_poll,
+                order_latency,
+                latency_started,
                 ..
             }) => (
                 Some(order_responses),
@@ -1726,8 +1823,10 @@ pub(super) async fn run_maker(
                 Some(&*account_stream_health),
                 Some(projection),
                 Some(account_poll),
+                Some(order_latency),
+                Some(*latency_started),
             ),
-            None => (None, None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None, None),
         };
         let work = async {
             if let Some(observed) = mismatch {
@@ -1769,6 +1868,10 @@ pub(super) async fn run_maker(
                     order_commands: cycle_order_commands,
                     order_response_health: cycle_order_response_health,
                     account_stream_health: cycle_account_stream_health,
+                    performance_time_ms: performance_epoch_ms.saturating_add(
+                        i64::try_from(performance_started.elapsed().as_millis())
+                            .unwrap_or(i64::MAX),
+                    ),
                 },
                 CycleState {
                     resting: &mut resting,
@@ -1779,6 +1882,8 @@ pub(super) async fn run_maker(
                     stats: &mut stats,
                     breaker: &mut breaker,
                     live_account_poll: cycle_account_poll.as_deref_mut(),
+                    order_latency: cycle_order_latency.as_deref_mut(),
+                    latency_started: cycle_latency_started,
                 },
             )
             .await?;
@@ -1873,6 +1978,12 @@ pub(super) async fn run_maker(
             // before account events to mirror the top-of-loop drain.
             for response in buffered_orders {
                 let request_id = response.request_id.clone();
+                observe_order_ack(
+                    Some(&mut session.order_latency),
+                    Some(session.latency_started),
+                    request_id.as_deref(),
+                    response.accepted(),
+                );
                 let outcome = apply_order_response(
                     response,
                     &mut session.projection,
@@ -1921,6 +2032,8 @@ pub(super) async fn run_maker(
                                 qty_tolerance,
                                 symbol: &symbol,
                                 cycle,
+                                order_latency: Some(&mut session.order_latency),
+                                latency_started: Some(session.latency_started),
                             },
                         )
                         .await;
@@ -2324,6 +2437,8 @@ pub(super) async fn run_maker(
                                             qty_tolerance,
                                             symbol: &symbol,
                                             cycle,
+                                            order_latency: Some(&mut session.order_latency),
+                                            latency_started: Some(session.latency_started),
                                         },
                                     )
                                     .await
@@ -2576,6 +2691,8 @@ pub(super) async fn run_maker(
                                         qty_tolerance,
                                         symbol: &symbol,
                                         cycle,
+                                        order_latency: Some(&mut session.order_latency),
+                                        latency_started: Some(session.latency_started),
                                     },
                                 )
                                 .await;
@@ -2640,11 +2757,31 @@ pub(super) async fn run_maker(
     };
 
     // ---- Cleanup on ALL exit paths ----
+    if let (Some(performance), Some(final_mark)) = (ledger.performance_mut(), last_mark) {
+        let end_time_ms = performance_epoch_ms.saturating_add(
+            i64::try_from(performance_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+        );
+        if let Err(error) = performance.finish(end_time_ms) {
+            eprintln!("⚠️ performance finalization unavailable: {error}");
+        }
+        match performance.summary(final_mark) {
+            Ok(summary) => output::emit_performance_summary(output_format, &symbol, &summary),
+            Err(error) => eprintln!("⚠️ performance summary unavailable: {error}"),
+        }
+    }
     let (account_stream_handle, order_response_handle) = match live_session {
-        Some(session) => (
-            Some(session.account_stream_handle),
-            Some(session.order_response_handle),
-        ),
+        Some(mut session) => {
+            let ended_ms =
+                u64::try_from(session.latency_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if let Err(error) = session.order_latency.finish_process(ended_ms) {
+                eprintln!("⚠️ order latency finalization unavailable: {error}");
+            }
+            output::emit_order_latency(output_format, &session.order_latency);
+            (
+                Some(session.account_stream_handle),
+                Some(session.order_response_handle),
+            )
+        }
         None => (None, None),
     };
     shutdown_report(ShutdownReport {

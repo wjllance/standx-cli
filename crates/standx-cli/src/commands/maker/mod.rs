@@ -26,6 +26,7 @@ mod notify;
 mod output;
 mod pipeline;
 mod recovery;
+mod replay;
 mod runtime;
 mod startup;
 #[cfg(test)]
@@ -235,6 +236,7 @@ pub async fn handle_maker(
             )
             .await
         }
+        MakerCommands::Replay { trace } => replay::run(&trace, output_format),
     }
 }
 
