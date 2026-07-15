@@ -2732,7 +2732,6 @@ pub(super) async fn run_maker(
                                 message: match &mismatch.cause {
                                     PositionReconciliationCause::CycleInvalidation => "account update invalidated active cycle; placements frozen and maker cleanup starting",
                                     PositionReconciliationCause::UnknownCurrentRunOrder => "unknown current-run order detected; placements frozen and maker cleanup starting",
-                                    PositionReconciliationCause::AccountProjectionMismatch(_) => "account projection audit failed; placements frozen and maker cleanup starting",
                                     PositionReconciliationCause::PositionMismatch => "position mismatch detected; placements frozen and maker cleanup starting",
                                 },
                                 symbol: &symbol,

@@ -23,7 +23,6 @@ const MAKER_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub(super) enum PositionReconciliationCause {
     PositionMismatch,
-    AccountProjectionMismatch(String),
     UnknownCurrentRunOrder,
     CycleInvalidation,
 }
@@ -32,7 +31,6 @@ impl PositionReconciliationCause {
     pub(super) fn label(&self) -> &'static str {
         match self {
             Self::PositionMismatch => "position_mismatch",
-            Self::AccountProjectionMismatch(_) => "account_projection_mismatch",
             Self::UnknownCurrentRunOrder => "unknown_current_run_order",
             Self::CycleInvalidation => "cycle_invalidation",
         }
@@ -41,9 +39,9 @@ impl PositionReconciliationCause {
     pub(super) fn recovery_trigger(&self) -> standx_maker::RecoveryTrigger {
         match self {
             Self::CycleInvalidation => standx_maker::RecoveryTrigger::CycleInvalidation,
-            Self::PositionMismatch
-            | Self::AccountProjectionMismatch(_)
-            | Self::UnknownCurrentRunOrder => standx_maker::RecoveryTrigger::PositionMismatch,
+            Self::PositionMismatch | Self::UnknownCurrentRunOrder => {
+                standx_maker::RecoveryTrigger::PositionMismatch
+            }
         }
     }
 }
@@ -61,18 +59,6 @@ impl PositionReconciliationError {
             expected,
             observed,
             cause: PositionReconciliationCause::PositionMismatch,
-        }
-    }
-
-    pub(super) fn account_projection_mismatch(
-        expected: f64,
-        observed: f64,
-        detail: String,
-    ) -> Self {
-        Self {
-            expected,
-            observed,
-            cause: PositionReconciliationCause::AccountProjectionMismatch(detail),
         }
     }
 
@@ -99,11 +85,6 @@ impl fmt::Display for PositionReconciliationError {
             PositionReconciliationCause::PositionMismatch => write!(
                 formatter,
                 "expected position {:+.8}, venue reported {:+.8}",
-                self.expected, self.observed
-            ),
-            PositionReconciliationCause::AccountProjectionMismatch(detail) => write!(
-                formatter,
-                "account projection mismatch ({detail}); ledger expected {:+.8}, venue reported {:+.8}",
                 self.expected, self.observed
             ),
             PositionReconciliationCause::UnknownCurrentRunOrder => write!(

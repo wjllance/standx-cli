@@ -21,7 +21,6 @@ use standx_sdk::account_stream::{OrderUpdate, TradeUpdate};
 use standx_sdk::client::order::CreateOrderParams;
 use standx_sdk::models::{Balance, OrderSide, OrderType, TimeInForce, Trade};
 use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
-use std::time::Duration;
 use std::time::Instant;
 
 const ORDER_LATENCY_TIMEOUT_MS: u64 = 15_000;
@@ -179,6 +178,10 @@ fn ensure_request_registry_capacity(projection: Option<&MakerAccountProjection>)
     Ok(())
 }
 
+fn order_creation_allowed(live: bool, rest_position_recheck_pending: bool) -> bool {
+    !live || !rest_position_recheck_pending
+}
+
 fn live_order_commands(commands: Option<&OrderCommandSender>) -> Result<&OrderCommandSender> {
     commands.ok_or_else(|| anyhow::anyhow!("order-command stream is unavailable"))
 }
@@ -284,6 +287,7 @@ pub(super) async fn maker_cycle(
     let mut account_balance: Option<Balance> = None;
     let mut fills: Vec<MakerFill> = Vec::new();
     let mut exit_fill_observed = false;
+    let mut rest_position_recheck_pending = false;
     if live {
         let projection = account_projection
             .as_deref_mut()
@@ -371,34 +375,49 @@ pub(super) async fn maker_cycle(
                 .map(rest_order_observation)
                 .collect::<Result<Vec<_>>>()?;
             let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
-            if (observed_position - ledger.expected_position).abs() > qty_tolerance {
-                // Preserve the prior bounded anomaly window. The normal path
-                // performs no REST read; this sleep is reached only by a
-                // periodic audit that found an unexplained position gap.
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            let unexpected_order_ids =
+                projection.unexpected_rest_open_order_ids(generation, &observations);
+            if !unexpected_order_ids.is_empty() {
+                eprintln!(
+                    "⚠️  REST audit found unexpected current-run open order IDs: {unexpected_order_ids:?}"
+                );
                 return Err(anyhow::Error::new(
-                    PositionReconciliationError::position_mismatch(
+                    PositionReconciliationError::unknown_current_run_order(
                         ledger.expected_position,
-                        observed_position,
                     ),
                 ));
             }
-            if let Err(error) = projection.verify_rest_snapshot(
-                generation,
-                observed_position,
-                &observations,
-                qty_tolerance,
-            ) {
-                eprintln!("⚠️  account projection audit failed: {error}");
-                // Reuse the runtime's immediate reconciliation/freeze path;
-                // the detailed order/projection mismatch is emitted above.
+
+            let projected_position = projection.observed_position();
+            if (projected_position - ledger.expected_position).abs() > qty_tolerance {
                 return Err(anyhow::Error::new(
-                    PositionReconciliationError::account_projection_mismatch(
+                    PositionReconciliationError::position_mismatch(
                         ledger.expected_position,
-                        observed_position,
-                        error.to_string(),
+                        projected_position,
                     ),
                 ));
+            }
+
+            if (observed_position - ledger.expected_position).abs() > qty_tolerance {
+                if poll.record_rest_position_mismatch(poll_now) {
+                    return Err(anyhow::Error::new(
+                        PositionReconciliationError::position_mismatch(
+                            ledger.expected_position,
+                            observed_position,
+                        ),
+                    ));
+                }
+                eprintln!(
+                    "⚠️  REST position {observed_position:+.8} differs from healthy WS/ledger {:+.8}; suppressing new orders until one recheck in 3s",
+                    ledger.expected_position
+                );
+            } else {
+                if poll.rest_position_recheck_pending() {
+                    eprintln!(
+                        "✅ REST position recheck converged at {observed_position:+.8}; resuming new orders"
+                    );
+                }
+                poll.record_account_audit(poll_now);
             }
             if let (Some(tracker), Some(started)) = (order_latency.as_deref_mut(), latency_started)
             {
@@ -411,14 +430,8 @@ pub(super) async fn maker_cycle(
                     eprintln!("⚠️ order latency REST-effective observation unavailable: {error}");
                 }
             }
-            projection.apply(
-                generation,
-                AccountProjectionEvent::PositionObserved {
-                    position: observed_position,
-                },
-            );
-            poll.record_account_audit(poll_now);
         }
+        rest_position_recheck_pending = poll.rest_position_recheck_pending();
         position = ledger.expected_position;
         projected_resting = projection.resting_quotes();
     } else {
@@ -519,7 +532,12 @@ pub(super) async fn maker_cycle(
         ));
     }
 
-    let inventory_exit = plan.inventory_exit;
+    let create_orders_allowed = order_creation_allowed(live, rest_position_recheck_pending);
+    let inventory_exit = if create_orders_allowed {
+        plan.inventory_exit
+    } else {
+        None
+    };
     // The pure reconciler intentionally knows nothing about transport state.
     // Remove desired placements whose slots are still reserved by an HTTP
     // submission before both execution and telemetry, so output never claims
@@ -528,6 +546,7 @@ pub(super) async fn maker_cycle(
         .actions
         .into_iter()
         .filter(|action| match action {
+            Action::Place(_) if !create_orders_allowed => false,
             Action::Place(q)
                 if live
                     && maker::pending_covers_slot(
@@ -954,6 +973,13 @@ mod tests {
         assert!(request.context.recovery);
         assert_eq!(request.context.generation, 7);
         assert_eq!(request.context.market_source.as_deref(), Some("ws"));
+    }
+
+    #[test]
+    fn rest_position_recheck_blocks_only_live_order_creation() {
+        assert!(!order_creation_allowed(true, true));
+        assert!(order_creation_allowed(true, false));
+        assert!(order_creation_allowed(false, true));
     }
 
     #[test]
