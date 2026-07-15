@@ -367,10 +367,27 @@ fn reconciliation_error_for_cycle(
     account_position_mismatch: Option<f64>,
     cycle_invalidated_by_account: bool,
 ) -> Option<PositionReconciliationError> {
-    mismatch
-        .or(account_position_mismatch)
-        .or(cycle_invalidated_by_account.then_some(expected))
-        .map(|observed| PositionReconciliationError { expected, observed })
+    if let Some(observed) = mismatch.or(account_position_mismatch) {
+        Some(PositionReconciliationError::position_mismatch(
+            expected, observed,
+        ))
+    } else if cycle_invalidated_by_account {
+        Some(PositionReconciliationError::cycle_invalidation(expected))
+    } else {
+        None
+    }
+}
+
+fn reconciliation_recovery_admission(
+    reconciliation: &PositionReconciliationError,
+    breaker: &mut maker::RecoveryCircuitBreaker,
+    now_secs: u64,
+) -> Option<maker::RecoveryAdmission> {
+    reconciliation
+        .cause
+        .recovery_trigger()
+        .meters_circuit()
+        .then(|| breaker.admit(now_secs))
 }
 
 fn market_update_requires_replan(
@@ -942,11 +959,11 @@ pub(super) async fn run_maker(
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
     let recovery_clock_started = std::time::Instant::now();
-    // One rolling budget shared across every automatic recovery — account-stream
-    // reconnect, order-response reconnect, and position-mismatch freeze/recover.
-    // The operator's "N incidents per window" bounds total recovery churn before
-    // a human must step in; letting any one path recover unmetered would defeat
-    // that ceiling.
+    // One rolling budget shared across abnormal automatic recoveries —
+    // account-stream reconnect, order-response reconnect, and genuine
+    // position/projection mismatch. A normal account event that invalidates an
+    // in-flight cycle still performs cleanup and reconciliation, but is not an
+    // incident: otherwise ordinary fills eventually exhaust the live budget.
     let mut recovery_breaker = maker::RecoveryCircuitBreaker::new(
         args.recovery_incidents_per_window,
         args.recovery_window_secs,
@@ -1714,16 +1731,19 @@ pub(super) async fn run_maker(
         };
         let work = async {
             if let Some(observed) = mismatch {
-                return Err(anyhow::Error::new(PositionReconciliationError {
-                    expected: ledger.expected_position,
-                    observed,
-                }));
+                return Err(anyhow::Error::new(
+                    PositionReconciliationError::position_mismatch(
+                        ledger.expected_position,
+                        observed,
+                    ),
+                ));
             }
             if order_reconciliation_required {
-                return Err(anyhow::Error::new(PositionReconciliationError {
-                    expected: ledger.expected_position,
-                    observed: ledger.expected_position,
-                }));
+                return Err(anyhow::Error::new(
+                    PositionReconciliationError::unknown_current_run_order(
+                        ledger.expected_position,
+                    ),
+                ));
             }
             let (mark, best_bid, best_ask, src, market_fallback_reason) =
                 market_snapshot(&client, &symbol, feed.as_ref()).await?;
@@ -2165,8 +2185,7 @@ pub(super) async fn run_maker(
                     continue 'main;
                 }
                 if let Some(mismatch) = e.downcast_ref::<PositionReconciliationError>() {
-                    let invalidated_without_position_gap =
-                        (mismatch.expected - mismatch.observed).abs() <= qty_tolerance;
+                    let reconciliation_cause = mismatch.cause.label();
                     runtime_state.handle(MakerEvent::PositionMismatch);
                     let cleanup_token = match take_cleanup_effect(
                         &mut runtime_state,
@@ -2192,6 +2211,7 @@ pub(super) async fn run_maker(
                         &symbol,
                         cycle,
                         "frozen",
+                        reconciliation_cause,
                         mismatch.expected,
                         mismatch.observed,
                     );
@@ -2201,10 +2221,11 @@ pub(super) async fn run_maker(
                             kind: "position_reconciliation",
                             severity: "warning",
                             event: "frozen",
-                            message: if invalidated_without_position_gap {
-                                "account update invalidated active cycle; placements frozen and maker cleanup starting"
-                            } else {
-                                "position mismatch detected; placements frozen and maker cleanup starting"
+                            message: match &mismatch.cause {
+                                PositionReconciliationCause::CycleInvalidation => "account update invalidated active cycle; placements frozen and maker cleanup starting",
+                                PositionReconciliationCause::UnknownCurrentRunOrder => "unknown current-run order detected; placements frozen and maker cleanup starting",
+                                PositionReconciliationCause::AccountProjectionMismatch(_) => "account projection audit failed; placements frozen and maker cleanup starting",
+                                PositionReconciliationCause::PositionMismatch => "position mismatch detected; placements frozen and maker cleanup starting",
                             },
                                 symbol: &symbol,
                                 cycle,
@@ -2246,25 +2267,26 @@ pub(super) async fn run_maker(
                             );
                         }
                     };
-                    // Meter this recovery against the same rolling budget as the
-                    // transport reconnects. An oscillating mismatch source (a
-                    // second actor on the account, settlement jitter around the
-                    // tolerance boundary) would otherwise drive unbounded
-                    // freeze -> cancel-all -> backfill -> resume churn that the
-                    // circuit breaker exists to stop.
-                    let admission =
-                        recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
-                    if !admission.is_admitted() {
-                        break 'main recovery_failed_exit(
-                            &mut runtime_state,
-                            recovery_token,
-                            format!(
-                                "position mismatch (expected {:+.8}, observed {:+.8}); {}; refusing further live orders",
-                                mismatch.expected,
-                                mismatch.observed,
-                                recovery_circuit_detail(admission)
-                            ),
-                        );
+                    // Genuine mismatch/projection anomalies share the same
+                    // rolling budget as transport reconnects. A normal account
+                    // event that invalidated in-flight cycle work is unmetered,
+                    // but still follows the complete cleanup + REST reconcile +
+                    // empty-book verification path below.
+                    if let Some(admission) = reconciliation_recovery_admission(
+                        mismatch,
+                        &mut recovery_breaker,
+                        recovery_clock_started.elapsed().as_secs(),
+                    ) {
+                        if !admission.is_admitted() {
+                            break 'main recovery_failed_exit(
+                                &mut runtime_state,
+                                recovery_token,
+                                format!(
+                                    "{mismatch}; {}; refusing further live orders",
+                                    recovery_circuit_detail(admission)
+                                ),
+                            );
+                        }
                     }
                     let mut recovered = false;
                     let mut last_observed = mismatch.observed;
@@ -2381,6 +2403,7 @@ pub(super) async fn run_maker(
                             &symbol,
                             cycle,
                             "recovered",
+                            reconciliation_cause,
                             ledger.expected_position,
                             last_observed,
                         );
@@ -2410,6 +2433,7 @@ pub(super) async fn run_maker(
                         &symbol,
                         cycle,
                         "failed",
+                        reconciliation_cause,
                         ledger.expected_position,
                         last_observed,
                     );
@@ -3363,6 +3387,7 @@ mod tests {
             .expect("an invalidated cycle must enter reconciliation cleanup");
         assert_eq!(reconciliation.expected, 0.2);
         assert_eq!(reconciliation.observed, 0.2);
+        assert_eq!(reconciliation.cause.label(), "cycle_invalidation");
 
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
@@ -3390,6 +3415,27 @@ mod tests {
             runtime_state.next_effect(),
             Some(MakerEffect::RunCycle(_))
         ));
+    }
+
+    #[test]
+    fn normal_cycle_invalidations_do_not_consume_recovery_incident_budget() {
+        let invalidation = PositionReconciliationError::cycle_invalidation(0.0);
+        let mismatch = PositionReconciliationError::position_mismatch(0.0, 0.2);
+        let mut breaker = maker::RecoveryCircuitBreaker::new(1, 3_600);
+
+        for now in [10, 20, 30, 40] {
+            assert!(reconciliation_recovery_admission(&invalidation, &mut breaker, now).is_none());
+        }
+        assert!(
+            reconciliation_recovery_admission(&mismatch, &mut breaker, 50)
+                .expect("a true mismatch must be metered")
+                .is_admitted()
+        );
+        assert!(
+            !reconciliation_recovery_admission(&mismatch, &mut breaker, 60)
+                .expect("a true mismatch must be metered")
+                .is_admitted()
+        );
     }
 
     #[test]

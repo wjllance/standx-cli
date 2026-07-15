@@ -376,6 +376,7 @@ pub(super) fn emit_reconciliation_state(
     symbol: &str,
     cycle: u64,
     event: &str,
+    cause: &str,
     expected: f64,
     observed: f64,
 ) {
@@ -388,13 +389,14 @@ pub(super) fn emit_reconciliation_state(
                 "cycle": cycle,
                 "action": "position_reconciliation",
                 "event": event,
+                "cause": cause,
                 "expected_position": expected,
                 "observed_position": observed,
             })
         );
     } else {
         eprintln!(
-            "⚠️  position reconciliation {event}: expected {expected:+.8}, observed {observed:+.8}"
+            "⚠️  position reconciliation {event} ({cause}): expected {expected:+.8}, observed {observed:+.8}"
         );
     }
 }
