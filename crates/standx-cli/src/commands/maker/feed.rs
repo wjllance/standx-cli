@@ -28,7 +28,8 @@ struct FeedMeta {
 /// as good as the old behavior while tolerating slow feed ticks.
 const WS_STALE_AFTER: Duration = Duration::from_secs(5);
 /// `price` and `depth_book` arrive on separate public channels. A pair older
-/// than this local or parsed venue-time skew is not a coherent quote input.
+/// than this parsed venue-time skew is not a coherent quote input. Local
+/// receive-time skew is used only when venue timestamps are unavailable.
 const WS_SNAPSHOT_MAX_SKEW: Duration = Duration::from_secs(1);
 
 /// Why the latest public WebSocket cache cannot safely be used for a maker
@@ -124,29 +125,29 @@ fn coherent_ws_snapshot(
             (false, false) => unreachable!("at least one cache entry is stale"),
         });
     }
-    let local_skew = mark_meta
-        .received_at
-        .saturating_duration_since(book_meta.received_at)
-        .max(
-            book_meta
-                .received_at
-                .saturating_duration_since(mark_meta.received_at),
-        );
-    if local_skew > WS_SNAPSHOT_MAX_SKEW {
-        return Err(WsSnapshotIssue::LocalSkew);
-    }
-    if let (Some(mark_time), Some(book_time)) = (
-        mark_meta
-            .server_time
-            .as_deref()
-            .and_then(parse_server_time_millis),
-        book_meta
-            .server_time
-            .as_deref()
-            .and_then(parse_server_time_millis),
-    ) {
+    let mark_server_time = mark_meta
+        .server_time
+        .as_deref()
+        .and_then(parse_server_time_millis);
+    let book_server_time = book_meta
+        .server_time
+        .as_deref()
+        .and_then(parse_server_time_millis);
+    if let (Some(mark_time), Some(book_time)) = (mark_server_time, book_server_time) {
         if mark_time.abs_diff(book_time) > WS_SNAPSHOT_MAX_SKEW.as_millis() as u64 {
             return Err(WsSnapshotIssue::ServerTimeSkew);
+        }
+    } else {
+        let local_skew = mark_meta
+            .received_at
+            .saturating_duration_since(book_meta.received_at)
+            .max(
+                book_meta
+                    .received_at
+                    .saturating_duration_since(mark_meta.received_at),
+            );
+        if local_skew > WS_SNAPSHOT_MAX_SKEW {
+            return Err(WsSnapshotIssue::LocalSkew);
         }
     }
     let mark = state.mark.ok_or(WsSnapshotIssue::WarmingUp)?;
@@ -348,34 +349,68 @@ mod tests {
     }
 
     #[test]
-    fn coherent_snapshot_rejects_stale_or_skewed_channels() {
+    fn coherent_snapshot_prefers_server_time_over_local_receive_skew() {
         let now = Instant::now();
-        let mut state = FeedState {
+        let state = FeedState {
             mark: Some(100.0),
             mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
             best_bid: Some(99.9),
             best_ask: Some(100.1),
-            book_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            book_meta: Some(meta(
+                1,
+                "2026-07-14T00:00:00Z",
+                now + Duration::from_secs(3),
+            )),
         };
-        assert!(coherent_ws_snapshot(&state, now).is_ok());
+        assert!(coherent_ws_snapshot(&state, now + Duration::from_secs(3)).is_ok());
+    }
 
-        state.book_meta = Some(meta(
-            2,
-            "2026-07-14T00:00:03Z",
-            now + Duration::from_secs(3),
-        ));
-        assert_eq!(
-            coherent_ws_snapshot(&state, now + Duration::from_secs(3)),
-            Err(WsSnapshotIssue::LocalSkew)
-        );
-
-        state.book_meta = Some(meta(2, "2026-07-14T00:00:03Z", now));
+    #[test]
+    fn coherent_snapshot_rejects_server_skew_even_when_receive_times_match() {
+        let now = Instant::now();
+        let state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(meta(2, "2026-07-14T00:00:03Z", now)),
+        };
         assert_eq!(
             coherent_ws_snapshot(&state, now),
             Err(WsSnapshotIssue::ServerTimeSkew)
         );
+    }
 
-        state.book_meta = Some(meta(2, "2026-07-14T00:00:00Z", now - WS_STALE_AFTER));
+    #[test]
+    fn coherent_snapshot_falls_back_to_local_skew_without_both_server_times() {
+        let now = Instant::now();
+        let state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(FeedMeta {
+                exchange_seq: Some(2),
+                server_time: None,
+                received_at: now + Duration::from_secs(3),
+            }),
+        };
+        assert_eq!(
+            coherent_ws_snapshot(&state, now + Duration::from_secs(3)),
+            Err(WsSnapshotIssue::LocalSkew)
+        );
+    }
+
+    #[test]
+    fn coherent_snapshot_rejects_stale_channel_before_skew_checks() {
+        let now = Instant::now();
+        let state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(meta(2, "2026-07-14T00:00:00Z", now - WS_STALE_AFTER)),
+        };
         assert_eq!(
             coherent_ws_snapshot(&state, now),
             Err(WsSnapshotIssue::BookStale)
