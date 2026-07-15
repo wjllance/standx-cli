@@ -131,17 +131,6 @@ fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason
     take_stop_effect(runtime_state, MakerExit::PositionReconciliation)
 }
 
-/// Which projection clear an incident flow performs after freeze cleanup.
-#[derive(Clone, Copy)]
-enum ProjectionReset {
-    /// `clear_orders_preserving_pending_acks` — a current-run ack may still
-    /// replay after cleanup (account-stream and reconciliation freezes).
-    PreservePendingAcks,
-    /// `clear_orders_and_pending` — the placement channel is being torn down,
-    /// so pending request acks can never arrive (order-response freeze).
-    DropPendingRequests,
-}
-
 /// How a missing or mismatched runtime effect maps to the flow's stop reason.
 /// (`RuntimeStopReason::CleanupFailure` carries the target, so a plain
 /// `fn(String) -> RuntimeStopReason` pointer cannot express it.)
@@ -163,13 +152,6 @@ fn effect_failure_stop(
         EffectFailureStop::PositionReconciliation => {
             RuntimeStopReason::PositionReconciliation(reason)
         }
-    }
-}
-
-fn reset_projection(projection: &mut MakerAccountProjection, reset: ProjectionReset) {
-    match reset {
-        ProjectionReset::PreservePendingAcks => projection.clear_orders_preserving_pending_acks(),
-        ProjectionReset::DropPendingRequests => projection.clear_orders_and_pending(),
     }
 }
 
@@ -221,7 +203,10 @@ struct FreezeSpec<'a> {
     /// Account-stream flow only: abort the stale stream task before
     /// reporting cleanup complete.
     abort_account_stream_handle: bool,
-    projection_reset: ProjectionReset,
+    /// Whether the order-response channel survives this freeze (account-stream
+    /// and reconciliation) or is being replaced (order-response), deciding
+    /// whether pending request acks stay correlated across the cleanup.
+    continuity: OrderResponseContinuity,
 }
 
 /// Freeze/cleanup preamble shared by the three incident-recovery flows:
@@ -274,7 +259,7 @@ async fn freeze_and_cleanup_for_recovery(
     io.resting.clear();
     if let Some(session) = io.session.as_deref_mut() {
         invalidate_session_latency(session);
-        reset_projection(&mut session.projection, spec.projection_reset);
+        session.projection.finish_verified_cleanup(spec.continuity);
     }
     *io.inventory_exit_pending = false;
     if spec.abort_account_stream_handle {
@@ -300,7 +285,7 @@ struct ResumeSpec<'a> {
     recovery_token: WorkToken,
     /// Venue position fed to the projection as authoritative after recovery.
     observed: f64,
-    projection_reset: ProjectionReset,
+    continuity: OrderResponseContinuity,
     /// Order-response flow only: the paper book is cleared again because the
     /// placement channel was replaced underneath it.
     clear_resting: bool,
@@ -319,7 +304,7 @@ async fn resume_quoting_after_recovery(io: &mut RecoveryIo<'_>, spec: ResumeSpec
         io.resting.clear();
     }
     if let Some(session) = io.session.as_deref_mut() {
-        reset_projection(&mut session.projection, spec.projection_reset);
+        session.projection.finish_verified_cleanup(spec.continuity);
         let generation = session.projection.generation();
         session.projection.apply(
             generation,
@@ -1492,7 +1477,7 @@ pub(super) async fn run_maker(
                         notice,
                         frozen_note: None,
                         abort_account_stream_handle: true,
-                        projection_reset: ProjectionReset::PreservePendingAcks,
+                        continuity: OrderResponseContinuity::Preserved,
                     },
                 )
                 .await
@@ -1733,7 +1718,7 @@ pub(super) async fn run_maker(
                     ResumeSpec {
                         recovery_token,
                         observed,
-                        projection_reset: ProjectionReset::PreservePendingAcks,
+                        continuity: OrderResponseContinuity::Preserved,
                         clear_resting: false,
                         recovered_note: None,
                         notice: RiskNotice {
@@ -1822,7 +1807,7 @@ pub(super) async fn run_maker(
                         notice,
                         frozen_note: None,
                         abort_account_stream_handle: false,
-                        projection_reset: ProjectionReset::DropPendingRequests,
+                        continuity: OrderResponseContinuity::Replaced,
                     },
                 )
                 .await
@@ -1910,7 +1895,7 @@ pub(super) async fn run_maker(
                                 ResumeSpec {
                                     recovery_token,
                                     observed: reconciled_position,
-                                    projection_reset: ProjectionReset::DropPendingRequests,
+                                    continuity: OrderResponseContinuity::Replaced,
                                     clear_resting: true,
                                     recovered_note: None,
                                     notice: RiskNotice {
@@ -2758,7 +2743,7 @@ pub(super) async fn run_maker(
                                 observed: mismatch.observed,
                             }),
                             abort_account_stream_handle: false,
-                            projection_reset: ProjectionReset::PreservePendingAcks,
+                            continuity: OrderResponseContinuity::Preserved,
                         },
                     )
                     .await
@@ -2923,7 +2908,7 @@ pub(super) async fn run_maker(
                             ResumeSpec {
                                 recovery_token,
                                 observed: last_observed,
-                                projection_reset: ProjectionReset::PreservePendingAcks,
+                                continuity: OrderResponseContinuity::Preserved,
                                 clear_resting: false,
                                 recovered_note: Some(ReconciliationStateNote {
                                     cause: reconciliation_cause,
@@ -4498,7 +4483,7 @@ mod tests {
             notice: FreezeNotice::Risk(warning_notice("order_response")),
             frozen_note: None,
             abort_account_stream_handle: false,
-            projection_reset: ProjectionReset::DropPendingRequests,
+            continuity: OrderResponseContinuity::Replaced,
         }
     }
 
@@ -4743,7 +4728,7 @@ mod tests {
             ResumeSpec {
                 recovery_token,
                 observed: 0.0,
-                projection_reset: ProjectionReset::PreservePendingAcks,
+                continuity: OrderResponseContinuity::Preserved,
                 clear_resting: true,
                 recovered_note: None,
                 notice: RiskNotice {
@@ -4771,23 +4756,23 @@ mod tests {
         );
     }
 
-    /// Invariant: the projection-reset knob keeps its per-flow semantics —
-    /// preserving pending request lifecycles for late acks, or dropping them
-    /// when the placement channel is being replaced.
+    /// Invariant: the continuity knob keeps its per-flow semantics —
+    /// preserving pending request lifecycles for late acks when the channel
+    /// survives, or dropping them when the placement channel is replaced.
     #[test]
-    fn projection_reset_knobs_preserve_or_drop_pending_requests() {
+    fn finish_verified_cleanup_preserves_or_drops_pending_requests() {
         let mut projection = projection_with_pending(&["request-1"]);
-        reset_projection(&mut projection, ProjectionReset::PreservePendingAcks);
+        projection.finish_verified_cleanup(OrderResponseContinuity::Preserved);
         assert!(
             projection.has_pending_request_lifecycle("request-1"),
-            "PreservePendingAcks must keep pending request lifecycles"
+            "Preserved continuity must keep pending request lifecycles"
         );
 
         let mut projection = projection_with_pending(&["request-1"]);
-        reset_projection(&mut projection, ProjectionReset::DropPendingRequests);
+        projection.finish_verified_cleanup(OrderResponseContinuity::Replaced);
         assert!(
             !projection.has_pending_request_lifecycle("request-1"),
-            "DropPendingRequests must clear pending request lifecycles"
+            "Replaced continuity must clear pending request lifecycles"
         );
     }
 }

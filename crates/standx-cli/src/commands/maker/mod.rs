@@ -2,9 +2,10 @@ use crate::cli::*;
 use anyhow::Result;
 use standx_maker::{
     self as maker, AccountProjectionEvent, AlertMonitor, MakerAccountProjection, MakerConfig,
-    MakerEffect, MakerEvent, MakerFill, MakerLedger, MakerState, MakerStats, PositionAlertAnchor,
-    ProjectionPendingRequest, ProjectionRegistryError, RecoveryTarget, RestingQuote,
-    RuntimeStopReason, VolBreaker, WorkToken, MAKER_CL_ORD_ID_PREFIX,
+    MakerEffect, MakerEvent, MakerFill, MakerLedger, MakerState, MakerStats,
+    OrderResponseContinuity, PositionAlertAnchor, ProjectionPendingRequest,
+    ProjectionRegistryError, RecoveryTarget, RestingQuote, RuntimeStopReason, VolBreaker,
+    WorkToken, MAKER_CL_ORD_ID_PREFIX,
 };
 use standx_sdk::account_stream::{
     AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,

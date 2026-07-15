@@ -60,6 +60,21 @@ pub enum ProjectionRequestResolution {
     CancelResolved,
 }
 
+/// Whether the order-response (placement) channel survived a verified maker
+/// cleanup or was torn down and replaced. This is the *decision* a recovery
+/// flow makes; [`MakerAccountProjection::finish_verified_cleanup`] maps it to
+/// the mechanical projection reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderResponseContinuity {
+    /// The order-response stream is still the same channel, so acknowledgements
+    /// it has not yet delivered may still arrive and must stay correlated.
+    Preserved,
+    /// The order-response stream was replaced, so no acknowledgement for a
+    /// request issued on the old channel can ever arrive; end those
+    /// obligations as part of the cleanup.
+    Replaced,
+}
+
 impl ProjectionRequestResolution {
     pub fn accepts_response(self, accepted: bool) -> bool {
         match self {
@@ -400,6 +415,20 @@ impl MakerAccountProjection {
         self.generation = generation;
         self.clear_orders_preserving_pending_acks();
         self.observed_position = position;
+    }
+
+    /// Close every executable quote slot after a maker cleanup has verified
+    /// the venue book is empty, resolving in-flight order-response
+    /// acknowledgements according to `continuity`. Both variants close the
+    /// venue slots — that invariant lives here, in one place — and differ only
+    /// in whether pending request correlation survives the cleanup. Recovery
+    /// flows call this instead of the mechanical `clear_orders_*` primitives so
+    /// the decision they make (did the placement channel survive?) is explicit.
+    pub fn finish_verified_cleanup(&mut self, continuity: OrderResponseContinuity) {
+        match continuity {
+            OrderResponseContinuity::Preserved => self.clear_orders_preserving_pending_acks(),
+            OrderResponseContinuity::Replaced => self.clear_orders_and_pending(),
+        }
     }
 
     pub fn clear_orders_and_pending(&mut self) {

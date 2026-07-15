@@ -28,10 +28,10 @@ pub mod risk;
 pub mod runtime;
 
 pub use account_projection::{
-    AccountProjectionEvent, MakerAccountProjection, OrderObservation, ProjectedOrder,
-    ProjectionMismatch, ProjectionOutcome, ProjectionPendingCancel, ProjectionPendingPlace,
-    ProjectionPendingRequest, ProjectionRegistryError, ProjectionRequestResolution,
-    MAX_PENDING_ORDER_REQUESTS,
+    AccountProjectionEvent, MakerAccountProjection, OrderObservation, OrderResponseContinuity,
+    ProjectedOrder, ProjectionMismatch, ProjectionOutcome, ProjectionPendingCancel,
+    ProjectionPendingPlace, ProjectionPendingRequest, ProjectionRegistryError,
+    ProjectionRequestResolution, MAX_PENDING_ORDER_REQUESTS,
 };
 pub use latency::{
     LatencyError, LatencyMetricSummary, LatencyRequest, LatencyRequestContext, LatencyRequestKind,
