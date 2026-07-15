@@ -470,6 +470,19 @@ impl MakerAccountProjection {
             .count()
     }
 
+    /// Whether either half of a submitted request lifecycle is still open.
+    ///
+    /// A request remains live while its acknowledgement or venue-exposure
+    /// slot is still open. For an accepted place that means waiting for the
+    /// corresponding account-order observation; terminal responses and
+    /// explicit cleanup may close a lifecycle earlier. The CLI uses this
+    /// clock-free query without duplicating projection correlation rules.
+    pub fn has_pending_request_lifecycle(&self, request_id: &str) -> bool {
+        self.pending
+            .iter()
+            .any(|entry| entry.request_id() == request_id)
+    }
+
     pub fn completed_request_resolution(
         &self,
         request_id: &str,

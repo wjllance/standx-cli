@@ -22,6 +22,7 @@ pub(super) struct LiveSession {
     /// Bumped on every account-stream reconnect; stamps projection generations.
     pub(super) account_stream_epoch: u64,
     pub(super) projection: MakerAccountProjection,
+    pub(super) order_request_deadlines: OrderRequestDeadlines,
     pub(super) account_poll: LiveAccountPollState,
     pub(super) order_latency: maker::OrderLatencyTracker,
     pub(super) latency_started: std::time::Instant,
@@ -467,6 +468,7 @@ pub(super) async fn run_startup(
                 cfg.price_tick() / 2.0,
                 qty_tolerance,
             ),
+            order_request_deadlines: OrderRequestDeadlines::default(),
             account_poll,
             order_latency: maker::OrderLatencyTracker::default(),
             latency_started: std::time::Instant::now(),
