@@ -1,0 +1,9 @@
+{"type":"header","schema_version":1,"symbol":"BTC-USD","git_sha":"ccdcf3191f206c17dda89105de0ee9346ff563d4","config_hash":"37a63617b5438d949415eacc26487020cd0a35299ea2f8bddc7b1655ea9d62dd","seed":7,"config":{"spread_bps":5.0,"band_bps":20.0,"level_step_bps":2.0,"refresh_bps":3.0,"levels":1,"size":1.0,"max_position":10.0,"skew_bps":0.0,"price_decimals":2,"qty_decimals":2,"min_order_qty":0.01},"settings":{"starting_position":0.0,"starting_mark":100.0,"max_divergence_bps":25.0,"require_full_touch":true,"vol_window":12,"vol_pause_bps":0.0,"active_exit_enabled":false,"inventory_exit_pct":0.0,"inventory_exit_qty":0.0}}
+{"type":"cycle","event_time_ms":0,"cycle":0,"mark":100.0,"best_bid":99.99,"best_ask":100.01,"position":0.0,"eligible_bid_qty":1.0,"eligible_ask_qty":1.0}
+{"type":"fill","trade_id":1,"order_id":10,"role":"passive_maker","side":"buy","price":99.95,"qty":1.0,"mark_at_fill":100.0,"event_time_ms":0,"costs":{"fee_quote":0.01,"rebate_quote":0.0}}
+{"type":"cycle","event_time_ms":1000,"cycle":1,"mark":100.1,"best_bid":100.09,"best_ask":100.11,"position":1.0,"eligible_bid_qty":1.0,"eligible_ask_qty":1.0}
+{"type":"funding","event_time_ms":2000,"cashflow_quote":0.02}
+{"type":"cycle","event_time_ms":5000,"cycle":2,"mark":100.2,"best_bid":100.19,"best_ask":100.21,"position":1.0,"eligible_bid_qty":0.5,"eligible_ask_qty":1.5}
+{"type":"fill","trade_id":2,"order_id":11,"role":"inventory_exit","side":"sell","price":100.15,"qty":0.5,"mark_at_fill":100.2,"event_time_ms":5000,"costs":{"fee_quote":0.01,"rebate_quote":0.0}}
+{"type":"cycle","event_time_ms":30000,"cycle":3,"mark":100.05,"best_bid":100.04,"best_ask":100.06,"position":0.5,"eligible_bid_qty":1.0,"eligible_ask_qty":1.0}
+{"type":"finish","event_time_ms":35000}

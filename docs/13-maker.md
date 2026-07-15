@@ -191,7 +191,7 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 三种输出格式：
 
 - **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。Live 模式还会打印 `ACCOUNT balance= equity= available= upnl=`，数据来自最近一次 REST 账户快照（正常每 30 秒刷新；启用 equity/margin floor 时，account-stream `balance` 更新会立即触发一次权威 REST 刷新；短暂失败时最多复用 60 秒）；这里的账户 `upnl` 与机器人本次会话的 `pnl` 是两个不同口径。
-- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，含 `position`、`starting_position`、`pnl`、`fills_total`、`uptime_pct`、`avg_capture_bps`、`halted`、`vol_bps`，以及 live 模式下的 `account`（`balance`、`equity`、`available`、`upnl`；paper 模式为 `null`）。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live session PnL 使用 current-run ledger 的权威仓位；每个去重后的增量成交会原子更新现金流与统计仓位。live fill 还包含 `trade_id`、`order_id`、`trade_ts` 与 `origin=current_run`。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，保留原字段并新增可选 `performance` 对象，包含 passive/exit 数量、净 PnL 归因、1s/5s/30s markout、时间加权双边 uptime 和合格深度时间积分。停机时另有 `performance_summary`、逐请求 `order_latency`、place/cancel 分位数 `order_latency_summary`；账户 typed event 产生 `account_event_lag`。旧消费者可以忽略这些新 action/可选字段。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live session PnL 使用 current-run ledger 的权威仓位；每个去重后的增量成交会原子更新现金流与统计仓位。live fill 还包含 `trade_id`、`order_id`、`trade_ts`、`origin`、`role`，以及可换算时的 `fee_quote` / `rebate_quote`。
 
 live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order + position + trade + balance` account stream 和 Order Response Stream。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。带稳定 `trade_id`/`order_id` 的 account-stream trade 与 REST backfill trade 走同一账本入口并按 `trade_id` exactly-once 去重；order 回调只确认订单归属与生命周期，不能单独记账。健康运行时订单、pending 命令、仓位和原始余额由本地 typed-event 投影维护，普通 maker cycle 不读取账户 REST；每 30 秒并发读取 open orders、positions、order history 和 trades 做完整审计，derived balance 默认按 30 秒 REST 快照刷新。WS `balance` 只包含钱包级 `free/total/locked/occupied`，不能冒充统一余额的 `equity/cross_available`；配置账户风险 floor 后，该事件会合并触发下一轮立即读取权威 REST balance，并复用同一 edge-triggered 告警状态机。account stream 断开、投影审计不一致或仓位不一致时立即冻结 placements、撤净 maker 订单，并在约 0.5s、1.5s、3.0s 结合 WS 与 REST 核对；恢复后从空 maker book 继续，3 秒仍不一致则 fail-safe 停机。
 
@@ -222,6 +222,25 @@ live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order +
 | fills / max pos | 成交笔数、会话内最大绝对持仓 |
 
 > paper 用精确模拟成交计算；live 从认证成交历史读取本次会话内、已关联到 `sxmk-` maker 订单的成交，并按成交 ID 去重。不会把手工/API 订单或单纯仓位变化当作 maker 成交。当前 mark-to-market 仍基于成交现金流与仓位估值；费用币种和交易所已实现盈亏会单列核对。**调参在 paper 里做**：观察 avg capture 与 PnL 的关系来调 `--spread-bps` / `--refresh-bps` / `--skew-bps`。
+
+### 确定性回放
+
+阶段 1 的 normalized NDJSON trace 可通过下面的纯回放命令验证；该子命令不加载认证、环境
+变量或实时时钟，不连接网络，也不执行订单 I/O：
+
+```bash
+standx --output json maker replay ./traces/btc-phase1.ndjson
+# 也可从 stdin 读取
+standx --output json maker replay - < ./traces/btc-phase1.ndjson
+# 仓库内可直接运行的 schema v1 示例
+standx --output json maker replay ./examples/maker-replay-trace.ndjson
+```
+
+trace 第一条必须是 `schema_version=1` 的 `header`，冻结 `git_sha`、`config_hash`、`seed`、
+完整 maker config 和 replay settings；随后只接受 typed `cycle`、`fill`、`funding`，最后以
+`finish` 关闭时间加权区间和未满足的 markout 窗口。未知字段、header/finish 缺失、时间回退
+或非有限数值都会拒绝回放。同一 trace 连续运行会得到相同的 `replay_cycle` 与
+`replay_summary` 结构化结果。
 
 ### 风险告警
 

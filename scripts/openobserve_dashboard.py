@@ -385,7 +385,8 @@ FROM "{stream}" WHERE {selected}
   AND action IN ('fill', 'cancel', 'alert', 'risk_notification', 'maker_cleanup', 'inventory_exit',
                  'order_response_reconnect', 'position_reconciliation',
                  'account_trade_shadow', 'ledger_sync', 'inventory_adopted',
-                 'startup_rejected', 'lifecycle')
+                 'startup_rejected', 'lifecycle', 'performance_summary',
+                 'order_latency', 'order_latency_summary')
 ORDER BY _timestamp DESC LIMIT 200''',
                 [axis("_timestamp", "Time"), axis("action", "Action"), axis("kind", "Kind"), axis("severity", "Severity"), axis("event", "Event"), axis("side", "Side"), axis("reason", "Reason"), axis("message", "Message")],
                 [axis("price", "Price"), axis("qty", "Qty"), axis("position_delta", "Position Delta"), axis("expected_position", "Expected Position"), axis("observed_position", "Observed Position")],
@@ -431,6 +432,158 @@ GROUP BY event ORDER BY events DESC''',
         ),
     ]
 
+    performance_latency = [
+        panel(
+            "standx_net_pnl_attribution",
+            "table",
+            "Net PnL Attribution",
+            "Latest phase-1 performance summary. Missing convertible execution costs remain explicitly counted.",
+            query(
+                stream,
+                f'''SELECT _timestamp, passive_fills, passive_qty, exit_fills, exit_qty,
+       gross_spread_quote, inventory_mtm_change_quote, rebate_quote, fee_quote,
+       funding_quote, exit_cost_quote, net_pnl_quote, execution_costs_unavailable
+FROM "{stream}" WHERE action = 'performance_summary' AND {selected}
+ORDER BY _timestamp DESC LIMIT 1''',
+                [axis("_timestamp", "Time")],
+                [
+                    axis("gross_spread_quote", "Gross spread"),
+                    axis("inventory_mtm_change_quote", "Inventory MTM"),
+                    axis("rebate_quote", "Rebate"),
+                    axis("fee_quote", "Fee"),
+                    axis("funding_quote", "Funding"),
+                    axis("exit_cost_quote", "Exit cost"),
+                    axis("net_pnl_quote", "Net PnL"),
+                ],
+            ),
+            (0, 0, 192, 8, 1),
+            decimals=None,
+        ),
+        panel(
+            "standx_markout",
+            "table",
+            "Post-fill Markout",
+            "Quantity-weighted 1s/5s/30s markout. Unavailable windows are never filled with the current mark.",
+            query(
+                stream,
+                f'''SELECT _timestamp, markout_1s_bps, markout_5s_bps, markout_30s_bps,
+       markout_1s_unavailable, markout_5s_unavailable, markout_30s_unavailable
+FROM "{stream}" WHERE action = 'performance_summary' AND {selected}
+ORDER BY _timestamp DESC LIMIT 1''',
+                [axis("_timestamp", "Time")],
+                [
+                    axis("markout_1s_bps", "1s bps"),
+                    axis("markout_5s_bps", "5s bps"),
+                    axis("markout_30s_bps", "30s bps"),
+                ],
+            ),
+            (0, 8, 96, 8, 2),
+            decimals=None,
+        ),
+        panel(
+            "standx_time_weighted_quotes",
+            "table",
+            "Time-weighted Quote Quality",
+            "Two-sided uptime and eligible bid/ask depth-time integrals from monotonic quote intervals.",
+            query(
+                stream,
+                f'''SELECT _timestamp, time_weighted_uptime_pct, eligible_bid_qty_ms,
+       eligible_ask_qty_ms, eligible_total_qty_ms
+FROM "{stream}" WHERE action = 'performance_summary' AND {selected}
+ORDER BY _timestamp DESC LIMIT 1''',
+                [axis("_timestamp", "Time")],
+                [
+                    axis("time_weighted_uptime_pct", "Uptime"),
+                    axis("eligible_bid_qty_ms", "Bid qty-ms"),
+                    axis("eligible_ask_qty_ms", "Ask qty-ms"),
+                    axis("eligible_total_qty_ms", "Total qty-ms"),
+                ],
+            ),
+            (96, 8, 96, 8, 3),
+            decimals=None,
+        ),
+        panel(
+            "standx_order_latency_summary",
+            "table",
+            "Place / Cancel Latency Summary",
+            "Write, ack and effective p50/p95/p99 with reject and censored timeout rates.",
+            query(
+                stream,
+                f'''SELECT _timestamp, kind, requests, accepted, rejected, effective, timeout,
+       invalidated, process_ended, pending, reject_rate, timeout_rate,
+       write_p50_ms, write_p95_ms, write_p99_ms,
+       ack_p50_ms, ack_p95_ms, ack_p99_ms,
+       effective_latency_p50_ms, effective_latency_p95_ms, effective_latency_p99_ms
+FROM "{stream}" WHERE action = 'order_latency_summary' AND {selected}
+ORDER BY kind, _timestamp DESC LIMIT 10''',
+                [axis("kind", "Kind"), axis("_timestamp", "Time")],
+                [
+                    axis("requests", "Requests"),
+                    axis("reject_rate", "Reject rate"),
+                    axis("timeout_rate", "Timeout rate"),
+                    axis("ack_p95_ms", "Ack p95"),
+                    axis("effective_latency_p95_ms", "Effective p95"),
+                ],
+            ),
+            (0, 16, 192, 9, 4),
+            decimals=None,
+        ),
+        panel(
+            "standx_order_latency_events",
+            "table",
+            "Order Lifecycle Correlation",
+            "Request-level lifecycle including account-order-before-ack, timeout, invalidation and fills during cancel windows.",
+            query(
+                stream,
+                f'''SELECT _timestamp, request_id, kind, generation, cycle, symbol, side, level,
+       market_source, recovery, outcome, place_write_ms, place_ack_ms,
+       place_effective_ms, cancel_write_ms, cancel_ack_ms, cancel_effective_ms,
+       fill_after_cancel_ms
+FROM "{stream}" WHERE action = 'order_latency' AND {selected}
+ORDER BY _timestamp DESC LIMIT 200''',
+                [
+                    axis("_timestamp", "Time"),
+                    axis("request_id", "Request"),
+                    axis("kind", "Kind"),
+                    axis("outcome", "Outcome"),
+                ],
+                [
+                    axis("place_ack_ms", "Place ack"),
+                    axis("place_effective_ms", "Place effective"),
+                    axis("cancel_ack_ms", "Cancel ack"),
+                    axis("cancel_effective_ms", "Cancel effective"),
+                ],
+            ),
+            (0, 25, 192, 12, 5),
+            decimals=None,
+        ),
+        panel(
+            "standx_account_event_lag",
+            "table",
+            "Account Stream Event Lag",
+            "Exchange event timestamp to local receipt lag by authenticated account channel.",
+            query(
+                stream,
+                f'''SELECT channel,
+       approx_percentile_cont(account_event_lag_ms, 0.50) AS p50_ms,
+       approx_percentile_cont(account_event_lag_ms, 0.95) AS p95_ms,
+       approx_percentile_cont(account_event_lag_ms, 0.99) AS p99_ms,
+       count(*) AS samples
+FROM "{stream}" WHERE action = 'account_event_lag' AND available = true AND {selected}
+GROUP BY channel ORDER BY channel''',
+                [axis("channel", "Channel")],
+                [
+                    axis("p50_ms", "p50"),
+                    axis("p95_ms", "p95"),
+                    axis("p99_ms", "p99"),
+                    axis("samples", "Samples"),
+                ],
+            ),
+            (0, 37, 192, 8, 6),
+            decimals=None,
+        ),
+    ]
+
     return {
         "version": 8,
         "dashboardId": "",
@@ -441,6 +594,11 @@ GROUP BY event ORDER BY events DESC''',
         "tabs": [
             {"tabId": "default", "name": "Overview", "panels": overview},
             {"tabId": "runs-events", "name": "Runs & Events", "panels": runs_and_events},
+            {
+                "tabId": "performance-latency",
+                "name": "Performance & Latency",
+                "panels": performance_latency,
+            },
         ],
         "variables": {
             "list": [
