@@ -256,7 +256,6 @@ struct ResumeSpec<'a> {
     /// Order-response flow only: the paper book is cleared again because the
     /// placement channel was replaced underneath it.
     clear_resting: bool,
-    reset_consecutive_errors: bool,
     recovered_note: Option<ReconciliationStateNote>,
     notice: RiskNotice<'a>,
 }
@@ -281,9 +280,7 @@ async fn resume_quoting_after_recovery(io: &mut RecoveryIo<'_>, spec: ResumeSpec
             },
         );
     }
-    if spec.reset_consecutive_errors {
-        *io.consecutive_errors = 0;
-    }
+    *io.consecutive_errors = 0;
     io.runtime_state
         .handle(MakerEvent::RecoverySucceeded(spec.recovery_token));
     *io.next_cycle_is_recovery = true;
@@ -1543,7 +1540,18 @@ pub(super) async fn run_maker(
                     // failing closed.
                     let mut gap_closed = false;
                     for delay in [500_u64, 1_000, 1_500] {
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        // The maker book is verified empty at this point, so
+                        // aborting the convergence wait on Ctrl+C is safe.
+                        tokio::select! {
+                            _ = ctrl_c_latched(&mut ctrl_c_rx) => {
+                                handle.abort();
+                                break 'main stop_requested_exit(
+                                    &mut runtime_state,
+                                    RuntimeStopReason::CtrlC,
+                                );
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                        }
                         match apply_account_events(
                             &mut events,
                             &mut AccountEventState {
@@ -1654,7 +1662,6 @@ pub(super) async fn run_maker(
                         observed,
                         projection_reset: ProjectionReset::PreservePendingAcks,
                         clear_resting: false,
-                        reset_consecutive_errors: false,
                         recovered_note: None,
                         notice: RiskNotice {
                             kind: "account_stream",
@@ -1811,7 +1818,6 @@ pub(super) async fn run_maker(
                                     observed: reconciled_position,
                                     projection_reset: ProjectionReset::DropPendingRequests,
                                     clear_resting: true,
-                                    reset_consecutive_errors: true,
                                     recovered_note: None,
                                     notice: RiskNotice {
                                         kind: "order_response",
@@ -2672,7 +2678,17 @@ pub(super) async fn run_maker(
                     let mut recovered = false;
                     let mut last_observed = mismatch.observed;
                     for delay in [500_u64, 1_000, 1_500] {
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                        // The maker book is verified empty at this point, so
+                        // aborting the convergence wait on Ctrl+C is safe.
+                        tokio::select! {
+                            _ = ctrl_c_latched(&mut ctrl_c_rx) => {
+                                break 'main stop_requested_exit(
+                                    &mut runtime_state,
+                                    RuntimeStopReason::CtrlC,
+                                );
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                        }
                         if let Some(session) = live_session.as_mut() {
                             match apply_account_events(
                                 &mut session.account_events,
@@ -2715,9 +2731,16 @@ pub(super) async fn run_maker(
                                     }
                                 }
                                 Err(error) => {
-                                    session
-                                        .account_stream_health
-                                        .mark_unhealthy(error.to_string());
+                                    // Fail closed like the account-stream
+                                    // path: recovery cannot trust a ledger
+                                    // whose event drain failed validation.
+                                    break 'main recovery_failed_exit(
+                                        &mut runtime_state,
+                                        recovery_token,
+                                        format!(
+                                            "position reconciliation event validation failed during REST backfill: {error}"
+                                        ),
+                                    );
                                 }
                             }
                         }
@@ -2790,7 +2813,6 @@ pub(super) async fn run_maker(
                                 observed: last_observed,
                                 projection_reset: ProjectionReset::PreservePendingAcks,
                                 clear_resting: false,
-                                reset_consecutive_errors: true,
                                 recovered_note: Some(ReconciliationStateNote {
                                     cause: reconciliation_cause,
                                     expected: ledger.expected_position,
@@ -4582,7 +4604,6 @@ mod tests {
                 observed: 0.0,
                 projection_reset: ProjectionReset::PreservePendingAcks,
                 clear_resting: true,
-                reset_consecutive_errors: true,
                 recovered_note: None,
                 notice: RiskNotice {
                     kind: "position_reconciliation",
