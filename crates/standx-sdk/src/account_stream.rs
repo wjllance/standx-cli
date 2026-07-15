@@ -208,7 +208,13 @@ pub struct AccountStreamHealth {
 }
 
 impl AccountStreamHealth {
-    fn new(epoch: u64) -> Self {
+    /// Constructs a standalone healthy handle for the given epoch. Production
+    /// handles are created by [`AccountStream::connect`]; this constructor
+    /// exists so downstream tests can build a session fixture and drive
+    /// [`Self::mark_unhealthy`], mirroring `OrderResponseHealth`. The epoch is
+    /// explicit (no `Default`) so fixtures cannot silently disagree with the
+    /// projection generation they are paired with.
+    pub fn new(epoch: u64) -> Self {
         Self {
             healthy: Arc::new(AtomicBool::new(true)),
             failure_reason: Arc::new(Mutex::new(None)),
