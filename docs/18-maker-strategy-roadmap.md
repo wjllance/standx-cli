@@ -24,7 +24,7 @@
 | 阶段 | 主题 | 主要产物 | 进入下一阶段的核心条件 |
 |---|---|---|---|
 | 0 | 基线与证据校准 | 冻结基线、配置/文档对齐、数据集清单 | 基线可复现，配置与 live 证据无冲突 |
-| 1 | 绩效账本与回放 | 净 PnL 归因、markout、时间加权 uptime、replay runner | 同一 trace 确定性重放，指标守恒且可查询 |
+| 1 | 绩效账本与回放 | 净 PnL 归因、markout、订单延迟、时间加权 uptime、replay runner | 同一 trace 确定性重放，指标守恒且可查询 |
 | 2 | 自适应 spread / refresh | 波动与逆向选择驱动的动态报价宽度 | 样本外风险改善，收益/uptime 不越过退化线 |
 | 3 | 库存控制器 | 非线性 price/size/level skew、库存年龄 | 尾部库存显著下降，退出成本和敞口不恶化 |
 | 4 | 公平价与订单流 | 深度数量、microprice、OFI、信号质量降级 | shadow/replay 中 markout 改善，坏数据安全回退 |
@@ -39,8 +39,9 @@
 3. 快速波动、盘口稀疏或行情源短暂异常市场。
 
 参数只允许在训练窗口调整，验收必须使用冻结参数和未参与调参的样本外窗口。比较报告至少
-包含：净 PnL、最大回撤、1s/5s/30s markout、时间加权双边 uptime、合格深度时间积分、
-成交率、撤单率、`p95 |position|`、高库存持续时间和主动退出成本。
+包含：净 PnL、最大回撤、1s/5s/30s markout、下单/撤单 effective latency、时间加权双边
+uptime、合格深度时间积分、成交率、撤单率、`p95 |position|`、高库存持续时间和主动退出
+成本。
 
 除各阶段的专项门槛外，所有阶段还必须满足：
 
@@ -93,9 +94,38 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 - 分离 passive maker fills、reduce-only inventory exits 和外部/错误 run 事件。
 - 增加 gross spread、fee/rebate、funding、exit slippage 和 net PnL 归因。
 - 增加数量加权 capture，以及成交后 1s/5s/30s markout。
+- 分阶段记录 place/cancel 从 intent、socket write、command ack 到 account-order 生效的延迟。
 - 将 uptime 从 cycle 占比升级为时间加权双边 uptime；增加合格报价深度 × 时间。
 - 新增 deterministic replay runner，读取归一化 market/account trace 驱动纯 planner/ledger。
 - 将新增指标接入 JSON、OpenObserve 查询和 dashboard。
+
+### 下单与撤单延迟观测
+
+不能把“本地 socket 写入成功”“交易所接受命令”和“订单已经在账户/盘口状态中生效”合并成
+一个延迟。阶段 1 至少记录以下区间：
+
+| 指标 | 起点 | 终点 | 含义 |
+|---|---|---|---|
+| `place_write_ms` | place intent 生成 | 完整 command frame 写入本地 WS sink | 本地调度、签名、锁和 socket backlog |
+| `place_ack_ms` | frame written | 关联 `request_id` 的 accepted/rejected response | 网络与交易所命令处理 |
+| `place_effective_ms` | place intent 生成 | account stream 首次观察到该 current-run order | 订单真正进入 live account projection 前的总延迟 |
+| `cancel_write_ms` | cancel intent 生成 | 完整 cancel frame 写入本地 WS sink | 本地撤单发送延迟 |
+| `cancel_ack_ms` | frame written | 关联 `request_id` 的 cancel accepted/rejected response | 撤单命令确认延迟 |
+| `cancel_effective_ms` | cancel intent 生成 | account stream terminal/零 open qty，或审计确认 absent | 真正解除挂单敞口的总延迟 |
+| `account_event_lag_ms` | 交易所 `updated_at` / `trade_ts` | 本地收到对应 typed event | 账户流传输和消费延迟 |
+| `fill_after_cancel_ms` | cancel intent 生成 | 撤单窗口内到达的关联成交 | 撤单在途期间的实际成交风险 |
+
+观测实现遵守以下边界：
+
+- `standx-cli` 使用单调时钟计算进程内 duration，并同时记录 UTC 时间供跨系统对齐。
+- `standx-maker` 的 projection/reducer 不读取时钟、不保存 `Instant`；以后若策略需要延迟状态，
+  只接收 CLI 归一化后的 typed latency summary。
+- 使用 `request_id + client_order_id/order_id + generation + cycle` 关联生命周期，允许
+  account-order 先于 command ack 到达。
+- 超时、拒绝、generation invalidation、断流和进程结束都必须产生 terminal/censored outcome；
+  不能只统计成功请求，否则延迟分位数会产生 survivor bias。
+- 通过新增可选字段或独立 `action="order_latency"` 输出，不修改现有 JSON action/字段语义。
+- 阶段 1 只观测和回放延迟，不因延迟阈值改变报价、冻结或恢复行为。
 
 ### 验收标准
 
@@ -105,9 +135,20 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 - [ ] `gross spread + inventory MTM change + rebate - fee + signed funding cashflow - exit cost` 与 net PnL 的差异不超过一个计价币最小精度单位；无法换算的费用单列且不静默忽略。
 - [ ] 1s/5s/30s markout 使用成交时点后的行情；缺失窗口标为 unavailable，不使用回补时的当前 mark 伪造。
 - [ ] 合成 trace 中时间加权 uptime、深度时间积分和库存持有时间与手工计算一致。
+- [ ] 100% 已注册 place/cancel request 最终归入 accepted、rejected、effective、timeout、
+  invalidated 或 process_ended 之一；没有无解释的 pending request。
+- [ ] 同一请求的生命周期时间单调、duration 非负，并正确覆盖 account-order 先于 ack、晚到
+  ack、拒单、超时、重连和 stale generation。
+- [ ] place/cancel 分别输出 p50、p95、p99、timeout rate 和 reject rate；超时样本作为
+  censored/timeout 保留，不从分布中静默删除。
+- [ ] `cancel_effective_ms` 能与 `fill_after_cancel_ms`、负向 markout 和仓位跳变按
+  `run_id/config_hash/symbol` 关联查询。
+- [ ] 延迟指标可按正常运行/recovery、symbol、side、level 和 market source 分组，且不会把
+  socket write success 误标为 venue accepted。
 - [ ] replay runner 不访问网络、环境变量、终端或实时时钟，且不会执行任何订单 I/O。
 - [ ] 旧 JSON 字段语义不变；新增字段在旧消费者缺失时仍可正常工作。
-- [ ] dashboard 能按 `run_id/config_hash` 对比上述指标，并能区分 passive fill 与 inventory exit。
+- [ ] dashboard 能按 `run_id/config_hash` 对比上述指标，区分 passive fill 与 inventory exit，
+  并展示 place/cancel latency 分位数、超时率和撤单后晚到成交。
 
 ## 阶段 2：自适应 Spread 与 Refresh
 
@@ -115,8 +156,9 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 让报价宽度和重报阈值响应市场风险，同时保持 SIP-5A band、post-only 和 anti-flicker 约束。
 
-建议的纯策略输入包括短窗 realized volatility、当前 touch spread、近期 markout/toxicity 和
-可换算的手续费下限。输出仍只是目标 spread/refresh 或 typed quote intent。
+建议的纯策略输入包括短窗 realized volatility、当前 touch spread、近期 markout/toxicity、
+阶段 1 产出的滚动 latency summary 和可换算的手续费下限。输出仍只是目标 spread/refresh
+或 typed quote intent。
 
 ### 范围
 
