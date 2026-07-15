@@ -27,8 +27,12 @@ mod output;
 mod pipeline;
 mod recovery;
 mod runtime;
+mod startup;
 #[cfg(test)]
 use runtime::apply_order_responses;
+#[cfg(test)]
+use startup::new_maker_rest_client;
+use startup::{run_startup, LiveSession, MakerStartup};
 
 use cycle::maker_cycle;
 use feed::{fresh_ws_snapshot, market_snapshot, spawn_market_feed};
@@ -526,7 +530,7 @@ mod tests {
 
     #[test]
     fn alert_thresholds_reject_silent_disable_and_unfireable_ranges() {
-        use runtime::validate_alert_thresholds;
+        use startup::validate_alert_thresholds;
         // Baseline: all valid.
         assert!(validate_alert_thresholds(50.0, 80.0, 20.0, 3600.0).is_ok());
         // Zero everywhere means "disabled" and is allowed.
