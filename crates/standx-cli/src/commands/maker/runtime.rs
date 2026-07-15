@@ -91,6 +91,156 @@ fn stop_requested_exit(runtime_state: &mut MakerState, reason: RuntimeStopReason
     take_stop_effect(runtime_state, MakerExit::PositionReconciliation)
 }
 
+/// Which projection clear an incident flow performs after freeze cleanup.
+#[derive(Clone, Copy)]
+enum ProjectionReset {
+    /// `clear_orders_preserving_pending_acks` — a current-run ack may still
+    /// replay after cleanup (account-stream and reconciliation freezes).
+    PreservePendingAcks,
+    /// `clear_orders_and_pending` — the placement channel is being torn down,
+    /// so pending request acks can never arrive (order-response freeze).
+    DropPendingRequests,
+}
+
+/// How a missing or mismatched runtime effect maps to the flow's stop reason.
+/// (`RuntimeStopReason::CleanupFailure` carries the target, so a plain
+/// `fn(String) -> RuntimeStopReason` pointer cannot express it.)
+#[derive(Clone, Copy)]
+enum EffectFailureStop {
+    CleanupFailure,
+    OrderResponse,
+    PositionReconciliation,
+}
+
+fn effect_failure_stop(
+    kind: EffectFailureStop,
+    target: RecoveryTarget,
+    reason: String,
+) -> RuntimeStopReason {
+    match kind {
+        EffectFailureStop::CleanupFailure => RuntimeStopReason::CleanupFailure { target, reason },
+        EffectFailureStop::OrderResponse => RuntimeStopReason::OrderResponse(reason),
+        EffectFailureStop::PositionReconciliation => {
+            RuntimeStopReason::PositionReconciliation(reason)
+        }
+    }
+}
+
+/// Payload for the position-reconciliation flow's structured
+/// `emit_reconciliation_state` emits around freeze and resume.
+struct ReconciliationStateNote {
+    cause: &'static str,
+    expected: f64,
+    observed: f64,
+}
+
+/// Borrowed bundle of the `run_maker` locals every incident-recovery block
+/// touches. Constructed fresh immediately before each helper call; all
+/// borrows end when the helper returns, so flow-specific code in between
+/// re-borrows the same locals freely.
+struct RecoveryIo<'a> {
+    runtime_state: &'a mut MakerState,
+    notifier: &'a MakerNotifier,
+    client: &'a StandXClient,
+    session: Option<&'a mut LiveSession>,
+    resting: &'a mut Vec<RestingQuote>,
+    inventory_exit_pending: &'a mut bool,
+    symbol: &'a str,
+    cycle: u64,
+    output_format: OutputFormat,
+}
+
+/// Everything that differs between the three incident flows' freeze/cleanup
+/// preambles. The `notice` is built entirely by the caller so the risk
+/// payloads stay reviewable string-for-string at the call sites.
+struct FreezeSpec<'a> {
+    target: RecoveryTarget,
+    trigger: MakerEvent,
+    cleanup_effect_stop: EffectFailureStop,
+    recovery_effect_stop: EffectFailureStop,
+    /// Prepended to `"freeze cleanup failed: {error}"` in the CleanupFailed
+    /// reason so each flow keeps its exact historical wording.
+    cleanup_failure_prefix: String,
+    cleanup_failed_exit: fn(String) -> MakerExit,
+    notice: RiskNotice<'a>,
+    frozen_note: Option<ReconciliationStateNote>,
+    /// Account-stream flow only: abort the stale stream task before
+    /// reporting cleanup complete.
+    abort_account_stream_handle: bool,
+    projection_reset: ProjectionReset,
+}
+
+/// Freeze/cleanup preamble shared by the three incident-recovery flows:
+/// report the fault to the runtime, drain the cleanup effect, notify,
+/// cancel every maker order, reset the local book state, and drain the
+/// recovery effect. `Ok` carries the recovery token for the flow-specific
+/// reconnect/convergence work; `Err` carries the exit the caller must
+/// `break 'main` with.
+async fn freeze_and_cleanup_for_recovery(
+    io: &mut RecoveryIo<'_>,
+    spec: FreezeSpec<'_>,
+) -> std::result::Result<WorkToken, MakerExit> {
+    io.runtime_state.handle(spec.trigger);
+    let cleanup_token = match take_cleanup_effect(io.runtime_state, spec.target) {
+        Ok(token) => token,
+        Err(error) => {
+            return Err(stop_requested_exit(
+                io.runtime_state,
+                effect_failure_stop(spec.cleanup_effect_stop, spec.target, error.to_string()),
+            ));
+        }
+    };
+    if let Some(note) = &spec.frozen_note {
+        emit_reconciliation_state(
+            io.output_format,
+            io.symbol,
+            io.cycle,
+            "frozen",
+            note.cause,
+            note.expected,
+            note.observed,
+        );
+    }
+    io.notifier.risk(spec.notice, false).await;
+    if let Err(error) =
+        cancel_maker_orders_with_retry(io.client, io.symbol, 3, io.output_format).await
+    {
+        io.runtime_state.handle(MakerEvent::CleanupFailed {
+            token: cleanup_token,
+            reason: format!(
+                "{}freeze cleanup failed: {error}",
+                spec.cleanup_failure_prefix
+            ),
+        });
+        return Err(take_stop_effect(io.runtime_state, spec.cleanup_failed_exit));
+    }
+    io.resting.clear();
+    if let Some(session) = io.session.as_deref_mut() {
+        invalidate_session_latency(session);
+        match spec.projection_reset {
+            ProjectionReset::PreservePendingAcks => {
+                session.projection.clear_orders_preserving_pending_acks()
+            }
+            ProjectionReset::DropPendingRequests => session.projection.clear_orders_and_pending(),
+        }
+    }
+    *io.inventory_exit_pending = false;
+    if spec.abort_account_stream_handle {
+        if let Some(session) = io.session.as_deref_mut() {
+            session.account_stream_handle.abort();
+        }
+    }
+    io.runtime_state
+        .handle(MakerEvent::CleanupCompleted(cleanup_token));
+    match take_recovery_effect(io.runtime_state, spec.target) {
+        Ok(token) => Ok(token),
+        Err(error) => Err(stop_requested_exit(
+            io.runtime_state,
+            effect_failure_stop(spec.recovery_effect_stop, spec.target, error.to_string()),
+        )),
+    }
+}
+
 /// A buffered or queued order-response signals a genuine correlation failure
 /// only when it carried a `request_id` that matched no pending request. A
 /// matched accepted placement/cancel or rejected placement remains correlated,
@@ -1167,26 +1317,33 @@ pub(super) async fn run_maker(
                     .unwrap_or_else(|| {
                         "account stream became unhealthy without a recorded reason".to_string()
                     });
-                runtime_state.handle(MakerEvent::AccountStreamDisconnected(detail.clone()));
-                let cleanup_token =
-                    match take_cleanup_effect(&mut runtime_state, RecoveryTarget::AccountStream) {
-                        Ok(token) => token,
-                        Err(error) => {
-                            break stop_requested_exit(
-                                &mut runtime_state,
-                                RuntimeStopReason::CleanupFailure {
-                                    target: RecoveryTarget::AccountStream,
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
-                    };
                 let message = format!(
                     "account stream unavailable; placements frozen and cleanup starting: {detail}"
                 );
-                notifier
-                    .risk(
-                        RiskNotice {
+                // Freeze immediately: no further cycle can place while the
+                // authoritative account stream is unavailable. The stale
+                // receiver/health stay in place until the reconnect replaces
+                // them; every failure path below exits the loop.
+                let recovery_token = match freeze_and_cleanup_for_recovery(
+                    &mut RecoveryIo {
+                        runtime_state: &mut runtime_state,
+                        notifier: &notifier,
+                        client: &client,
+                        session: Some(&mut *session),
+                        resting: &mut resting,
+                        inventory_exit_pending: &mut inventory_exit_pending,
+                        symbol: &symbol,
+                        cycle,
+                        output_format,
+                    },
+                    FreezeSpec {
+                        target: RecoveryTarget::AccountStream,
+                        trigger: MakerEvent::AccountStreamDisconnected(detail.clone()),
+                        cleanup_effect_stop: EffectFailureStop::CleanupFailure,
+                        recovery_effect_stop: EffectFailureStop::PositionReconciliation,
+                        cleanup_failure_prefix: format!("account stream disconnected ({detail}); "),
+                        cleanup_failed_exit: MakerExit::PositionReconciliation,
+                        notice: RiskNotice {
                             kind: "account_stream",
                             severity: "warning",
                             event: "disconnected_frozen",
@@ -1198,40 +1355,16 @@ pub(super) async fn run_maker(
                             expected: Some(ledger.expected_position),
                             observed: None,
                         },
-                        false,
-                    )
-                    .await;
-                // Freeze immediately: no further cycle can place while the
-                // authoritative account stream is unavailable.
-                if let Err(cleanup_error) =
-                    cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                        frozen_note: None,
+                        abort_account_stream_handle: true,
+                        projection_reset: ProjectionReset::PreservePendingAcks,
+                    },
+                )
+                .await
                 {
-                    runtime_state.handle(MakerEvent::CleanupFailed {
-                        token: cleanup_token,
-                        reason: format!(
-                            "account stream disconnected ({detail}); freeze cleanup failed: {cleanup_error}"
-                        ),
-                    });
-                    break take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
-                }
-                resting.clear();
-                invalidate_session_latency(session);
-                session.projection.clear_orders_preserving_pending_acks();
-                inventory_exit_pending = false;
-                // The stale receiver/health stay in place until the reconnect
-                // replaces them; every failure path below exits the loop.
-                session.account_stream_handle.abort();
-                runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
-                let recovery_token =
-                    match take_recovery_effect(&mut runtime_state, RecoveryTarget::AccountStream) {
-                        Ok(token) => token,
-                        Err(error) => {
-                            break stop_requested_exit(
-                                &mut runtime_state,
-                                RuntimeStopReason::PositionReconciliation(error.to_string()),
-                            );
-                        }
-                    };
+                    Ok(token) => token,
+                    Err(exit) => break exit,
+                };
 
                 if args.account_stream_reconnect_attempts == 0 {
                     break recovery_failed_exit(
@@ -1473,25 +1606,31 @@ pub(super) async fn run_maker(
                         "order-response stream became unhealthy without a recorded reason"
                             .to_string()
                     });
-                runtime_state.handle(MakerEvent::OrderResponseDisconnected(detail.clone()));
-                let cleanup_token =
-                    match take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse) {
-                        Ok(token) => token,
-                        Err(error) => {
-                            break stop_requested_exit(
-                                &mut runtime_state,
-                                RuntimeStopReason::OrderResponse(error.to_string()),
-                            );
-                        }
-                    };
                 let controlled_fault = detail.starts_with("controlled fault injection");
                 // Mirror the account-stream path: the order-response stream was
                 // previously silent on the webhook across disconnect/reconnect.
                 let disconnect_message =
                     format!("order-response stream unavailable; placements frozen: {detail}");
-                notifier
-                    .risk(
-                        RiskNotice {
+                let recovery_token = match freeze_and_cleanup_for_recovery(
+                    &mut RecoveryIo {
+                        runtime_state: &mut runtime_state,
+                        notifier: &notifier,
+                        client: &client,
+                        session: Some(&mut *session),
+                        resting: &mut resting,
+                        inventory_exit_pending: &mut inventory_exit_pending,
+                        symbol: &symbol,
+                        cycle,
+                        output_format,
+                    },
+                    FreezeSpec {
+                        target: RecoveryTarget::OrderResponse,
+                        trigger: MakerEvent::OrderResponseDisconnected(detail.clone()),
+                        cleanup_effect_stop: EffectFailureStop::OrderResponse,
+                        recovery_effect_stop: EffectFailureStop::OrderResponse,
+                        cleanup_failure_prefix: "order-response ".to_string(),
+                        cleanup_failed_exit: MakerExit::OrderResponse,
+                        notice: RiskNotice {
                             kind: "order_response",
                             severity: "warning",
                             event: "disconnected_frozen",
@@ -1503,33 +1642,16 @@ pub(super) async fn run_maker(
                             expected: Some(ledger.expected_position),
                             observed: None,
                         },
-                        false,
-                    )
-                    .await;
-                if let Err(error) =
-                    cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                        frozen_note: None,
+                        abort_account_stream_handle: false,
+                        projection_reset: ProjectionReset::DropPendingRequests,
+                    },
+                )
+                .await
                 {
-                    runtime_state.handle(MakerEvent::CleanupFailed {
-                        token: cleanup_token,
-                        reason: format!("order-response freeze cleanup failed: {error}"),
-                    });
-                    break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
-                }
-                resting.clear();
-                invalidate_session_latency(session);
-                session.projection.clear_orders_and_pending();
-                inventory_exit_pending = false;
-                runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
-                let recovery_token =
-                    match take_recovery_effect(&mut runtime_state, RecoveryTarget::OrderResponse) {
-                        Ok(token) => token,
-                        Err(error) => {
-                            break stop_requested_exit(
-                                &mut runtime_state,
-                                RuntimeStopReason::OrderResponse(error.to_string()),
-                            );
-                        }
-                    };
+                    Ok(token) => token,
+                    Err(exit) => break exit,
+                };
                 let reconnect_unavailable = if controlled_fault {
                     Some("controlled fault injection requires fail-safe shutdown".to_string())
                 } else if args.order_response_reconnect_attempts == 0 {
@@ -2386,47 +2508,39 @@ pub(super) async fn run_maker(
                 }
                 if let Some(mismatch) = e.downcast_ref::<PositionReconciliationError>() {
                     let reconciliation_cause = mismatch.cause.label();
-                    runtime_state.handle(MakerEvent::PositionMismatch);
-                    let cleanup_token = match take_cleanup_effect(
-                        &mut runtime_state,
-                        RecoveryTarget::PositionReconciliation,
-                    ) {
-                        Ok(token) => token,
-                        Err(error) => {
-                            break 'main stop_requested_exit(
-                                &mut runtime_state,
-                                RuntimeStopReason::CleanupFailure {
-                                    target: RecoveryTarget::PositionReconciliation,
-                                    reason: error.to_string(),
-                                },
-                            );
-                        }
-                    };
                     // A mismatch is not a normal cycle error. Freeze quoting,
                     // empty the maker book, and give account-order callbacks
                     // plus REST settlement a bounded three-second window to
                     // converge before failing closed.
-                    emit_reconciliation_state(
-                        output_format,
-                        &symbol,
-                        cycle,
-                        "frozen",
-                        reconciliation_cause,
-                        mismatch.expected,
-                        mismatch.observed,
-                    );
-                    notifier
-                        .risk(
-                            RiskNotice {
-                            kind: "position_reconciliation",
-                            severity: "warning",
-                            event: "frozen",
-                            message: match &mismatch.cause {
-                                PositionReconciliationCause::CycleInvalidation => "account update invalidated active cycle; placements frozen and maker cleanup starting",
-                                PositionReconciliationCause::UnknownCurrentRunOrder => "unknown current-run order detected; placements frozen and maker cleanup starting",
-                                PositionReconciliationCause::AccountProjectionMismatch(_) => "account projection audit failed; placements frozen and maker cleanup starting",
-                                PositionReconciliationCause::PositionMismatch => "position mismatch detected; placements frozen and maker cleanup starting",
-                            },
+                    let recovery_token = match freeze_and_cleanup_for_recovery(
+                        &mut RecoveryIo {
+                            runtime_state: &mut runtime_state,
+                            notifier: &notifier,
+                            client: &client,
+                            session: live_session.as_mut(),
+                            resting: &mut resting,
+                            inventory_exit_pending: &mut inventory_exit_pending,
+                            symbol: &symbol,
+                            cycle,
+                            output_format,
+                        },
+                        FreezeSpec {
+                            target: RecoveryTarget::PositionReconciliation,
+                            trigger: MakerEvent::PositionMismatch,
+                            cleanup_effect_stop: EffectFailureStop::CleanupFailure,
+                            recovery_effect_stop: EffectFailureStop::PositionReconciliation,
+                            cleanup_failure_prefix: String::new(),
+                            cleanup_failed_exit: MakerExit::PositionReconciliation,
+                            notice: RiskNotice {
+                                kind: "position_reconciliation",
+                                severity: "warning",
+                                event: "frozen",
+                                message: match &mismatch.cause {
+                                    PositionReconciliationCause::CycleInvalidation => "account update invalidated active cycle; placements frozen and maker cleanup starting",
+                                    PositionReconciliationCause::UnknownCurrentRunOrder => "unknown current-run order detected; placements frozen and maker cleanup starting",
+                                    PositionReconciliationCause::AccountProjectionMismatch(_) => "account projection audit failed; placements frozen and maker cleanup starting",
+                                    PositionReconciliationCause::PositionMismatch => "position mismatch detected; placements frozen and maker cleanup starting",
+                                },
                                 symbol: &symbol,
                                 cycle,
                                 position_before: None,
@@ -2434,39 +2548,19 @@ pub(super) async fn run_maker(
                                 expected: Some(mismatch.expected),
                                 observed: Some(mismatch.observed),
                             },
-                            false,
-                        )
-                    .await;
-                    if let Err(cleanup_error) =
-                        cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                            frozen_note: Some(ReconciliationStateNote {
+                                cause: reconciliation_cause,
+                                expected: mismatch.expected,
+                                observed: mismatch.observed,
+                            }),
+                            abort_account_stream_handle: false,
+                            projection_reset: ProjectionReset::PreservePendingAcks,
+                        },
+                    )
+                    .await
                     {
-                        runtime_state.handle(MakerEvent::CleanupFailed {
-                            token: cleanup_token,
-                            reason: format!("freeze cleanup failed: {cleanup_error}"),
-                        });
-                        break 'main take_stop_effect(
-                            &mut runtime_state,
-                            MakerExit::PositionReconciliation,
-                        );
-                    }
-                    resting.clear();
-                    if let Some(session) = live_session.as_mut() {
-                        invalidate_session_latency(session);
-                        session.projection.clear_orders_preserving_pending_acks();
-                    }
-                    inventory_exit_pending = false;
-                    runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
-                    let recovery_token = match take_recovery_effect(
-                        &mut runtime_state,
-                        RecoveryTarget::PositionReconciliation,
-                    ) {
                         Ok(token) => token,
-                        Err(error) => {
-                            break 'main stop_requested_exit(
-                                &mut runtime_state,
-                                RuntimeStopReason::PositionReconciliation(error.to_string()),
-                            );
-                        }
+                        Err(exit) => break 'main exit,
                     };
                     // Genuine mismatch/projection anomalies share the same
                     // rolling budget as transport reconnects. A normal account
@@ -2933,6 +3027,52 @@ mod tests {
         assert_eq!(
             detail,
             "order request lifecycle timed out after 10.250s: kind=cancel request_id=request-7 waiting_for=account_order; refusing further live orders"
+        );
+    }
+
+    /// Pins the per-flow mapping from a missing/mismatched runtime effect to
+    /// its stop reason: the order-response flow stops as OrderResponse even
+    /// for cleanup failures, while the other flows carry the target through
+    /// CleanupFailure or fall back to PositionReconciliation.
+    #[test]
+    fn effect_failure_stop_maps_each_flow_variant() {
+        assert_eq!(
+            effect_failure_stop(
+                EffectFailureStop::CleanupFailure,
+                RecoveryTarget::AccountStream,
+                "boom".to_string(),
+            ),
+            RuntimeStopReason::CleanupFailure {
+                target: RecoveryTarget::AccountStream,
+                reason: "boom".to_string(),
+            }
+        );
+        assert_eq!(
+            effect_failure_stop(
+                EffectFailureStop::CleanupFailure,
+                RecoveryTarget::PositionReconciliation,
+                "boom".to_string(),
+            ),
+            RuntimeStopReason::CleanupFailure {
+                target: RecoveryTarget::PositionReconciliation,
+                reason: "boom".to_string(),
+            }
+        );
+        assert_eq!(
+            effect_failure_stop(
+                EffectFailureStop::OrderResponse,
+                RecoveryTarget::OrderResponse,
+                "boom".to_string(),
+            ),
+            RuntimeStopReason::OrderResponse("boom".to_string())
+        );
+        assert_eq!(
+            effect_failure_stop(
+                EffectFailureStop::PositionReconciliation,
+                RecoveryTarget::AccountStream,
+                "boom".to_string(),
+            ),
+            RuntimeStopReason::PositionReconciliation("boom".to_string())
         );
     }
 
