@@ -3,7 +3,7 @@ use super::output::{
     emit_reconciliation_state, emit_startup_rejected, emit_stop_loss_triggered,
 };
 use super::*;
-use standx_sdk::order_response::OrderResponse;
+use standx_sdk::order_response::{OrderCommandSender, OrderResponse, OrderResponseHealth};
 
 fn take_cleanup_effect(
     runtime_state: &mut MakerState,
@@ -267,14 +267,13 @@ impl AccountEventOutcome {
 fn schedule_account_balance_refresh(
     requested: &mut bool,
     account_alerts_enabled: bool,
-    poll: Option<&mut LiveAccountPollState>,
+    poll: &mut LiveAccountPollState,
     now: std::time::Instant,
 ) -> bool {
     if !std::mem::take(requested) || !account_alerts_enabled {
         return false;
     }
-    poll.expect("live account floors require initialized account polling")
-        .request_balance_refresh(now);
+    poll.request_balance_refresh(now);
     true
 }
 
@@ -596,6 +595,29 @@ pub(super) fn validate_alert_thresholds(
         return Err(anyhow::anyhow!("--alert-uptime must be >= 0"));
     }
     Ok(())
+}
+
+/// Everything that exists exactly when the maker runs `--live`: the
+/// order-response stream, the authenticated account stream, the projection
+/// they feed, and the REST polling schedule for account floors.
+///
+/// `run_maker` holds a single `Option<LiveSession>` that is `Some` iff
+/// `args.live`, so live-only code paths bind the session once and use plain
+/// fields instead of re-proving "live implies initialized" per use. Reconnect
+/// paths replace the relevant fields in place (aborting the old task handle
+/// first); the session itself stays `Some` for the whole run.
+struct LiveSession {
+    order_responses: tokio::sync::mpsc::Receiver<OrderResponse>,
+    order_commands: OrderCommandSender,
+    order_response_health: OrderResponseHealth,
+    order_response_handle: tokio::task::JoinHandle<()>,
+    account_events: tokio::sync::mpsc::Receiver<AccountEvent>,
+    account_stream_health: AccountStreamHealth,
+    account_stream_handle: tokio::task::JoinHandle<()>,
+    /// Bumped on every account-stream reconnect; stamps projection generations.
+    account_stream_epoch: u64,
+    projection: MakerAccountProjection,
+    account_poll: LiveAccountPollState,
 }
 
 struct ShutdownReport<'a> {
@@ -963,16 +985,10 @@ pub(super) async fn run_maker(
     let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
 
     // ---- Live gating & clean start ----
-    let mut order_responses = None;
-    let mut order_commands = None;
-    let mut order_response_health = None;
-    let mut order_response_handle = None;
-    let mut account_events = None;
-    let mut account_stream_health: Option<AccountStreamHealth> = None;
-    let mut account_stream_handle = None;
-    let mut account_stream_epoch = 1_u64;
-    let mut live_account_poll = None;
-    if args.live {
+    // `order_session_id` is `Some` iff `args.live`, so this block is the live
+    // startup path; it either fails fast or yields a complete `LiveSession`.
+    let mut live_session: Option<LiveSession> = None;
+    if let Some(order_session_id) = order_session_id.as_deref() {
         if std::env::var(LIVE_MAKER_ENV).ok().as_deref() != Some("1") {
             return Err(anyhow::anyhow!(
                 "live mode not yet enabled: it has not been supervised-tested against production. Set {}=1 to unlock (at your own risk).",
@@ -1051,10 +1067,7 @@ pub(super) async fn run_maker(
         let balance = balance?;
         starting_position = position_for_symbol(&positions, &symbol)?;
         baseline_mark = mark;
-        live_account_poll = Some(LiveAccountPollState::new(
-            balance,
-            std::time::Instant::now(),
-        ));
+        let account_poll = LiveAccountPollState::new(balance, std::time::Instant::now());
 
         let historical_order_ids = filled_orders
             .iter()
@@ -1113,8 +1126,9 @@ pub(super) async fn run_maker(
         // before order-response readiness, then require a second REST
         // snapshot so events buffered during authentication cannot create an
         // unobserved startup gap.
+        let account_stream_epoch = 1_u64;
         let account_stream = AccountStream::new(account_stream_epoch)?;
-        let (events, health, handle) = account_stream
+        let (account_events, account_stream_health, account_stream_handle) = account_stream
             .connect(&[
                 AccountChannel::Order,
                 AccountChannel::Position,
@@ -1125,7 +1139,7 @@ pub(super) async fn run_maker(
         let post_auth_positions = client.get_positions(Some(&symbol)).await?;
         let post_auth_position = position_for_symbol(&post_auth_positions, &symbol)?;
         if (post_auth_position - starting_position).abs() > qty_tolerance {
-            handle.abort();
+            account_stream_handle.abort();
             notifier
                 .risk(
                     RiskNotice {
@@ -1147,19 +1161,12 @@ pub(super) async fn run_maker(
                 "position changed while account stream was authenticating: baseline {starting_position:+.8}, snapshot {post_auth_position:+.8}"
             ));
         }
-        account_events = Some(events);
-        account_stream_health = Some(health);
-        account_stream_handle = Some(handle);
-
-        let stream = OrderResponseStream::new(
-            order_session_id
-                .as_deref()
-                .expect("live maker must have an order session"),
-        )?;
-        let (commands, responses, health, handle) = stream.connect().await?;
+        let stream = OrderResponseStream::new(order_session_id)?;
+        let (order_commands, order_responses, order_response_health, order_response_handle) =
+            stream.connect().await?;
         if let Some(after) = args.controlled_disconnect_after {
-            let health_for_fault = health.clone();
-            let abort = handle.abort_handle();
+            let health_for_fault = order_response_health.clone();
+            let abort = order_response_handle.abort_handle();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(after)).await;
                 // Aborting drops the local WebSocket halves; set health first
@@ -1174,10 +1181,24 @@ pub(super) async fn run_maker(
                 "⚠️ controlled fault injection armed: closing order-response stream after {after}s"
             );
         }
-        order_responses = Some(responses);
-        order_commands = Some(commands);
-        order_response_health = Some(health);
-        order_response_handle = Some(handle);
+        live_session = Some(LiveSession {
+            order_responses,
+            order_commands,
+            order_response_health,
+            order_response_handle,
+            account_events,
+            account_stream_health,
+            account_stream_handle,
+            account_stream_epoch,
+            projection: MakerAccountProjection::new(
+                account_stream_epoch,
+                run_order_prefix.clone(),
+                starting_position,
+                cfg.price_tick() / 2.0,
+                qty_tolerance,
+            ),
+            account_poll,
+        });
         emit_ledger_sync(
             output_format,
             &symbol,
@@ -1351,15 +1372,6 @@ pub(super) async fn run_maker(
     // ---- Loop state ----
     let mut cycle: u64 = 0;
     let mut resting: Vec<RestingQuote> = Vec::new(); // paper-mode book
-    let mut account_projection = args.live.then(|| {
-        MakerAccountProjection::new(
-            account_stream_epoch,
-            run_order_prefix.clone(),
-            starting_position,
-            cfg.price_tick() / 2.0,
-            qty_tolerance,
-        )
-    });
     let mut inventory_exit_pending = false;
     let mut ledger = MakerLedger::new(starting_position);
     let mut position_alert_anchor =
@@ -1460,13 +1472,15 @@ pub(super) async fn run_maker(
                     }
                 }
             }
-            if let Some(health) = account_stream_health
-                .as_ref()
-                .filter(|health| !health.is_healthy())
-            {
-                let detail = health.failure_reason().unwrap_or_else(|| {
-                    "account stream became unhealthy without a recorded reason".to_string()
-                });
+        }
+        if let Some(session) = live_session.as_mut() {
+            if !session.account_stream_health.is_healthy() {
+                let detail = session
+                    .account_stream_health
+                    .failure_reason()
+                    .unwrap_or_else(|| {
+                        "account stream became unhealthy without a recorded reason".to_string()
+                    });
                 runtime_state.handle(MakerEvent::AccountStreamDisconnected(detail.clone()));
                 let cleanup_token =
                     match take_cleanup_effect(&mut runtime_state, RecoveryTarget::AccountStream) {
@@ -1515,14 +1529,11 @@ pub(super) async fn run_maker(
                     break take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 }
                 resting.clear();
-                if let Some(projection) = account_projection.as_mut() {
-                    projection.clear_orders_preserving_pending_acks();
-                }
+                session.projection.clear_orders_preserving_pending_acks();
                 inventory_exit_pending = false;
-                if let Some(handle) = account_stream_handle.take() {
-                    handle.abort();
-                }
-                account_events.take();
+                // The stale receiver/health stay in place until the reconnect
+                // replaces them; every failure path below exits the loop.
+                session.account_stream_handle.abort();
                 runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
                 let recovery_token =
                     match take_recovery_effect(&mut runtime_state, RecoveryTarget::AccountStream) {
@@ -1556,7 +1567,7 @@ pub(super) async fn run_maker(
                 }
 
                 let (mut events, health, handle) = match reconnect_account_stream(
-                    &mut account_stream_epoch,
+                    &mut session.account_stream_epoch,
                     args.account_stream_reconnect_attempts,
                     args.account_stream_reconnect_backoff,
                     &mut ctrl_c_rx,
@@ -1585,11 +1596,9 @@ pub(super) async fn run_maker(
                     }
                 };
 
-                let projection = account_projection
-                    .as_mut()
-                    .expect("live account reconnect requires initialized projection");
+                let projection = &mut session.projection;
                 projection.reset_after_cleanup_preserving_pending_acks(
-                    account_stream_epoch,
+                    session.account_stream_epoch,
                     ledger.expected_position,
                 );
 
@@ -1742,16 +1751,14 @@ pub(super) async fn run_maker(
                 }
                 projection.clear_orders_preserving_pending_acks();
 
-                account_events = Some(events);
-                account_stream_health = Some(health);
-                account_stream_handle = Some(handle);
-                if let Some(projection) = account_projection.as_mut() {
-                    let generation = projection.generation();
-                    projection.apply(
-                        generation,
-                        AccountProjectionEvent::PositionObserved { position: observed },
-                    );
-                }
+                session.account_events = events;
+                session.account_stream_health = health;
+                session.account_stream_handle = handle;
+                let generation = session.projection.generation();
+                session.projection.apply(
+                    generation,
+                    AccountProjectionEvent::PositionObserved { position: observed },
+                );
                 total_fills += reconnect_fills;
                 runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                 notifier
@@ -1773,13 +1780,14 @@ pub(super) async fn run_maker(
                 .await;
                 continue;
             }
-            if let Some(health) = order_response_health
-                .as_ref()
-                .filter(|health| !health.is_healthy())
-            {
-                let detail = health.failure_reason().unwrap_or_else(|| {
-                    "order-response stream became unhealthy without a recorded reason".to_string()
-                });
+            if !session.order_response_health.is_healthy() {
+                let detail = session
+                    .order_response_health
+                    .failure_reason()
+                    .unwrap_or_else(|| {
+                        "order-response stream became unhealthy without a recorded reason"
+                            .to_string()
+                    });
                 runtime_state.handle(MakerEvent::OrderResponseDisconnected(detail.clone()));
                 let cleanup_token =
                     match take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse) {
@@ -1823,9 +1831,7 @@ pub(super) async fn run_maker(
                     break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
                 }
                 resting.clear();
-                if let Some(projection) = account_projection.as_mut() {
-                    projection.clear_orders_and_pending();
-                }
+                session.projection.clear_orders_and_pending();
                 inventory_exit_pending = false;
                 runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
                 let recovery_token =
@@ -1849,11 +1855,10 @@ pub(super) async fn run_maker(
                         .then(|| format!("{}; circuit is open", recovery_circuit_detail(admission)))
                 };
                 if reconnect_unavailable.is_none() {
-                    if let Some(handle) = order_response_handle.take() {
-                        handle.abort();
-                    }
-                    order_responses.take();
-                    order_commands.take();
+                    // Abort the stream task in place; the stale halves are
+                    // replaced together on success, and every failure path
+                    // below exits the loop.
+                    session.order_response_handle.abort();
                     match reconnect_order_response(ReconnectRequest {
                         cleanup_client: client.clone(),
                         symbol: &symbol,
@@ -1870,16 +1875,14 @@ pub(super) async fn run_maker(
                     .await
                     {
                         Ok(reconnected) => {
-                            order_commands = Some(reconnected.commands);
-                            order_responses = Some(reconnected.responses);
-                            order_response_health = Some(reconnected.health);
-                            order_response_handle = Some(reconnected.handle);
+                            session.order_commands = reconnected.commands;
+                            session.order_responses = reconnected.responses;
+                            session.order_response_health = reconnected.health;
+                            session.order_response_handle = reconnected.handle;
                             // Cleanup verified an empty maker book. The next
                             // cycle rebuilds exchange state before it may place.
                             resting.clear();
-                            if let Some(projection) = account_projection.as_mut() {
-                                projection.clear_orders_and_pending();
-                            }
+                            session.projection.clear_orders_and_pending();
                             consecutive_errors = 0;
                             runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                             notifier
@@ -2012,38 +2015,27 @@ pub(super) async fn run_maker(
                 break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
             }
         }
-        if let Some(receiver) = order_responses.as_mut() {
-            let projection = account_projection
-                .as_mut()
-                .expect("live order responses require initialized account projection");
+        if let Some(session) = live_session.as_mut() {
             if let Err(error) = apply_order_responses(
-                receiver,
-                projection,
+                &mut session.order_responses,
+                &mut session.projection,
                 &mut runtime_state,
                 output_format,
                 &symbol,
                 cycle,
                 cfg.price_decimals,
             ) {
-                if let Some(health) = order_response_health.as_ref() {
-                    health.mark_unhealthy(error.to_string());
-                    continue;
-                }
-                break stop_requested_exit(
-                    &mut runtime_state,
-                    RuntimeStopReason::OrderResponse(error.to_string()),
-                );
+                session
+                    .order_response_health
+                    .mark_unhealthy(error.to_string());
+                continue;
             }
-        }
-        if let Some(receiver) = account_events.as_mut() {
             match apply_account_events(
-                receiver,
+                &mut session.account_events,
                 &mut AccountEventState {
                     ledger: &mut ledger,
                     stats: &mut stats,
-                    projection: account_projection
-                        .as_mut()
-                        .expect("live account events require initialized projection"),
+                    projection: &mut session.projection,
                 },
                 &AccountEventContext {
                     symbol: &symbol,
@@ -2079,23 +2071,19 @@ pub(super) async fn run_maker(
                     }
                 }
                 Err(error) => {
-                    if let Some(health) = account_stream_health.as_ref() {
-                        health.mark_unhealthy(error.to_string());
-                        continue;
-                    }
-                    break stop_requested_exit(
-                        &mut runtime_state,
-                        RuntimeStopReason::PositionReconciliation(error.to_string()),
-                    );
+                    session
+                        .account_stream_health
+                        .mark_unhealthy(error.to_string());
+                    continue;
                 }
             }
+            schedule_account_balance_refresh(
+                &mut account_balance_refresh_requested,
+                alerts.account_enabled(),
+                &mut session.account_poll,
+                std::time::Instant::now(),
+            );
         }
-        schedule_account_balance_refresh(
-            &mut account_balance_refresh_requested,
-            alerts.account_enabled(),
-            live_account_poll.as_mut(),
-            std::time::Instant::now(),
-        );
         if account_position_mismatch
             .is_some_and(|position| (position - ledger.expected_position).abs() <= qty_tolerance)
         {
@@ -2139,6 +2127,40 @@ pub(super) async fn run_maker(
             }
             None => continue,
         };
+        // Split the live session into disjoint field borrows once per cycle:
+        // the pinned `work` future holds the command/health/projection/poll
+        // halves for its whole lifetime while the select loop below drains
+        // both receivers concurrently, so a plain `live_session.as_mut()` in
+        // each place would alias.
+        let (
+            mut cycle_order_responses,
+            mut cycle_account_events,
+            cycle_order_commands,
+            cycle_order_response_health,
+            cycle_account_stream_health,
+            mut cycle_projection,
+            mut cycle_account_poll,
+        ) = match live_session.as_mut() {
+            Some(LiveSession {
+                order_responses,
+                order_commands,
+                order_response_health,
+                account_events,
+                account_stream_health,
+                projection,
+                account_poll,
+                ..
+            }) => (
+                Some(order_responses),
+                Some(account_events),
+                Some(&*order_commands),
+                Some(&*order_response_health),
+                Some(&*account_stream_health),
+                Some(projection),
+                Some(account_poll),
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
         let work = async {
             if let Some(observed) = mismatch {
                 return Err(anyhow::Error::new(PositionReconciliationError {
@@ -2173,19 +2195,19 @@ pub(super) async fn run_maker(
                     run_order_prefix: &run_order_prefix,
                     starting_position,
                     output_format,
-                    order_commands: order_commands.as_ref(),
-                    order_response_health: order_response_health.as_ref(),
-                    account_stream_health: account_stream_health.as_ref(),
+                    order_commands: cycle_order_commands,
+                    order_response_health: cycle_order_response_health,
+                    account_stream_health: cycle_account_stream_health,
                 },
                 CycleState {
                     resting: &mut resting,
-                    account_projection: account_projection.as_mut(),
+                    account_projection: cycle_projection.as_deref_mut(),
                     inventory_exit_pending: &mut inventory_exit_pending,
                     ledger: &mut ledger,
                     sim_position: &mut sim_position,
                     stats: &mut stats,
                     breaker: &mut breaker,
-                    live_account_poll: live_account_poll.as_mut(),
+                    live_account_poll: cycle_account_poll.as_deref_mut(),
                 },
             )
             .await?;
@@ -2217,13 +2239,13 @@ pub(super) async fn run_maker(
             tokio::pin!(work);
             loop {
                 let account_during_work = async {
-                    match account_events.as_mut() {
+                    match cycle_account_events.as_deref_mut() {
                         Some(receiver) => receiver.recv().await,
                         None => std::future::pending().await,
                     }
                 };
                 let order_during_work = async {
-                    match order_responses.as_mut() {
+                    match cycle_order_responses.as_deref_mut() {
                         Some(receiver) => receiver.recv().await,
                         None => std::future::pending().await,
                     }
@@ -2238,7 +2260,7 @@ pub(super) async fn run_maker(
                         let Some(event) = event else {
                             let reason = "authenticated account stream disconnected during cycle".to_string();
                             runtime_state.handle(MakerEvent::AccountStreamDisconnected(reason.clone()));
-                            if let Some(health) = account_stream_health.as_ref() {
+                            if let Some(health) = cycle_account_stream_health {
                                 health.mark_unhealthy(reason);
                             }
                             continue 'main;
@@ -2257,7 +2279,7 @@ pub(super) async fn run_maker(
                         let Some(response) = response else {
                             let reason = "order-response stream disconnected during cycle".to_string();
                             runtime_state.handle(MakerEvent::OrderResponseDisconnected(reason.clone()));
-                            if let Some(health) = order_response_health.as_ref() {
+                            if let Some(health) = cycle_order_response_health {
                                 health.mark_unhealthy(reason);
                             }
                             continue 'main;
@@ -2268,86 +2290,83 @@ pub(super) async fn run_maker(
                 }
             }
         };
-        if cycle_invalidated_by_account {
-            if let Some(receiver) = account_events.as_mut() {
-                while let Ok(event) = receiver.try_recv() {
+        // The buffers are only fed from live-session receivers, so both are
+        // empty in paper mode.
+        if let Some(session) = live_session.as_mut() {
+            if cycle_invalidated_by_account {
+                while let Ok(event) = session.account_events.try_recv() {
                     buffered_account.push(event);
                 }
             }
-        }
-        // Apply the events buffered during work, ordering order-responses
-        // before account events to mirror the top-of-loop drain.
-        for response in buffered_orders {
-            let request_id = response.request_id.clone();
-            let outcome = apply_order_response(
-                response,
-                account_projection
-                    .as_mut()
-                    .expect("live order responses require initialized projection"),
-                output_format,
-                &symbol,
-                cycle,
-                cfg.price_decimals,
-            );
-            if let Some(reason) =
-                order_response_failure(&outcome, request_id.as_deref(), &mut runtime_state)
-            {
-                if let Some(health) = order_response_health.as_ref() {
-                    health.mark_unhealthy(reason);
+            // Apply the events buffered during work, ordering order-responses
+            // before account events to mirror the top-of-loop drain.
+            for response in buffered_orders {
+                let request_id = response.request_id.clone();
+                let outcome = apply_order_response(
+                    response,
+                    &mut session.projection,
+                    output_format,
+                    &symbol,
+                    cycle,
+                    cfg.price_decimals,
+                );
+                if let Some(reason) =
+                    order_response_failure(&outcome, request_id.as_deref(), &mut runtime_state)
+                {
+                    session.order_response_health.mark_unhealthy(reason);
                 }
             }
-        }
-        for event in buffered_account {
-            match apply_account_event(
-                event,
-                &mut AccountEventState {
-                    ledger: &mut ledger,
-                    stats: &mut stats,
-                    projection: account_projection
-                        .as_mut()
-                        .expect("live account events require initialized projection"),
-                },
-                &AccountEventContext {
-                    symbol: &symbol,
-                    run_order_prefix: &run_order_prefix,
-                    mark: last_mark.unwrap_or(baseline_mark),
-                    cycle,
-                    output_format,
-                },
-            ) {
-                Ok(outcome) => {
-                    if outcome.requires_order_reconciliation {
-                        cycle_invalidated_by_account = true;
-                    }
-                    let position = absorb_account_outcome(
-                        outcome,
-                        OutcomeSink {
-                            total_fills: &mut total_fills,
-                            balance_refresh_requested: &mut account_balance_refresh_requested,
-                            inventory_exit_pending: &mut inventory_exit_pending,
-                            notifier: &notifier,
-                            position_alert_anchor: &mut position_alert_anchor,
-                            expected_position: ledger.expected_position,
-                            max_position: cfg.max_position,
-                            inventory_exit_pct: args.inventory_exit_pct,
-                            qty_tolerance,
-                            symbol: &symbol,
-                            cycle,
-                        },
-                    )
-                    .await;
-                    if let Some(position) = position {
-                        if (position - ledger.expected_position).abs() > qty_tolerance {
-                            account_position_mismatch = Some(position);
-                        } else {
-                            account_position_mismatch = None;
+            for event in buffered_account {
+                match apply_account_event(
+                    event,
+                    &mut AccountEventState {
+                        ledger: &mut ledger,
+                        stats: &mut stats,
+                        projection: &mut session.projection,
+                    },
+                    &AccountEventContext {
+                        symbol: &symbol,
+                        run_order_prefix: &run_order_prefix,
+                        mark: last_mark.unwrap_or(baseline_mark),
+                        cycle,
+                        output_format,
+                    },
+                ) {
+                    Ok(outcome) => {
+                        if outcome.requires_order_reconciliation {
+                            cycle_invalidated_by_account = true;
+                        }
+                        let position = absorb_account_outcome(
+                            outcome,
+                            OutcomeSink {
+                                total_fills: &mut total_fills,
+                                balance_refresh_requested: &mut account_balance_refresh_requested,
+                                inventory_exit_pending: &mut inventory_exit_pending,
+                                notifier: &notifier,
+                                position_alert_anchor: &mut position_alert_anchor,
+                                expected_position: ledger.expected_position,
+                                max_position: cfg.max_position,
+                                inventory_exit_pct: args.inventory_exit_pct,
+                                qty_tolerance,
+                                symbol: &symbol,
+                                cycle,
+                            },
+                        )
+                        .await;
+                        if let Some(position) = position {
+                            if (position - ledger.expected_position).abs() > qty_tolerance {
+                                account_position_mismatch = Some(position);
+                            } else {
+                                account_position_mismatch = None;
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    runtime_state.handle(MakerEvent::AccountStreamDisconnected(error.to_string()));
-                    if let Some(health) = account_stream_health.as_ref() {
-                        health.mark_unhealthy(error.to_string());
+                    Err(error) => {
+                        runtime_state
+                            .handle(MakerEvent::AccountStreamDisconnected(error.to_string()));
+                        session
+                            .account_stream_health
+                            .mark_unhealthy(error.to_string());
                     }
                 }
             }
@@ -2588,8 +2607,8 @@ pub(super) async fn run_maker(
             Err(e) => {
                 if e.downcast_ref::<ProjectionRegistryError>().is_some() {
                     let detail = format!("order-response correlation failed closed: {e}");
-                    if let Some(health) = order_response_health.as_ref() {
-                        health.mark_unhealthy(detail.clone());
+                    if let Some(session) = live_session.as_ref() {
+                        session.order_response_health.mark_unhealthy(detail.clone());
                     }
                     runtime_state.handle(MakerEvent::OrderResponseDisconnected(detail));
                     continue 'main;
@@ -2659,8 +2678,8 @@ pub(super) async fn run_maker(
                         );
                     }
                     resting.clear();
-                    if let Some(projection) = account_projection.as_mut() {
-                        projection.clear_orders_preserving_pending_acks();
+                    if let Some(session) = live_session.as_mut() {
+                        session.projection.clear_orders_preserving_pending_acks();
                     }
                     inventory_exit_pending = false;
                     runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
@@ -2680,15 +2699,13 @@ pub(super) async fn run_maker(
                     let mut last_observed = mismatch.observed;
                     for delay in [500_u64, 1_000, 1_500] {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
-                        if let Some(receiver) = account_events.as_mut() {
+                        if let Some(session) = live_session.as_mut() {
                             match apply_account_events(
-                                receiver,
+                                &mut session.account_events,
                                 &mut AccountEventState {
                                     ledger: &mut ledger,
                                     stats: &mut stats,
-                                    projection: account_projection.as_mut().expect(
-                                        "live account events require initialized projection",
-                                    ),
+                                    projection: &mut session.projection,
                                 },
                                 &AccountEventContext {
                                     symbol: &symbol,
@@ -2722,9 +2739,9 @@ pub(super) async fn run_maker(
                                     }
                                 }
                                 Err(error) => {
-                                    if let Some(health) = account_stream_health.as_ref() {
-                                        health.mark_unhealthy(error.to_string());
-                                    }
+                                    session
+                                        .account_stream_health
+                                        .mark_unhealthy(error.to_string());
                                 }
                             }
                         }
@@ -2777,13 +2794,11 @@ pub(super) async fn run_maker(
                                 ),
                             );
                         }
-                        if let Some(projection) = account_projection.as_mut() {
-                            projection.clear_orders_preserving_pending_acks();
-                        }
                         account_order_reconciliation_required = false;
-                        if let Some(projection) = account_projection.as_mut() {
-                            let generation = projection.generation();
-                            projection.apply(
+                        if let Some(session) = live_session.as_mut() {
+                            session.projection.clear_orders_preserving_pending_acks();
+                            let generation = session.projection.generation();
+                            session.projection.apply(
                                 generation,
                                 AccountProjectionEvent::PositionObserved {
                                     position: last_observed,
@@ -2918,8 +2933,8 @@ pub(super) async fn run_maker(
                 }
             };
             let account_update = async {
-                match account_events.as_mut() {
-                    Some(receiver) => receiver.recv().await,
+                match live_session.as_mut() {
+                    Some(session) => session.account_events.recv().await,
                     None => std::future::pending().await,
                 }
             };
@@ -2930,62 +2945,64 @@ pub(super) async fn run_maker(
                 },
                 _ = tokio::time::sleep_until(deadline) => break,
                 event = account_update => {
-                    let Some(event) = event else {
-                        if let Some(health) = account_stream_health.as_ref() {
-                            health.mark_unhealthy("authenticated account stream disconnected");
-                        }
-                        break;
-                    };
-                    match apply_account_event(
-                        event,
-                        &mut AccountEventState {
-                            ledger: &mut ledger,
-                            stats: &mut stats,
-                            projection: account_projection
-                                .as_mut()
-                                .expect("live account events require initialized projection"),
-                        },
-                        &AccountEventContext {
-                            symbol: &symbol,
-                            run_order_prefix: &run_order_prefix,
-                            mark: last_mark.unwrap_or(baseline_mark),
-                            cycle,
-                            output_format,
-                        },
-                    ) {
-                        Ok(outcome) => {
-                            account_order_reconciliation_required |=
-                                outcome.requires_order_reconciliation;
-                            let position = absorb_account_outcome(
-                                outcome,
-                                OutcomeSink {
-                                    total_fills: &mut total_fills,
-                                    balance_refresh_requested: &mut account_balance_refresh_requested,
-                                    inventory_exit_pending: &mut inventory_exit_pending,
-                                    notifier: &notifier,
-                                    position_alert_anchor: &mut position_alert_anchor,
-                                    expected_position: ledger.expected_position,
-                                    max_position: cfg.max_position,
-                                    inventory_exit_pct: args.inventory_exit_pct,
-                                    qty_tolerance,
-                                    symbol: &symbol,
-                                    cycle,
-                                },
-                            )
-                            .await;
-                            if let Some(position) = position.filter(|position| {
-                                (*position - ledger.expected_position).abs() > qty_tolerance
-                            }) {
-                                account_position_mismatch = Some(position);
+                    // The branch futures are dropped before select! handlers
+                    // run, so the session can be re-borrowed here. An event
+                    // only arrives when the live session exists.
+                    match (event, live_session.as_mut()) {
+                        (Some(event), Some(session)) => match apply_account_event(
+                            event,
+                            &mut AccountEventState {
+                                ledger: &mut ledger,
+                                stats: &mut stats,
+                                projection: &mut session.projection,
+                            },
+                            &AccountEventContext {
+                                symbol: &symbol,
+                                run_order_prefix: &run_order_prefix,
+                                mark: last_mark.unwrap_or(baseline_mark),
+                                cycle,
+                                output_format,
+                            },
+                        ) {
+                            Ok(outcome) => {
+                                account_order_reconciliation_required |=
+                                    outcome.requires_order_reconciliation;
+                                let position = absorb_account_outcome(
+                                    outcome,
+                                    OutcomeSink {
+                                        total_fills: &mut total_fills,
+                                        balance_refresh_requested: &mut account_balance_refresh_requested,
+                                        inventory_exit_pending: &mut inventory_exit_pending,
+                                        notifier: &notifier,
+                                        position_alert_anchor: &mut position_alert_anchor,
+                                        expected_position: ledger.expected_position,
+                                        max_position: cfg.max_position,
+                                        inventory_exit_pct: args.inventory_exit_pct,
+                                        qty_tolerance,
+                                        symbol: &symbol,
+                                        cycle,
+                                    },
+                                )
+                                .await;
+                                if let Some(position) = position.filter(|position| {
+                                    (*position - ledger.expected_position).abs() > qty_tolerance
+                                }) {
+                                    account_position_mismatch = Some(position);
+                                }
+                                break;
                             }
+                            Err(error) => {
+                                session.account_stream_health.mark_unhealthy(error.to_string());
+                                break;
+                            }
+                        },
+                        (None, Some(session)) => {
+                            session
+                                .account_stream_health
+                                .mark_unhealthy("authenticated account stream disconnected");
                             break;
                         }
-                        Err(error) => {
-                            if let Some(health) = account_stream_health.as_ref() {
-                                health.mark_unhealthy(error.to_string());
-                            }
-                            break;
-                        }
+                        (_, None) => break,
                     }
                 }
                 ok = update => {
@@ -3000,13 +3017,9 @@ pub(super) async fn run_maker(
                     let (Some(feed), Some(prev)) = (feed.as_ref(), last_mark) else {
                         continue;
                     };
-                    let resting_for_replan = if args.live {
-                        account_projection
-                            .as_ref()
-                            .map(|projection| projection.resting_quotes())
-                            .unwrap_or_default()
-                    } else {
-                        resting.clone()
+                    let resting_for_replan = match live_session.as_ref() {
+                        Some(session) => session.projection.resting_quotes(),
+                        None => resting.clone(),
                     };
                     let requires_replan = {
                         let s = feed.read().await;
@@ -3032,6 +3045,13 @@ pub(super) async fn run_maker(
     };
 
     // ---- Cleanup on ALL exit paths ----
+    let (account_stream_handle, order_response_handle) = match live_session {
+        Some(session) => (
+            Some(session.account_stream_handle),
+            Some(session.order_response_handle),
+        ),
+        None => (None, None),
+    };
     shutdown_report(ShutdownReport {
         live: args.live,
         output_format,
@@ -3171,7 +3191,7 @@ mod tests {
         assert!(schedule_account_balance_refresh(
             &mut requested,
             true,
-            Some(&mut poll),
+            &mut poll,
             now,
         ));
         assert!(!requested);
@@ -3183,7 +3203,7 @@ mod tests {
         assert!(!schedule_account_balance_refresh(
             &mut disabled_request,
             false,
-            Some(&mut poll),
+            &mut poll,
             later,
         ));
         assert!(!disabled_request);
