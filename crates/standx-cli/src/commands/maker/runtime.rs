@@ -145,6 +145,8 @@ struct RecoveryIo<'a> {
     session: Option<&'a mut LiveSession>,
     resting: &'a mut Vec<RestingQuote>,
     inventory_exit_pending: &'a mut bool,
+    consecutive_errors: &'a mut u32,
+    next_cycle_is_recovery: &'a mut bool,
     symbol: &'a str,
     cycle: u64,
     output_format: OutputFormat,
@@ -239,6 +241,70 @@ async fn freeze_and_cleanup_for_recovery(
             effect_failure_stop(spec.recovery_effect_stop, spec.target, error.to_string()),
         )),
     }
+}
+
+/// Everything that differs between the three incident flows' resume tails.
+/// As with [`FreezeSpec`], the resolved `notice` is built entirely by the
+/// caller.
+struct ResumeSpec<'a> {
+    recovery_token: WorkToken,
+    /// Venue position fed to the projection as authoritative after recovery.
+    observed: f64,
+    projection_reset: ProjectionReset,
+    /// Order-response flow only: the paper book is cleared again because the
+    /// placement channel was replaced underneath it.
+    clear_resting: bool,
+    reset_consecutive_errors: bool,
+    recovered_note: Option<ReconciliationStateNote>,
+    notice: RiskNotice<'a>,
+}
+
+/// Resume tail shared by the three incident-recovery flows: reset the
+/// projection to an empty verified book, seed it with the reconciled venue
+/// position, report RecoverySucceeded, and send the resolved notice. The
+/// caller performs its flow-specific final book verification and session
+/// half installation *before* calling this, and `continue`s the main loop
+/// afterwards.
+async fn resume_quoting_after_recovery(io: &mut RecoveryIo<'_>, spec: ResumeSpec<'_>) {
+    if spec.clear_resting {
+        io.resting.clear();
+    }
+    if let Some(session) = io.session.as_deref_mut() {
+        match spec.projection_reset {
+            ProjectionReset::PreservePendingAcks => {
+                session.projection.clear_orders_preserving_pending_acks()
+            }
+            ProjectionReset::DropPendingRequests => session.projection.clear_orders_and_pending(),
+        }
+        let generation = session.projection.generation();
+        session.projection.apply(
+            generation,
+            AccountProjectionEvent::PositionObserved {
+                position: spec.observed,
+            },
+        );
+    }
+    if spec.reset_consecutive_errors {
+        *io.consecutive_errors = 0;
+    }
+    io.runtime_state
+        .handle(MakerEvent::RecoverySucceeded(spec.recovery_token));
+    *io.next_cycle_is_recovery = true;
+    // The mutations above must stay synchronous and contiguous: no awaits or
+    // output may be inserted between them, so the runtime state, projection,
+    // and loop flags advance atomically with respect to the notice below.
+    if let Some(note) = &spec.recovered_note {
+        emit_reconciliation_state(
+            io.output_format,
+            io.symbol,
+            io.cycle,
+            "recovered",
+            note.cause,
+            note.expected,
+            note.observed,
+        );
+    }
+    io.notifier.risk(spec.notice, false).await;
 }
 
 /// A buffered or queued order-response signals a genuine correlation failure
@@ -1332,6 +1398,8 @@ pub(super) async fn run_maker(
                         session: Some(&mut *session),
                         resting: &mut resting,
                         inventory_exit_pending: &mut inventory_exit_pending,
+                        consecutive_errors: &mut consecutive_errors,
+                        next_cycle_is_recovery: &mut next_cycle_is_recovery,
                         symbol: &symbol,
                         cycle,
                         output_format,
@@ -1566,22 +1634,32 @@ pub(super) async fn run_maker(
                         ),
                     );
                 }
-                projection.clear_orders_preserving_pending_acks();
-
                 session.account_events = events;
                 session.account_stream_health = health;
                 session.account_stream_handle = handle;
-                let generation = session.projection.generation();
-                session.projection.apply(
-                    generation,
-                    AccountProjectionEvent::PositionObserved { position: observed },
-                );
                 total_fills += reconnect_fills;
-                runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
-                next_cycle_is_recovery = true;
-                notifier
-                    .risk(
-                        RiskNotice {
+                resume_quoting_after_recovery(
+                    &mut RecoveryIo {
+                        runtime_state: &mut runtime_state,
+                        notifier: &notifier,
+                        client: &client,
+                        session: Some(&mut *session),
+                        resting: &mut resting,
+                        inventory_exit_pending: &mut inventory_exit_pending,
+                        consecutive_errors: &mut consecutive_errors,
+                        next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                        symbol: &symbol,
+                        cycle,
+                        output_format,
+                    },
+                    ResumeSpec {
+                        recovery_token,
+                        observed,
+                        projection_reset: ProjectionReset::PreservePendingAcks,
+                        clear_resting: false,
+                        reset_consecutive_errors: false,
+                        recovered_note: None,
+                        notice: RiskNotice {
                             kind: "account_stream",
                             severity: "resolved",
                             event: "reconnected",
@@ -1593,8 +1671,8 @@ pub(super) async fn run_maker(
                             expected: Some(ledger.expected_position),
                             observed: Some(observed),
                         },
-                        false,
-                    )
+                    },
+                )
                 .await;
                 continue;
             }
@@ -1619,6 +1697,8 @@ pub(super) async fn run_maker(
                         session: Some(&mut *session),
                         resting: &mut resting,
                         inventory_exit_pending: &mut inventory_exit_pending,
+                        consecutive_errors: &mut consecutive_errors,
+                        next_cycle_is_recovery: &mut next_cycle_is_recovery,
                         symbol: &symbol,
                         cycle,
                         output_format,
@@ -1715,21 +1795,28 @@ pub(super) async fn run_maker(
                             session.order_response_handle = reconnected.handle;
                             // Cleanup verified an empty maker book. The next
                             // cycle rebuilds exchange state before it may place.
-                            resting.clear();
-                            session.projection.clear_orders_and_pending();
-                            let generation = session.projection.generation();
-                            session.projection.apply(
-                                generation,
-                                AccountProjectionEvent::PositionObserved {
-                                    position: reconciled_position,
+                            resume_quoting_after_recovery(
+                                &mut RecoveryIo {
+                                    runtime_state: &mut runtime_state,
+                                    notifier: &notifier,
+                                    client: &client,
+                                    session: Some(&mut *session),
+                                    resting: &mut resting,
+                                    inventory_exit_pending: &mut inventory_exit_pending,
+                                    consecutive_errors: &mut consecutive_errors,
+                                    next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                                    symbol: &symbol,
+                                    cycle,
+                                    output_format,
                                 },
-                            );
-                            consecutive_errors = 0;
-                            runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
-                            next_cycle_is_recovery = true;
-                            notifier
-                                .risk(
-                                    RiskNotice {
+                                ResumeSpec {
+                                    recovery_token,
+                                    observed: reconciled_position,
+                                    projection_reset: ProjectionReset::DropPendingRequests,
+                                    clear_resting: true,
+                                    reset_consecutive_errors: true,
+                                    recovered_note: None,
+                                    notice: RiskNotice {
                                         kind: "order_response",
                                         severity: "resolved",
                                         event: "reconnected",
@@ -1741,9 +1828,9 @@ pub(super) async fn run_maker(
                                         expected: Some(ledger.expected_position),
                                         observed: Some(reconciled_position),
                                     },
-                                    false,
-                                )
-                                .await;
+                                },
+                            )
+                            .await;
                             continue;
                         }
                         Err(error) => {
@@ -2520,6 +2607,8 @@ pub(super) async fn run_maker(
                             session: live_session.as_mut(),
                             resting: &mut resting,
                             inventory_exit_pending: &mut inventory_exit_pending,
+                            consecutive_errors: &mut consecutive_errors,
+                            next_cycle_is_recovery: &mut next_cycle_is_recovery,
                             symbol: &symbol,
                             cycle,
                             output_format,
@@ -2685,28 +2774,32 @@ pub(super) async fn run_maker(
                             );
                         }
                         account_order_reconciliation_required = false;
-                        if let Some(session) = live_session.as_mut() {
-                            session.projection.clear_orders_preserving_pending_acks();
-                            let generation = session.projection.generation();
-                            session.projection.apply(
-                                generation,
-                                AccountProjectionEvent::PositionObserved {
-                                    position: last_observed,
-                                },
-                            );
-                        }
-                        emit_reconciliation_state(
-                            output_format,
-                            &symbol,
-                            cycle,
-                            "recovered",
-                            reconciliation_cause,
-                            ledger.expected_position,
-                            last_observed,
-                        );
-                        notifier
-                            .risk(
-                                RiskNotice {
+                        resume_quoting_after_recovery(
+                            &mut RecoveryIo {
+                                runtime_state: &mut runtime_state,
+                                notifier: &notifier,
+                                client: &client,
+                                session: live_session.as_mut(),
+                                resting: &mut resting,
+                                inventory_exit_pending: &mut inventory_exit_pending,
+                                consecutive_errors: &mut consecutive_errors,
+                                next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                                symbol: &symbol,
+                                cycle,
+                                output_format,
+                            },
+                            ResumeSpec {
+                                recovery_token,
+                                observed: last_observed,
+                                projection_reset: ProjectionReset::PreservePendingAcks,
+                                clear_resting: false,
+                                reset_consecutive_errors: true,
+                                recovered_note: Some(ReconciliationStateNote {
+                                    cause: reconciliation_cause,
+                                    expected: ledger.expected_position,
+                                    observed: last_observed,
+                                }),
+                                notice: RiskNotice {
                                     kind: "position_reconciliation",
                                     severity: "resolved",
                                     event: "recovered",
@@ -2718,12 +2811,9 @@ pub(super) async fn run_maker(
                                     expected: Some(ledger.expected_position),
                                     observed: Some(last_observed),
                                 },
-                                false,
-                            )
+                            },
+                        )
                         .await;
-                        consecutive_errors = 0;
-                        runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
-                        next_cycle_is_recovery = true;
                         continue;
                     }
                     emit_reconciliation_state(
