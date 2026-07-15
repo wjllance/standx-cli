@@ -25,7 +25,8 @@ docs/
 ├── 14-maker-live-gate.md     # Maker 实盘解锁门槛
 ├── 15-openobserve.md         # OpenObserve 遥测
 ├── 16-ws-iteration-goals.md  # Maker WebSocket 迭代目标
-└── 17-ws-command-canary-quickstart.md # WS 生产 Canary 快速启动
+├── 17-ws-command-canary-quickstart.md # WS 生产 Canary 快速启动
+└── 18-maker-strategy-roadmap.md # Maker 策略迭代路线与验收标准
 ```
 
 ---
@@ -51,6 +52,7 @@ docs/
 | [15-openobserve.md](15-openobserve.md) | OpenObserve 遥测与看板 | 进阶 |
 | [16-ws-iteration-goals.md](16-ws-iteration-goals.md) | Maker WebSocket 迭代目标与验收边界 | 开发参考 |
 | [17-ws-command-canary-quickstart.md](17-ws-command-canary-quickstart.md) | WS 生产 Canary 配置、执行与成功判据 | 操作手册 |
+| [18-maker-strategy-roadmap.md](18-maker-strategy-roadmap.md) | Maker 策略分阶段目标、量化验收标准与晋级门槛 | 开发参考 |
 
 ---
 
@@ -67,7 +69,7 @@ docs/
 
 1. **新用户**: 按顺序阅读 01 → 02 → 03 → 04
 2. **开发者**: 重点关注 03, 05, 08, 09, 10
-3. **做市/量化**: 13-maker.md（依赖 02, 05, 08, 09）；迭代 WS 能力时配合 16-ws-iteration-goals.md
+3. **做市/量化**: 13-maker.md（依赖 02, 05, 08, 09）；迭代 WS 能力时配合 16-ws-iteration-goals.md，迭代策略时配合 18-maker-strategy-roadmap.md
 4. **测试人员**: 每个文档末尾的「测试检查清单」
 5. **故障排查**: 直接查阅 11-troubleshooting.md
 

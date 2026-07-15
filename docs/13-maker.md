@@ -361,3 +361,4 @@ live 模式当前锁定,需要 `export STANDX_ENABLE_LIVE_MAKER=1` 解锁,并确
 - 认证配置:[02-authentication.md](02-authentication.md)
 - 输出格式:[09-output-formats.md](09-output-formats.md)
 - 下单/撤单基础:[05-orders.md](05-orders.md)
+- 策略迭代路线与验收标准:[18-maker-strategy-roadmap.md](18-maker-strategy-roadmap.md)
