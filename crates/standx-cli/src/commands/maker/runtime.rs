@@ -143,6 +143,17 @@ fn observe_order_ack(
     }
 }
 
+fn invalidate_session_latency(session: &mut LiveSession) {
+    let generation = session.projection.generation();
+    let at_ms = u64::try_from(session.latency_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if let Err(error) = session
+        .order_latency
+        .invalidate_generation(generation, at_ms)
+    {
+        eprintln!("⚠️ order latency generation invalidation unavailable: {error}");
+    }
+}
+
 #[cfg(test)]
 pub(super) fn apply_order_responses(
     receiver: &mut tokio::sync::mpsc::Receiver<OrderResponse>,
@@ -1033,6 +1044,9 @@ pub(super) async fn run_maker(
     let mut total_holds: u64 = 0;
     let mut total_fills: u64 = 0;
     let mut total_halted: u64 = 0;
+    // Observation only: classify the first successfully committed cycle after
+    // bounded recovery without feeding the flag into strategy or safety.
+    let mut next_cycle_is_recovery = false;
     let mut sim_position: f64 = 0.0; // paper-mode simulated inventory
     let mut stats = if args.live {
         MakerStats::with_inventory_baseline(starting_position, baseline_mark)
@@ -1185,6 +1199,7 @@ pub(super) async fn run_maker(
                     break take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 }
                 resting.clear();
+                invalidate_session_latency(session);
                 session.projection.clear_orders_preserving_pending_acks();
                 inventory_exit_pending = false;
                 // The stale receiver/health stay in place until the reconnect
@@ -1416,6 +1431,7 @@ pub(super) async fn run_maker(
                 );
                 total_fills += reconnect_fills;
                 runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
+                next_cycle_is_recovery = true;
                 notifier
                     .risk(
                         RiskNotice {
@@ -1486,6 +1502,7 @@ pub(super) async fn run_maker(
                     break take_stop_effect(&mut runtime_state, MakerExit::OrderResponse);
                 }
                 resting.clear();
+                invalidate_session_latency(session);
                 session.projection.clear_orders_and_pending();
                 inventory_exit_pending = false;
                 runtime_state.handle(MakerEvent::CleanupCompleted(cleanup_token));
@@ -1540,6 +1557,7 @@ pub(super) async fn run_maker(
                             session.projection.clear_orders_and_pending();
                             consecutive_errors = 0;
                             runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
+                            next_cycle_is_recovery = true;
                             notifier
                                 .risk(
                                     RiskNotice {
@@ -1772,6 +1790,7 @@ pub(super) async fn run_maker(
             std::mem::take(&mut account_order_reconciliation_required);
         let exit_pending_before = inventory_exit_pending;
         let breaker_halted_before = breaker.halted();
+        let recovery_cycle = next_cycle_is_recovery;
         if runtime_state.pending_effect().is_none() {
             runtime_state.handle(MakerEvent::Timer);
         }
@@ -1857,6 +1876,7 @@ pub(super) async fn run_maker(
                     best_bid,
                     best_ask,
                     market_source: src,
+                    recovery: recovery_cycle,
                     market_fallback_reason,
                     max_divergence_bps: args.max_divergence_bps,
                     inventory_exit_pct: args.inventory_exit_pct,
@@ -2115,6 +2135,7 @@ pub(super) async fn run_maker(
                     continue 'main;
                 }
                 consecutive_errors = 0;
+                next_cycle_is_recovery = false;
                 total_places += places;
                 total_cancels += cancels;
                 total_holds += holds;
@@ -2364,6 +2385,7 @@ pub(super) async fn run_maker(
                     }
                     resting.clear();
                     if let Some(session) = live_session.as_mut() {
+                        invalidate_session_latency(session);
                         session.projection.clear_orders_preserving_pending_acks();
                     }
                     inventory_exit_pending = false;
@@ -2541,6 +2563,7 @@ pub(super) async fn run_maker(
                         .await;
                         consecutive_errors = 0;
                         runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
+                        next_cycle_is_recovery = true;
                         continue;
                     }
                     emit_reconciliation_state(

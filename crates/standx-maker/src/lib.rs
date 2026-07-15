@@ -45,8 +45,8 @@ pub use ownership::{
 };
 pub use performance::{
     ExecutionCosts, FillRole, InventoryTimeSummary, MarkoutSummary, PerformanceError,
-    PerformanceFill, PerformanceLedger, PerformanceSummary, QuoteQualityInterval,
-    QuoteTimeSummary, MARKOUT_WINDOWS_MS,
+    PerformanceFill, PerformanceLedger, PerformanceSummary, QuoteQualityInterval, QuoteTimeSummary,
+    MARKOUT_WINDOWS_MS,
 };
 pub use recovery::{RecoveryAdmission, RecoveryCircuitBreaker, RecoveryTrigger};
 pub use replay::{

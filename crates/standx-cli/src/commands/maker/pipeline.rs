@@ -26,6 +26,9 @@ pub(super) struct CycleRequest<'a> {
     pub(super) best_bid: Option<f64>,
     pub(super) best_ask: Option<f64>,
     pub(super) market_source: &'static str,
+    /// Observation-only classification. The first successfully committed
+    /// cycle after bounded recovery is grouped separately in latency output.
+    pub(super) recovery: bool,
     pub(super) market_fallback_reason: Option<&'static str>,
     pub(super) max_divergence_bps: f64,
     pub(super) inventory_exit_pct: f64,
