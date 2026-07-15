@@ -1,5 +1,6 @@
 use super::ledger::{adopt_order, apply_rest_trade};
 use super::model::{is_current_run_order, is_maker_order, position_for_symbol};
+use super::output::emit_live_fill;
 use super::pipeline::{fetch_account_audit, AccountAudit};
 use crate::cli::OutputFormat;
 use anyhow::Result;
@@ -276,6 +277,51 @@ pub(super) struct ReconcileRequest<'a> {
     pub(super) run_order_prefix: &'a str,
     pub(super) qty_tolerance: f64,
     pub(super) mark: f64,
+}
+
+pub(super) enum ConvergenceProbe {
+    Converged {
+        observed: f64,
+    },
+    Pending {
+        observed: f64,
+    },
+    /// The REST snapshot failed; the caller reports it its own way and keeps
+    /// its previously observed position.
+    SnapshotFailed(anyhow::Error),
+}
+
+/// One iteration of the bounded position-convergence window shared by the
+/// account-stream and position-reconciliation recovery paths: REST-reconcile
+/// the ledger, emit every newly explained fill, count fills into `fills_sink`,
+/// and compare the observed venue position against `ledger.expected_position`
+/// at `qty_tolerance`. The caller owns the retry loop, its delays, and the
+/// preceding account-event drain.
+pub(super) async fn probe_position_convergence(
+    client: &StandXClient,
+    request: ReconcileRequest<'_>,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+    fills_sink: &mut u64,
+    cycle: u64,
+    output_format: OutputFormat,
+) -> ConvergenceProbe {
+    let symbol = request.symbol;
+    let qty_tolerance = request.qty_tolerance;
+    match reconcile_ledger_snapshot(client, request, ledger, stats).await {
+        Ok((observed, fills)) => {
+            *fills_sink += fills.len() as u64;
+            for fill in &fills {
+                emit_live_fill(fill, symbol, cycle, output_format);
+            }
+            if (observed - ledger.expected_position).abs() <= qty_tolerance {
+                ConvergenceProbe::Converged { observed }
+            } else {
+                ConvergenceProbe::Pending { observed }
+            }
+        }
+        Err(error) => ConvergenceProbe::SnapshotFailed(error),
+    }
 }
 
 pub(super) async fn cancel_maker_orders_with_retry(
