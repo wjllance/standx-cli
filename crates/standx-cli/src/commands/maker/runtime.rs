@@ -588,6 +588,193 @@ pub(super) fn validate_alert_thresholds(
     Ok(())
 }
 
+struct ShutdownReport<'a> {
+    live: bool,
+    output_format: OutputFormat,
+    symbol: &'a str,
+    cfg: &'a MakerConfig,
+    client: &'a StandXClient,
+    notifier: &'a MakerNotifier,
+    ledger: &'a MakerLedger,
+    stats: &'a MakerStats,
+    breaker: &'a VolBreaker,
+    exit: MakerExit,
+    cycle: u64,
+    total_places: u64,
+    total_cancels: u64,
+    total_holds: u64,
+    total_fills: u64,
+    total_halted: u64,
+    sim_position: f64,
+    last_mark: Option<f64>,
+    feed_handle: Option<tokio::task::JoinHandle<()>>,
+    account_stream_handle: Option<tokio::task::JoinHandle<()>>,
+    order_response_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Abort feed/stream tasks, cancel any residual maker orders, print the human
+/// summary, and deliver the stopped-lifecycle notifications. Runs on every
+/// exit path; returns the process result (fail-safe error or clean Ok).
+async fn shutdown_report(report: ShutdownReport<'_>) -> Result<()> {
+    let ShutdownReport {
+        live,
+        output_format,
+        symbol,
+        cfg,
+        client,
+        notifier,
+        ledger,
+        stats,
+        breaker,
+        exit,
+        cycle,
+        total_places,
+        total_cancels,
+        total_holds,
+        total_fills,
+        total_halted,
+        sim_position,
+        last_mark,
+        feed_handle,
+        account_stream_handle,
+        order_response_handle,
+    } = report;
+    if let Some(handle) = feed_handle {
+        handle.abort();
+    }
+    if let Some(handle) = account_stream_handle {
+        handle.abort();
+    }
+    let final_position = if live {
+        ledger.expected_position
+    } else {
+        stats.position()
+    };
+    if output_format == OutputFormat::Table {
+        println!(
+            "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
+            cycle, total_places, total_cancels, total_holds
+        );
+        let pnl_note = match last_mark {
+            Some(m) => format!(
+                " | PnL {:+.2} (mark-to-market)",
+                stats.pnl(final_position, m)
+            ),
+            None => String::new(),
+        };
+        println!(
+            "   {} fills | uptime {:.0}% | max pos {} | avg capture {:.1}bps{}",
+            total_fills,
+            stats.uptime_pct(),
+            maker::format_decimals(stats.max_abs_position, cfg.qty_decimals),
+            stats.avg_spread_capture_bps(),
+            pnl_note
+        );
+        if breaker.enabled() {
+            println!("   vol breaker: {} cycles halted", total_halted);
+        }
+        if !live {
+            println!(
+                "   paper sim: ending position {}",
+                maker::format_decimals(sim_position, cfg.qty_decimals)
+            );
+        }
+    }
+    if let Some(handle) = order_response_handle {
+        handle.abort();
+    }
+    // Do not return early on cleanup failure: operators need the stopped
+    // lifecycle alert most when residual maker orders may still be live.
+    let cleanup_error = if live {
+        cancel_maker_orders_with_retry(client, symbol, 3, output_format)
+            .await
+            .err()
+    } else {
+        None
+    };
+
+    // Notify stop on every exit path. Await delivery so the message lands
+    // before the process exits.
+    let reason = exit.lifecycle_reason();
+    let pnl_str = last_mark
+        .map(|m| format!("{:+.2}", stats.pnl(final_position, m)))
+        .unwrap_or_else(|| "n/a".to_string());
+    let cleanup_note = cleanup_error.as_ref().map_or_else(String::new, |error| {
+        format!(" | ⚠️ cleanup failed: {error}")
+    });
+    if let Some(error) = cleanup_error.as_ref() {
+        let message = format!("maker cleanup failed or left residual orders: {error}");
+        notifier
+            .risk(
+                RiskNotice {
+                    kind: "maker_cleanup",
+                    severity: "critical",
+                    event: "residual_orders",
+                    message: &message,
+                    symbol,
+                    cycle,
+                    position_before: None,
+                    position_after: None,
+                    expected: Some(ledger.expected_position),
+                    observed: None,
+                },
+                true,
+            )
+            .await;
+    }
+    if !matches!(&exit, MakerExit::CtrlC) {
+        notifier
+            .risk(
+                RiskNotice {
+                    kind: "fail_safe",
+                    severity: "critical",
+                    event: "stopped",
+                    message: &reason,
+                    symbol,
+                    cycle,
+                    position_before: None,
+                    position_after: None,
+                    expected: Some(ledger.expected_position),
+                    observed: None,
+                },
+                true,
+            )
+            .await;
+    }
+    notifier
+        .lifecycle(
+            "stopped",
+            &format!(
+                "🔴 maker stopped ({}) — {} | {} cycles, {} fills, uptime {:.0}%, PnL {}{}",
+                reason,
+                symbol,
+                cycle,
+                total_fills,
+                stats.uptime_pct(),
+                pnl_str,
+                cleanup_note,
+            ),
+            symbol,
+            true,
+        )
+        .await;
+
+    if let Some(error) = cleanup_error {
+        // A residual-order cleanup failure is an intentional fail-safe stop
+        // that needs a human, not an automatic restart.
+        return Err(anyhow::Error::new(FailSafeShutdown {
+            message: format!(
+                "maker stopped (fail-safe) but maker-owned order cleanup failed: {error}"
+            ),
+        }));
+    }
+
+    match exit.terminal_error() {
+        Some(message) => Err(anyhow::Error::new(FailSafeShutdown { message })),
+        None => Ok(()),
+    }
+}
+
 pub(super) async fn run_maker(
     symbol: String,
     args: MakerRunArgs,
@@ -2814,140 +3001,30 @@ pub(super) async fn run_maker(
     };
 
     // ---- Cleanup on ALL exit paths ----
-    if let Some(handle) = feed_handle {
-        handle.abort();
-    }
-    if let Some(handle) = account_stream_handle {
-        handle.abort();
-    }
-    let final_position = if args.live {
-        ledger.expected_position
-    } else {
-        stats.position()
-    };
-    if output_format == OutputFormat::Table {
-        println!(
-            "\n👋 Stopping maker (ran {} cycles: {} places, {} cancels, {} holds)",
-            cycle, total_places, total_cancels, total_holds
-        );
-        let pnl_note = match last_mark {
-            Some(m) => format!(
-                " | PnL {:+.2} (mark-to-market)",
-                stats.pnl(final_position, m)
-            ),
-            None => String::new(),
-        };
-        println!(
-            "   {} fills | uptime {:.0}% | max pos {} | avg capture {:.1}bps{}",
-            total_fills,
-            stats.uptime_pct(),
-            maker::format_decimals(stats.max_abs_position, cfg.qty_decimals),
-            stats.avg_spread_capture_bps(),
-            pnl_note
-        );
-        if breaker.enabled() {
-            println!("   vol breaker: {} cycles halted", total_halted);
-        }
-        if !args.live {
-            println!(
-                "   paper sim: ending position {}",
-                maker::format_decimals(sim_position, cfg.qty_decimals)
-            );
-        }
-    }
-    if let Some(handle) = order_response_handle {
-        handle.abort();
-    }
-    // Do not return early on cleanup failure: operators need the stopped
-    // lifecycle alert most when residual maker orders may still be live.
-    let cleanup_error = if args.live {
-        cancel_maker_orders_with_retry(&client, &symbol, 3, output_format)
-            .await
-            .err()
-    } else {
-        None
-    };
-
-    // Notify stop on every exit path. Await delivery so the message lands
-    // before the process exits.
-    let reason = exit.lifecycle_reason();
-    let pnl_str = last_mark
-        .map(|m| format!("{:+.2}", stats.pnl(final_position, m)))
-        .unwrap_or_else(|| "n/a".to_string());
-    let cleanup_note = cleanup_error.as_ref().map_or_else(String::new, |error| {
-        format!(" | ⚠️ cleanup failed: {error}")
-    });
-    if let Some(error) = cleanup_error.as_ref() {
-        let message = format!("maker cleanup failed or left residual orders: {error}");
-        notifier
-            .risk(
-                RiskNotice {
-                    kind: "maker_cleanup",
-                    severity: "critical",
-                    event: "residual_orders",
-                    message: &message,
-                    symbol: &symbol,
-                    cycle,
-                    position_before: None,
-                    position_after: None,
-                    expected: Some(ledger.expected_position),
-                    observed: None,
-                },
-                true,
-            )
-            .await;
-    }
-    if !matches!(&exit, MakerExit::CtrlC) {
-        notifier
-            .risk(
-                RiskNotice {
-                    kind: "fail_safe",
-                    severity: "critical",
-                    event: "stopped",
-                    message: &reason,
-                    symbol: &symbol,
-                    cycle,
-                    position_before: None,
-                    position_after: None,
-                    expected: Some(ledger.expected_position),
-                    observed: None,
-                },
-                true,
-            )
-            .await;
-    }
-    notifier
-        .lifecycle(
-            "stopped",
-            &format!(
-                "🔴 maker stopped ({}) — {} | {} cycles, {} fills, uptime {:.0}%, PnL {}{}",
-                reason,
-                symbol,
-                cycle,
-                total_fills,
-                stats.uptime_pct(),
-                pnl_str,
-                cleanup_note,
-            ),
-            &symbol,
-            true,
-        )
-        .await;
-
-    if let Some(error) = cleanup_error {
-        // A residual-order cleanup failure is an intentional fail-safe stop
-        // that needs a human, not an automatic restart.
-        return Err(anyhow::Error::new(FailSafeShutdown {
-            message: format!(
-                "maker stopped (fail-safe) but maker-owned order cleanup failed: {error}"
-            ),
-        }));
-    }
-
-    match exit.terminal_error() {
-        Some(message) => Err(anyhow::Error::new(FailSafeShutdown { message })),
-        None => Ok(()),
-    }
+    shutdown_report(ShutdownReport {
+        live: args.live,
+        output_format,
+        symbol: &symbol,
+        cfg: &cfg,
+        client: &client,
+        notifier: &notifier,
+        ledger: &ledger,
+        stats: &stats,
+        breaker: &breaker,
+        exit,
+        cycle,
+        total_places,
+        total_cancels,
+        total_holds,
+        total_fills,
+        total_halted,
+        sim_position,
+        last_mark,
+        feed_handle,
+        account_stream_handle,
+        order_response_handle,
+    })
+    .await
 }
 
 #[cfg(test)]
