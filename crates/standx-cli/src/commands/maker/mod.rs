@@ -718,6 +718,9 @@ mod tests {
         )
         .unwrap();
 
+        for cycle in 3..=100 {
+            projection.apply(1, AccountProjectionEvent::AdvanceCycle { cycle });
+        }
         assert_eq!(projection.pending_places().len(), 1);
     }
 

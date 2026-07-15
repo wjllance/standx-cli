@@ -20,8 +20,8 @@ const MAX_RETIRED_ORDER_IDS: usize = 512;
 
 /// Recently completed command request IDs and their typed request metadata.
 /// This keeps duplicate/late acknowledgements idempotent and lets a delayed
-/// account-order update recover the exact accepted place after its short-lived
-/// quote slot expires. The bound keeps long-running sessions from accumulating
+/// account-order update recover the exact accepted place after cleanup closes
+/// its quote slot. The bound keeps long-running sessions from accumulating
 /// unbounded correlation state; older replays continue to fail closed.
 const MAX_COMPLETED_ORDER_REQUESTS: usize = 512;
 
@@ -216,8 +216,8 @@ impl std::error::Error for ProjectionMismatch {}
 ///   and request-id dedup.
 /// - `slot_open`: still an unmatched pending place/cancel — visible in the
 ///   `pending_places()` / `pending_cancels()` views and eligible for order
-///   adoption. Cleared once the order is observed, rejected, resolved, or
-///   expired.
+///   adoption. Cleared only once the order is observed, rejected, resolved,
+///   or explicit cleanup invalidates the venue exposure.
 ///
 /// The two clear independently: a place can be adopted from the account stream
 /// (slot closes) before its command-stream ack arrives, or observed terminal
@@ -268,13 +268,6 @@ impl PendingEntry {
         match &self.request {
             ProjectionPendingRequest::Cancel(cancel) => Some(cancel),
             ProjectionPendingRequest::Place(_) => None,
-        }
-    }
-
-    fn cycle(&self) -> u64 {
-        match &self.request {
-            ProjectionPendingRequest::Place(place) => place.cycle,
-            ProjectionPendingRequest::Cancel(cancel) => cancel.cycle,
         }
     }
 
@@ -480,16 +473,13 @@ impl MakerAccountProjection {
             return ProjectionOutcome::default();
         }
         match event {
-            AccountProjectionEvent::AdvanceCycle { cycle } => {
-                // Expiry closes the pending *slot* but leaves a still-unacked
-                // registry entry in place (its ack may yet arrive); the entry
-                // is dropped only once it is fully settled.
-                for entry in &mut self.pending {
-                    if entry.slot_open && cycle.saturating_sub(entry.cycle()) > 2 {
-                        entry.slot_open = false;
-                    }
-                }
-                self.drop_settled();
+            AccountProjectionEvent::AdvanceCycle { .. } => {
+                // Strategy cycles are not a transport deadline: account/order
+                // events can advance several cycles inside one wall-clock
+                // second. Keep every pending venue exposure reserved until an
+                // explicit response, account-order observation, or cleanup
+                // closes it. Silently expiring here can permit a duplicate
+                // place while the original request is still live.
                 ProjectionOutcome {
                     applied: true,
                     ..ProjectionOutcome::default()
@@ -586,7 +576,8 @@ impl MakerAccountProjection {
                     return ProjectionOutcome::default();
                 };
                 // Only a still-open cancel is holding an order out of the map;
-                // an already-expired one leaves the map untouched.
+                // cleanup or a terminal account observation may have closed
+                // the slot before the response arrives.
                 let entry = self.pending.remove(index);
                 let order_changed = if entry.slot_open {
                     let order_id = entry.cancel().expect("cancel entry").order_id;
@@ -718,24 +709,24 @@ impl MakerAccountProjection {
     }
 
     /// A terminal (or zero-qty) observation removes the projected order and
-    /// closes the pending place slot for its client-order-id — the registry
-    /// entry lingers so a late place ack can still settle it.
+    /// closes matching place/cancel slots — registry entries linger when an
+    /// acknowledgement is still pending so the late response can settle.
     fn handle_terminal_observation(&mut self, observation: &OrderObservation) -> ProjectionOutcome {
         let known = self.order_observation_is_known(observation);
         let changed = self.orders.remove(&observation.order_id).is_some();
-        if let Some(client_order_id) = observation.client_order_id.as_deref() {
-            for entry in &mut self.pending {
-                let matches = matches!(
-                    &entry.request,
-                    ProjectionPendingRequest::Place(place)
-                        if place.client_order_id == client_order_id
-                );
-                if matches {
-                    entry.slot_open = false;
-                }
+        for entry in &mut self.pending {
+            let matches = match &entry.request {
+                ProjectionPendingRequest::Place(place) => observation
+                    .client_order_id
+                    .as_deref()
+                    .is_some_and(|client_order_id| place.client_order_id == client_order_id),
+                ProjectionPendingRequest::Cancel(cancel) => cancel.order_id == observation.order_id,
+            };
+            if matches {
+                entry.slot_open = false;
             }
-            self.drop_settled();
         }
+        self.drop_settled();
         if known {
             self.remember_retired_order(observation.order_id);
         }
@@ -1025,6 +1016,11 @@ mod tests {
             }),
         );
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.0, true)));
+        assert!(state.pending_cancels().is_empty());
+        assert!(matches!(
+            state.pending_request("c1"),
+            Some(ProjectionPendingRequest::Cancel(_))
+        ));
         assert!(
             state
                 .apply(
@@ -1309,38 +1305,62 @@ mod tests {
     }
 
     #[test]
-    fn advance_cycle_expires_pending_slot_but_keeps_unacked_registry_entry() {
+    fn rapid_cycle_advances_keep_unconfirmed_slots_reserved() {
         let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: 9,
+                side: OrderSide::Sell,
+                level: 0,
+                price: 101.0,
+                cycle: 1,
+            }),
+        );
         assert_eq!(state.pending_places().len(), 1);
+        assert_eq!(state.pending_cancels().len(), 1);
 
-        // Within two cycles of submission the slot survives.
-        state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle: 3 });
+        // Account events can wake several cycles in one wall-clock second.
+        // None may release the quote slot while the original venue request is
+        // still awaiting a correlated outcome.
+        for cycle in 2..=100 {
+            state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle });
+        }
         assert_eq!(state.pending_places().len(), 1);
-
-        // Beyond two cycles the pending slot expires, but the entry is still
-        // awaiting its command-stream ack so it lingers in the registry (it
-        // still counts toward capacity and dedup).
-        state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle: 4 });
-        assert!(state.pending_places().is_empty());
-        assert_eq!(state.pending_request_count(), 1);
+        assert_eq!(state.pending_cancels().len(), 1);
+        assert_eq!(state.pending_request_count(), 2);
         assert!(matches!(
             state.pending_request("p1"),
             Some(ProjectionPendingRequest::Place(_))
         ));
+        assert!(matches!(
+            state.pending_request("c1"),
+            Some(ProjectionPendingRequest::Cancel(_))
+        ));
 
-        // The late ack then settles it fully.
+        // A rejection is the explicit terminal outcome that releases it.
         state.apply(
             1,
-            AccountProjectionEvent::PlaceAccepted {
+            AccountProjectionEvent::PlaceRejected {
                 request_id: "p1".to_string(),
             },
         );
+        assert!(state.pending_places().is_empty());
+        assert_eq!(state.pending_request_count(), 1);
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelResolved {
+                request_id: "c1".to_string(),
+            },
+        );
+        assert!(state.pending_cancels().is_empty());
         assert_eq!(state.pending_request_count(), 0);
     }
 
     #[test]
-    fn accepted_place_tombstone_adopts_account_order_after_slot_expiry() {
+    fn accepted_place_stays_reserved_until_account_order_is_visible() {
         let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(
@@ -1349,8 +1369,10 @@ mod tests {
                 request_id: "p1".to_string(),
             },
         );
-        state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle: 4 });
-        assert!(state.pending_places().is_empty());
+        for cycle in 2..=100 {
+            state.apply(1, AccountProjectionEvent::AdvanceCycle { cycle });
+        }
+        assert_eq!(state.pending_places().len(), 1);
         assert_eq!(state.pending_request_count(), 0);
         assert_eq!(
             state.completed_request_resolution("p1"),
@@ -1363,6 +1385,7 @@ mod tests {
             !outcome.unknown_current_run_order,
             "a delayed account update must retain the accepted place identity"
         );
+        assert!(state.pending_places().is_empty());
         assert_eq!(state.resting_quotes()[0].level, 0);
     }
 

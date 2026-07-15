@@ -199,7 +199,7 @@ live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order +
 
 运行时使用单一事件循环同时等待周期任务、account/order-response 回调、行情刷新和 Ctrl+C。仓位、成交或流错误在多动作 cycle 中途到达时，会先递增 generation 并进入冻结清理，再取消当前 REST/下单 future；因此本轮后续 placement 不会继续提交，可能已到达交易所的请求也始终由 maker 清理和 REST 对账补偿。旧 generation 的工作结果不会重新开启挂单。普通订单生命周期回报在 cycle 内短暂缓冲，普通行情刷新则合并为一次后续 replan，避免首单确认撕裂多订单计划或产生并发 cycle。
 
-订单回报连接每 30 秒主动发送 heartbeat，45 秒无任何入站流量视为半开，并在 24 小时上限前（23 小时 50 分）主动轮换。create、cancel 和库存退出共用最多 256 项的 request registry；接受、拒绝和晚到回报都按 `request_id` 严格闭环。坏载荷、缺失或未知 `request_id`、close/error、registry 重复或溢出都会立即冻结 placement，执行 maker 清理，并以 REST 空簿与仓位对账作为最终确认。
+订单回报连接每 30 秒主动发送 heartbeat，45 秒无任何入站流量视为半开，并在 24 小时上限前（23 小时 50 分）主动轮换。create、cancel 和库存退出共用最多 256 项的 request registry；接受、拒绝和晚到回报都按 `request_id` 严格闭环。未确认 place/cancel 的 quote slot 不按策略 cycle 数过期：账户事件可能在一秒内推进多个 cycle，只有关联响应、账户订单终态或显式 cleanup 才能释放对应的 venue exposure。坏载荷、缺失或未知 `request_id`、close/error、registry 重复或溢出都会立即冻结 placement，执行 maker 清理，并以 REST 空簿与仓位对账作为最终确认。
 
 `alert_position_change_pct` 默认 `0`（关闭）。设置为 `20` 时，实际仓位相对上次通知锚点累计变化达到 `max_position` 的 20% 会输出 `risk_notification(kind=position_jump)` 并复用现有 webhook；跨越 inventory-exit/max-position 阈值或多空翻转不受该百分比限制。account stream 断流/恢复、reconciliation 冻结/恢复/失败、volatility breaker、inventory exit、cleanup residual 和最终 fail-safe 也会生成结构化风险通知。
 - **Quiet（`--quiet`）**：只打印成交与增删挂单。
