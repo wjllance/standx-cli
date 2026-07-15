@@ -222,6 +222,17 @@ pub(super) async fn reconcile_ledger_snapshot(
     let now = chrono::Utc::now().timestamp();
     let audit =
         fetch_account_audit(client, request.symbol, request.session_started_at, now).await?;
+    reconcile_account_audit(client, request, audit, now, ledger, stats).await
+}
+
+async fn reconcile_account_audit(
+    client: &StandXClient,
+    request: ReconcileRequest<'_>,
+    audit: AccountAudit,
+    now: i64,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+) -> Result<(f64, Vec<MakerFill>)> {
     let AccountAudit {
         open_orders,
         positions,
@@ -382,6 +393,8 @@ pub(super) struct ReconnectedOrderResponse {
     pub(super) responses: tokio::sync::mpsc::Receiver<OrderResponse>,
     pub(super) health: OrderResponseHealth,
     pub(super) handle: tokio::task::JoinHandle<()>,
+    pub(super) position: f64,
+    pub(super) fills: Vec<MakerFill>,
 }
 
 fn emit_order_response_reconnect(
@@ -476,20 +489,34 @@ pub(super) fn validate_reconnect_snapshot(
 
 async fn query_reconnect_snapshot(
     client: &StandXClient,
-    symbol: &str,
-    session_started_at: i64,
-    run_order_prefix: &str,
-) -> Result<ReconnectSnapshot> {
+    request: ReconcileRequest<'_>,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+) -> Result<(ReconnectSnapshot, Vec<MakerFill>)> {
     let now = chrono::Utc::now().timestamp();
-    let audit = fetch_account_audit(client, symbol, session_started_at, now).await?;
-    validate_reconnect_snapshot(
-        symbol,
-        run_order_prefix,
+    let audit =
+        fetch_account_audit(client, request.symbol, request.session_started_at, now).await?;
+    reconcile_reconnect_audit(client, request, audit, now, ledger, stats).await
+}
+
+async fn reconcile_reconnect_audit(
+    client: &StandXClient,
+    request: ReconcileRequest<'_>,
+    audit: AccountAudit,
+    now: i64,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
+) -> Result<(ReconnectSnapshot, Vec<MakerFill>)> {
+    let snapshot = validate_reconnect_snapshot(
+        request.symbol,
+        request.run_order_prefix,
         &audit.open_orders,
         &audit.positions,
         &audit.filled_orders,
         &audit.trades,
-    )
+    )?;
+    let (_, fills) = reconcile_account_audit(client, request, audit, now, ledger, stats).await?;
+    Ok((snapshot, fills))
 }
 
 /// The live halves of a freshly authenticated account stream.
@@ -576,8 +603,8 @@ pub(super) struct ReconnectRequest<'a> {
     pub(super) symbol: &'a str,
     pub(super) session_started_at: i64,
     pub(super) run_order_prefix: &'a str,
-    pub(super) expected_position: f64,
     pub(super) qty_tolerance: f64,
+    pub(super) mark: f64,
     pub(super) output_format: OutputFormat,
     pub(super) max_attempts: u32,
     pub(super) base_backoff: Duration,
@@ -587,14 +614,16 @@ pub(super) struct ReconnectRequest<'a> {
 
 pub(super) async fn reconnect_order_response(
     request: ReconnectRequest<'_>,
+    ledger: &mut MakerLedger,
+    stats: &mut MakerStats,
 ) -> Result<ReconnectedOrderResponse> {
     let ReconnectRequest {
         cleanup_client,
         symbol,
         session_started_at,
         run_order_prefix,
-        expected_position,
         qty_tolerance,
+        mark,
         output_format,
         max_attempts,
         base_backoff,
@@ -603,6 +632,7 @@ pub(super) async fn reconnect_order_response(
     } = request;
     let mut ctrl_c = ctrl_c;
     let mut last_error = None;
+    let mut recovered_fills = Vec::new();
     // The runtime Cleanup effect has already emptied and verified the maker
     // book before it emits Recover. Only repeat cleanup between failed
     // reconnect attempts, when a late venue-side request may have surfaced.
@@ -651,62 +681,116 @@ pub(super) async fn reconnect_order_response(
                 result = tokio::time::timeout(Duration::from_secs(15), stream.connect()) => result,
             };
             match connect_attempt {
-                Ok(Ok((commands, responses, health, handle))) => {
-                    match query_reconnect_snapshot(
+                Ok(Ok((commands, responses, health, handle))) => 'reconcile: {
+                    let mut snapshot = match query_reconnect_snapshot(
                         &cleanup_client,
-                        symbol,
-                        session_started_at,
-                        run_order_prefix,
+                        ReconcileRequest {
+                            symbol,
+                            session_started_at,
+                            run_order_prefix,
+                            qty_tolerance,
+                            mark,
+                        },
+                        ledger,
+                        stats,
                     )
                     .await
                     {
-                        Ok(snapshot) => {
-                            if (snapshot.position - expected_position).abs() > qty_tolerance {
-                                handle.abort();
-                                return Err(anyhow::Error::new(
-                                    PositionReconciliationError::position_mismatch(
-                                        expected_position,
-                                        snapshot.position,
-                                    ),
-                                ));
-                            }
-                            if !health.is_healthy() {
-                                let reason = health.failure_reason().unwrap_or_else(|| {
-                                    "new order-response session became unhealthy during reconciliation without a recorded reason".to_string()
-                                });
-                                handle.abort();
-                                last_error = Some(anyhow::anyhow!(
-                                    "new order-response session failed during reconciliation: {reason}"
-                                ));
-                            } else {
-                                let message = format!(
-                                    "authenticated new session {}; maker book empty; position={:+.8}; maker filled orders={}; maker trades={}",
-                                    session_id,
-                                    snapshot.position,
-                                    snapshot.maker_filled_orders,
-                                    snapshot.maker_trades,
-                                );
-                                emit_order_response_reconnect(
-                                    output_format,
-                                    symbol,
-                                    "complete",
-                                    attempt,
-                                    max_attempts,
-                                    &message,
-                                );
-                                return Ok(ReconnectedOrderResponse {
-                                    commands,
-                                    responses,
-                                    health,
-                                    handle,
-                                });
-                            }
+                        Ok((snapshot, fills)) => {
+                            recovered_fills.extend(fills);
+                            snapshot
                         }
                         Err(error) => {
                             handle.abort();
                             last_error =
                                 Some(anyhow::anyhow!("post-auth reconciliation failed: {error}"));
+                            break 'reconcile;
                         }
+                    };
+
+                    if (snapshot.position - ledger.expected_position).abs() > qty_tolerance {
+                        let mut gap_closed = false;
+                        for delay in [500_u64, 1_000, 1_500] {
+                            tokio::select! {
+                                biased;
+                                _ = ctrl_c_latched(&mut ctrl_c) => {
+                                    handle.abort();
+                                    return Err(anyhow::Error::new(ReconnectInterrupted));
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+                            }
+                            match query_reconnect_snapshot(
+                                &cleanup_client,
+                                ReconcileRequest {
+                                    symbol,
+                                    session_started_at,
+                                    run_order_prefix,
+                                    qty_tolerance,
+                                    mark,
+                                },
+                                ledger,
+                                stats,
+                            )
+                            .await
+                            {
+                                Ok((next_snapshot, fills)) => {
+                                    snapshot = next_snapshot;
+                                    recovered_fills.extend(fills);
+                                    if (snapshot.position - ledger.expected_position).abs()
+                                        <= qty_tolerance
+                                    {
+                                        gap_closed = true;
+                                        break;
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "⚠️  order-response reconnect REST trade backfill failed: {error}"
+                                ),
+                            }
+                        }
+                        if !gap_closed {
+                            handle.abort();
+                            return Err(anyhow::Error::new(
+                                PositionReconciliationError::position_mismatch(
+                                    ledger.expected_position,
+                                    snapshot.position,
+                                ),
+                            ));
+                        }
+                    }
+
+                    if !health.is_healthy() {
+                        let reason = health.failure_reason().unwrap_or_else(|| {
+                            "new order-response session became unhealthy during reconciliation without a recorded reason".to_string()
+                        });
+                        handle.abort();
+                        last_error = Some(anyhow::anyhow!(
+                            "new order-response session failed during reconciliation: {reason}"
+                        ));
+                    } else {
+                        let message = format!(
+                            "authenticated new session {}; maker book empty; position={:+.8}; maker filled orders={}; maker trades={}",
+                            session_id,
+                            snapshot.position,
+                            snapshot.maker_filled_orders,
+                            snapshot.maker_trades,
+                        );
+                        emit_order_response_reconnect(
+                            output_format,
+                            symbol,
+                            "complete",
+                            attempt,
+                            max_attempts,
+                            &message,
+                        );
+                        return Ok(ReconnectedOrderResponse {
+                            commands,
+                            responses,
+                            health,
+                            handle,
+                            position: snapshot.position,
+                            fills: recovered_fills,
+                        });
                     }
                 }
                 Ok(Err(error)) => {
@@ -754,4 +838,199 @@ pub(super) async fn reconnect_order_response(
             .map(|error| error.to_string())
             .unwrap_or_else(|| "no attempts available".to_string())
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use standx_sdk::models::{OrderSide, OrderStatus, OrderType};
+
+    const SYMBOL: &str = "XAG-USD";
+    const RUN_PREFIX: &str = "sxmk-reconnect-";
+    const ORDER_ID: u64 = 11_575_317_826;
+    const TRADE_ID: u64 = 900_001;
+
+    fn filled_sell_order() -> Order {
+        Order {
+            id: ORDER_ID.to_string(),
+            cl_ord_id: Some(format!("{RUN_PREFIX}q0000028cs0")),
+            symbol: SYMBOL.to_string(),
+            side: OrderSide::Sell,
+            order_type: OrderType::Limit,
+            qty: "0.2".to_string(),
+            fill_qty: "0.2".to_string(),
+            price: "58.23".to_string(),
+            status: OrderStatus::Filled,
+            created_at: "2026-07-15T08:27:04Z".to_string(),
+            updated_at: "2026-07-15T08:28:19Z".to_string(),
+        }
+    }
+
+    fn short_position() -> Position {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "symbol": SYMBOL,
+            "side": "short",
+            "qty": "0.2",
+            "entry_price": "58.23",
+            "entry_value": "11.646",
+            "holding_margin": "1",
+            "initial_margin": "1",
+            "leverage": "1",
+            "mark_price": "58.20",
+            "margin_asset": "USDT",
+            "margin_mode": "cross",
+            "position_value": "11.64",
+            "realized_pnl": "0",
+            "required_margin": "1",
+            "status": "open",
+            "upnl": "0.006",
+            "time": "2026-07-15T08:28:22Z",
+            "created_at": "2026-07-15T08:28:19Z",
+            "updated_at": "2026-07-15T08:28:22Z",
+            "user": "test"
+        }))
+        .unwrap()
+    }
+
+    fn sell_trade(now: i64) -> Trade {
+        Trade {
+            id: TRADE_ID,
+            time: chrono::DateTime::from_timestamp(now, 0)
+                .unwrap()
+                .to_rfc3339(),
+            price: "58.23".to_string(),
+            qty: "0.2".to_string(),
+            side: Some("sell".to_string()),
+            is_buyer_taker: false,
+            fee_asset: None,
+            fee_qty: None,
+            pnl: None,
+            order_id: Some(ORDER_ID),
+            symbol: Some(SYMBOL.to_string()),
+            value: Some("11.646".to_string()),
+        }
+    }
+
+    fn filled_audit(now: i64) -> AccountAudit {
+        AccountAudit {
+            open_orders: Vec::new(),
+            positions: vec![short_position()],
+            filled_orders: vec![filled_sell_order()],
+            trades: vec![sell_trade(now)],
+        }
+    }
+
+    fn unexplained_audit() -> AccountAudit {
+        AccountAudit {
+            open_orders: Vec::new(),
+            positions: vec![short_position()],
+            filled_orders: Vec::new(),
+            trades: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_race_fill_is_backfilled_before_reconnect_position_check() {
+        let now = chrono::Utc::now().timestamp();
+        let client = StandXClient::new().unwrap();
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::with_inventory_baseline(0.0, 58.20);
+
+        let (snapshot, fills) = reconcile_reconnect_audit(
+            &client,
+            ReconcileRequest {
+                symbol: SYMBOL,
+                session_started_at: now - 60,
+                run_order_prefix: RUN_PREFIX,
+                qty_tolerance: 0.0005,
+                mark: 58.20,
+            },
+            filled_audit(now),
+            now,
+            &mut ledger,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot.position, -0.2);
+        assert_eq!(snapshot.maker_filled_orders, 1);
+        assert_eq!(snapshot.maker_trades, 1);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].trade_id, Some(TRADE_ID));
+        assert_eq!(ledger.expected_position, -0.2);
+        assert_eq!(stats.position(), -0.2);
+        assert!((snapshot.position - ledger.expected_position).abs() <= 0.0005);
+    }
+
+    #[tokio::test]
+    async fn repeated_reconnect_snapshot_deduplicates_rest_fill() {
+        let now = chrono::Utc::now().timestamp();
+        let client = StandXClient::new().unwrap();
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::with_inventory_baseline(0.0, 58.20);
+        let request = || ReconcileRequest {
+            symbol: SYMBOL,
+            session_started_at: now - 60,
+            run_order_prefix: RUN_PREFIX,
+            qty_tolerance: 0.0005,
+            mark: 58.20,
+        };
+
+        let (_, first) = reconcile_reconnect_audit(
+            &client,
+            request(),
+            filled_audit(now),
+            now,
+            &mut ledger,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+        let (_, duplicate) = reconcile_reconnect_audit(
+            &client,
+            request(),
+            filled_audit(now),
+            now,
+            &mut ledger,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert!(duplicate.is_empty());
+        assert_eq!(ledger.expected_position, -0.2);
+        assert_eq!(stats.sell_fills, 1);
+    }
+
+    #[tokio::test]
+    async fn unexplained_reconnect_position_remains_fail_closed() {
+        let now = chrono::Utc::now().timestamp();
+        let client = StandXClient::new().unwrap();
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::with_inventory_baseline(0.0, 58.20);
+
+        let (snapshot, fills) = reconcile_reconnect_audit(
+            &client,
+            ReconcileRequest {
+                symbol: SYMBOL,
+                session_started_at: now - 60,
+                run_order_prefix: RUN_PREFIX,
+                qty_tolerance: 0.0005,
+                mark: 58.20,
+            },
+            unexplained_audit(),
+            now,
+            &mut ledger,
+            &mut stats,
+        )
+        .await
+        .unwrap();
+
+        assert!(fills.is_empty());
+        assert_eq!(ledger.expected_position, 0.0);
+        assert!((snapshot.position - ledger.expected_position).abs() > 0.0005);
+    }
 }
