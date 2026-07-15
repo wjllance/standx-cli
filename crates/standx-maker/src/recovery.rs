@@ -3,6 +3,24 @@
 
 use std::collections::VecDeque;
 
+/// Why the live runtime entered a cleanup/recovery flow.
+///
+/// A cycle invalidated by an account event still requires compensating cleanup
+/// and authoritative reconciliation, but it is expected during normal fills.
+/// Counting it as an incident would eventually stop every healthy active maker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryTrigger {
+    TransportFailure,
+    PositionMismatch,
+    CycleInvalidation,
+}
+
+impl RecoveryTrigger {
+    pub fn meters_circuit(self) -> bool {
+        !matches!(self, Self::CycleInvalidation)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryAdmission {
     Admitted {
@@ -104,5 +122,12 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn normal_cycle_invalidation_does_not_meter_the_incident_circuit() {
+        assert!(!RecoveryTrigger::CycleInvalidation.meters_circuit());
+        assert!(RecoveryTrigger::PositionMismatch.meters_circuit());
+        assert!(RecoveryTrigger::TransportFailure.meters_circuit());
     }
 }

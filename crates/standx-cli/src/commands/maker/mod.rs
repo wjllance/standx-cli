@@ -45,7 +45,8 @@ use pipeline::{CycleRequest, CycleState, LiveAccountPollState};
 use recovery::{
     cancel_maker_orders_with_retry, ctrl_c_latched, reconcile_ledger_snapshot,
     reconnect_account_stream, reconnect_order_response, AccountStreamReconnect,
-    PositionReconciliationError, ReconcileRequest, ReconnectInterrupted, ReconnectRequest,
+    PositionReconciliationCause, PositionReconciliationError, ReconcileRequest,
+    ReconnectInterrupted, ReconnectRequest,
 };
 #[cfg(test)]
 use recovery::{

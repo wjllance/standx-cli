@@ -20,18 +20,102 @@ const MAKER_CLEANUP_VERIFY_DELAY: Duration = Duration::from_millis(500);
 const MAKER_CLEANUP_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
+pub(super) enum PositionReconciliationCause {
+    PositionMismatch,
+    AccountProjectionMismatch(String),
+    UnknownCurrentRunOrder,
+    CycleInvalidation,
+}
+
+impl PositionReconciliationCause {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::PositionMismatch => "position_mismatch",
+            Self::AccountProjectionMismatch(_) => "account_projection_mismatch",
+            Self::UnknownCurrentRunOrder => "unknown_current_run_order",
+            Self::CycleInvalidation => "cycle_invalidation",
+        }
+    }
+
+    pub(super) fn recovery_trigger(&self) -> standx_maker::RecoveryTrigger {
+        match self {
+            Self::CycleInvalidation => standx_maker::RecoveryTrigger::CycleInvalidation,
+            Self::PositionMismatch
+            | Self::AccountProjectionMismatch(_)
+            | Self::UnknownCurrentRunOrder => standx_maker::RecoveryTrigger::PositionMismatch,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct PositionReconciliationError {
     pub(super) expected: f64,
     pub(super) observed: f64,
+    pub(super) cause: PositionReconciliationCause,
+}
+
+impl PositionReconciliationError {
+    pub(super) fn position_mismatch(expected: f64, observed: f64) -> Self {
+        Self {
+            expected,
+            observed,
+            cause: PositionReconciliationCause::PositionMismatch,
+        }
+    }
+
+    pub(super) fn account_projection_mismatch(
+        expected: f64,
+        observed: f64,
+        detail: String,
+    ) -> Self {
+        Self {
+            expected,
+            observed,
+            cause: PositionReconciliationCause::AccountProjectionMismatch(detail),
+        }
+    }
+
+    pub(super) fn unknown_current_run_order(position: f64) -> Self {
+        Self {
+            expected: position,
+            observed: position,
+            cause: PositionReconciliationCause::UnknownCurrentRunOrder,
+        }
+    }
+
+    pub(super) fn cycle_invalidation(position: f64) -> Self {
+        Self {
+            expected: position,
+            observed: position,
+            cause: PositionReconciliationCause::CycleInvalidation,
+        }
+    }
 }
 
 impl fmt::Display for PositionReconciliationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "expected position {:+.8}, venue reported {:+.8}",
-            self.expected, self.observed
-        )
+        match &self.cause {
+            PositionReconciliationCause::PositionMismatch => write!(
+                formatter,
+                "expected position {:+.8}, venue reported {:+.8}",
+                self.expected, self.observed
+            ),
+            PositionReconciliationCause::AccountProjectionMismatch(detail) => write!(
+                formatter,
+                "account projection mismatch ({detail}); ledger expected {:+.8}, venue reported {:+.8}",
+                self.expected, self.observed
+            ),
+            PositionReconciliationCause::UnknownCurrentRunOrder => write!(
+                formatter,
+                "unknown current-run order requires reconciliation at position {:+.8}",
+                self.expected
+            ),
+            PositionReconciliationCause::CycleInvalidation => write!(
+                formatter,
+                "account event invalidated active cycle at reconciled position {:+.8}",
+                self.expected
+            ),
+        }
     }
 }
 
@@ -579,10 +663,12 @@ pub(super) async fn reconnect_order_response(
                         Ok(snapshot) => {
                             if (snapshot.position - expected_position).abs() > qty_tolerance {
                                 handle.abort();
-                                return Err(anyhow::Error::new(PositionReconciliationError {
-                                    expected: expected_position,
-                                    observed: snapshot.position,
-                                }));
+                                return Err(anyhow::Error::new(
+                                    PositionReconciliationError::position_mismatch(
+                                        expected_position,
+                                        snapshot.position,
+                                    ),
+                                ));
                             }
                             if !health.is_healthy() {
                                 let reason = health.failure_reason().unwrap_or_else(|| {

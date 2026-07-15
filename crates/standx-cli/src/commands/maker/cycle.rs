@@ -262,10 +262,12 @@ pub(super) async fn maker_cycle(
                 // performs no REST read; this sleep is reached only by a
                 // periodic audit that found an unexplained position gap.
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                return Err(anyhow::Error::new(PositionReconciliationError {
-                    expected: ledger.expected_position,
-                    observed: observed_position,
-                }));
+                return Err(anyhow::Error::new(
+                    PositionReconciliationError::position_mismatch(
+                        ledger.expected_position,
+                        observed_position,
+                    ),
+                ));
             }
             if let Err(error) = projection.verify_rest_snapshot(
                 generation,
@@ -276,10 +278,13 @@ pub(super) async fn maker_cycle(
                 eprintln!("⚠️  account projection audit failed: {error}");
                 // Reuse the runtime's immediate reconciliation/freeze path;
                 // the detailed order/projection mismatch is emitted above.
-                return Err(anyhow::Error::new(PositionReconciliationError {
-                    expected: ledger.expected_position,
-                    observed: observed_position,
-                }));
+                return Err(anyhow::Error::new(
+                    PositionReconciliationError::account_projection_mismatch(
+                        ledger.expected_position,
+                        observed_position,
+                        error.to_string(),
+                    ),
+                ));
             }
             projection.apply(
                 generation,
