@@ -126,6 +126,13 @@ fn effect_failure_stop(
     }
 }
 
+fn reset_projection(projection: &mut MakerAccountProjection, reset: ProjectionReset) {
+    match reset {
+        ProjectionReset::PreservePendingAcks => projection.clear_orders_preserving_pending_acks(),
+        ProjectionReset::DropPendingRequests => projection.clear_orders_and_pending(),
+    }
+}
+
 /// Payload for the position-reconciliation flow's structured
 /// `emit_reconciliation_state` emits around freeze and resume.
 struct ReconciliationStateNote {
@@ -219,12 +226,7 @@ async fn freeze_and_cleanup_for_recovery(
     io.resting.clear();
     if let Some(session) = io.session.as_deref_mut() {
         invalidate_session_latency(session);
-        match spec.projection_reset {
-            ProjectionReset::PreservePendingAcks => {
-                session.projection.clear_orders_preserving_pending_acks()
-            }
-            ProjectionReset::DropPendingRequests => session.projection.clear_orders_and_pending(),
-        }
+        reset_projection(&mut session.projection, spec.projection_reset);
     }
     *io.inventory_exit_pending = false;
     if spec.abort_account_stream_handle {
@@ -270,12 +272,7 @@ async fn resume_quoting_after_recovery(io: &mut RecoveryIo<'_>, spec: ResumeSpec
         io.resting.clear();
     }
     if let Some(session) = io.session.as_deref_mut() {
-        match spec.projection_reset {
-            ProjectionReset::PreservePendingAcks => {
-                session.projection.clear_orders_preserving_pending_acks()
-            }
-            ProjectionReset::DropPendingRequests => session.projection.clear_orders_and_pending(),
-        }
+        reset_projection(&mut session.projection, spec.projection_reset);
         let generation = session.projection.generation();
         session.projection.apply(
             generation,
@@ -4257,6 +4254,378 @@ mod tests {
             accounting_invariant_exit(&notifier, "XAG-USD", 1396, 0.0, 0.00049, 0.0005,)
                 .await
                 .is_none()
+        );
+    }
+
+    // ---- Fault-injection conformance tests for the shared recovery helpers ----
+
+    struct JwtGuard {
+        original: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl JwtGuard {
+        fn set() -> Self {
+            // Share the crate-wide env lock so this STANDX_JWT mutation cannot
+            // race env reads in other modules' tests. See crate::TEST_ENV_LOCK.
+            let lock = crate::TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var("STANDX_JWT").ok();
+            std::env::set_var("STANDX_JWT", "runtime-test-jwt");
+            Self {
+                original,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for JwtGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var("STANDX_JWT", value),
+                None => std::env::remove_var("STANDX_JWT"),
+            }
+        }
+    }
+
+    fn quiet_notifier() -> MakerNotifier {
+        MakerNotifier::new(
+            OutputFormat::Quiet,
+            None,
+            crate::cli::AlertWebhookFormat::Raw,
+        )
+    }
+
+    fn resting_quote() -> RestingQuote {
+        RestingQuote {
+            order_id: None,
+            side: OrderSide::Buy,
+            level: 0,
+            price: 100.0,
+            qty: 0.001,
+            ref_center: 100.0,
+            placed_at_cycle: 1,
+        }
+    }
+
+    fn warning_notice(kind: &'static str) -> RiskNotice<'static> {
+        RiskNotice {
+            kind,
+            severity: "warning",
+            event: "disconnected_frozen",
+            message: "test freeze",
+            symbol: "BTC-USD",
+            cycle: 7,
+            position_before: None,
+            position_after: None,
+            expected: Some(0.0),
+            observed: None,
+        }
+    }
+
+    fn order_response_freeze_spec() -> FreezeSpec<'static> {
+        FreezeSpec {
+            target: RecoveryTarget::OrderResponse,
+            trigger: MakerEvent::OrderResponseDisconnected("stream closed".to_string()),
+            cleanup_effect_stop: EffectFailureStop::OrderResponse,
+            recovery_effect_stop: EffectFailureStop::OrderResponse,
+            cleanup_failure_prefix: "order-response ".to_string(),
+            cleanup_failed_exit: MakerExit::OrderResponse,
+            notice: warning_notice("order_response"),
+            frozen_note: None,
+            abort_account_stream_handle: false,
+            projection_reset: ProjectionReset::DropPendingRequests,
+        }
+    }
+
+    /// Invariant: the freeze preamble empties the maker book on the venue
+    /// (cancelling only maker-owned orders), clears local book state, and
+    /// hands back a recovery token from which quoting can resume.
+    #[tokio::test]
+    async fn freeze_preamble_empties_the_maker_book_and_hands_back_recovery() {
+        use mockito::{Matcher, Server};
+        let _jwt = JwtGuard::set();
+        let mut server = Server::new_async().await;
+        let open_before = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"code":0,"message":"ok","result":[
+                    {"id":"42","cl_ord_id":"sxmk-freeze-buy","symbol":"BTC-USD","side":"buy","order_type":"limit","qty":"0.001","fill_qty":"0","price":"63000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"},
+                    {"id":"99","cl_ord_id":"manual-order","symbol":"BTC-USD","side":"sell","order_type":"limit","qty":"0.001","fill_qty":"0","price":"65000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}
+                ]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let cancel = server
+            .mock("POST", "/api/cancel_orders")
+            .match_body(Matcher::Json(serde_json::json!({ "order_id_list": [42] })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"code":0,"message":"accepted"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let open_after = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"code":0,"message":"ok","result":[
+                    {"id":"99","cl_ord_id":"manual-order","symbol":"BTC-USD","side":"sell","order_type":"limit","qty":"0.001","fill_qty":"0","price":"65000","status":"open","created_at":"2026-07-10T00:00:00Z","updated_at":"2026-07-10T00:00:00Z"}
+                ]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let notifier = quiet_notifier();
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        assert!(matches!(
+            runtime_state.next_effect(),
+            Some(MakerEffect::RunCycle(_))
+        ));
+        let mut resting = vec![resting_quote()];
+        let mut inventory_exit_pending = true;
+        let mut consecutive_errors = 2;
+        let mut next_cycle_is_recovery = false;
+
+        let recovery_token = freeze_and_cleanup_for_recovery(
+            &mut RecoveryIo {
+                runtime_state: &mut runtime_state,
+                notifier: &notifier,
+                client: &client,
+                session: None,
+                resting: &mut resting,
+                inventory_exit_pending: &mut inventory_exit_pending,
+                consecutive_errors: &mut consecutive_errors,
+                next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                symbol: "BTC-USD",
+                cycle: 7,
+                output_format: OutputFormat::Quiet,
+            },
+            order_response_freeze_spec(),
+        )
+        .await
+        .expect("freeze preamble must hand back a recovery token");
+
+        assert!(resting.is_empty(), "local book must be cleared");
+        assert!(!inventory_exit_pending);
+        assert!(
+            runtime_state.pending_effect().is_none(),
+            "no stale effects may remain after the preamble"
+        );
+        open_before.assert_async().await;
+        cancel.assert_async().await;
+        open_after.assert_async().await;
+
+        // Recovery success must resume quoting with a fresh cycle.
+        runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
+        assert!(matches!(
+            runtime_state.next_effect(),
+            Some(MakerEffect::RunCycle(_))
+        ));
+    }
+
+    /// Invariant: when the venue book cannot be emptied, the preamble stops
+    /// the runtime with the flow's exit and its exact historical wording.
+    #[tokio::test]
+    async fn freeze_preamble_cleanup_failure_stops_with_the_flow_exit() {
+        use mockito::{Matcher, Server};
+        let _jwt = JwtGuard::set();
+        let mut server = Server::new_async().await;
+        let open_orders = server
+            .mock("GET", "/api/query_open_orders")
+            .match_query(Matcher::UrlEncoded("symbol".into(), "BTC-USD".into()))
+            .with_status(500)
+            .with_body("venue unavailable")
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let client = StandXClient::with_base_url(server.url()).unwrap();
+        let notifier = quiet_notifier();
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let _ = runtime_state.next_effect();
+        let mut resting = vec![resting_quote()];
+        let mut inventory_exit_pending = false;
+        let mut consecutive_errors = 0;
+        let mut next_cycle_is_recovery = false;
+
+        let exit = freeze_and_cleanup_for_recovery(
+            &mut RecoveryIo {
+                runtime_state: &mut runtime_state,
+                notifier: &notifier,
+                client: &client,
+                session: None,
+                resting: &mut resting,
+                inventory_exit_pending: &mut inventory_exit_pending,
+                consecutive_errors: &mut consecutive_errors,
+                next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                symbol: "BTC-USD",
+                cycle: 7,
+                output_format: OutputFormat::Quiet,
+            },
+            order_response_freeze_spec(),
+        )
+        .await
+        .expect_err("cleanup failure must stop the runtime");
+
+        match exit {
+            MakerExit::OrderResponse(reason) => {
+                assert!(
+                    reason.contains("order-response freeze cleanup failed:"),
+                    "cleanup-failure wording drifted: {reason}"
+                );
+            }
+            other => panic!(
+                "order-response cleanup failure must exit as OrderResponse, got {:?}",
+                other.lifecycle_reason()
+            ),
+        }
+        // The runtime is stopping: no further work may be scheduled.
+        runtime_state.handle(MakerEvent::Timer);
+        assert!(runtime_state.pending_effect().is_none());
+        open_orders.assert_async().await;
+    }
+
+    /// Invariant: if the runtime cannot enter the freeze (it is already
+    /// stopping), the preamble fails closed instead of proceeding to cleanup.
+    #[tokio::test]
+    async fn freeze_preamble_fails_closed_when_runtime_cannot_freeze() {
+        let client = StandXClient::new().unwrap();
+        let notifier = quiet_notifier();
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let _ = runtime_state.next_effect();
+        runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
+        while runtime_state.next_effect().is_some() {}
+        let mut resting = vec![resting_quote()];
+        let mut inventory_exit_pending = false;
+        let mut consecutive_errors = 0;
+        let mut next_cycle_is_recovery = false;
+
+        let exit = freeze_and_cleanup_for_recovery(
+            &mut RecoveryIo {
+                runtime_state: &mut runtime_state,
+                notifier: &notifier,
+                client: &client,
+                session: None,
+                resting: &mut resting,
+                inventory_exit_pending: &mut inventory_exit_pending,
+                consecutive_errors: &mut consecutive_errors,
+                next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                symbol: "BTC-USD",
+                cycle: 7,
+                output_format: OutputFormat::Quiet,
+            },
+            order_response_freeze_spec(),
+        )
+        .await
+        .expect_err("a stopping runtime must not begin cleanup");
+        assert!(matches!(exit, MakerExit::PositionReconciliation(_)));
+        assert!(
+            !resting.is_empty(),
+            "no cleanup may run when the freeze was rejected"
+        );
+    }
+
+    /// Invariant: the resume tail restores quoting state (flags, error
+    /// streak, paper book) and schedules the next cycle via the runtime.
+    #[tokio::test]
+    async fn resume_tail_restores_quoting_state_and_schedules_a_cycle() {
+        let client = StandXClient::new().unwrap();
+        let notifier = quiet_notifier();
+        let mut runtime_state = MakerState::starting();
+        runtime_state.handle(MakerEvent::StartupReady);
+        let _ = runtime_state.next_effect();
+        runtime_state.handle(MakerEvent::PositionMismatch);
+        let _ = runtime_state.next_effect(); // AbortInFlight
+        let cleanup = match runtime_state.next_effect() {
+            Some(MakerEffect::Cleanup { token, .. }) => token,
+            other => panic!("expected cleanup effect, got {other:?}"),
+        };
+        runtime_state.handle(MakerEvent::CleanupCompleted(cleanup));
+        let recovery_token = match runtime_state.next_effect() {
+            Some(MakerEffect::Recover { token, .. }) => token,
+            other => panic!("expected recovery effect, got {other:?}"),
+        };
+        let mut resting = vec![resting_quote()];
+        let mut inventory_exit_pending = false;
+        let mut consecutive_errors = 2;
+        let mut next_cycle_is_recovery = false;
+
+        resume_quoting_after_recovery(
+            &mut RecoveryIo {
+                runtime_state: &mut runtime_state,
+                notifier: &notifier,
+                client: &client,
+                session: None,
+                resting: &mut resting,
+                inventory_exit_pending: &mut inventory_exit_pending,
+                consecutive_errors: &mut consecutive_errors,
+                next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                symbol: "BTC-USD",
+                cycle: 7,
+                output_format: OutputFormat::Quiet,
+            },
+            ResumeSpec {
+                recovery_token,
+                observed: 0.0,
+                projection_reset: ProjectionReset::PreservePendingAcks,
+                clear_resting: true,
+                reset_consecutive_errors: true,
+                recovered_note: None,
+                notice: RiskNotice {
+                    kind: "position_reconciliation",
+                    severity: "resolved",
+                    event: "recovered",
+                    message: "test resume",
+                    symbol: "BTC-USD",
+                    cycle: 7,
+                    position_before: None,
+                    position_after: None,
+                    expected: Some(0.0),
+                    observed: Some(0.0),
+                },
+            },
+        )
+        .await;
+
+        assert!(resting.is_empty());
+        assert_eq!(consecutive_errors, 0);
+        assert!(next_cycle_is_recovery);
+        assert!(
+            matches!(runtime_state.next_effect(), Some(MakerEffect::RunCycle(_))),
+            "resume must schedule the next quoting cycle"
+        );
+    }
+
+    /// Invariant: the projection-reset knob keeps its per-flow semantics —
+    /// preserving pending request lifecycles for late acks, or dropping them
+    /// when the placement channel is being replaced.
+    #[test]
+    fn projection_reset_knobs_preserve_or_drop_pending_requests() {
+        let mut projection = projection_with_pending(&["request-1"]);
+        reset_projection(&mut projection, ProjectionReset::PreservePendingAcks);
+        assert!(
+            projection.has_pending_request_lifecycle("request-1"),
+            "PreservePendingAcks must keep pending request lifecycles"
+        );
+
+        let mut projection = projection_with_pending(&["request-1"]);
+        reset_projection(&mut projection, ProjectionReset::DropPendingRequests);
+        assert!(
+            !projection.has_pending_request_lifecycle("request-1"),
+            "DropPendingRequests must clear pending request lifecycles"
         );
     }
 }
