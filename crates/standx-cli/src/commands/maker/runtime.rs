@@ -103,12 +103,13 @@ fn order_response_failure(
 ) -> Option<String> {
     match outcome {
         Ok(matched) if order_response_correlation_failed(*matched, request_id) => {
+            let request_id = request_id.expect("correlation failure requires request ID");
             runtime_state.handle(MakerEvent::OrderResponseUnmatched {
-                request_id: request_id
-                    .expect("correlation failure requires request ID")
-                    .to_string(),
+                request_id: request_id.to_string(),
             });
-            Some("order-response correlation failed closed".to_string())
+            Some(format!(
+                "order-response correlation failed closed: unexpected request_id={request_id}"
+            ))
         }
         Err(rejection) => {
             let detail = maker::order_cancel_rejection_reason(
@@ -174,6 +175,9 @@ fn apply_order_response(
         return Ok(false);
     };
     let Some(pending) = projection.pending_request(request_id).cloned() else {
+        if let Some(resolution) = projection.completed_request_resolution(request_id) {
+            return Ok(resolution.accepts_response(response.accepted()));
+        }
         return Ok(false);
     };
     let generation = projection.generation();
@@ -418,7 +422,14 @@ fn apply_account_event(
             );
             if projection_outcome.unknown_current_run_order {
                 return Err(anyhow::anyhow!(
-                    "account stream reported an unknown current-run maker order"
+                    "account stream reported an unknown current-run maker order: order_id={} client_order_id={:?} status={:?} side={:?} price={} qty={} fill_qty={}",
+                    update.order_id,
+                    update.cl_ord_id,
+                    update.status,
+                    update.side,
+                    update.price,
+                    update.qty,
+                    update.fill_qty,
                 ));
             }
             for fill in &fills {
@@ -3243,6 +3254,167 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_place_ack_matches_completed_request_after_cleanup() {
+        let mut projection = projection_with_pending(&["req-1"]);
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap());
+        projection.clear_orders_and_pending();
+
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            2,
+            2,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn delayed_account_order_and_replayed_ack_survive_account_reconnect() {
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
+        projection.apply(
+            1,
+            AccountProjectionEvent::PlaceSubmitted(ProjectionPendingPlace {
+                request_id: "req-1".to_string(),
+                client_order_id: "sxmk-test-q00000001b0".to_string(),
+                side: OrderSide::Buy,
+                price: 100.0,
+                qty: 1.0,
+                level: 0,
+                ref_center: 100.0,
+                cycle: 1,
+            }),
+        );
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap());
+        projection.apply(1, AccountProjectionEvent::AdvanceCycle { cycle: 4 });
+        projection.reset_after_cleanup_preserving_pending_acks(2, 0.0);
+
+        let outcome = projection.apply(
+            2,
+            AccountProjectionEvent::OrderObserved(OrderObservation {
+                order_id: 7,
+                client_order_id: Some("sxmk-test-q00000001b0".to_string()),
+                side: OrderSide::Buy,
+                price: 100.0,
+                open_qty: 1.0,
+                terminal: false,
+            }),
+        );
+        assert!(!outcome.unknown_current_run_order);
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            4,
+            2,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn duplicate_place_rejection_matches_completed_request_after_cleanup() {
+        let mut projection = projection_with_pending(&["req-1"]);
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 400),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap());
+        projection.clear_orders_and_pending();
+
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 400),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            2,
+            2,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn duplicate_cancel_ack_matches_completed_request_after_cleanup() {
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
+        projection.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "cancel-1".to_string(),
+                order_id: 7,
+                side: OrderSide::Buy,
+                level: 0,
+                price: 100.0,
+                cycle: 1,
+            }),
+        );
+        assert!(apply_order_response(
+            order_response(Some("cancel-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap());
+        projection.clear_orders_and_pending();
+
+        assert!(apply_order_response(
+            order_response(Some("cancel-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            2,
+            2,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn contradictory_replay_for_completed_request_remains_fail_closed() {
+        let mut projection = projection_with_pending(&["req-1"]);
+        assert!(apply_order_response(
+            order_response(Some("req-1"), 0),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            1,
+            2,
+        )
+        .unwrap());
+
+        assert!(!apply_order_response(
+            order_response(Some("req-1"), 400),
+            &mut projection,
+            OutputFormat::Quiet,
+            "BTC-USD",
+            2,
+            2,
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn apply_order_response_fails_closed_on_rejected_cancel_acknowledgement() {
         let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
         projection.apply(
@@ -3397,6 +3569,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("correlation failed closed"));
+        assert!(error.to_string().contains("request_id=req-1"));
         assert!(matches!(
             runtime_state.pending_effect(),
             Some(MakerEffect::AbortInFlight(_))
