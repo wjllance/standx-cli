@@ -20,6 +20,7 @@ use standx_sdk::models::OrderSide;
 pub mod account_projection;
 pub mod ledger;
 pub mod ownership;
+pub mod recovery;
 pub mod risk;
 pub mod runtime;
 
@@ -35,6 +36,7 @@ pub use ownership::{
     open_qty_adopts, pending_covers_slot, position_within_limit, quote_client_order_id, QuoteSlot,
     MAKER_CL_ORD_ID_PREFIX,
 };
+pub use recovery::{RecoveryAdmission, RecoveryCircuitBreaker};
 pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
 pub use runtime::{
     order_cancel_rejection_reason, MakerEffect, MakerEvent, MakerState, RecoveryTarget,

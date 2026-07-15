@@ -39,10 +39,9 @@ use notify::webhook_body;
 use notify::{token_expiry_level, MakerNotifier, PositionChange, RiskNotice, TokenExpiryLevel};
 use pipeline::{CycleRequest, CycleState, LiveAccountPollState};
 use recovery::{
-    cancel_maker_orders_with_retry, ctrl_c_latched, order_response_reconnect_available,
-    reconcile_ledger_snapshot, reconnect_account_stream, reconnect_order_response,
-    AccountStreamReconnect, PositionReconciliationError, ReconcileRequest, ReconnectInterrupted,
-    ReconnectRequest,
+    cancel_maker_orders_with_retry, ctrl_c_latched, reconcile_ledger_snapshot,
+    reconnect_account_stream, reconnect_order_response, AccountStreamReconnect,
+    PositionReconciliationError, ReconcileRequest, ReconnectInterrupted, ReconnectRequest,
 };
 #[cfg(test)]
 use recovery::{
@@ -138,6 +137,8 @@ pub async fn handle_maker(
             order_response_reconnect_backoff,
             account_stream_reconnect_attempts,
             account_stream_reconnect_backoff,
+            recovery_incidents_per_window,
+            recovery_window_secs,
             controlled_disconnect_after,
         } => {
             let file = config::load(maker_config.as_deref())?;
@@ -192,6 +193,16 @@ pub async fn handle_maker(
                         account_stream_reconnect_backoff,
                         file.account_stream_reconnect_backoff,
                         2,
+                    ),
+                    recovery_incidents_per_window: choose(
+                        recovery_incidents_per_window,
+                        file.recovery_incidents_per_window,
+                        3,
+                    ),
+                    recovery_window_secs: choose(
+                        recovery_window_secs,
+                        file.recovery_window_secs,
+                        3600,
                     ),
                     controlled_disconnect_after,
                     verbose,
@@ -256,6 +267,8 @@ struct MakerRunArgs {
     order_response_reconnect_backoff: u64,
     account_stream_reconnect_attempts: u32,
     account_stream_reconnect_backoff: u64,
+    recovery_incidents_per_window: u32,
+    recovery_window_secs: u64,
     controlled_disconnect_after: Option<u64>,
     verbose: bool,
 }
@@ -370,30 +383,6 @@ mod tests {
             model::signed_position_quantity("0.13", Some(OrderSide::Sell)).unwrap(),
             -0.13
         );
-    }
-
-    #[test]
-    fn reconnect_policy_is_bounded_and_preserves_controlled_fail_safe() {
-        assert!(order_response_reconnect_available(
-            "order-response WebSocket error: reset",
-            0,
-            3
-        ));
-        assert!(!order_response_reconnect_available(
-            "order-response WebSocket error: reset",
-            3,
-            3
-        ));
-        assert!(!order_response_reconnect_available(
-            "controlled fault injection closed the order-response stream after 15s",
-            0,
-            3
-        ));
-        assert!(!order_response_reconnect_available(
-            "order-response WebSocket error: reset",
-            0,
-            0
-        ));
     }
 
     struct EnvGuard {

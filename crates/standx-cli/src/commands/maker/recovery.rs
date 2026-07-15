@@ -294,7 +294,6 @@ pub(super) struct ReconnectSnapshot {
 }
 
 pub(super) struct ReconnectedOrderResponse {
-    pub(super) client: StandXClient,
     pub(super) commands: OrderCommandSender,
     pub(super) responses: tokio::sync::mpsc::Receiver<OrderResponse>,
     pub(super) health: OrderResponseHealth,
@@ -327,14 +326,6 @@ fn emit_order_response_reconnect(
             "⚠️  order-response reconnect {event} ({attempt}/{max_attempts}) on {symbol}: {message}"
         );
     }
-}
-
-pub(super) fn order_response_reconnect_available(
-    failure: &str,
-    attempts_used: u32,
-    max: u32,
-) -> bool {
-    !failure.starts_with("controlled fault injection") && attempts_used < max
 }
 
 pub(super) fn validate_reconnect_snapshot(
@@ -434,23 +425,20 @@ pub(super) enum AccountStreamReconnect {
 }
 
 /// Reconnect the authenticated account stream with bounded attempts and
-/// exponential backoff, both interruptible by Ctrl+C. Bumps `epoch` and
-/// `attempts_used` in place so the caller's projection reset and budget stay in
-/// sync. The maker book is already cancelled by the completed cleanup, so
+/// exponential backoff, both interruptible by Ctrl+C. Bumps `epoch` per
+/// attempt so the caller's projection reset follows the connected stream. The
+/// maker book is already cancelled by the completed cleanup, so
 /// aborting the waits on Ctrl+C is safe. Symmetric with
 /// [`reconnect_order_response`]; the caller owns the post-connect event
 /// application and REST reconciliation (account-stream-specific).
 pub(super) async fn reconnect_account_stream(
     epoch: &mut u64,
-    attempts_used: &mut u32,
     max_attempts: u32,
     backoff_secs: u64,
     ctrl_c: &mut tokio::sync::watch::Receiver<bool>,
 ) -> AccountStreamReconnect {
     let mut last_connect_error: Option<String> = None;
-    while *attempts_used < max_attempts {
-        *attempts_used += 1;
-        let attempt = *attempts_used;
+    for attempt in 1..=max_attempts {
         *epoch = epoch.saturating_add(1);
         let connect_epoch = *epoch;
         let reconnect = async {
@@ -507,7 +495,6 @@ pub(super) struct ReconnectRequest<'a> {
     pub(super) expected_position: f64,
     pub(super) qty_tolerance: f64,
     pub(super) output_format: OutputFormat,
-    pub(super) attempts_used: u32,
     pub(super) max_attempts: u32,
     pub(super) base_backoff: Duration,
     pub(super) original_failure: &'a str,
@@ -516,7 +503,7 @@ pub(super) struct ReconnectRequest<'a> {
 
 pub(super) async fn reconnect_order_response(
     request: ReconnectRequest<'_>,
-) -> Result<(ReconnectedOrderResponse, u32)> {
+) -> Result<ReconnectedOrderResponse> {
     let ReconnectRequest {
         cleanup_client,
         symbol,
@@ -525,22 +512,19 @@ pub(super) async fn reconnect_order_response(
         expected_position,
         qty_tolerance,
         output_format,
-        attempts_used,
         max_attempts,
         base_backoff,
         original_failure,
         ctrl_c,
     } = request;
-    let mut cleanup_client = cleanup_client;
     let mut ctrl_c = ctrl_c;
-    let first_attempt = attempts_used.saturating_add(1);
     let mut last_error = None;
     // The runtime Cleanup effect has already emptied and verified the maker
     // book before it emits Recover. Only repeat cleanup between failed
     // reconnect attempts, when a late venue-side request may have surfaced.
     let mut cleanup_needed = false;
 
-    for attempt in first_attempt..=max_attempts {
+    for attempt in 1..=max_attempts {
         emit_order_response_reconnect(
             output_format,
             symbol,
@@ -574,7 +558,6 @@ pub(super) async fn reconnect_order_response(
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
             let session_id = uuid::Uuid::new_v4().to_string();
-            let candidate_client = StandXClient::new()?.with_session_id(&session_id);
             let stream = OrderResponseStream::new(&session_id)?;
             let connect_attempt = tokio::select! {
                 biased;
@@ -586,7 +569,7 @@ pub(super) async fn reconnect_order_response(
             match connect_attempt {
                 Ok(Ok((commands, responses, health, handle))) => {
                     match query_reconnect_snapshot(
-                        &candidate_client,
+                        &cleanup_client,
                         symbol,
                         session_started_at,
                         run_order_prefix,
@@ -606,7 +589,6 @@ pub(super) async fn reconnect_order_response(
                                     "new order-response session became unhealthy during reconciliation without a recorded reason".to_string()
                                 });
                                 handle.abort();
-                                cleanup_client = candidate_client;
                                 last_error = Some(anyhow::anyhow!(
                                     "new order-response session failed during reconciliation: {reason}"
                                 ));
@@ -626,34 +608,27 @@ pub(super) async fn reconnect_order_response(
                                     max_attempts,
                                     &message,
                                 );
-                                return Ok((
-                                    ReconnectedOrderResponse {
-                                        client: candidate_client,
-                                        commands,
-                                        responses,
-                                        health,
-                                        handle,
-                                    },
-                                    attempt,
-                                ));
+                                return Ok(ReconnectedOrderResponse {
+                                    commands,
+                                    responses,
+                                    health,
+                                    handle,
+                                });
                             }
                         }
                         Err(error) => {
                             handle.abort();
-                            cleanup_client = candidate_client;
                             last_error =
                                 Some(anyhow::anyhow!("post-auth reconciliation failed: {error}"));
                         }
                     }
                 }
                 Ok(Err(error)) => {
-                    cleanup_client = candidate_client;
                     last_error = Some(anyhow::anyhow!(
                         "order-response authentication failed: {error}"
                     ));
                 }
                 Err(_) => {
-                    cleanup_client = candidate_client;
                     last_error = Some(anyhow::anyhow!(
                         "order-response reconnect timed out after 15 seconds"
                     ));
@@ -675,7 +650,7 @@ pub(super) async fn reconnect_order_response(
             &error_text,
         );
         if attempt < max_attempts {
-            let local_attempt = attempt.saturating_sub(first_attempt).min(4);
+            let local_attempt = attempt.saturating_sub(1).min(4);
             let multiplier = 1_u32 << local_attempt;
             tokio::select! {
                 biased;
