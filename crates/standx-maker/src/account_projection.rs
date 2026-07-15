@@ -1261,6 +1261,52 @@ mod tests {
     }
 
     #[test]
+    fn late_unknown_open_after_verified_cleanup_forces_reconciliation() {
+        // After a verified cleanup (either continuity), a fresh current-run
+        // open order with no pending place must never silently become a
+        // holdable quote: it is flagged unknown and adopted at the sentinel
+        // level so reconciliation cancels it rather than resuming on it.
+        for continuity in [
+            OrderResponseContinuity::Preserved,
+            OrderResponseContinuity::Replaced,
+        ] {
+            let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+            // Establish and adopt an initial quote, then verify-cleanup it.
+            state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+            state.apply(
+                1,
+                AccountProjectionEvent::PlaceAccepted {
+                    request_id: "p1".to_string(),
+                },
+            );
+            state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+            state.finish_verified_cleanup(continuity);
+            assert!(
+                state.resting_quotes().is_empty(),
+                "{continuity:?}: cleanup must leave no executable quote"
+            );
+
+            // A brand-new current-run order (unseen id, no pending place) lands
+            // late on the venue.
+            let mut late = order(0.2, false);
+            late.order_id = 4242;
+            late.client_order_id = Some(format!("{PREFIX}q00000099x9"));
+            let outcome = state.apply(1, AccountProjectionEvent::OrderObserved(late));
+
+            assert!(
+                outcome.unknown_current_run_order,
+                "{continuity:?}: a late unknown current-run order must require reconciliation"
+            );
+            let resting = state.resting_quotes();
+            assert_eq!(resting.len(), 1);
+            assert_eq!(
+                resting[0].level, UNKNOWN_ADOPTED_LEVEL,
+                "{continuity:?}: it must be adopted at the sentinel level, not a holdable quote"
+            );
+        }
+    }
+
+    #[test]
     fn account_reconnect_reset_preserves_unacked_order_response_registry() {
         let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
