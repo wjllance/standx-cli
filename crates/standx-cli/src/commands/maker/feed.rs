@@ -20,17 +20,50 @@ pub(super) struct FeedState {
 struct FeedMeta {
     exchange_seq: Option<u64>,
     server_time: Option<String>,
+    envelope_time: Option<String>,
+    payload_time: Option<String>,
     received_at: Instant,
+}
+
+/// Observation-only metadata for explaining why the latest independently
+/// published mark and book updates did or did not form a coherent snapshot.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct WsSnapshotDiagnostics {
+    pub(super) mark_seq: Option<u64>,
+    pub(super) book_seq: Option<u64>,
+    pub(super) mark_server_time: Option<String>,
+    pub(super) book_server_time: Option<String>,
+    pub(super) mark_envelope_time: Option<String>,
+    pub(super) book_envelope_time: Option<String>,
+    pub(super) mark_payload_time: Option<String>,
+    pub(super) book_payload_time: Option<String>,
+    pub(super) mark_age_ms: Option<u64>,
+    pub(super) book_age_ms: Option<u64>,
+    pub(super) local_skew_ms: Option<u64>,
+    pub(super) server_skew_ms: Option<u64>,
+}
+
+/// One acquired market input plus observation-only WS cache diagnostics.
+pub(super) struct AcquiredMarketSnapshot {
+    pub(super) mark: f64,
+    pub(super) best_bid: Option<f64>,
+    pub(super) best_ask: Option<f64>,
+    pub(super) source: &'static str,
+    pub(super) fallback_reason: Option<&'static str>,
+    pub(super) ws_snapshot: Option<WsSnapshotDiagnostics>,
 }
 
 /// WS cache entries older than this fall back to REST for the cycle. REST
 /// polling refreshed data once per interval, so 5s keeps freshness at least
 /// as good as the old behavior while tolerating slow feed ticks.
 const WS_STALE_AFTER: Duration = Duration::from_secs(5);
-/// `price` and `depth_book` arrive on separate public channels. A pair older
-/// than this parsed venue-time skew is not a coherent quote input. Local
-/// receive-time skew is used only when venue timestamps are unavailable.
-const WS_SNAPSHOT_MAX_SKEW: Duration = Duration::from_secs(1);
+/// `price` and `depth_book` arrive on separate public channels at different
+/// cadences. Cross-channel skew therefore shares the same budget as the
+/// independent freshness check: both inputs may be used while each remains
+/// fresh, with mark/mid divergence still enforced by maker preflight. Venue
+/// time is preferred; local receive-time skew is used only when either venue
+/// timestamp is unavailable.
+const WS_SNAPSHOT_MAX_SKEW: Duration = WS_STALE_AFTER;
 
 /// Why the latest public WebSocket cache cannot safely be used for a maker
 /// cycle. These stable labels are emitted with `cycle_summary` so a REST
@@ -103,7 +136,49 @@ fn update_meta<T>(update: &WsMarketUpdate<T>) -> FeedMeta {
     FeedMeta {
         exchange_seq: update.seq,
         server_time: update.server_time.clone(),
+        envelope_time: update.envelope_time.clone(),
+        payload_time: update.payload_time.clone(),
         received_at: update.received_at,
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn ws_snapshot_diagnostics(state: &FeedState, now: Instant) -> WsSnapshotDiagnostics {
+    let mark_meta = state.mark_meta.as_ref();
+    let book_meta = state.book_meta.as_ref();
+    let mark_server_time = mark_meta
+        .and_then(|meta| meta.server_time.as_deref())
+        .and_then(parse_server_time_millis);
+    let book_server_time = book_meta
+        .and_then(|meta| meta.server_time.as_deref())
+        .and_then(parse_server_time_millis);
+
+    WsSnapshotDiagnostics {
+        mark_seq: mark_meta.and_then(|meta| meta.exchange_seq),
+        book_seq: book_meta.and_then(|meta| meta.exchange_seq),
+        mark_server_time: mark_meta.and_then(|meta| meta.server_time.clone()),
+        book_server_time: book_meta.and_then(|meta| meta.server_time.clone()),
+        mark_envelope_time: mark_meta.and_then(|meta| meta.envelope_time.clone()),
+        book_envelope_time: book_meta.and_then(|meta| meta.envelope_time.clone()),
+        mark_payload_time: mark_meta.and_then(|meta| meta.payload_time.clone()),
+        book_payload_time: book_meta.and_then(|meta| meta.payload_time.clone()),
+        mark_age_ms: mark_meta
+            .map(|meta| duration_millis(now.saturating_duration_since(meta.received_at))),
+        book_age_ms: book_meta
+            .map(|meta| duration_millis(now.saturating_duration_since(meta.received_at))),
+        local_skew_ms: mark_meta.zip(book_meta).map(|(mark, book)| {
+            duration_millis(
+                mark.received_at
+                    .saturating_duration_since(book.received_at)
+                    .max(book.received_at.saturating_duration_since(mark.received_at)),
+            )
+        }),
+        server_skew_ms: mark_server_time
+            .zip(book_server_time)
+            .map(|(mark, book)| mark.abs_diff(book)),
     }
 }
 
@@ -251,19 +326,23 @@ pub(super) async fn market_snapshot(
     client: &StandXClient,
     symbol: &str,
     feed: Option<&Arc<RwLock<FeedState>>>,
-) -> Result<(
-    f64,
-    Option<f64>,
-    Option<f64>,
-    &'static str,
-    Option<&'static str>,
-)> {
+) -> Result<AcquiredMarketSnapshot> {
     let mut ws_issue = None;
+    let mut ws_snapshot = None;
     if let Some(feed) = feed {
         let s = feed.read().await;
-        match coherent_ws_snapshot(&s, Instant::now()) {
+        let now = Instant::now();
+        ws_snapshot = Some(ws_snapshot_diagnostics(&s, now));
+        match coherent_ws_snapshot(&s, now) {
             Ok((mark, best_bid, best_ask)) => {
-                return Ok((mark, best_bid, best_ask, "ws", None));
+                return Ok(AcquiredMarketSnapshot {
+                    mark,
+                    best_bid,
+                    best_ask,
+                    source: "ws",
+                    fallback_reason: None,
+                    ws_snapshot,
+                });
             }
             Err(issue) => ws_issue = Some(issue.as_str()),
         }
@@ -281,8 +360,16 @@ pub(super) async fn market_snapshot(
         .map_err(|_| anyhow::anyhow!("unparseable mark price: {}", price.mark_price))?;
     let best_bid: Option<f64> = depth.best_bid().and_then(|s| s.parse().ok());
     let best_ask: Option<f64> = depth.best_ask().and_then(|s| s.parse().ok());
-    validated_snapshot(mark, best_bid, best_ask, "rest")
-        .map(|(mark, best_bid, best_ask, source)| (mark, best_bid, best_ask, source, ws_issue))
+    validated_snapshot(mark, best_bid, best_ask, "rest").map(
+        |(mark, best_bid, best_ask, source)| AcquiredMarketSnapshot {
+            mark,
+            best_bid,
+            best_ask,
+            source,
+            fallback_reason: ws_issue,
+            ws_snapshot,
+        },
+    )
 }
 
 fn validated_snapshot(
@@ -324,6 +411,8 @@ mod tests {
         FeedMeta {
             exchange_seq: Some(seq),
             server_time: Some(server_time.to_string()),
+            envelope_time: Some(server_time.to_string()),
+            payload_time: Some(server_time.to_string()),
             received_at,
         }
     }
@@ -336,6 +425,8 @@ mod tests {
             data: (),
             seq: Some(9),
             server_time: Some("2026-07-14T00:00:11Z".to_string()),
+            envelope_time: Some("2026-07-14T00:00:11Z".to_string()),
+            payload_time: None,
             received_at: now,
         };
         assert!(!update_is_newer(Some(&previous), &regressed_seq));
@@ -343,6 +434,8 @@ mod tests {
             data: (),
             seq: Some(11),
             server_time: Some("2026-07-14T00:00:09Z".to_string()),
+            envelope_time: Some("2026-07-14T00:00:09Z".to_string()),
+            payload_time: None,
             received_at: now,
         };
         assert!(!update_is_newer(Some(&previous), &regressed_time));
@@ -366,7 +459,7 @@ mod tests {
     }
 
     #[test]
-    fn coherent_snapshot_rejects_server_skew_even_when_receive_times_match() {
+    fn coherent_snapshot_accepts_channel_cadence_skew_within_freshness_budget() {
         let now = Instant::now();
         let state = FeedState {
             mark: Some(100.0),
@@ -375,6 +468,19 @@ mod tests {
             best_ask: Some(100.1),
             book_meta: Some(meta(2, "2026-07-14T00:00:03Z", now)),
         };
+        assert!(coherent_ws_snapshot(&state, now).is_ok());
+    }
+
+    #[test]
+    fn coherent_snapshot_rejects_server_skew_beyond_freshness_budget() {
+        let now = Instant::now();
+        let state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(meta(2, "2026-07-14T00:00:06Z", now)),
+        };
         assert_eq!(
             coherent_ws_snapshot(&state, now),
             Err(WsSnapshotIssue::ServerTimeSkew)
@@ -382,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn coherent_snapshot_falls_back_to_local_skew_without_both_server_times() {
+    fn coherent_snapshot_accepts_local_cadence_skew_within_freshness_budget() {
         let now = Instant::now();
         let state = FeedState {
             mark: Some(100.0),
@@ -392,12 +498,68 @@ mod tests {
             book_meta: Some(FeedMeta {
                 exchange_seq: Some(2),
                 server_time: None,
+                envelope_time: None,
+                payload_time: None,
                 received_at: now + Duration::from_secs(3),
             }),
         };
+        assert!(coherent_ws_snapshot(&state, now + Duration::from_secs(3)).is_ok());
+    }
+
+    #[test]
+    fn coherent_snapshot_rejects_local_skew_beyond_freshness_budget() {
+        let now = Instant::now();
+        let state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(meta(1, "2026-07-14T00:00:00Z", now)),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(FeedMeta {
+                exchange_seq: Some(2),
+                server_time: None,
+                envelope_time: None,
+                payload_time: None,
+                received_at: now + Duration::from_secs(6),
+            }),
+        };
         assert_eq!(
-            coherent_ws_snapshot(&state, now + Duration::from_secs(3)),
+            coherent_ws_snapshot(&state, now),
             Err(WsSnapshotIssue::LocalSkew)
+        );
+    }
+
+    #[test]
+    fn snapshot_diagnostics_preserve_raw_times_and_both_skew_domains() {
+        let now = Instant::now();
+        let mut mark = meta(10, "2026-07-14T00:00:01Z", now - Duration::from_millis(250));
+        mark.envelope_time = Some("1752451201000".to_string());
+        mark.payload_time = Some("2026-07-14T00:00:01Z".to_string());
+        let mut book = meta(20, "2026-07-14T00:00:03Z", now - Duration::from_millis(50));
+        book.envelope_time = Some("1752451203000".to_string());
+        book.payload_time = Some("2026-07-14T00:00:02Z".to_string());
+        let state = FeedState {
+            mark: Some(100.0),
+            mark_meta: Some(mark),
+            best_bid: Some(99.9),
+            best_ask: Some(100.1),
+            book_meta: Some(book),
+        };
+
+        let diagnostics = ws_snapshot_diagnostics(&state, now);
+
+        assert_eq!(diagnostics.mark_seq, Some(10));
+        assert_eq!(diagnostics.book_seq, Some(20));
+        assert_eq!(diagnostics.mark_age_ms, Some(250));
+        assert_eq!(diagnostics.book_age_ms, Some(50));
+        assert_eq!(diagnostics.local_skew_ms, Some(200));
+        assert_eq!(diagnostics.server_skew_ms, Some(2_000));
+        assert_eq!(
+            diagnostics.mark_envelope_time.as_deref(),
+            Some("1752451201000")
+        );
+        assert_eq!(
+            diagnostics.book_payload_time.as_deref(),
+            Some("2026-07-14T00:00:02Z")
         );
     }
 

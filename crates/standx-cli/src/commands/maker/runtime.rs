@@ -2237,8 +2237,12 @@ pub(super) async fn run_maker(
                     ),
                 ));
             }
-            let (mark, best_bid, best_ask, src, market_fallback_reason) =
-                market_snapshot(&client, &symbol, feed.as_ref()).await?;
+            let market = market_snapshot(&client, &symbol, feed.as_ref()).await?;
+            let mark = market.mark;
+            let best_bid = market.best_bid;
+            let best_ask = market.best_ask;
+            let src = market.source;
+            let market_fallback_reason = market.fallback_reason;
             let result = maker_cycle(
                 CycleRequest {
                     client: &client,
@@ -2252,6 +2256,7 @@ pub(super) async fn run_maker(
                     market_source: src,
                     recovery: recovery_cycle,
                     market_fallback_reason,
+                    ws_snapshot: market.ws_snapshot.as_ref(),
                     max_divergence_bps: args.max_divergence_bps,
                     inventory_exit_pct: args.inventory_exit_pct,
                     inventory_exit_qty: args.inventory_exit_qty,

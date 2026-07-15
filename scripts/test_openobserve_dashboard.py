@@ -16,9 +16,15 @@ class DashboardContractTests(unittest.TestCase):
             panel["id"]: panel
             for panel in self.tabs["performance-latency"]["panels"]
         }
+        self.runs_and_events = {
+            panel["id"]: panel for panel in self.tabs["runs-events"]["panels"]
+        }
 
     def query_sql(self, panel_id: str) -> str:
         return self.phase_one[panel_id]["queries"][0]["query"]
+
+    def run_event_query_sql(self, panel_id: str) -> str:
+        return self.runs_and_events[panel_id]["queries"][0]["query"]
 
     def test_phase_one_tab_has_unique_required_panels(self) -> None:
         self.assertEqual(self.payload["version"], 10)
@@ -59,12 +65,16 @@ class DashboardContractTests(unittest.TestCase):
             "write_p95_ms",
             "ack_p95_ms",
             "effective_latency_p95_ms",
-            "fill_after_cancel_p95_ms",
         ):
             self.assertIn(field, latency)
         latency_events = self.query_sql("standx_order_latency_events")
         for field in ("timeout_phase", "timeout_ms"):
             self.assertIn(field, latency_events)
+        self.assertNotIn("fill_after_cancel", latency)
+        self.assertNotIn(
+            "fill_after_cancel",
+            self.query_sql("standx_order_latency_events"),
+        )
         for panel_id in (
             "standx_net_pnl_attribution",
             "standx_markout",
@@ -84,6 +94,24 @@ class DashboardContractTests(unittest.TestCase):
             self.assertIn("run_id", sql)
             self.assertIn("config_hash", sql)
             self.assertNotIn("$run_id", sql)
+
+    def test_runs_events_queries_surface_real_exit_events_and_stop_context(self) -> None:
+        exits = self.run_event_query_sql("standx_inventory_exits")
+        self.assertIn("action = 'inventory_exit_submitted'", exits)
+        self.assertIn("run_id = '$run_id'", exits)
+
+        timeline = self.run_event_query_sql("standx_key_events")
+        self.assertIn("inventory_exit_submitted", timeline)
+
+        comparison = self.run_event_query_sql("standx_run_comparison")
+        for field in (
+            "position",
+            "starting_position",
+            "lifecycle_event",
+            "lifecycle_message",
+        ):
+            self.assertIn(field, comparison)
+        self.assertNotIn("$run_id", comparison)
 
     def test_every_panel_query_targets_the_configured_stream(self) -> None:
         for tab in self.payload["tabs"]:

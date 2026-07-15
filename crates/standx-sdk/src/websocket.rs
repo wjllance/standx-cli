@@ -50,6 +50,10 @@ pub struct WsMarketUpdate<T> {
     pub seq: Option<u64>,
     /// Venue timestamp copied without reinterpretation from the envelope/data.
     pub server_time: Option<String>,
+    /// Raw venue timestamp from the message envelope, when present.
+    pub envelope_time: Option<String>,
+    /// Raw venue timestamp from the channel payload, when present.
+    pub payload_time: Option<String>,
     /// Local monotonic receipt time, assigned before forwarding the payload.
     pub received_at: Instant,
 }
@@ -75,17 +79,16 @@ where
         .get("seq")
         .and_then(serde_json::Value::as_u64)
         .or_else(|| payload.get("seq").and_then(serde_json::Value::as_u64));
-    let server_time = scalar_to_string(
-        envelope
-            .get("timestamp")
-            .or_else(|| envelope.get("time"))
-            .or_else(|| payload.get("timestamp"))
-            .or_else(|| payload.get("time")),
-    );
+    let envelope_time =
+        scalar_to_string(envelope.get("timestamp").or_else(|| envelope.get("time")));
+    let payload_time = scalar_to_string(payload.get("timestamp").or_else(|| payload.get("time")));
+    let server_time = envelope_time.clone().or_else(|| payload_time.clone());
     Some(WsMarketUpdate {
         data,
         seq,
         server_time,
+        envelope_time,
+        payload_time,
         received_at,
     })
 }
@@ -580,6 +583,30 @@ mod tests {
         assert_eq!(update.data.symbol, "BTC-USD");
         assert_eq!(update.seq, Some(42));
         assert_eq!(update.server_time.as_deref(), Some("2026-07-14T00:00:00Z"));
+        assert_eq!(
+            update.envelope_time.as_deref(),
+            Some("2026-07-14T00:00:00Z")
+        );
+        assert_eq!(update.payload_time.as_deref(), Some("2026-07-14T00:00:00Z"));
         assert_eq!(update.received_at, received_at);
+    }
+
+    #[test]
+    fn market_update_keeps_distinct_envelope_and_payload_times() {
+        let envelope = serde_json::json!({
+            "channel": "depth_book",
+            "timestamp": 1_752_499_200_000i64,
+            "data": {
+                "symbol": "BTC-USD",
+                "bids": [["99", "1"]],
+                "asks": [["101", "1"]],
+                "timestamp": "2026-07-15T00:00:01Z"
+            }
+        });
+        let update = parse_market_update::<OrderBook>(&envelope, Instant::now()).unwrap();
+
+        assert_eq!(update.server_time.as_deref(), Some("1752499200000"));
+        assert_eq!(update.envelope_time.as_deref(), Some("1752499200000"));
+        assert_eq!(update.payload_time.as_deref(), Some("2026-07-15T00:00:01Z"));
     }
 }
