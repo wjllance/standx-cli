@@ -24,6 +24,7 @@ maker by itself.
 - Every accepted current-run fill atomically synchronizes ledger position and session telemetry position; an internal mismatch beyond half a quantity tick fails closed before further live placement or risk evaluation.
 - Pending place/cancel quote slots remain reserved across arbitrarily fast strategy cycles until a correlated response, account-order terminal state, or explicit cleanup closes the venue exposure; cycle count alone never authorizes a replacement order.
 - Every submitted create/cancel/inventory-exit request has a 10-second monotonic lifecycle deadline. A missing acknowledgement, or an accepted place that never becomes visible on the correlated account-order stream, freezes placement and requires maker cleanup plus authoritative REST reconciliation; timeout never releases a quote slot by itself.
+- Order-response recovery adopts current-run filled orders and exactly-once backfills stable-ID REST trades before comparing ledger and venue positions. A bounded 0.5s/1.0s/1.5s retry window covers cancel-versus-fill visibility races; unexplained position gaps still fail closed.
 - Position jumps, account-stream state changes, reconciliation, volatility breaker, inventory exit, residual cleanup, and final fail-safe emit `risk_notification` telemetry; critical shutdown/cleanup delivery is awaited with a timeout.
 - Inventory-exit configuration remains disabled unless a supervised test has approved its exact threshold and chunk; the recorded XAG-USD test approves only `max_position=0.8`, trigger `25%`, and chunk `0.2`.
 

@@ -1547,22 +1547,48 @@ pub(super) async fn run_maker(
                     // replaced together on success, and every failure path
                     // below exits the loop.
                     session.order_response_handle.abort();
-                    match reconnect_order_response(ReconnectRequest {
-                        cleanup_client: client.clone(),
-                        symbol: &symbol,
-                        session_started_at,
-                        run_order_prefix: &run_order_prefix,
-                        expected_position: ledger.expected_position,
-                        qty_tolerance,
-                        output_format,
-                        max_attempts: args.order_response_reconnect_attempts,
-                        base_backoff: Duration::from_secs(args.order_response_reconnect_backoff),
-                        original_failure: &detail,
-                        ctrl_c: ctrl_c_rx.clone(),
-                    })
+                    match reconnect_order_response(
+                        ReconnectRequest {
+                            cleanup_client: client.clone(),
+                            symbol: &symbol,
+                            session_started_at,
+                            run_order_prefix: &run_order_prefix,
+                            qty_tolerance,
+                            mark: last_mark.unwrap_or(baseline_mark),
+                            output_format,
+                            max_attempts: args.order_response_reconnect_attempts,
+                            base_backoff: Duration::from_secs(
+                                args.order_response_reconnect_backoff,
+                            ),
+                            original_failure: &detail,
+                            ctrl_c: ctrl_c_rx.clone(),
+                        },
+                        &mut ledger,
+                        &mut stats,
+                    )
                     .await
                     {
                         Ok(reconnected) => {
+                            total_fills += reconnected.fills.len() as u64;
+                            for fill in &reconnected.fills {
+                                emit_live_fill(fill, &symbol, cycle, output_format);
+                                if let Some(order_id) = fill.order_id {
+                                    let at_ms = u64::try_from(
+                                        session.latency_started.elapsed().as_millis(),
+                                    )
+                                    .unwrap_or(u64::MAX);
+                                    if let Err(error) = session
+                                        .order_latency
+                                        .record_fill_after_cancel_order(order_id, at_ms)
+                                    {
+                                        eprintln!(
+                                            "⚠️ fill-after-cancel observation unavailable: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                            account_balance_refresh_requested |= !reconnected.fills.is_empty();
+                            let reconciled_position = reconnected.position;
                             session.order_commands = reconnected.commands;
                             session.order_responses = reconnected.responses;
                             session.order_response_health = reconnected.health;
@@ -1571,6 +1597,13 @@ pub(super) async fn run_maker(
                             // cycle rebuilds exchange state before it may place.
                             resting.clear();
                             session.projection.clear_orders_and_pending();
+                            let generation = session.projection.generation();
+                            session.projection.apply(
+                                generation,
+                                AccountProjectionEvent::PositionObserved {
+                                    position: reconciled_position,
+                                },
+                            );
                             consecutive_errors = 0;
                             runtime_state.handle(MakerEvent::RecoverySucceeded(recovery_token));
                             next_cycle_is_recovery = true;
@@ -1586,7 +1619,7 @@ pub(super) async fn run_maker(
                                         position_before: None,
                                         position_after: None,
                                         expected: Some(ledger.expected_position),
-                                        observed: None,
+                                        observed: Some(reconciled_position),
                                     },
                                     false,
                                 )
