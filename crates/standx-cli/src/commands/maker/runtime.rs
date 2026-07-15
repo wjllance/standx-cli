@@ -1513,89 +1513,35 @@ pub(super) async fn run_maker(
                     );
                 }
 
-                let mut last_connect_error: Option<String> = None;
-                let mut reconnected = None;
-                while account_stream_reconnect_attempts_used
-                    < args.account_stream_reconnect_attempts
+                let (mut events, health, handle) = match reconnect_account_stream(
+                    &mut account_stream_epoch,
+                    &mut account_stream_reconnect_attempts_used,
+                    args.account_stream_reconnect_attempts,
+                    args.account_stream_reconnect_backoff,
+                    &mut ctrl_c_rx,
+                )
+                .await
                 {
-                    account_stream_reconnect_attempts_used += 1;
-                    let attempt = account_stream_reconnect_attempts_used;
-                    account_stream_epoch = account_stream_epoch.saturating_add(1);
-                    let reconnect = async {
-                        let stream = AccountStream::new(account_stream_epoch)?;
-                        stream
-                            .connect(&[
-                                AccountChannel::Order,
-                                AccountChannel::Position,
-                                AccountChannel::Trade,
-                                AccountChannel::Balance,
-                            ])
-                            .await
-                            .map_err(anyhow::Error::from)
-                    };
-                    // The maker book is already cancelled (cleanup completed),
-                    // so aborting the reconnect wait on Ctrl+C is safe.
-                    let connect_attempt = tokio::select! {
-                        biased;
-                        _ = ctrl_c_latched(&mut ctrl_c_rx) => None,
-                        result = tokio::time::timeout(Duration::from_secs(15), reconnect) => {
-                            Some(result)
-                        }
-                    };
-                    let Some(connect_attempt) = connect_attempt else {
+                    AccountStreamReconnect::Connected(triple) => triple,
+                    AccountStreamReconnect::Interrupted => {
                         runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
                         break 'main take_stop_effect(
                             &mut runtime_state,
                             MakerExit::PositionReconciliation,
                         );
-                    };
-                    match connect_attempt {
-                        Ok(Ok(triple)) => {
-                            reconnected = Some(triple);
-                            break;
-                        }
-                        Ok(Err(error)) => {
-                            last_connect_error = Some(format!("connect failed: {error}"));
-                        }
-                        Err(_) => {
-                            last_connect_error =
-                                Some("connect timed out after 15 seconds".to_string());
-                        }
                     }
-                    eprintln!(
-                        "⚠️  account stream reconnect attempt {}/{} failed: {}",
-                        attempt,
-                        args.account_stream_reconnect_attempts,
-                        last_connect_error.as_deref().unwrap_or("unknown error")
-                    );
-                    if attempt < args.account_stream_reconnect_attempts {
-                        let multiplier = 1_u32 << attempt.saturating_sub(1).min(4);
-                        let backoff = Duration::from_secs(args.account_stream_reconnect_backoff)
-                            .saturating_mul(multiplier);
-                        tokio::select! {
-                            biased;
-                            _ = ctrl_c_latched(&mut ctrl_c_rx) => {
-                                runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
-                                break 'main take_stop_effect(
-                                    &mut runtime_state,
-                                    MakerExit::PositionReconciliation,
-                                );
-                            }
-                            _ = tokio::time::sleep(backoff) => {}
-                        }
+                    AccountStreamReconnect::Exhausted(reason) => {
+                        runtime_state.handle(MakerEvent::RecoveryFailed {
+                            token: recovery_token,
+                            reason: format!(
+                                "account stream disconnected ({detail}); reconnect exhausted: {reason}"
+                            ),
+                        });
+                        break take_stop_effect(
+                            &mut runtime_state,
+                            MakerExit::PositionReconciliation,
+                        );
                     }
-                }
-
-                let Some((mut events, health, handle)) = reconnected else {
-                    runtime_state.handle(MakerEvent::RecoveryFailed {
-                        token: recovery_token,
-                        reason: format!(
-                            "account stream disconnected ({detail}); reconnect exhausted: {}",
-                            last_connect_error
-                                .unwrap_or_else(|| "no attempts available".to_string())
-                        ),
-                    });
-                    break take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 };
 
                 let projection = account_projection
