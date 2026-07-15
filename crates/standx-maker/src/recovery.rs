@@ -1,4 +1,5 @@
-//! Deterministic recovery admission policy for live transport incidents.
+//! Deterministic recovery admission policy for live recovery incidents
+//! (transport reconnects and position-mismatch freeze/recover alike).
 
 use std::collections::VecDeque;
 
@@ -38,9 +39,10 @@ impl RecoveryCircuitBreaker {
         }
     }
 
-    /// Admit one transport-recovery incident at monotonic `now_secs`.
-    /// Individual reconnect attempts are deliberately not recorded here; the
-    /// caller owns that bounded retry loop for the admitted incident.
+    /// Admit one recovery incident at monotonic `now_secs`.
+    /// The individual recovery attempts inside an admitted incident (reconnect
+    /// retries, the position-mismatch backfill loop) are deliberately not
+    /// recorded here; the caller owns that bounded work for the admitted incident.
     pub fn admit(&mut self, now_secs: u64) -> RecoveryAdmission {
         while self
             .incidents

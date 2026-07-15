@@ -942,7 +942,12 @@ pub(super) async fn run_maker(
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
     let recovery_clock_started = std::time::Instant::now();
-    let mut transport_recovery_breaker = maker::RecoveryCircuitBreaker::new(
+    // One rolling budget shared across every automatic recovery — account-stream
+    // reconnect, order-response reconnect, and position-mismatch freeze/recover.
+    // The operator's "N incidents per window" bounds total recovery churn before
+    // a human must step in; letting any one path recover unmetered would defeat
+    // that ceiling.
+    let mut recovery_breaker = maker::RecoveryCircuitBreaker::new(
         args.recovery_incidents_per_window,
         args.recovery_window_secs,
     );
@@ -1100,8 +1105,7 @@ pub(super) async fn run_maker(
                         format!("account stream disconnected ({detail}); reconnect disabled"),
                     );
                 }
-                let admission =
-                    transport_recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
+                let admission = recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
                 if !admission.is_admitted() {
                     break recovery_failed_exit(
                         &mut runtime_state,
@@ -1396,8 +1400,8 @@ pub(super) async fn run_maker(
                 } else if args.order_response_reconnect_attempts == 0 {
                     Some("safe reconnect is disabled".to_string())
                 } else {
-                    let admission = transport_recovery_breaker
-                        .admit(recovery_clock_started.elapsed().as_secs());
+                    let admission =
+                        recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
                     (!admission.is_admitted())
                         .then(|| format!("{}; circuit is open", recovery_circuit_detail(admission)))
                 };
@@ -2242,6 +2246,26 @@ pub(super) async fn run_maker(
                             );
                         }
                     };
+                    // Meter this recovery against the same rolling budget as the
+                    // transport reconnects. An oscillating mismatch source (a
+                    // second actor on the account, settlement jitter around the
+                    // tolerance boundary) would otherwise drive unbounded
+                    // freeze -> cancel-all -> backfill -> resume churn that the
+                    // circuit breaker exists to stop.
+                    let admission =
+                        recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
+                    if !admission.is_admitted() {
+                        break 'main recovery_failed_exit(
+                            &mut runtime_state,
+                            recovery_token,
+                            format!(
+                                "position mismatch (expected {:+.8}, observed {:+.8}); {}; refusing further live orders",
+                                mismatch.expected,
+                                mismatch.observed,
+                                recovery_circuit_detail(admission)
+                            ),
+                        );
+                    }
                     let mut recovered = false;
                     let mut last_observed = mismatch.observed;
                     for delay in [500_u64, 1_000, 1_500] {
