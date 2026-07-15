@@ -183,6 +183,22 @@ struct PendingMarkout {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+struct InventoryEvent {
+    event_time_ms: i64,
+    trade_id: u64,
+    delta: f64,
+}
+
+/// Time-weighted inventory exposure over the observed market interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InventoryTimeSummary {
+    pub observed_ms: i64,
+    pub nonzero_ms: i64,
+    pub abs_qty_ms: f64,
+    pub avg_abs_qty: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct MarketObservation {
     event_time_ms: i64,
     mark: f64,
@@ -283,8 +299,11 @@ fn validate_quote_interval(interval: QuoteQualityInterval) -> Result<(), Perform
 pub struct PerformanceSummary {
     pub passive_fills: u64,
     pub passive_qty: f64,
+    pub passive_cashflow_quote: f64,
+    pub passive_capture_bps: Option<f64>,
     pub exit_fills: u64,
     pub exit_qty: f64,
+    pub exit_cashflow_quote: f64,
     pub gross_spread_quote: f64,
     pub fee_quote: f64,
     pub rebate_quote: f64,
@@ -296,6 +315,7 @@ pub struct PerformanceSummary {
     pub position: f64,
     pub markouts: [MarkoutSummary; 3],
     pub quote_time: QuoteTimeSummary,
+    pub inventory_time: InventoryTimeSummary,
 }
 
 /// Current-run performance state. Trade IDs are deduplicated defensively even
@@ -308,8 +328,11 @@ pub struct PerformanceLedger {
     fill_cash: f64,
     passive_fills: u64,
     passive_qty: f64,
+    passive_cashflow_quote: f64,
+    passive_capture_bps_qty_sum: f64,
     exit_fills: u64,
     exit_qty: f64,
+    exit_cashflow_quote: f64,
     gross_spread_quote: f64,
     fee_quote: f64,
     rebate_quote: f64,
@@ -318,6 +341,9 @@ pub struct PerformanceLedger {
     seen_trade_ids: HashSet<u64>,
     costs_by_trade_id: HashMap<u64, ExecutionCosts>,
     markets: Vec<MarketObservation>,
+    inventory_events: Vec<InventoryEvent>,
+    observation_start_ms: Option<i64>,
+    observation_end_ms: Option<i64>,
     pending_markouts: Vec<PendingMarkout>,
     markouts: [MarkoutAccumulator; 3],
     last_funding_time_ms: Option<i64>,
@@ -339,8 +365,11 @@ impl PerformanceLedger {
             fill_cash: 0.0,
             passive_fills: 0,
             passive_qty: 0.0,
+            passive_cashflow_quote: 0.0,
+            passive_capture_bps_qty_sum: 0.0,
             exit_fills: 0,
             exit_qty: 0.0,
+            exit_cashflow_quote: 0.0,
             gross_spread_quote: 0.0,
             fee_quote: 0.0,
             rebate_quote: 0.0,
@@ -349,6 +378,9 @@ impl PerformanceLedger {
             seen_trade_ids: HashSet::new(),
             costs_by_trade_id: HashMap::new(),
             markets: Vec::new(),
+            inventory_events: Vec::new(),
+            observation_start_ms: None,
+            observation_end_ms: None,
             pending_markouts: Vec::new(),
             markouts: [MarkoutAccumulator::default(); 3],
             last_funding_time_ms: None,
@@ -378,7 +410,13 @@ impl PerformanceLedger {
 
         let direction = side_direction(fill.side);
         self.position += direction * fill.qty;
-        self.fill_cash -= direction * fill.price * fill.qty;
+        let cashflow_quote = -direction * fill.price * fill.qty;
+        self.fill_cash += cashflow_quote;
+        self.inventory_events.push(InventoryEvent {
+            event_time_ms: fill.event_time_ms,
+            trade_id: fill.trade_id,
+            delta: direction * fill.qty,
+        });
         if let Some(costs) = fill.costs {
             self.apply_execution_costs(fill.trade_id, costs);
         }
@@ -386,11 +424,15 @@ impl PerformanceLedger {
             FillRole::PassiveMaker => {
                 self.passive_fills += 1;
                 self.passive_qty += fill.qty;
+                self.passive_cashflow_quote += cashflow_quote;
                 self.gross_spread_quote += direction * (fill.mark_at_fill - fill.price) * fill.qty;
+                self.passive_capture_bps_qty_sum +=
+                    direction * (fill.mark_at_fill - fill.price) / fill.price * 10_000.0 * fill.qty;
             }
             FillRole::InventoryExit => {
                 self.exit_fills += 1;
                 self.exit_qty += fill.qty;
+                self.exit_cashflow_quote += cashflow_quote;
                 self.exit_cost_quote += direction * (fill.price - fill.mark_at_fill) * fill.qty;
             }
         }
@@ -471,6 +513,8 @@ impl PerformanceLedger {
             event_time_ms,
             mark,
         });
+        self.observation_start_ms.get_or_insert(event_time_ms);
+        self.observation_end_ms = Some(event_time_ms);
 
         let mut unresolved = Vec::with_capacity(self.pending_markouts.len());
         for pending in std::mem::take(&mut self.pending_markouts) {
@@ -528,6 +572,15 @@ impl PerformanceLedger {
     /// with the latest mark.
     pub fn finish(&mut self, end_time_ms: i64) -> Result<(), PerformanceError> {
         self.quote_time.finish(end_time_ms)?;
+        if let Some(start_ms) = self.observation_start_ms {
+            if end_time_ms < start_ms {
+                return Err(PerformanceError::MarketTimeRegression {
+                    previous_ms: start_ms,
+                    next_ms: end_time_ms,
+                });
+            }
+            self.observation_end_ms = Some(end_time_ms);
+        }
         for pending in self.pending_markouts.drain(..) {
             self.markouts[pending.window_index].unavailable += 1;
         }
@@ -569,11 +622,16 @@ impl PerformanceLedger {
                 avg_bps: (value.qty > 0.0).then_some(value.bps_qty_sum / value.qty),
             }
         });
+        let inventory_time = self.inventory_time_summary();
         Ok(PerformanceSummary {
             passive_fills: self.passive_fills,
             passive_qty: self.passive_qty,
+            passive_cashflow_quote: self.passive_cashflow_quote,
+            passive_capture_bps: (self.passive_qty > 0.0)
+                .then_some(self.passive_capture_bps_qty_sum / self.passive_qty),
             exit_fills: self.exit_fills,
             exit_qty: self.exit_qty,
+            exit_cashflow_quote: self.exit_cashflow_quote,
             gross_spread_quote: self.gross_spread_quote,
             fee_quote: self.fee_quote,
             rebate_quote: self.rebate_quote,
@@ -589,7 +647,37 @@ impl PerformanceLedger {
             position: self.position,
             markouts,
             quote_time: self.quote_time.summary,
+            inventory_time,
         })
+    }
+
+    fn inventory_time_summary(&self) -> InventoryTimeSummary {
+        let (Some(start_ms), Some(end_ms)) =
+            (self.observation_start_ms, self.observation_end_ms)
+        else {
+            return InventoryTimeSummary::default();
+        };
+        let mut events = self.inventory_events.clone();
+        events.sort_by_key(|event| (event.event_time_ms, event.trade_id));
+        let mut position = self.starting_position;
+        let mut cursor_ms = start_ms;
+        let mut summary = InventoryTimeSummary {
+            observed_ms: end_ms.saturating_sub(start_ms),
+            ..InventoryTimeSummary::default()
+        };
+        for event in events {
+            let event_ms = event.event_time_ms.clamp(start_ms, end_ms);
+            accrue_inventory_time(&mut summary, position, event_ms.saturating_sub(cursor_ms));
+            position += event.delta;
+            cursor_ms = cursor_ms.max(event_ms);
+        }
+        accrue_inventory_time(&mut summary, position, end_ms.saturating_sub(cursor_ms));
+        summary.avg_abs_qty = if summary.observed_ms > 0 {
+            summary.abs_qty_ms / summary.observed_ms as f64
+        } else {
+            0.0
+        };
+        summary
     }
 
     fn apply_markout(
@@ -629,6 +717,16 @@ fn side_direction(side: OrderSide) -> f64 {
         OrderSide::Buy => 1.0,
         OrderSide::Sell => -1.0,
     }
+}
+
+fn accrue_inventory_time(summary: &mut InventoryTimeSummary, position: f64, duration_ms: i64) {
+    if duration_ms <= 0 {
+        return;
+    }
+    if position.abs() > 1e-12 {
+        summary.nonzero_ms += duration_ms;
+    }
+    summary.abs_qty_ms += position.abs() * duration_ms as f64;
 }
 
 #[cfg(test)]
@@ -681,6 +779,9 @@ mod tests {
 
         assert_eq!(summary.passive_fills, 1);
         assert_eq!(summary.exit_fills, 1);
+        assert!((summary.passive_cashflow_quote + 99.0).abs() < 1e-12);
+        assert!((summary.exit_cashflow_quote - 101.0).abs() < 1e-12);
+        assert!((summary.passive_capture_bps.unwrap() - 100.0 / 99.0 * 100.0).abs() < 1e-12);
         assert!((summary.gross_spread_quote - 1.0).abs() < 1e-12);
         assert!((summary.exit_cost_quote + 1.0).abs() < 1e-12);
         assert!((summary.net_pnl_quote - 2.17).abs() < 1e-12);
@@ -690,6 +791,42 @@ mod tests {
                 + summary.funding_quote
                 - summary.exit_cost_quote;
         assert!((recomposed - summary.net_pnl_quote).abs() < 1e-12);
+    }
+
+    #[test]
+    fn inventory_holding_time_uses_event_time_and_survives_late_arrival() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger.observe_market(0, 100.0).unwrap();
+        ledger.observe_market(6_000, 100.0).unwrap();
+        // Deliver the later sell first to prove the integral is reconstructed
+        // from normalized event time rather than transport arrival order.
+        ledger
+            .record_fill(fill(
+                2,
+                FillRole::PassiveMaker,
+                OrderSide::Sell,
+                100.0,
+                1.0,
+                4_000,
+            ))
+            .unwrap();
+        ledger
+            .record_fill(fill(
+                1,
+                FillRole::PassiveMaker,
+                OrderSide::Buy,
+                100.0,
+                2.0,
+                1_000,
+            ))
+            .unwrap();
+        ledger.finish(6_000).unwrap();
+
+        let inventory = ledger.summary(100.0).unwrap().inventory_time;
+        assert_eq!(inventory.observed_ms, 6_000);
+        assert_eq!(inventory.nonzero_ms, 5_000);
+        assert!((inventory.abs_qty_ms - 8_000.0).abs() < 1e-12);
+        assert!((inventory.avg_abs_qty - 4.0 / 3.0).abs() < 1e-12);
     }
 
     #[test]

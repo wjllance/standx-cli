@@ -44,8 +44,9 @@ pub use ownership::{
     MAKER_CL_ORD_ID_PREFIX,
 };
 pub use performance::{
-    ExecutionCosts, FillRole, MarkoutSummary, PerformanceError, PerformanceFill, PerformanceLedger,
-    PerformanceSummary, QuoteQualityInterval, QuoteTimeSummary, MARKOUT_WINDOWS_MS,
+    ExecutionCosts, FillRole, InventoryTimeSummary, MarkoutSummary, PerformanceError,
+    PerformanceFill, PerformanceLedger, PerformanceSummary, QuoteQualityInterval,
+    QuoteTimeSummary, MARKOUT_WINDOWS_MS,
 };
 pub use recovery::{RecoveryAdmission, RecoveryCircuitBreaker, RecoveryTrigger};
 pub use replay::{

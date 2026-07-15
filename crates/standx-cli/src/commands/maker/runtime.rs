@@ -2776,7 +2776,7 @@ pub(super) async fn run_maker(
             if let Err(error) = session.order_latency.finish_process(ended_ms) {
                 eprintln!("⚠️ order latency finalization unavailable: {error}");
             }
-            output::emit_order_latency(output_format, &session.order_latency);
+            output::emit_order_latency(output_format, &symbol, &session.order_latency);
             (
                 Some(session.account_stream_handle),
                 Some(session.order_response_handle),

@@ -60,6 +60,7 @@ fn parse_event_time_ms(value: &str) -> Option<i64> {
 
 pub(super) fn emit_order_latency(
     output_format: OutputFormat,
+    symbol: &str,
     tracker: &standx_maker::OrderLatencyTracker,
 ) {
     use standx_maker::{LatencyRequestKind, LatencyRequestOutcome};
@@ -105,6 +106,7 @@ pub(super) fn emit_order_latency(
                 "{}",
                 serde_json::json!({
                     "action": "order_latency_summary",
+                    "symbol": symbol,
                     "kind": latency_kind(kind),
                     "requests": summary.requests,
                     "accepted": summary.accepted,
@@ -120,6 +122,18 @@ pub(super) fn emit_order_latency(
                     "ack": latency_metric_json(summary.ack),
                     "effective_latency": latency_metric_json(summary.effective_latency),
                     "fill_after_cancel": latency_metric_json(summary.fill_after_cancel),
+                    "write_p50_ms": summary.write.p50_ms,
+                    "write_p95_ms": summary.write.p95_ms,
+                    "write_p99_ms": summary.write.p99_ms,
+                    "ack_p50_ms": summary.ack.p50_ms,
+                    "ack_p95_ms": summary.ack.p95_ms,
+                    "ack_p99_ms": summary.ack.p99_ms,
+                    "effective_latency_p50_ms": summary.effective_latency.p50_ms,
+                    "effective_latency_p95_ms": summary.effective_latency.p95_ms,
+                    "effective_latency_p99_ms": summary.effective_latency.p99_ms,
+                    "fill_after_cancel_p50_ms": summary.fill_after_cancel.p50_ms,
+                    "fill_after_cancel_p95_ms": summary.fill_after_cancel.p95_ms,
+                    "fill_after_cancel_p99_ms": summary.fill_after_cancel.p99_ms,
                 })
             );
         }
@@ -444,8 +458,11 @@ fn performance_json(summary: &maker::PerformanceSummary) -> serde_json::Value {
     serde_json::json!({
         "passive_fills": summary.passive_fills,
         "passive_qty": summary.passive_qty,
+        "passive_cashflow_quote": summary.passive_cashflow_quote,
+        "passive_capture_bps": summary.passive_capture_bps,
         "exit_fills": summary.exit_fills,
         "exit_qty": summary.exit_qty,
+        "exit_cashflow_quote": summary.exit_cashflow_quote,
         "gross_spread_quote": summary.gross_spread_quote,
         "fee_quote": summary.fee_quote,
         "rebate_quote": summary.rebate_quote,
@@ -464,6 +481,10 @@ fn performance_json(summary: &maker::PerformanceSummary) -> serde_json::Value {
         "eligible_bid_qty_ms": summary.quote_time.eligible_bid_qty_ms,
         "eligible_ask_qty_ms": summary.quote_time.eligible_ask_qty_ms,
         "eligible_total_qty_ms": summary.quote_time.eligible_total_qty_ms,
+        "inventory_observed_ms": summary.inventory_time.observed_ms,
+        "inventory_nonzero_ms": summary.inventory_time.nonzero_ms,
+        "inventory_abs_qty_ms": summary.inventory_time.abs_qty_ms,
+        "inventory_avg_abs_qty": summary.inventory_time.avg_abs_qty,
     })
 }
 
