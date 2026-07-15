@@ -9,7 +9,7 @@
 
 use crate::{is_current_run_client_order_id, MakerStats};
 use standx_sdk::models::OrderSide;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
 const MAX_PENDING_TRADES: usize = 512;
@@ -139,7 +139,7 @@ pub struct MakerLedger {
     pub exit_order_ids: HashSet<u64>,
     seen_trade_ids: HashSet<u64>,
     pending_trade_ids: HashSet<u64>,
-    pending_trades: HashMap<u64, Vec<PendingTrade>>,
+    pending_trades: VecDeque<PendingTrade>,
 }
 
 impl MakerLedger {
@@ -150,7 +150,7 @@ impl MakerLedger {
             exit_order_ids: HashSet::new(),
             seen_trade_ids: HashSet::new(),
             pending_trade_ids: HashSet::new(),
-            pending_trades: HashMap::new(),
+            pending_trades: VecDeque::new(),
         }
     }
 
@@ -196,16 +196,13 @@ impl MakerLedger {
             return Ok(None);
         }
         if !self.maker_order_ids.contains(&trade.order_id) {
-            if self.pending_trade_ids.len() >= MAX_PENDING_TRADES {
-                return Err(LedgerError::PendingTradeOverflow {
-                    limit: MAX_PENDING_TRADES,
-                });
+            if self.pending_trades.len() >= MAX_PENDING_TRADES {
+                if let Some(evicted) = self.pending_trades.pop_front() {
+                    self.pending_trade_ids.remove(&evicted.trade_id);
+                }
             }
             self.pending_trade_ids.insert(trade.trade_id);
-            self.pending_trades
-                .entry(trade.order_id)
-                .or_default()
-                .push(trade.into());
+            self.pending_trades.push_back(trade.into());
             return Ok(None);
         }
         self.apply_trade(trade, stats)
@@ -221,10 +218,17 @@ impl MakerLedger {
         if !self.maker_order_ids.contains(&order_id) {
             return Ok(Vec::new());
         }
-        let pending = self.pending_trades.remove(&order_id).unwrap_or_default();
+        let mut pending = Vec::new();
+        for trade in std::mem::take(&mut self.pending_trades) {
+            if trade.order_id == order_id {
+                self.pending_trade_ids.remove(&trade.trade_id);
+                pending.push(trade);
+            } else {
+                self.pending_trades.push_back(trade);
+            }
+        }
         let mut fills = Vec::with_capacity(pending.len());
         for pending in pending {
-            self.pending_trade_ids.remove(&pending.trade_id);
             if let Some(fill) = self.apply_trade(
                 LedgerTrade {
                     trade_id: pending.trade_id,
@@ -418,6 +422,35 @@ mod tests {
     }
 
     #[test]
+    fn buffered_trades_keep_arrival_order_when_other_orders_are_retained() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        for trade in [
+            trade(1, 7, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+            trade(2, 8, OrderSide::Sell, 0.2, TradeSource::AccountStream),
+            trade(3, 7, OrderSide::Buy, 0.3, TradeSource::AccountStream),
+        ] {
+            assert!(ledger.record_trade(trade, &mut stats).unwrap().is_none());
+        }
+
+        assert!(ledger.adopt_order(7, Some("sxmk-run-q00000001a0"), "sxmk-run-"));
+        let fills = ledger.apply_buffered_trades(7, &mut stats).unwrap();
+        assert_eq!(
+            fills
+                .iter()
+                .map(|fill| fill.trade_id.unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        assert!(ledger.adopt_order(8, Some("sxmk-run-q00000002a0"), "sxmk-run-"));
+        let fills = ledger.apply_buffered_trades(8, &mut stats).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].trade_id, Some(2));
+        assert_eq!(stats.fills(), 3);
+    }
+
+    #[test]
     fn partial_trade_then_cancel_keeps_positions_aligned() {
         let (mut ledger, mut stats) = adopted_ledger();
         ledger
@@ -452,13 +485,13 @@ mod tests {
     }
 
     #[test]
-    fn buffered_trades_for_unknown_orders_are_strictly_bounded() {
+    fn buffered_trades_evict_oldest_without_stopping_the_session() {
         // Trades whose owning order has not yet been adopted are buffered. That
-        // buffer must be capped so a flood of trades for foreign orders cannot
-        // grow it without bound.
+        // buffer must be capped so a flood of trades for foreign orders neither
+        // grows it without bound nor stops this maker session.
         let mut ledger = MakerLedger::new(0.0);
         let mut stats = MakerStats::default();
-        for index in 0..MAX_PENDING_TRADES as u64 {
+        for index in 0..=MAX_PENDING_TRADES as u64 {
             // Distinct trade and order ids so none dedupe or get owned.
             let outcome = ledger
                 .record_trade(
@@ -475,30 +508,49 @@ mod tests {
             assert!(outcome.is_none(), "unowned trade should buffer, not fill");
         }
 
-        assert!(matches!(
-            ledger.record_trade(
-                trade(
-                    MAX_PENDING_TRADES as u64 + 1,
-                    MAX_PENDING_TRADES as u64 + 1,
-                    OrderSide::Buy,
-                    0.1,
-                    TradeSource::AccountStream,
-                ),
-                &mut stats,
-            ),
-            Err(LedgerError::PendingTradeOverflow {
-                limit: MAX_PENDING_TRADES
-            })
-        ));
+        assert_eq!(ledger.pending_trades.len(), MAX_PENDING_TRADES);
+        assert!(!ledger.pending_trade_ids.contains(&1));
+        assert!(ledger
+            .pending_trade_ids
+            .contains(&(MAX_PENDING_TRADES as u64 + 1)));
+        assert_eq!(stats.fills(), 0);
 
-        // A duplicate of an already-buffered trade is still deduped, not an
-        // overflow — the cap only rejects genuinely new buffered trades.
+        // A duplicate of a surviving buffered trade remains deduplicated.
         assert!(ledger
             .record_trade(
-                trade(1, 1, OrderSide::Buy, 0.1, TradeSource::AccountStream),
+                trade(2, 2, OrderSide::Buy, 0.1, TradeSource::AccountStream),
                 &mut stats,
             )
             .unwrap()
             .is_none());
+        assert_eq!(ledger.pending_trades.len(), MAX_PENDING_TRADES);
+
+        // The oldest trade was discarded, while a recent trade can still be
+        // applied in arrival order if its order is later proven to be ours.
+        assert!(ledger.adopt_order(1, Some("sxmk-run-q00000001a0"), "sxmk-run-"));
+        assert!(ledger
+            .apply_buffered_trades(1, &mut stats)
+            .unwrap()
+            .is_empty());
+        let latest_order_id = MAX_PENDING_TRADES as u64 + 1;
+        assert!(ledger.adopt_order(latest_order_id, Some("sxmk-run-q00000002a0"), "sxmk-run-"));
+        assert_eq!(
+            ledger
+                .apply_buffered_trades(latest_order_id, &mut stats)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // An evicted execution is not marked seen. A later WS/REST replay can
+        // still account it once ownership has been established.
+        assert!(ledger
+            .record_trade(
+                trade(1, 1, OrderSide::Buy, 0.1, TradeSource::RestBackfill),
+                &mut stats,
+            )
+            .unwrap()
+            .is_some());
+        assert_eq!(stats.fills(), 2);
     }
 }
