@@ -258,7 +258,9 @@ pub(super) async fn fetch_account_audit(
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
-    use standx_maker::{AccountProjectionEvent, OrderObservation, ProjectionPendingPlace};
+    use standx_maker::{
+        AccountProjectionEvent, OrderObservation, OrderResponseContinuity, ProjectionPendingPlace,
+    };
     use standx_sdk::models::OrderSide;
 
     const TEST_RUN_PREFIX: &str = "sxmk-deadline-";
@@ -410,6 +412,60 @@ mod tests {
             .unwrap();
         assert_eq!(timed_out.kind, OrderRequestKind::Place);
         assert_eq!(timed_out.phase, RequestTimeoutPhase::Acknowledgement);
+    }
+
+    #[test]
+    fn preserved_cleanup_keeps_an_unacked_deadline_until_it_times_out() {
+        // A freeze whose order-response channel survives (account-stream or
+        // reconciliation) must not release an in-flight placement's deadline:
+        // the ack can still arrive, so the request must keep timing out if it
+        // never does.
+        let submitted_at = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut projection = projection_with_pending_place("p1");
+        let mut deadlines = OrderRequestDeadlines::default();
+        deadlines.record("p1".to_owned(), OrderRequestKind::Place, submitted_at);
+
+        projection.finish_verified_cleanup(OrderResponseContinuity::Preserved);
+        deadlines.retain_pending(&projection);
+
+        assert_eq!(
+            deadlines.next_deadline(timeout),
+            Some(submitted_at + timeout),
+            "a preserved unacked placement must keep its deadline"
+        );
+        let timed_out = deadlines
+            .timed_out(&projection, submitted_at + timeout, timeout)
+            .expect("a preserved unacked placement must still fail closed on timeout");
+        assert_eq!(timed_out.kind, OrderRequestKind::Place);
+        assert_eq!(timed_out.phase, OrderRequestTimeoutPhase::Acknowledgement);
+    }
+
+    #[test]
+    fn replaced_cleanup_retires_the_old_deadline_so_it_cannot_time_out() {
+        // A freeze that replaces the order-response channel ends the old ack
+        // obligation: no response can arrive on the torn-down stream, so the
+        // stale deadline must be dropped and can never fire a spurious timeout.
+        let submitted_at = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut projection = projection_with_pending_place("p1");
+        let mut deadlines = OrderRequestDeadlines::default();
+        deadlines.record("p1".to_owned(), OrderRequestKind::Place, submitted_at);
+
+        projection.finish_verified_cleanup(OrderResponseContinuity::Replaced);
+        deadlines.retain_pending(&projection);
+
+        assert_eq!(
+            deadlines.next_deadline(timeout),
+            None,
+            "a replaced channel's stale deadline must be dropped"
+        );
+        assert!(
+            deadlines
+                .timed_out(&projection, submitted_at + timeout, timeout)
+                .is_none(),
+            "a retired request must never fire a spurious timeout"
+        );
     }
 
     #[test]
