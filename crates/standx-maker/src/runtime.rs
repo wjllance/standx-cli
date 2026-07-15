@@ -608,6 +608,298 @@ mod tests {
         ));
     }
 
+    /// Every event that must freeze the runtime, paired with the recovery
+    /// target its cleanup and recovery effects must carry. Conformance tests
+    /// below iterate this table so a new fault variant that misses one of the
+    /// shared safety steps fails here rather than drifting silently.
+    fn freeze_cases() -> Vec<(MakerEvent, RecoveryTarget)> {
+        vec![
+            (
+                MakerEvent::AccountStreamDisconnected("stream closed".to_string()),
+                RecoveryTarget::AccountStream,
+            ),
+            (
+                MakerEvent::OrderResponseDisconnected("stream closed".to_string()),
+                RecoveryTarget::OrderResponse,
+            ),
+            (
+                MakerEvent::PositionMismatch,
+                RecoveryTarget::PositionReconciliation,
+            ),
+            (
+                MakerEvent::OrderResponseUnmatched {
+                    request_id: "req-1".to_string(),
+                },
+                RecoveryTarget::OrderResponse,
+            ),
+            (
+                MakerEvent::OrderCancelRejected {
+                    request_id: "cancel-1".to_string(),
+                    code: 400,
+                    message: "rejected".to_string(),
+                },
+                RecoveryTarget::OrderResponse,
+            ),
+            (
+                MakerEvent::CycleInvalidated {
+                    reason: "account state changed".to_string(),
+                },
+                RecoveryTarget::PositionReconciliation,
+            ),
+        ]
+    }
+
+    fn stop_reasons() -> Vec<RuntimeStopReason> {
+        vec![
+            RuntimeStopReason::CtrlC,
+            RuntimeStopReason::OrderResponse("boom".to_string()),
+            RuntimeStopReason::PositionReconciliation("boom".to_string()),
+            RuntimeStopReason::ConsecutiveCycleErrors("boom".to_string()),
+            RuntimeStopReason::StopLoss("boom".to_string()),
+            RuntimeStopReason::CleanupFailure {
+                target: RecoveryTarget::OrderResponse,
+                reason: "boom".to_string(),
+            },
+        ]
+    }
+
+    /// Freezes a fresh runtime with `event` and returns the cleanup token,
+    /// asserting the queued effects are exactly AbortInFlight → Cleanup.
+    fn freeze_and_take_cleanup(
+        event: MakerEvent,
+        target: RecoveryTarget,
+    ) -> (MakerState, WorkToken) {
+        let mut state = MakerState::starting();
+        state.handle(MakerEvent::StartupReady);
+        let cycle = next_cycle(&mut state);
+        state.handle(event);
+        assert_eq!(state.next_effect(), Some(MakerEffect::AbortInFlight(cycle)));
+        let cleanup = match state.next_effect().expect("cleanup effect") {
+            MakerEffect::Cleanup {
+                token,
+                target: actual,
+            } => {
+                assert_eq!(actual, target);
+                token
+            }
+            effect => panic!("expected cleanup, got {effect:?}"),
+        };
+        assert_eq!(state.next_effect(), None);
+        (state, cleanup)
+    }
+
+    #[test]
+    fn every_fault_clears_queued_work_and_freezes_with_abort_then_cleanup() {
+        for (event, target) in freeze_cases() {
+            let mut state = MakerState::starting();
+            // Leave StartupReady's RunCycle effect *undrained* so the test
+            // proves a fault clears stale queued work instead of leaving a
+            // placement effect behind the abort/cleanup pair.
+            state.handle(MakerEvent::StartupReady);
+            let queued = match state.pending_effect() {
+                Some(MakerEffect::RunCycle(token)) => *token,
+                effect => panic!("expected queued cycle, got {effect:?}"),
+            };
+            state.handle(event.clone());
+            assert!(state.is_frozen(), "{event:?} must freeze the runtime");
+            assert_eq!(
+                state.next_effect(),
+                Some(MakerEffect::AbortInFlight(queued)),
+                "{event:?} must abort in-flight work first"
+            );
+            assert!(
+                matches!(
+                    state.next_effect(),
+                    Some(MakerEffect::Cleanup { target: actual, .. }) if actual == target
+                ),
+                "{event:?} must queue cleanup for {target:?}"
+            );
+            assert_eq!(
+                state.next_effect(),
+                None,
+                "{event:?} must not leave stale effects behind cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_runtime_ignores_market_events_and_later_faults() {
+        for (event, target) in freeze_cases() {
+            let (mut state, cleanup) = freeze_and_take_cleanup(event.clone(), target);
+            state.handle(MakerEvent::Timer);
+            state.handle(MakerEvent::MarketChanged);
+            for (other, _) in freeze_cases() {
+                state.handle(other);
+            }
+            assert_eq!(
+                state.next_effect(),
+                None,
+                "no effect may be queued while frozen for {event:?}"
+            );
+            // The original fault still owns the recovery flow.
+            state.handle(MakerEvent::CleanupCompleted(cleanup));
+            assert!(
+                matches!(
+                    state.next_effect(),
+                    Some(MakerEffect::Recover { target: actual, .. }) if actual == target
+                ),
+                "recovery after {event:?} must keep target {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_cleanup_and_recovery_tokens_are_rejected() {
+        for (event, target) in freeze_cases() {
+            let (mut state, cleanup) = freeze_and_take_cleanup(event.clone(), target);
+            let stale = WorkToken {
+                generation: cleanup.generation + 7,
+                kind: cleanup.kind,
+            };
+            state.handle(MakerEvent::CleanupCompleted(stale));
+            state.handle(MakerEvent::CleanupFailed {
+                token: stale,
+                reason: "stale".to_string(),
+            });
+            assert_eq!(state.next_effect(), None);
+            assert!(state.is_frozen());
+
+            state.handle(MakerEvent::CleanupCompleted(cleanup));
+            let recovery = match state.next_effect().expect("recovery effect") {
+                MakerEffect::Recover { token, .. } => token,
+                effect => panic!("expected recovery, got {effect:?}"),
+            };
+            let stale = WorkToken {
+                generation: recovery.generation + 7,
+                kind: recovery.kind,
+            };
+            state.handle(MakerEvent::RecoverySucceeded(stale));
+            state.handle(MakerEvent::RecoveryFailed {
+                token: stale,
+                reason: "stale".to_string(),
+            });
+            assert_eq!(state.next_effect(), None);
+            assert!(state.is_frozen());
+        }
+    }
+
+    #[test]
+    fn recovery_failure_stop_reason_maps_by_target() {
+        for (event, target) in freeze_cases() {
+            let (mut state, cleanup) = freeze_and_take_cleanup(event.clone(), target);
+            state.handle(MakerEvent::CleanupCompleted(cleanup));
+            let recovery = match state.next_effect().expect("recovery effect") {
+                MakerEffect::Recover { token, .. } => token,
+                effect => panic!("expected recovery, got {effect:?}"),
+            };
+            state.handle(MakerEvent::RecoveryFailed {
+                token: recovery,
+                reason: "reconnect exhausted".to_string(),
+            });
+            let stop = match state.next_effect().expect("stop effect") {
+                MakerEffect::Stop(reason) => reason,
+                effect => panic!("expected stop, got {effect:?}"),
+            };
+            match target {
+                RecoveryTarget::OrderResponse => assert_eq!(
+                    stop,
+                    RuntimeStopReason::OrderResponse("reconnect exhausted".to_string()),
+                    "order-response recovery failure must stop as OrderResponse for {event:?}"
+                ),
+                RecoveryTarget::AccountStream | RecoveryTarget::PositionReconciliation => {
+                    assert_eq!(
+                        stop,
+                        RuntimeStopReason::PositionReconciliation(
+                            "reconnect exhausted".to_string()
+                        ),
+                        "recovery failure must stop as PositionReconciliation for {event:?}"
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cleanup_failure_stop_carries_the_recovery_target() {
+        for (event, target) in freeze_cases() {
+            let (mut state, cleanup) = freeze_and_take_cleanup(event.clone(), target);
+            state.handle(MakerEvent::CleanupFailed {
+                token: cleanup,
+                reason: "residual orders".to_string(),
+            });
+            assert_eq!(
+                state.next_effect(),
+                Some(MakerEffect::Stop(RuntimeStopReason::CleanupFailure {
+                    target,
+                    reason: "residual orders".to_string(),
+                })),
+                "cleanup failure must stop with CleanupFailure {target:?} for {event:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_requested_passes_the_reason_through_and_seals_the_runtime() {
+        for reason in stop_reasons() {
+            let mut state = MakerState::starting();
+            state.handle(MakerEvent::StartupReady);
+            let cycle = next_cycle(&mut state);
+            state.handle(MakerEvent::StopRequested(reason.clone()));
+            assert_eq!(state.next_effect(), Some(MakerEffect::AbortInFlight(cycle)));
+            assert_eq!(state.next_effect(), Some(MakerEffect::Stop(reason.clone())));
+            // Once stopping, nothing may queue further work or a second stop.
+            state.handle(MakerEvent::Timer);
+            state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
+            for (fault, _) in freeze_cases() {
+                state.handle(fault);
+            }
+            assert_eq!(
+                state.next_effect(),
+                None,
+                "stopping runtime must ignore all later events after {reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_success_resets_the_cycle_error_streak() {
+        let mut state = MakerState::starting();
+        state.handle(MakerEvent::StartupReady);
+        for attempt in 0..2 {
+            let token = next_cycle(&mut state);
+            state.handle(MakerEvent::CycleFailed {
+                token,
+                reason: format!("failure {attempt}"),
+            });
+            assert!(state.pending_effect().is_none());
+            state.handle(MakerEvent::Timer);
+        }
+        let _ = next_cycle(&mut state);
+        state.handle(MakerEvent::PositionMismatch);
+        let _ = state.next_effect();
+        let cleanup = match state.next_effect().expect("cleanup effect") {
+            MakerEffect::Cleanup { token, .. } => token,
+            effect => panic!("expected cleanup, got {effect:?}"),
+        };
+        state.handle(MakerEvent::CleanupCompleted(cleanup));
+        let recovery = match state.next_effect().expect("recovery effect") {
+            MakerEffect::Recover { token, .. } => token,
+            effect => panic!("expected recovery, got {effect:?}"),
+        };
+        state.handle(MakerEvent::RecoverySucceeded(recovery));
+        // A third consecutive failure would have stopped the runtime had the
+        // streak survived recovery; a fresh failure must not.
+        let token = next_cycle(&mut state);
+        state.handle(MakerEvent::CycleFailed {
+            token,
+            reason: "post-recovery failure".to_string(),
+        });
+        assert!(
+            state.pending_effect().is_none(),
+            "recovery must reset the consecutive cycle error streak"
+        );
+    }
+
     #[test]
     fn invalidated_cycle_aborts_cleans_up_and_rejects_stale_completion() {
         let mut state = MakerState::starting();

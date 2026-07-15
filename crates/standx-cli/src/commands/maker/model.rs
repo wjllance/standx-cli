@@ -240,3 +240,75 @@ pub(super) fn signed_position_quantity(
         None => qty,
     })
 }
+
+#[cfg(test)]
+mod exit_mapping_tests {
+    use super::MakerExit;
+    use standx_maker::{RecoveryTarget, RuntimeStopReason};
+
+    /// Pins the full RuntimeStopReason → MakerExit mapping so a new stop
+    /// reason (or a re-targeted CleanupFailure) cannot silently land in the
+    /// wrong fail-safe exit bucket.
+    #[test]
+    fn every_runtime_stop_reason_maps_to_the_expected_exit() {
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::CtrlC),
+            MakerExit::CtrlC
+        ));
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::OrderResponse("boom".to_string())),
+            MakerExit::OrderResponse(detail) if detail == "boom"
+        ));
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::PositionReconciliation("boom".to_string())),
+            MakerExit::PositionReconciliation(detail) if detail == "boom"
+        ));
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::ConsecutiveCycleErrors("boom".to_string())),
+            MakerExit::ConsecutiveErrors(detail) if detail == "boom"
+        ));
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::StopLoss("boom".to_string())),
+            MakerExit::StopLoss(detail) if detail == "boom"
+        ));
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::CleanupFailure {
+                target: RecoveryTarget::OrderResponse,
+                reason: "boom".to_string(),
+            }),
+            MakerExit::OrderResponse(detail) if detail == "boom"
+        ));
+        for target in [
+            RecoveryTarget::AccountStream,
+            RecoveryTarget::PositionReconciliation,
+        ] {
+            assert!(matches!(
+                MakerExit::from(RuntimeStopReason::CleanupFailure {
+                    target,
+                    reason: "boom".to_string(),
+                }),
+                MakerExit::PositionReconciliation(detail) if detail == "boom"
+            ));
+        }
+    }
+
+    /// Every fail-safe exit must surface a terminal error (only a clean
+    /// Ctrl+C stop is silent) so supervisors always see a reason on exit 75.
+    #[test]
+    fn only_ctrl_c_exits_without_a_terminal_error() {
+        assert!(MakerExit::CtrlC.terminal_error().is_none());
+        for exit in [
+            MakerExit::OrderResponse("boom".to_string()),
+            MakerExit::ConsecutiveErrors("boom".to_string()),
+            MakerExit::PositionReconciliation("boom".to_string()),
+            MakerExit::AccountingInvariant("boom".to_string()),
+            MakerExit::StopLoss("boom".to_string()),
+        ] {
+            let error = exit
+                .terminal_error()
+                .expect("fail-safe exits carry an error");
+            assert!(error.contains("boom"));
+            assert!(exit.lifecycle_reason().contains("boom"));
+        }
+    }
+}
