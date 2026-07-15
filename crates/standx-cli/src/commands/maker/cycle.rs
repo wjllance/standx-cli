@@ -35,6 +35,7 @@ struct LatencyRegistration<'a> {
     level: u32,
     order_id: Option<u64>,
     market_source: &'a str,
+    recovery: bool,
 }
 
 fn register_order_latency(
@@ -52,6 +53,7 @@ fn register_order_latency(
         level,
         order_id,
         market_source,
+        recovery,
     } = registration;
     let (Some(tracker), Some(started)) = (tracker.as_deref_mut(), started) else {
         return;
@@ -66,7 +68,7 @@ fn register_order_latency(
         level: Some(level),
         order_id,
         market_source: Some(market_source.to_string()),
-        recovery: false,
+        recovery,
         intent_ms: elapsed_ms(started),
         intent_utc_ms: chrono::Utc::now().timestamp_millis(),
     }) {
@@ -196,6 +198,7 @@ pub(super) async fn maker_cycle(
         best_bid,
         best_ask,
         market_source,
+        recovery,
         market_fallback_reason,
         max_divergence_bps,
         inventory_exit_pct,
@@ -456,6 +459,8 @@ pub(super) async fn maker_cycle(
                     side: q.side,
                     price: q.price,
                     qty: q.qty,
+                    mark_at_fill: mark,
+                    event_time_ms: performance_time_ms,
                     trade_id: None,
                     order_id: None,
                     trade_ts: None,
@@ -608,6 +613,7 @@ pub(super) async fn maker_cycle(
                                 level: *level,
                                 order_id: Some(order_id),
                                 market_source,
+                                recovery,
                             },
                         );
                         let sent = commands.send_prepared(command).await;
@@ -677,6 +683,7 @@ pub(super) async fn maker_cycle(
                             level: q.level,
                             order_id: None,
                             market_source,
+                            recovery,
                         },
                     );
                     let sent = commands.send_prepared(command).await;
@@ -767,6 +774,7 @@ pub(super) async fn maker_cycle(
                     level: u32::MAX,
                     order_id: None,
                     market_source,
+                    recovery,
                 },
             );
             let sent = commands.send_prepared(command).await;
@@ -897,6 +905,34 @@ mod tests {
             symbol: Some("BTC-USD".to_string()),
             value: None,
         }
+    }
+
+    #[test]
+    fn latency_registration_preserves_recovery_classification() {
+        let mut tracker = OrderLatencyTracker::default();
+        let started = Instant::now();
+        let mut tracker_ref = Some(&mut tracker);
+        register_order_latency(
+            &mut tracker_ref,
+            LatencyRegistration {
+                started: Some(started),
+                request_id: "recovery-place",
+                kind: maker::LatencyRequestKind::Place,
+                generation: 7,
+                cycle: 11,
+                symbol: "BTC-USD",
+                side: OrderSide::Buy,
+                level: 0,
+                order_id: None,
+                market_source: "ws",
+                recovery: true,
+            },
+        );
+
+        let request = tracker.requests().next().expect("registered request");
+        assert!(request.context.recovery);
+        assert_eq!(request.context.generation, 7);
+        assert_eq!(request.context.market_source.as_deref(), Some("ws"));
     }
 
     #[test]

@@ -74,6 +74,53 @@ class IncrementalIngestTests(unittest.TestCase):
             self.assertEqual(posted[2]["event_id"], ingest.incremental_event_id("test-live-run", 3))
             self.assertEqual(len({event["event_id"] for event in posted}), 3)
 
+    def test_phase_one_fields_keep_run_and_config_correlation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "phase-one.ndjson"
+            state_file = root / "state.json"
+            log.write_text(
+                json.dumps(
+                    {
+                        "action": "performance_summary",
+                        "symbol": "XAG-USD",
+                        "passive_capture_bps": 3.5,
+                        "inventory_nonzero_ms": 5000,
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "action": "order_latency_summary",
+                        "symbol": "XAG-USD",
+                        "kind": "cancel",
+                        "ack_p95_ms": 21,
+                        "effective_latency_p95_ms": 34,
+                        "fill_after_cancel_p95_ms": 55,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            args = self.args(log, state_file)
+            posted: list[dict[str, object]] = []
+            with mock.patch.object(
+                ingest,
+                "post_batch",
+                side_effect=lambda _endpoint, _user, _password, events, _retries: posted.extend(
+                    events
+                ),
+            ):
+                result = self.upload(args, {})
+
+            self.assertEqual(result["uploaded"], 2)
+            self.assertEqual({event["run_id"] for event in posted}, {"test-live-run"})
+            self.assertEqual({event["config_hash"] for event in posted}, {"config123"})
+            self.assertEqual(posted[0]["passive_capture_bps"], 3.5)
+            self.assertEqual(posted[0]["inventory_nonzero_ms"], 5000)
+            self.assertEqual(posted[1]["ack_p95_ms"], 21)
+            self.assertEqual(posted[1]["fill_after_cancel_p95_ms"], 55)
+
     def test_partial_trailing_line_is_not_checkpointed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

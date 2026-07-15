@@ -443,7 +443,8 @@ GROUP BY event ORDER BY events DESC''',
                 f'''SELECT _timestamp, passive_fills, passive_qty, exit_fills, exit_qty,
        passive_cashflow_quote, passive_capture_bps, exit_cashflow_quote,
        gross_spread_quote, inventory_mtm_change_quote, rebate_quote, fee_quote,
-       funding_quote, exit_cost_quote, net_pnl_quote, execution_costs_unavailable
+       funding_quote, funding_available, exit_cost_quote, net_pnl_quote,
+       net_pnl_complete, execution_costs_unavailable
 FROM "{stream}" WHERE action = 'performance_summary' AND {selected}
 ORDER BY _timestamp DESC LIMIT 1''',
                 [axis("_timestamp", "Time")],
@@ -587,10 +588,79 @@ GROUP BY channel ORDER BY channel''',
             (0, 37, 192, 8, 6),
             decimals=None,
         ),
+        panel(
+            "standx_performance_run_comparison",
+            "table",
+            "Phase-1 Performance by Run / Config",
+            "Latest deterministic performance summary per run for cross-config comparison. This table intentionally ignores the run selector.",
+            query(
+                stream,
+                f'''WITH ranked AS (
+  SELECT _timestamp, run_id, config_hash, symbol, passive_fills, exit_fills,
+         passive_capture_bps, net_pnl_quote, markout_1s_bps, markout_5s_bps,
+         markout_30s_bps, time_weighted_uptime_pct, inventory_nonzero_ms,
+         inventory_abs_qty_ms, funding_available, net_pnl_complete,
+         row_number() OVER (PARTITION BY run_id ORDER BY _timestamp DESC) AS rn
+  FROM "{stream}" WHERE action = 'performance_summary'
+)
+SELECT _timestamp, run_id, config_hash, symbol, passive_fills, exit_fills,
+       passive_capture_bps, net_pnl_quote, markout_1s_bps, markout_5s_bps,
+       markout_30s_bps, time_weighted_uptime_pct, inventory_nonzero_ms,
+       inventory_abs_qty_ms, funding_available, net_pnl_complete
+FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
+                [
+                    axis("_timestamp", "Time"),
+                    axis("run_id", "Run"),
+                    axis("config_hash", "Config"),
+                    axis("symbol", "Symbol"),
+                ],
+                [
+                    axis("net_pnl_quote", "Net PnL"),
+                    axis("markout_5s_bps", "5s markout"),
+                    axis("time_weighted_uptime_pct", "Uptime"),
+                ],
+            ),
+            (0, 45, 192, 10, 7),
+            decimals=None,
+        ),
+        panel(
+            "standx_latency_run_comparison",
+            "table",
+            "Phase-1 Latency by Run / Config",
+            "Latest place/cancel distribution per run and config, retaining timeout and reject rates. This table intentionally ignores the run selector.",
+            query(
+                stream,
+                f'''WITH ranked AS (
+  SELECT _timestamp, run_id, config_hash, symbol, kind, requests, reject_rate,
+         timeout_rate, write_p95_ms, ack_p95_ms, effective_latency_p95_ms,
+         fill_after_cancel_p95_ms,
+         row_number() OVER (PARTITION BY run_id, kind ORDER BY _timestamp DESC) AS rn
+  FROM "{stream}" WHERE action = 'order_latency_summary'
+)
+SELECT _timestamp, run_id, config_hash, symbol, kind, requests, reject_rate,
+       timeout_rate, write_p95_ms, ack_p95_ms, effective_latency_p95_ms,
+       fill_after_cancel_p95_ms
+FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC, kind LIMIT 100''',
+                [
+                    axis("_timestamp", "Time"),
+                    axis("run_id", "Run"),
+                    axis("config_hash", "Config"),
+                    axis("symbol", "Symbol"),
+                    axis("kind", "Kind"),
+                ],
+                [
+                    axis("timeout_rate", "Timeout rate"),
+                    axis("ack_p95_ms", "Ack p95"),
+                    axis("effective_latency_p95_ms", "Effective p95"),
+                ],
+            ),
+            (0, 55, 192, 10, 8),
+            decimals=None,
+        ),
     ]
 
     return {
-        "version": 8,
+        "version": 9,
         "dashboardId": "",
         "title": DASHBOARD_TITLE,
         "description": "Maker paper/live validation: uptime, fills, maker-session PnL, authenticated account-stream health, position jumps, reconciliation, cleanup, volatility breaker, and inventory exit evidence.",

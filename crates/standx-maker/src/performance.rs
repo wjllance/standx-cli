@@ -309,6 +309,8 @@ pub struct PerformanceSummary {
     pub rebate_quote: f64,
     pub execution_costs_unavailable: u64,
     pub funding_quote: f64,
+    pub funding_available: bool,
+    pub net_pnl_complete: bool,
     pub exit_cost_quote: f64,
     pub inventory_mtm_change_quote: f64,
     pub net_pnl_quote: f64,
@@ -337,6 +339,7 @@ pub struct PerformanceLedger {
     fee_quote: f64,
     rebate_quote: f64,
     funding_quote: f64,
+    funding_observed: bool,
     exit_cost_quote: f64,
     seen_trade_ids: HashSet<u64>,
     costs_by_trade_id: HashMap<u64, ExecutionCosts>,
@@ -374,6 +377,7 @@ impl PerformanceLedger {
             fee_quote: 0.0,
             rebate_quote: 0.0,
             funding_quote: 0.0,
+            funding_observed: false,
             exit_cost_quote: 0.0,
             seen_trade_ids: HashSet::new(),
             costs_by_trade_id: HashMap::new(),
@@ -556,6 +560,7 @@ impl PerformanceLedger {
             }
         }
         self.last_funding_time_ms = Some(event_time_ms);
+        self.funding_observed = true;
         self.funding_quote += cashflow_quote;
         Ok(())
     }
@@ -623,6 +628,10 @@ impl PerformanceLedger {
             }
         });
         let inventory_time = self.inventory_time_summary();
+        let execution_costs_unavailable =
+            self.seen_trade_ids
+                .len()
+                .saturating_sub(self.costs_by_trade_id.len()) as u64;
         Ok(PerformanceSummary {
             passive_fills: self.passive_fills,
             passive_qty: self.passive_qty,
@@ -635,12 +644,10 @@ impl PerformanceLedger {
             gross_spread_quote: self.gross_spread_quote,
             fee_quote: self.fee_quote,
             rebate_quote: self.rebate_quote,
-            execution_costs_unavailable: self
-                .seen_trade_ids
-                .len()
-                .saturating_sub(self.costs_by_trade_id.len())
-                as u64,
+            execution_costs_unavailable,
             funding_quote: self.funding_quote,
+            funding_available: self.funding_observed,
+            net_pnl_complete: execution_costs_unavailable == 0 && self.funding_observed,
             exit_cost_quote: self.exit_cost_quote,
             inventory_mtm_change_quote,
             net_pnl_quote,
@@ -652,8 +659,7 @@ impl PerformanceLedger {
     }
 
     fn inventory_time_summary(&self) -> InventoryTimeSummary {
-        let (Some(start_ms), Some(end_ms)) =
-            (self.observation_start_ms, self.observation_end_ms)
+        let (Some(start_ms), Some(end_ms)) = (self.observation_start_ms, self.observation_end_ms)
         else {
             return InventoryTimeSummary::default();
         };
@@ -860,6 +866,29 @@ mod tests {
             ),
             Err(PerformanceError::ConflictingExecutionCosts { trade_id: 1 })
         ));
+    }
+
+    #[test]
+    fn missing_funding_is_explicit_and_zero_event_completes_attribution() {
+        let mut ledger = PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger
+            .record_fill(fill(
+                1,
+                FillRole::PassiveMaker,
+                OrderSide::Buy,
+                100.0,
+                1.0,
+                0,
+            ))
+            .unwrap();
+        let incomplete = ledger.summary(100.0).unwrap();
+        assert!(!incomplete.funding_available);
+        assert!(!incomplete.net_pnl_complete);
+
+        ledger.record_funding(0, 0.0).unwrap();
+        let complete = ledger.summary(100.0).unwrap();
+        assert!(complete.funding_available);
+        assert!(complete.net_pnl_complete);
     }
 
     #[test]

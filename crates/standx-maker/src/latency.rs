@@ -63,6 +63,13 @@ pub enum LatencyError {
         intent_ms: u64,
         event_ms: u64,
     },
+    TimeBeforeStage {
+        request_id: String,
+        earlier_stage: &'static str,
+        earlier_ms: u64,
+        event_stage: &'static str,
+        event_ms: u64,
+    },
     DuplicateStage {
         request_id: String,
         stage: &'static str,
@@ -89,6 +96,16 @@ impl fmt::Display for LatencyError {
             } => write!(
                 formatter,
                 "latency event for {request_id} at {event_ms} precedes intent at {intent_ms}"
+            ),
+            Self::TimeBeforeStage {
+                request_id,
+                earlier_stage,
+                earlier_ms,
+                event_stage,
+                event_ms,
+            } => write!(
+                formatter,
+                "latency {event_stage} for {request_id} at {event_ms} precedes {earlier_stage} at {earlier_ms}"
             ),
             Self::DuplicateStage { request_id, stage } => {
                 write!(
@@ -168,6 +185,20 @@ impl OrderLatencyTracker {
         if request.written_ms.is_some() {
             return Err(duplicate_stage(request_id, "write"));
         }
+        if let Some((event_stage, event_ms)) =
+            [("ack", request.ack_ms), ("effective", request.effective_ms)]
+                .into_iter()
+                .filter_map(|(stage, value)| value.map(|at| (stage, at)))
+                .find(|(_, event_ms)| *event_ms < at_ms)
+        {
+            return Err(LatencyError::TimeBeforeStage {
+                request_id: request_id.to_string(),
+                earlier_stage: "write",
+                earlier_ms: at_ms,
+                event_stage,
+                event_ms,
+            });
+        }
         request.written_ms = Some(at_ms);
         Ok(())
     }
@@ -182,6 +213,7 @@ impl OrderLatencyTracker {
         if request.ack_ms.is_some() {
             return Err(duplicate_stage(request_id, "ack"));
         }
+        require_not_before(request_id, "write", request.written_ms, "ack", at_ms)?;
         if !accepted {
             if request.effective_ms.is_some() {
                 return Err(LatencyError::InvalidTransition {
@@ -202,6 +234,7 @@ impl OrderLatencyTracker {
         if request.effective_ms.is_some() {
             return Err(duplicate_stage(request_id, "effective"));
         }
+        require_not_before(request_id, "write", request.written_ms, "effective", at_ms)?;
         match request.outcome {
             Some(LatencyRequestOutcome::Rejected) => {
                 return Err(LatencyError::InvalidTransition {
@@ -248,6 +281,25 @@ impl OrderLatencyTracker {
             .collect::<Vec<_>>();
         for request_id in &request_ids {
             self.mark_timeout(request_id, at_ms)?;
+        }
+        Ok(request_ids.len())
+    }
+
+    /// Censor every non-terminal request owned by an invalidated projection
+    /// generation. Late ack/effective events remain attachable without
+    /// changing the explicit invalidated outcome.
+    pub fn invalidate_generation(
+        &mut self,
+        generation: u64,
+        at_ms: u64,
+    ) -> Result<usize, LatencyError> {
+        let request_ids = self
+            .requests()
+            .filter(|request| request.context.generation == generation && request.outcome.is_none())
+            .map(|request| request.context.request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in &request_ids {
+            self.mark_invalidated(request_id, at_ms)?;
         }
         Ok(request_ids.len())
     }
@@ -438,6 +490,25 @@ fn duplicate_stage(request_id: &str, stage: &'static str) -> LatencyError {
         request_id: request_id.to_string(),
         stage,
     }
+}
+
+fn require_not_before(
+    request_id: &str,
+    earlier_stage: &'static str,
+    earlier_ms: Option<u64>,
+    event_stage: &'static str,
+    event_ms: u64,
+) -> Result<(), LatencyError> {
+    if let Some(earlier_ms) = earlier_ms.filter(|earlier_ms| event_ms < *earlier_ms) {
+        return Err(LatencyError::TimeBeforeStage {
+            request_id: request_id.to_string(),
+            earlier_stage,
+            earlier_ms,
+            event_stage,
+            event_ms,
+        });
+    }
+    Ok(())
 }
 
 fn rate(count: u64, total: u64) -> f64 {
@@ -638,5 +709,77 @@ mod tests {
             tracker.mark_effective("p1", 120),
             Err(LatencyError::InvalidTransition { .. })
         ));
+    }
+
+    #[test]
+    fn lifecycle_stages_cannot_create_negative_durations() {
+        let mut tracker = OrderLatencyTracker::default();
+        tracker
+            .register(context("ack", LatencyRequestKind::Place, 100))
+            .unwrap();
+        tracker.mark_written("ack", 110).unwrap();
+        assert!(matches!(
+            tracker.mark_ack("ack", 109, true),
+            Err(LatencyError::TimeBeforeStage { .. })
+        ));
+
+        tracker
+            .register(context("effective", LatencyRequestKind::Place, 100))
+            .unwrap();
+        tracker.mark_effective("effective", 105).unwrap();
+        assert!(matches!(
+            tracker.mark_written("effective", 110),
+            Err(LatencyError::TimeBeforeStage { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_generation_invalidation_survives_late_ack_and_effective() {
+        let mut tracker = OrderLatencyTracker::default();
+        let mut stale = context("stale", LatencyRequestKind::Place, 100);
+        stale.generation = 9;
+        stale.recovery = true;
+        tracker.register(stale).unwrap();
+        tracker.mark_written("stale", 110).unwrap();
+        tracker.mark_invalidated("stale", 120).unwrap();
+        tracker.mark_ack("stale", 130, true).unwrap();
+        tracker.mark_effective("stale", 140).unwrap();
+
+        let request = tracker.requests().next().unwrap();
+        assert_eq!(request.context.generation, 9);
+        assert!(request.context.recovery);
+        assert_eq!(request.outcome, Some(LatencyRequestOutcome::Invalidated));
+        assert_eq!(request.ack_ms, Some(130));
+        assert_eq!(request.effective_ms, Some(140));
+        assert_eq!(tracker.summary(LatencyRequestKind::Place).pending, 0);
+    }
+
+    #[test]
+    fn generation_invalidation_censors_only_unresolved_requests_in_that_generation() {
+        let mut tracker = OrderLatencyTracker::default();
+        let mut old = context("old", LatencyRequestKind::Place, 100);
+        old.generation = 4;
+        tracker.register(old).unwrap();
+        let mut settled = context("settled", LatencyRequestKind::Place, 100);
+        settled.generation = 4;
+        tracker.register(settled).unwrap();
+        tracker.mark_effective("settled", 110).unwrap();
+        let mut current = context("current", LatencyRequestKind::Place, 100);
+        current.generation = 5;
+        tracker.register(current).unwrap();
+
+        assert_eq!(tracker.invalidate_generation(4, 120).unwrap(), 1);
+        let outcomes = tracker
+            .requests()
+            .map(|request| (request.context.request_id.as_str(), request.outcome))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("old", Some(LatencyRequestOutcome::Invalidated)),
+                ("settled", Some(LatencyRequestOutcome::Effective)),
+                ("current", None),
+            ]
+        );
     }
 }

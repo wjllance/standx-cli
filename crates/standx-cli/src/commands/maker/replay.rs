@@ -464,6 +464,8 @@ fn summary_json(trace: &ParsedTrace, result: &ReplayResult) -> serde_json::Value
         "rebate_quote": performance.rebate_quote,
         "execution_costs_unavailable": performance.execution_costs_unavailable,
         "funding_quote": performance.funding_quote,
+        "funding_available": performance.funding_available,
+        "net_pnl_complete": performance.net_pnl_complete,
         "exit_cost_quote": performance.exit_cost_quote,
         "inventory_mtm_change_quote": performance.inventory_mtm_change_quote,
         "net_pnl_quote": performance.net_pnl_quote,

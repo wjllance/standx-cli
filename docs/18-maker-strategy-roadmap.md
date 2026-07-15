@@ -145,25 +145,25 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 ### 验收标准
 
-- [ ] 同一 trace、配置和 seed 连续重放三次，结构化 summary 完全一致。
-- [ ] WS→REST、REST→WS、重复成交、部分成交后撤单均只记账一次。
-- [ ] passive fill 和 active exit 的数量、现金流、capture/exit cost 可独立汇总。
-- [ ] `gross spread + inventory MTM change + rebate - fee + signed funding cashflow - exit cost` 与 net PnL 的差异不超过一个计价币最小精度单位；无法换算的费用单列且不静默忽略。
-- [ ] 1s/5s/30s markout 使用成交时点后的行情；缺失窗口标为 unavailable，不使用回补时的当前 mark 伪造。
-- [ ] 合成 trace 中时间加权 uptime、深度时间积分和库存持有时间与手工计算一致。
-- [ ] 100% 已注册 place/cancel request 最终归入 accepted、rejected、effective、timeout、
+- [x] 同一 trace、配置和 seed 连续重放三次，结构化 summary 完全一致。
+- [x] WS→REST、REST→WS、重复成交、部分成交后撤单均只记账一次。
+- [x] passive fill 和 active exit 的数量、现金流、capture/exit cost 可独立汇总。
+- [x] `gross spread + inventory MTM change + rebate - fee + signed funding cashflow - exit cost` 与 net PnL 的差异不超过一个计价币最小精度单位；无法换算的费用单列且不静默忽略。
+- [x] 1s/5s/30s markout 使用成交时点后的行情；缺失窗口标为 unavailable，不使用回补时的当前 mark 伪造。
+- [x] 合成 trace 中时间加权 uptime、深度时间积分和库存持有时间与手工计算一致。
+- [x] 100% 已注册 place/cancel request 最终归入 accepted、rejected、effective、timeout、
   invalidated 或 process_ended 之一；没有无解释的 pending request。
-- [ ] 同一请求的生命周期时间单调、duration 非负，并正确覆盖 account-order 先于 ack、晚到
+- [x] 同一请求的生命周期时间单调、duration 非负，并正确覆盖 account-order 先于 ack、晚到
   ack、拒单、超时、重连和 stale generation。
-- [ ] place/cancel 分别输出 p50、p95、p99、timeout rate 和 reject rate；超时样本作为
+- [x] place/cancel 分别输出 p50、p95、p99、timeout rate 和 reject rate；超时样本作为
   censored/timeout 保留，不从分布中静默删除。
-- [ ] `cancel_effective_ms` 能与 `fill_after_cancel_ms`、负向 markout 和仓位跳变按
+- [x] `cancel_effective_ms` 能与 `fill_after_cancel_ms`、负向 markout 和仓位跳变按
   `run_id/config_hash/symbol` 关联查询。
-- [ ] 延迟指标可按正常运行/recovery、symbol、side、level 和 market source 分组，且不会把
+- [x] 延迟指标可按正常运行/recovery、symbol、side、level 和 market source 分组，且不会把
   socket write success 误标为 venue accepted。
-- [ ] replay runner 不访问网络、环境变量、终端或实时时钟，且不会执行任何订单 I/O。
-- [ ] 旧 JSON 字段语义不变；新增字段在旧消费者缺失时仍可正常工作。
-- [ ] dashboard 能按 `run_id/config_hash` 对比上述指标，区分 passive fill 与 inventory exit，
+- [x] replay runner 不访问网络、环境变量、终端或实时时钟，且不会执行任何订单 I/O。
+- [x] 旧 JSON 字段语义不变；新增字段在旧消费者缺失时仍可正常工作。
+- [x] dashboard 能按 `run_id/config_hash` 对比上述指标，区分 passive fill 与 inventory exit，
   并展示 place/cancel latency 分位数、超时率和撤单后晚到成交。
 
 ## 阶段 2：自适应 Spread 与 Refresh

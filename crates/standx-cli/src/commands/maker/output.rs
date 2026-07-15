@@ -102,40 +102,7 @@ pub(super) fn emit_order_latency(
         }
         for kind in [LatencyRequestKind::Place, LatencyRequestKind::Cancel] {
             let summary = tracker.summary(kind);
-            println!(
-                "{}",
-                serde_json::json!({
-                    "action": "order_latency_summary",
-                    "symbol": symbol,
-                    "kind": latency_kind(kind),
-                    "requests": summary.requests,
-                    "accepted": summary.accepted,
-                    "rejected": summary.rejected,
-                    "effective": summary.effective,
-                    "timeout": summary.timeout,
-                    "invalidated": summary.invalidated,
-                    "process_ended": summary.process_ended,
-                    "pending": summary.pending,
-                    "reject_rate": summary.reject_rate,
-                    "timeout_rate": summary.timeout_rate,
-                    "write": latency_metric_json(summary.write),
-                    "ack": latency_metric_json(summary.ack),
-                    "effective_latency": latency_metric_json(summary.effective_latency),
-                    "fill_after_cancel": latency_metric_json(summary.fill_after_cancel),
-                    "write_p50_ms": summary.write.p50_ms,
-                    "write_p95_ms": summary.write.p95_ms,
-                    "write_p99_ms": summary.write.p99_ms,
-                    "ack_p50_ms": summary.ack.p50_ms,
-                    "ack_p95_ms": summary.ack.p95_ms,
-                    "ack_p99_ms": summary.ack.p99_ms,
-                    "effective_latency_p50_ms": summary.effective_latency.p50_ms,
-                    "effective_latency_p95_ms": summary.effective_latency.p95_ms,
-                    "effective_latency_p99_ms": summary.effective_latency.p99_ms,
-                    "fill_after_cancel_p50_ms": summary.fill_after_cancel.p50_ms,
-                    "fill_after_cancel_p95_ms": summary.fill_after_cancel.p95_ms,
-                    "fill_after_cancel_p99_ms": summary.fill_after_cancel.p99_ms,
-                })
-            );
+            println!("{}", latency_summary_json(symbol, &summary));
         }
     } else if output_format != OutputFormat::Quiet {
         for kind in [LatencyRequestKind::Place, LatencyRequestKind::Cancel] {
@@ -180,6 +147,40 @@ fn latency_metric_json(metric: standx_maker::LatencyMetricSummary) -> serde_json
         "p50_ms": metric.p50_ms,
         "p95_ms": metric.p95_ms,
         "p99_ms": metric.p99_ms,
+    })
+}
+
+fn latency_summary_json(symbol: &str, summary: &standx_maker::LatencySummary) -> serde_json::Value {
+    serde_json::json!({
+        "action": "order_latency_summary",
+        "symbol": symbol,
+        "kind": latency_kind(summary.kind),
+        "requests": summary.requests,
+        "accepted": summary.accepted,
+        "rejected": summary.rejected,
+        "effective": summary.effective,
+        "timeout": summary.timeout,
+        "invalidated": summary.invalidated,
+        "process_ended": summary.process_ended,
+        "pending": summary.pending,
+        "reject_rate": summary.reject_rate,
+        "timeout_rate": summary.timeout_rate,
+        "write": latency_metric_json(summary.write),
+        "ack": latency_metric_json(summary.ack),
+        "effective_latency": latency_metric_json(summary.effective_latency),
+        "fill_after_cancel": latency_metric_json(summary.fill_after_cancel),
+        "write_p50_ms": summary.write.p50_ms,
+        "write_p95_ms": summary.write.p95_ms,
+        "write_p99_ms": summary.write.p99_ms,
+        "ack_p50_ms": summary.ack.p50_ms,
+        "ack_p95_ms": summary.ack.p95_ms,
+        "ack_p99_ms": summary.ack.p99_ms,
+        "effective_latency_p50_ms": summary.effective_latency.p50_ms,
+        "effective_latency_p95_ms": summary.effective_latency.p95_ms,
+        "effective_latency_p99_ms": summary.effective_latency.p99_ms,
+        "fill_after_cancel_p50_ms": summary.fill_after_cancel.p50_ms,
+        "fill_after_cancel_p95_ms": summary.fill_after_cancel.p95_ms,
+        "fill_after_cancel_p99_ms": summary.fill_after_cancel.p99_ms,
     })
 }
 
@@ -256,6 +257,8 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
                         "action": "fill", "side": fill.side,
                         "price": format_decimals(fill.price, cfg.price_decimals),
                         "qty": format_decimals(fill.qty, cfg.qty_decimals),
+                        "mark_at_fill": fill.mark_at_fill,
+                        "event_time_ms": fill.event_time_ms,
                         "trade_id": fill.trade_id,
                         "order_id": fill.order_id,
                         "trade_ts": fill.trade_ts,
@@ -468,6 +471,8 @@ fn performance_json(summary: &maker::PerformanceSummary) -> serde_json::Value {
         "rebate_quote": summary.rebate_quote,
         "execution_costs_unavailable": summary.execution_costs_unavailable,
         "funding_quote": summary.funding_quote,
+        "funding_available": summary.funding_available,
+        "net_pnl_complete": summary.net_pnl_complete,
         "exit_cost_quote": summary.exit_cost_quote,
         "inventory_mtm_change_quote": summary.inventory_mtm_change_quote,
         "net_pnl_quote": summary.net_pnl_quote,
@@ -613,6 +618,14 @@ pub(super) fn emit_live_fill(
                 "side": fill.side,
                 "price": fill.price,
                 "qty": fill.qty,
+                "mark_at_fill": fill.mark_at_fill,
+                "event_time_ms": fill.event_time_ms,
+                "role": match fill.role {
+                    maker::FillRole::PassiveMaker => "passive_maker",
+                    maker::FillRole::InventoryExit => "inventory_exit",
+                },
+                "fee_quote": fill.costs.map(|costs| costs.fee_quote),
+                "rebate_quote": fill.costs.map(|costs| costs.rebate_quote),
             })
         ),
         _ => eprintln!(
@@ -883,5 +896,66 @@ mod tests {
         assert_eq!(format_account_amount("101.375"), "101.38");
         assert_eq!(format_account_amount("-0.005"), "-0.01");
         assert_eq!(format_account_amount("unavailable"), "unavailable");
+    }
+
+    #[test]
+    fn phase_one_performance_json_exposes_cashflow_capture_and_inventory_time() {
+        let mut ledger = maker::PerformanceLedger::new(0.0, 100.0).unwrap();
+        ledger.observe_market(0, 100.0).unwrap();
+        ledger
+            .record_fill(maker::PerformanceFill {
+                trade_id: 1,
+                order_id: 2,
+                role: maker::FillRole::PassiveMaker,
+                side: OrderSide::Buy,
+                price: 99.0,
+                qty: 1.0,
+                mark_at_fill: 100.0,
+                event_time_ms: 0,
+                costs: Some(maker::ExecutionCosts::default()),
+            })
+            .unwrap();
+        ledger.finish(1_000).unwrap();
+        let json = performance_json(&ledger.summary(100.0).unwrap());
+
+        assert_eq!(json["passive_cashflow_quote"], -99.0);
+        assert!(json["passive_capture_bps"].as_f64().unwrap() > 100.0);
+        assert_eq!(json["inventory_nonzero_ms"], 1_000);
+        assert_eq!(json["inventory_abs_qty_ms"], 1_000.0);
+    }
+
+    #[test]
+    fn latency_summary_json_has_flat_dashboard_fields_and_symbol() {
+        let metric = maker::LatencyMetricSummary {
+            samples: 3,
+            p50_ms: Some(10),
+            p95_ms: Some(20),
+            p99_ms: Some(30),
+        };
+        let summary = maker::LatencySummary {
+            kind: maker::LatencyRequestKind::Cancel,
+            requests: 3,
+            accepted: 1,
+            rejected: 0,
+            effective: 1,
+            timeout: 1,
+            invalidated: 0,
+            process_ended: 0,
+            pending: 0,
+            reject_rate: 0.0,
+            timeout_rate: 1.0 / 3.0,
+            write: metric,
+            ack: metric,
+            effective_latency: metric,
+            fill_after_cancel: metric,
+        };
+        let json = latency_summary_json("XAG-USD", &summary);
+
+        assert_eq!(json["symbol"], "XAG-USD");
+        assert_eq!(json["kind"], "cancel");
+        assert_eq!(json["ack_p95_ms"], 20);
+        assert_eq!(json["effective_latency_p99_ms"], 30);
+        assert_eq!(json["fill_after_cancel_p50_ms"], 10);
+        assert_eq!(json["ack"]["p95_ms"], 20);
     }
 }
