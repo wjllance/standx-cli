@@ -1376,7 +1376,7 @@ pub(super) async fn run_maker(
                                 );
                             }
                         }
-                        match reconcile_ledger_snapshot(
+                        match probe_position_convergence(
                             &client,
                             ReconcileRequest {
                                 symbol: &symbol,
@@ -1387,21 +1387,19 @@ pub(super) async fn run_maker(
                             },
                             &mut ledger,
                             &mut stats,
+                            &mut reconnect_fills,
+                            cycle,
+                            output_format,
                         )
                         .await
                         {
-                            Ok((obs, fills)) => {
+                            ConvergenceProbe::Converged { observed: obs } => {
                                 observed = obs;
-                                reconnect_fills += fills.len() as u64;
-                                for fill in &fills {
-                                    emit_live_fill(fill, &symbol, cycle, output_format);
-                                }
-                                if (observed - ledger.expected_position).abs() <= qty_tolerance {
-                                    gap_closed = true;
-                                    break;
-                                }
+                                gap_closed = true;
+                                break;
                             }
-                            Err(error) => eprintln!(
+                            ConvergenceProbe::Pending { observed: obs } => observed = obs,
+                            ConvergenceProbe::SnapshotFailed(error) => eprintln!(
                                 "⚠️  account stream reconnect REST trade backfill failed: {error}"
                             ),
                         }
@@ -2543,7 +2541,7 @@ pub(super) async fn run_maker(
                                 }
                             }
                         }
-                        match reconcile_ledger_snapshot(
+                        match probe_position_convergence(
                             &client,
                             ReconcileRequest {
                                 symbol: &symbol,
@@ -2554,26 +2552,26 @@ pub(super) async fn run_maker(
                             },
                             &mut ledger,
                             &mut stats,
+                            &mut total_fills,
+                            cycle,
+                            output_format,
                         )
                         .await
                         {
-                            Ok((observed, fills)) => {
+                            ConvergenceProbe::Converged { observed } => {
                                 last_observed = observed;
-                                total_fills += fills.len() as u64;
-                                for fill in &fills {
-                                    emit_live_fill(fill, &symbol, cycle, output_format);
-                                }
-                                if (observed - ledger.expected_position).abs() <= qty_tolerance {
-                                    recovered = true;
-                                    break;
-                                }
+                                recovered = true;
+                                break;
                             }
-                            Err(error) => emit_reconciliation_snapshot_error(
-                                output_format,
-                                &symbol,
-                                cycle,
-                                &error.to_string(),
-                            ),
+                            ConvergenceProbe::Pending { observed } => last_observed = observed,
+                            ConvergenceProbe::SnapshotFailed(error) => {
+                                emit_reconciliation_snapshot_error(
+                                    output_format,
+                                    &symbol,
+                                    cycle,
+                                    &error.to_string(),
+                                )
+                            }
                         }
                     }
                     if recovered {

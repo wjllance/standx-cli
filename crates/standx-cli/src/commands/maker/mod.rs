@@ -46,8 +46,8 @@ use pipeline::{
     CycleRequest, CycleState, LiveAccountPollState, OrderRequestDeadlines, TimedOutOrderRequest,
 };
 use recovery::{
-    cancel_maker_orders_with_retry, ctrl_c_latched, reconcile_ledger_snapshot,
-    reconnect_account_stream, reconnect_order_response, AccountStreamReconnect,
+    cancel_maker_orders_with_retry, ctrl_c_latched, probe_position_convergence,
+    reconnect_account_stream, reconnect_order_response, AccountStreamReconnect, ConvergenceProbe,
     PositionReconciliationCause, PositionReconciliationError, ReconcileRequest,
     ReconnectInterrupted, ReconnectRequest,
 };
