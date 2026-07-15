@@ -438,7 +438,7 @@ mod tests {
             .timed_out(&projection, submitted_at + timeout, timeout)
             .expect("a preserved unacked placement must still fail closed on timeout");
         assert_eq!(timed_out.kind, OrderRequestKind::Place);
-        assert_eq!(timed_out.phase, OrderRequestTimeoutPhase::Acknowledgement);
+        assert_eq!(timed_out.phase, RequestTimeoutPhase::Acknowledgement);
     }
 
     #[test]
