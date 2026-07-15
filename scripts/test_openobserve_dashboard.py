@@ -21,7 +21,7 @@ class DashboardContractTests(unittest.TestCase):
         return self.phase_one[panel_id]["queries"][0]["query"]
 
     def test_phase_one_tab_has_unique_required_panels(self) -> None:
-        self.assertEqual(self.payload["version"], 9)
+        self.assertEqual(self.payload["version"], 10)
         self.assertEqual(
             set(self.phase_one),
             {
@@ -62,6 +62,9 @@ class DashboardContractTests(unittest.TestCase):
             "fill_after_cancel_p95_ms",
         ):
             self.assertIn(field, latency)
+        latency_events = self.query_sql("standx_order_latency_events")
+        for field in ("timeout_phase", "timeout_ms"):
+            self.assertIn(field, latency_events)
         for panel_id in (
             "standx_net_pnl_attribution",
             "standx_markout",

@@ -96,6 +96,8 @@ pub(super) fn emit_order_latency(
                     "cancel_effective_ms": (context.kind == LatencyRequestKind::Cancel)
                         .then(|| request.effective_ms.map(|at| at - context.intent_ms)).flatten(),
                     "fill_after_cancel_ms": request.fill_after_cancel_ms,
+                    "timeout_phase": request.timeout_phase.map(|phase| phase.label()),
+                    "timeout_ms": request.timeout_ms,
                     "outcome": request.outcome.map(latency_outcome),
                 })
             );

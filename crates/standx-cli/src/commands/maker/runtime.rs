@@ -17,6 +17,46 @@ fn order_request_timeout_detail(timeout: &TimedOutOrderRequest) -> String {
     )
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn request_timeout_notice<'a>(
+    timeout: &'a TimedOutOrderRequest,
+    message: &'a str,
+    symbol: &'a str,
+    cycle: u64,
+    expected_position: f64,
+) -> RequestTimeoutNotice<'a> {
+    RequestTimeoutNotice {
+        message,
+        symbol,
+        cycle,
+        request_id: &timeout.request_id,
+        request_kind: timeout.kind.label(),
+        timeout_phase: timeout.phase.label(),
+        age_ms: duration_ms(timeout.age),
+        timeout_ms: duration_ms(ORDER_REQUEST_TIMEOUT),
+        recovery_target: timeout.phase.recovery_target().label(),
+        expected_position,
+    }
+}
+
+fn mark_request_timeout_stream_unhealthy(
+    account_stream_health: &standx_sdk::account_stream::AccountStreamHealth,
+    order_response_health: &standx_sdk::order_response::OrderResponseHealth,
+    timeout: &TimedOutOrderRequest,
+    detail: &str,
+) {
+    match timeout.phase.recovery_target() {
+        RecoveryTarget::AccountStream => account_stream_health.mark_unhealthy(detail.to_string()),
+        RecoveryTarget::OrderResponse => order_response_health.mark_unhealthy(detail.to_string()),
+        RecoveryTarget::PositionReconciliation => {
+            unreachable!("request timeout phases never target position reconciliation")
+        }
+    }
+}
+
 fn take_cleanup_effect(
     runtime_state: &mut MakerState,
     expected_target: RecoveryTarget,
@@ -162,6 +202,11 @@ struct RecoveryIo<'a> {
 /// Everything that differs between the three incident flows' freeze/cleanup
 /// preambles. The `notice` is built entirely by the caller so the risk
 /// payloads stay reviewable string-for-string at the call sites.
+enum FreezeNotice<'a> {
+    Risk(RiskNotice<'a>),
+    RequestTimeout(RequestTimeoutNotice<'a>),
+}
+
 struct FreezeSpec<'a> {
     target: RecoveryTarget,
     trigger: MakerEvent,
@@ -171,7 +216,7 @@ struct FreezeSpec<'a> {
     /// reason so each flow keeps its exact historical wording.
     cleanup_failure_prefix: String,
     cleanup_failed_exit: fn(String) -> MakerExit,
-    notice: RiskNotice<'a>,
+    notice: FreezeNotice<'a>,
     frozen_note: Option<ReconciliationStateNote>,
     /// Account-stream flow only: abort the stale stream task before
     /// reporting cleanup complete.
@@ -210,7 +255,10 @@ async fn freeze_and_cleanup_for_recovery(
             note.observed,
         );
     }
-    io.notifier.risk(spec.notice, false).await;
+    match spec.notice {
+        FreezeNotice::Risk(notice) => io.notifier.risk(notice, false).await,
+        FreezeNotice::RequestTimeout(notice) => io.notifier.request_timeout(notice, false).await,
+    }
     if let Err(error) =
         cancel_maker_orders_with_retry(io.client, io.symbol, 3, io.output_format).await
     {
@@ -1296,6 +1344,10 @@ pub(super) async fn run_maker(
         args.recovery_window_secs,
     );
     let mut account_position_mismatch: Option<f64> = None;
+    // Retain the request correlation across the loop boundary so the shared
+    // stream-recovery preamble emits one phase-aware timeout event instead of
+    // an additional generic disconnect warning.
+    let mut pending_request_timeout: Option<TimedOutOrderRequest> = None;
     let mut account_order_reconciliation_required = false;
     // A wallet-level WS balance update cannot be substituted for the unified
     // REST equity/margin model. Coalesce updates into one immediate
@@ -1380,6 +1432,38 @@ pub(super) async fn run_maker(
                 let message = format!(
                     "account stream unavailable; placements frozen and cleanup starting: {detail}"
                 );
+                let request_timeout = if pending_request_timeout.as_ref().is_some_and(|timeout| {
+                    timeout.phase.recovery_target() == RecoveryTarget::AccountStream
+                }) {
+                    pending_request_timeout.take()
+                } else {
+                    None
+                };
+                let notice = request_timeout.as_ref().map_or_else(
+                    || {
+                        FreezeNotice::Risk(RiskNotice {
+                            kind: "account_stream",
+                            severity: "warning",
+                            event: "disconnected_frozen",
+                            message: &message,
+                            symbol: &symbol,
+                            cycle,
+                            position_before: None,
+                            position_after: None,
+                            expected: Some(ledger.expected_position),
+                            observed: None,
+                        })
+                    },
+                    |timeout| {
+                        FreezeNotice::RequestTimeout(request_timeout_notice(
+                            timeout,
+                            &detail,
+                            &symbol,
+                            cycle,
+                            ledger.expected_position,
+                        ))
+                    },
+                );
                 // Freeze immediately: no further cycle can place while the
                 // authoritative account stream is unavailable. The stale
                 // receiver/health stay in place until the reconnect replaces
@@ -1405,18 +1489,7 @@ pub(super) async fn run_maker(
                         recovery_effect_stop: EffectFailureStop::PositionReconciliation,
                         cleanup_failure_prefix: format!("account stream disconnected ({detail}); "),
                         cleanup_failed_exit: MakerExit::PositionReconciliation,
-                        notice: RiskNotice {
-                            kind: "account_stream",
-                            severity: "warning",
-                            event: "disconnected_frozen",
-                            message: &message,
-                            symbol: &symbol,
-                            cycle,
-                            position_before: None,
-                            position_after: None,
-                            expected: Some(ledger.expected_position),
-                            observed: None,
-                        },
+                        notice,
                         frozen_note: None,
                         abort_account_stream_handle: true,
                         projection_reset: ProjectionReset::PreservePendingAcks,
@@ -1693,6 +1766,38 @@ pub(super) async fn run_maker(
                 // previously silent on the webhook across disconnect/reconnect.
                 let disconnect_message =
                     format!("order-response stream unavailable; placements frozen: {detail}");
+                let request_timeout = if pending_request_timeout.as_ref().is_some_and(|timeout| {
+                    timeout.phase.recovery_target() == RecoveryTarget::OrderResponse
+                }) {
+                    pending_request_timeout.take()
+                } else {
+                    None
+                };
+                let notice = request_timeout.as_ref().map_or_else(
+                    || {
+                        FreezeNotice::Risk(RiskNotice {
+                            kind: "order_response",
+                            severity: "warning",
+                            event: "disconnected_frozen",
+                            message: &disconnect_message,
+                            symbol: &symbol,
+                            cycle,
+                            position_before: None,
+                            position_after: None,
+                            expected: Some(ledger.expected_position),
+                            observed: None,
+                        })
+                    },
+                    |timeout| {
+                        FreezeNotice::RequestTimeout(request_timeout_notice(
+                            timeout,
+                            &detail,
+                            &symbol,
+                            cycle,
+                            ledger.expected_position,
+                        ))
+                    },
+                );
                 let recovery_token = match freeze_and_cleanup_for_recovery(
                     &mut RecoveryIo {
                         runtime_state: &mut runtime_state,
@@ -1714,18 +1819,7 @@ pub(super) async fn run_maker(
                         recovery_effect_stop: EffectFailureStop::OrderResponse,
                         cleanup_failure_prefix: "order-response ".to_string(),
                         cleanup_failed_exit: MakerExit::OrderResponse,
-                        notice: RiskNotice {
-                            kind: "order_response",
-                            severity: "warning",
-                            event: "disconnected_frozen",
-                            message: &disconnect_message,
-                            symbol: &symbol,
-                            cycle,
-                            position_before: None,
-                            position_after: None,
-                            expected: Some(ledger.expected_position),
-                            observed: None,
-                        },
+                        notice,
                         frozen_note: None,
                         abort_account_stream_handle: false,
                         projection_reset: ProjectionReset::DropPendingRequests,
@@ -2024,15 +2118,33 @@ pub(super) async fn run_maker(
             session
                 .order_request_deadlines
                 .retain_pending(&session.projection);
-            if session.order_response_health.is_healthy() {
+            if session.order_response_health.is_healthy()
+                && session.account_stream_health.is_healthy()
+            {
                 if let Some(timeout) = session.order_request_deadlines.timed_out(
                     &session.projection,
                     std::time::Instant::now(),
                     ORDER_REQUEST_TIMEOUT,
                 ) {
-                    session
-                        .order_response_health
-                        .mark_unhealthy(order_request_timeout_detail(&timeout));
+                    let detail = order_request_timeout_detail(&timeout);
+                    let timeout_at_ms = duration_ms(session.latency_started.elapsed());
+                    if let Err(error) = session.order_latency.mark_timeout_phase(
+                        &timeout.request_id,
+                        timeout.phase,
+                        timeout_at_ms,
+                    ) {
+                        eprintln!(
+                            "warning: failed to record order request timeout latency for {}: {error}",
+                            timeout.request_id
+                        );
+                    }
+                    mark_request_timeout_stream_unhealthy(
+                        &session.account_stream_health,
+                        &session.order_response_health,
+                        &timeout,
+                        &detail,
+                    );
+                    pending_request_timeout = Some(timeout);
                     continue;
                 }
             }
@@ -2623,7 +2735,7 @@ pub(super) async fn run_maker(
                             recovery_effect_stop: EffectFailureStop::PositionReconciliation,
                             cleanup_failure_prefix: String::new(),
                             cleanup_failed_exit: MakerExit::PositionReconciliation,
-                            notice: RiskNotice {
+                            notice: FreezeNotice::Risk(RiskNotice {
                                 kind: "position_reconciliation",
                                 severity: "warning",
                                 event: "frozen",
@@ -2639,7 +2751,7 @@ pub(super) async fn run_maker(
                                 position_after: None,
                                 expected: Some(mismatch.expected),
                                 observed: Some(mismatch.observed),
-                            },
+                            }),
                             frozen_note: Some(ReconciliationStateNote {
                                 cause: reconciliation_cause,
                                 expected: mismatch.expected,
@@ -3118,9 +3230,11 @@ pub(super) async fn run_maker(
 
 #[cfg(test)]
 mod tests {
-    use super::super::pipeline::{OrderRequestKind, OrderRequestTimeoutPhase};
+    use super::super::pipeline::OrderRequestKind;
     use super::*;
-    use standx_maker::{OrderObservation, ProjectionPendingCancel, ProjectionPendingPlace};
+    use standx_maker::{
+        OrderObservation, ProjectionPendingCancel, ProjectionPendingPlace, RequestTimeoutPhase,
+    };
     use standx_sdk::account_stream::{OrderUpdate, PositionUpdate};
     use standx_sdk::order_response::OrderResponseHealth;
 
@@ -3129,7 +3243,7 @@ mod tests {
         let detail = order_request_timeout_detail(&TimedOutOrderRequest {
             request_id: "request-7".to_string(),
             kind: OrderRequestKind::Cancel,
-            phase: OrderRequestTimeoutPhase::AccountOrder,
+            phase: RequestTimeoutPhase::AccountOrder,
             age: Duration::from_millis(10_250),
         });
 
@@ -3137,6 +3251,33 @@ mod tests {
             detail,
             "order request lifecycle timed out after 10.250s: kind=cancel request_id=request-7 waiting_for=account_order; refusing further live orders"
         );
+    }
+
+    #[test]
+    fn request_timeout_marks_only_the_stream_responsible_for_the_missing_phase() {
+        for (phase, account_healthy, order_response_healthy) in [
+            (RequestTimeoutPhase::Acknowledgement, true, false),
+            (RequestTimeoutPhase::AccountOrder, false, true),
+        ] {
+            let account = standx_sdk::account_stream::AccountStreamHealth::new(1);
+            let order_response = OrderResponseHealth::default();
+            let timeout = TimedOutOrderRequest {
+                request_id: "request-7".to_string(),
+                kind: OrderRequestKind::Place,
+                phase,
+                age: ORDER_REQUEST_TIMEOUT,
+            };
+
+            mark_request_timeout_stream_unhealthy(
+                &account,
+                &order_response,
+                &timeout,
+                "request timed out",
+            );
+
+            assert_eq!(account.is_healthy(), account_healthy);
+            assert_eq!(order_response.is_healthy(), order_response_healthy);
+        }
     }
 
     /// Pins the per-flow mapping from a missing/mismatched runtime effect to
@@ -4354,7 +4495,7 @@ mod tests {
             recovery_effect_stop: EffectFailureStop::OrderResponse,
             cleanup_failure_prefix: "order-response ".to_string(),
             cleanup_failed_exit: MakerExit::OrderResponse,
-            notice: warning_notice("order_response"),
+            notice: FreezeNotice::Risk(warning_notice("order_response")),
             frozen_note: None,
             abort_account_stream_handle: false,
             projection_reset: ProjectionReset::DropPendingRequests,

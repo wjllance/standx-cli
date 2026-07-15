@@ -162,6 +162,24 @@ impl MakerNotifier {
         self.deliver(&text, raw, await_delivery).await;
     }
 
+    pub(super) async fn request_timeout(
+        &self,
+        notice: RequestTimeoutNotice<'_>,
+        await_delivery: bool,
+    ) {
+        let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let (text, raw) = request_timeout_payload(&notice, &ts);
+        if self.output_format == OutputFormat::Json {
+            println!("{raw}");
+        } else {
+            eprintln!(
+                "⚠️  risk [warning/order_request_timeout] {}: {}",
+                notice.symbol, notice.message
+            );
+        }
+        self.deliver(&text, raw, await_delivery).await;
+    }
+
     pub(super) async fn position_jump(
         &self,
         anchor: &mut PositionAlertAnchor,
@@ -287,6 +305,52 @@ pub(super) struct RiskNotice<'a> {
     pub(super) observed: Option<f64>,
 }
 
+pub(super) struct RequestTimeoutNotice<'a> {
+    pub(super) message: &'a str,
+    pub(super) symbol: &'a str,
+    pub(super) cycle: u64,
+    pub(super) request_id: &'a str,
+    pub(super) request_kind: &'a str,
+    pub(super) timeout_phase: &'a str,
+    pub(super) age_ms: u64,
+    pub(super) timeout_ms: u64,
+    pub(super) recovery_target: &'a str,
+    pub(super) expected_position: f64,
+}
+
+fn request_timeout_payload(
+    notice: &RequestTimeoutNotice<'_>,
+    ts: &str,
+) -> (String, serde_json::Value) {
+    let text = format!(
+        "[warning/order_request_timeout] {}: {}",
+        notice.symbol, notice.message
+    );
+    let raw = serde_json::json!({
+        "text": text,
+        "ts": ts,
+        "symbol": notice.symbol,
+        "cycle": notice.cycle,
+        "action": "risk_notification",
+        "kind": "order_request_timeout",
+        "severity": "warning",
+        "event": "frozen",
+        "message": notice.message,
+        "request_id": notice.request_id,
+        "request_kind": notice.request_kind,
+        "timeout_phase": notice.timeout_phase,
+        "age_ms": notice.age_ms,
+        "timeout_ms": notice.timeout_ms,
+        "recovery_target": notice.recovery_target,
+        "position_before": null,
+        "position_after": null,
+        "position_delta": null,
+        "expected_position": notice.expected_position,
+        "observed_position": null,
+    });
+    (text, raw)
+}
+
 pub(super) struct PositionChange<'a> {
     pub(super) observed: f64,
     pub(super) expected: f64,
@@ -322,6 +386,32 @@ mod tests {
             risk_kind_descriptor(PositionRiskKind::InventoryExitCrossed),
             ("inventory_exit_crossed", "warning")
         );
+    }
+
+    #[test]
+    fn request_timeout_payload_preserves_correlation_and_recovery_fields() {
+        let notice = RequestTimeoutNotice {
+            message: "request timed out",
+            symbol: "XAG-USD",
+            cycle: 754,
+            request_id: "request-7",
+            request_kind: "place",
+            timeout_phase: "account_order",
+            age_ms: 10_250,
+            timeout_ms: 10_000,
+            recovery_target: "account_stream",
+            expected_position: 0.0,
+        };
+        let (_, raw) = request_timeout_payload(&notice, "2026-07-15T07:38:39Z");
+
+        assert_eq!(raw["action"], "risk_notification");
+        assert_eq!(raw["kind"], "order_request_timeout");
+        assert_eq!(raw["request_id"], "request-7");
+        assert_eq!(raw["request_kind"], "place");
+        assert_eq!(raw["timeout_phase"], "account_order");
+        assert_eq!(raw["age_ms"], 10_250);
+        assert_eq!(raw["timeout_ms"], 10_000);
+        assert_eq!(raw["recovery_target"], "account_stream");
     }
 }
 
