@@ -41,6 +41,7 @@ log_dir="${STANDX_LOG_DIR:-$repo_root/var/standx}"
 run_id="${STANDX_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 stdout_log="$log_dir/$run_id.ndjson"
 stderr_log="$log_dir/$run_id.stderr.log"
+manifest_file="$log_dir/$run_id.manifest.json"
 pipe_dir=""
 child_pid=""
 uploader_pid=""
@@ -98,6 +99,25 @@ config_hash=""
 if [[ -n "$config_file" && -f "$config_file" ]]; then
   config_hash="$(shasum -a 256 "$config_file" | awk '{print $1}')"
 fi
+
+manifest_args=(
+  "$script_dir/maker_run_manifest.py" start
+  --manifest "$manifest_file"
+  --log "$stdout_log"
+  --run-id "$run_id"
+  --repo-root "$repo_root"
+  --collector-wrapper "$script_dir/run_maker_observed.sh"
+)
+[[ -n "$config_file" ]] && manifest_args+=(--config-file "$config_file")
+[[ -n "${STANDX_BASELINE_PRICE_TICK_DECIMALS:-}" ]] &&
+  manifest_args+=(--price-tick-decimals "$STANDX_BASELINE_PRICE_TICK_DECIMALS")
+[[ -n "${STANDX_BASELINE_QTY_TICK_DECIMALS:-}" ]] &&
+  manifest_args+=(--qty-tick-decimals "$STANDX_BASELINE_QTY_TICK_DECIMALS")
+[[ -n "${STANDX_BASELINE_MIN_ORDER_QTY:-}" ]] &&
+  manifest_args+=(--min-order-qty "$STANDX_BASELINE_MIN_ORDER_QTY")
+manifest_args+=(-- "${args[@]}")
+python3 "${manifest_args[@]}" ||
+  printf 'warning: maker baseline manifest could not be initialized: %s\n' "$manifest_file" >&2
 
 uploader_enabled=0
 
@@ -158,6 +178,12 @@ wait "$stderr_tee_pid" || true
 
 printf 'maker run_id=%s exit=%s stdout=%s stderr=%s\n' \
   "$run_id" "$child_status" "$stdout_log" "$stderr_log" >&2
+
+python3 "$script_dir/maker_run_manifest.py" finalize \
+  --manifest "$manifest_file" \
+  --log "$stdout_log" \
+  --exit-status "$child_status" ||
+  printf 'warning: maker baseline manifest could not be finalized: %s\n' "$manifest_file" >&2
 
 if [[ -n "$uploader_pid" ]]; then
   uploader_status=0

@@ -5,12 +5,13 @@
 #     --maker-config examples/maker-xag-100u-conservative.toml \
 #     --live --yes
 #
-# Set isolated 2x leverage separately. Quote geometry and the active-exit
-# tuple are unchanged from the production-tested maker-xag-100u.toml profile
-# (max_position=0.8, inventory_exit_pct=25, inventory_exit_qty=0.2); this
-# variant only tightens the financial brakes on top of it. Around a 58.9
-# mark the full inventory is ~47 DUSD notional (~24% of 2x capacity) with
-# ~24 DUSD isolated margin, ~30 including one resting quote per side.
+# Set isolated 2x leverage separately. Quote geometry is unchanged from the
+# production-tested maker-xag-100u.toml profile, but this profile delays the
+# active-exit trigger from 25% to 50%. The exact (max_position=0.8,
+# inventory_exit_pct=50, inventory_exit_qty=0.2) tuple has NOT been validated
+# live. Around a 58.9 mark the full inventory is ~47 DUSD notional (~24% of
+# 2x capacity) with ~24 DUSD isolated margin, ~30 including one resting quote
+# per side.
 #
 # Pre-existing XAG inventory up to max_position is adopted automatically at
 # the startup mark, so maker-session PnL starts at zero. Larger inventory is
@@ -32,8 +33,7 @@ max_divergence_bps = 6.0
 vol_pause_bps = 30.0
 vol_window = 20
 
-# Supervised active inventory exit (production-tested tuple, do not scale
-# without re-validation)
+# Supervised active inventory exit (exact 50% / 0.2 tuple is not live-validated)
 inventory_exit_pct = 50.0
 inventory_exit_qty = 0.2
 
