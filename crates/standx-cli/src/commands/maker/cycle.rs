@@ -5,7 +5,9 @@ use super::model::{position_for_symbol, rest_order_observation};
 use super::output::{
     emit_cycle_skip, emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent,
 };
-use super::pipeline::{fetch_account_audit, CycleRequest, CycleResult, CycleState};
+use super::pipeline::{
+    fetch_account_audit, CycleRequest, CycleResult, CycleState, OrderRequestKind,
+};
 use super::recovery::PositionReconciliationError;
 use anyhow::Result;
 use standx_maker::{
@@ -220,6 +222,7 @@ pub(super) async fn maker_cycle(
         sim_position,
         stats,
         breaker,
+        mut order_request_deadlines,
         live_account_poll,
         mut order_latency,
         latency_started,
@@ -600,6 +603,10 @@ pub(super) async fn maker_cycle(
                                 cycle,
                             }),
                         )?;
+                        order_request_deadlines
+                            .as_deref_mut()
+                            .expect("live maker cycles require initialized request deadlines")
+                            .record(request_id.clone(), OrderRequestKind::Cancel, Instant::now());
                         register_order_latency(
                             &mut order_latency,
                             LatencyRegistration {
@@ -670,6 +677,10 @@ pub(super) async fn maker_cycle(
                             cycle,
                         }),
                     )?;
+                    order_request_deadlines
+                        .as_deref_mut()
+                        .expect("live maker cycles require initialized request deadlines")
+                        .record(request_id.clone(), OrderRequestKind::Place, Instant::now());
                     register_order_latency(
                         &mut order_latency,
                         LatencyRegistration {
@@ -743,8 +754,9 @@ pub(super) async fn maker_cycle(
             // Register the exit submission so its asynchronous ack correlates
             // to a pending entry instead of counting as an unmatched response.
             // The sentinel level keeps it out of quote-slot reservation; a
-            // reduce-only market order never rests, so reconciliation drops it
-            // when `pending` ages out.
+            // reduce-only market order never rests, so its request lifecycle
+            // stays tracked until a correlated response/account event or
+            // explicit cleanup resolves it.
             let projection = account_projection
                 .as_deref_mut()
                 .expect("live inventory exits require initialized account projection");
@@ -761,6 +773,13 @@ pub(super) async fn maker_cycle(
                     cycle,
                 }),
             )?;
+            order_request_deadlines
+                .expect("live inventory exits require initialized request deadlines")
+                .record(
+                    request_id.clone(),
+                    OrderRequestKind::InventoryExit,
+                    Instant::now(),
+                );
             register_order_latency(
                 &mut order_latency,
                 LatencyRegistration {

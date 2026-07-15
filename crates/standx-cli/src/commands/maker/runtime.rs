@@ -5,6 +5,18 @@ use super::output::{
 use super::*;
 use standx_sdk::order_response::OrderResponse;
 
+const ORDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn order_request_timeout_detail(timeout: &TimedOutOrderRequest) -> String {
+    format!(
+        "order request lifecycle timed out after {:.3}s: kind={} request_id={} waiting_for={}; refusing further live orders",
+        timeout.age.as_secs_f64(),
+        timeout.kind.label(),
+        timeout.request_id,
+        timeout.phase.label(),
+    )
+}
+
 fn take_cleanup_effect(
     runtime_state: &mut MakerState,
     expected_target: RecoveryTarget,
@@ -930,6 +942,10 @@ pub(super) async fn run_maker(
                 args.order_response_reconnect_attempts, args.order_response_reconnect_backoff
             );
             println!(
+                "│ order request deadline: {}s to correlated ACK/account visibility",
+                ORDER_REQUEST_TIMEOUT.as_secs()
+            );
+            println!(
                 "│ account-stream recovery: {} attempt(s), {}s base backoff",
                 args.account_stream_reconnect_attempts, args.account_stream_reconnect_backoff
             );
@@ -1762,6 +1778,21 @@ pub(super) async fn run_maker(
                 &mut session.account_poll,
                 std::time::Instant::now(),
             );
+            session
+                .order_request_deadlines
+                .retain_pending(&session.projection);
+            if session.order_response_health.is_healthy() {
+                if let Some(timeout) = session.order_request_deadlines.timed_out(
+                    &session.projection,
+                    std::time::Instant::now(),
+                    ORDER_REQUEST_TIMEOUT,
+                ) {
+                    session
+                        .order_response_health
+                        .mark_unhealthy(order_request_timeout_detail(&timeout));
+                    continue;
+                }
+            }
         }
         if account_position_mismatch
             .is_some_and(|position| (position - ledger.expected_position).abs() <= qty_tolerance)
@@ -1819,6 +1850,7 @@ pub(super) async fn run_maker(
             cycle_order_response_health,
             cycle_account_stream_health,
             mut cycle_projection,
+            mut cycle_order_request_deadlines,
             mut cycle_account_poll,
             mut cycle_order_latency,
             cycle_latency_started,
@@ -1830,6 +1862,7 @@ pub(super) async fn run_maker(
                 account_events,
                 account_stream_health,
                 projection,
+                order_request_deadlines,
                 account_poll,
                 order_latency,
                 latency_started,
@@ -1841,11 +1874,12 @@ pub(super) async fn run_maker(
                 Some(&*order_response_health),
                 Some(&*account_stream_health),
                 Some(projection),
+                Some(order_request_deadlines),
                 Some(account_poll),
                 Some(order_latency),
                 Some(*latency_started),
             ),
-            None => (None, None, None, None, None, None, None, None, None),
+            None => (None, None, None, None, None, None, None, None, None, None),
         };
         let work = async {
             if let Some(observed) = mismatch {
@@ -1901,6 +1935,7 @@ pub(super) async fn run_maker(
                     sim_position: &mut sim_position,
                     stats: &mut stats,
                     breaker: &mut breaker,
+                    order_request_deadlines: cycle_order_request_deadlines.as_deref_mut(),
                     live_account_poll: cycle_account_poll.as_deref_mut(),
                     order_latency: cycle_order_latency.as_deref_mut(),
                     latency_started: cycle_latency_started,
@@ -2659,6 +2694,19 @@ pub(super) async fn run_maker(
         let deadline = tokio::time::Instant::now() + Duration::from_secs(args.interval);
         let min_gap = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
+            let request_deadline = live_session.as_ref().and_then(|session| {
+                session
+                    .order_request_deadlines
+                    .next_deadline(ORDER_REQUEST_TIMEOUT)
+            });
+            let request_timeout = async {
+                match request_deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             let update = async {
                 match updates.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -2677,6 +2725,7 @@ pub(super) async fn run_maker(
                     break 'main take_stop_effect(&mut runtime_state, MakerExit::PositionReconciliation);
                 },
                 _ = tokio::time::sleep_until(deadline) => break,
+                _ = request_timeout => break,
                 event = account_update => {
                     // The branch futures are dropped before select! handlers
                     // run, so the session can be re-borrowed here. An event
@@ -2835,10 +2884,26 @@ pub(super) async fn run_maker(
 
 #[cfg(test)]
 mod tests {
+    use super::super::pipeline::{OrderRequestKind, OrderRequestTimeoutPhase};
     use super::*;
     use standx_maker::{OrderObservation, ProjectionPendingCancel, ProjectionPendingPlace};
     use standx_sdk::account_stream::{OrderUpdate, PositionUpdate};
     use standx_sdk::order_response::OrderResponseHealth;
+
+    #[test]
+    fn request_timeout_detail_identifies_request_kind_and_missing_phase() {
+        let detail = order_request_timeout_detail(&TimedOutOrderRequest {
+            request_id: "request-7".to_string(),
+            kind: OrderRequestKind::Cancel,
+            phase: OrderRequestTimeoutPhase::AccountOrder,
+            age: Duration::from_millis(10_250),
+        });
+
+        assert_eq!(
+            detail,
+            "order request lifecycle timed out after 10.250s: kind=cancel request_id=request-7 waiting_for=account_order; refusing further live orders"
+        );
+    }
 
     fn pending_place(request_id: &str) -> ProjectionPendingPlace {
         ProjectionPendingPlace {

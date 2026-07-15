@@ -9,12 +9,119 @@ use standx_sdk::account_stream::AccountStreamHealth;
 use standx_sdk::client::StandXClient;
 use standx_sdk::models::{Balance, Order, Position, Trade};
 use standx_sdk::order_response::{OrderCommandSender, OrderResponseHealth};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const ACCOUNT_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
 const BALANCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const BALANCE_MAX_STALE: Duration = Duration::from_secs(60);
 const BALANCE_REFRESH_RETRY: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OrderRequestKind {
+    Place,
+    Cancel,
+    InventoryExit,
+}
+
+impl OrderRequestKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Place => "place",
+            Self::Cancel => "cancel",
+            Self::InventoryExit => "inventory_exit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum OrderRequestTimeoutPhase {
+    Acknowledgement,
+    AccountOrder,
+}
+
+impl OrderRequestTimeoutPhase {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Acknowledgement => "acknowledgement",
+            Self::AccountOrder => "account_order",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackedOrderRequest {
+    kind: OrderRequestKind,
+    submitted_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TimedOutOrderRequest {
+    pub(super) request_id: String,
+    pub(super) kind: OrderRequestKind,
+    pub(super) phase: OrderRequestTimeoutPhase,
+    pub(super) age: Duration,
+}
+
+/// CLI-owned monotonic deadlines for requests registered in the pure account
+/// projection. Timing stays outside `standx-maker`; correlation stays inside.
+#[derive(Debug, Default)]
+pub(super) struct OrderRequestDeadlines {
+    requests: HashMap<String, TrackedOrderRequest>,
+}
+
+impl OrderRequestDeadlines {
+    pub(super) fn record(
+        &mut self,
+        request_id: String,
+        kind: OrderRequestKind,
+        submitted_at: Instant,
+    ) {
+        self.requests
+            .insert(request_id, TrackedOrderRequest { kind, submitted_at });
+    }
+
+    pub(super) fn retain_pending(&mut self, projection: &MakerAccountProjection) {
+        self.requests
+            .retain(|request_id, _| projection.has_pending_request_lifecycle(request_id));
+    }
+
+    pub(super) fn next_deadline(&self, timeout: Duration) -> Option<Instant> {
+        self.requests
+            .values()
+            .map(|request| request.submitted_at + timeout)
+            .min()
+    }
+
+    pub(super) fn timed_out(
+        &self,
+        projection: &MakerAccountProjection,
+        now: Instant,
+        timeout: Duration,
+    ) -> Option<TimedOutOrderRequest> {
+        self.requests
+            .iter()
+            .filter_map(|(request_id, request)| {
+                let age = now.saturating_duration_since(request.submitted_at);
+                (age >= timeout).then_some((request_id, request, age))
+            })
+            .min_by(|(left_id, left, _), (right_id, right, _)| {
+                left.submitted_at
+                    .cmp(&right.submitted_at)
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .map(|(request_id, request, age)| TimedOutOrderRequest {
+                request_id: request_id.clone(),
+                kind: request.kind,
+                phase: if projection.pending_request(request_id).is_some() {
+                    OrderRequestTimeoutPhase::Acknowledgement
+                } else {
+                    OrderRequestTimeoutPhase::AccountOrder
+                },
+                age,
+            })
+    }
+}
 
 pub(super) struct CycleRequest<'a> {
     pub(super) client: &'a StandXClient,
@@ -53,6 +160,7 @@ pub(super) struct CycleState<'a> {
     pub(super) sim_position: &'a mut f64,
     pub(super) stats: &'a mut MakerStats,
     pub(super) breaker: &'a mut VolBreaker,
+    pub(super) order_request_deadlines: Option<&'a mut OrderRequestDeadlines>,
     /// Live-only REST polling state. It is deliberately a CLI concern: it
     /// controls I/O cadence and cached account presentation, not strategy.
     pub(super) live_account_poll: Option<&'a mut LiveAccountPollState>,
@@ -165,6 +273,43 @@ pub(super) async fn fetch_account_audit(
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
+    use standx_maker::{AccountProjectionEvent, OrderObservation, ProjectionPendingPlace};
+    use standx_sdk::models::OrderSide;
+
+    const TEST_RUN_PREFIX: &str = "sxmk-deadline-";
+
+    fn pending_place(request_id: &str) -> ProjectionPendingPlace {
+        ProjectionPendingPlace {
+            request_id: request_id.to_owned(),
+            client_order_id: format!("{TEST_RUN_PREFIX}q00000001b0"),
+            side: OrderSide::Buy,
+            price: 100.0,
+            qty: 0.2,
+            level: 0,
+            ref_center: 100.0,
+            cycle: 1,
+        }
+    }
+
+    fn observed_order() -> OrderObservation {
+        OrderObservation {
+            order_id: 7,
+            client_order_id: Some(format!("{TEST_RUN_PREFIX}q00000001b0")),
+            side: OrderSide::Buy,
+            price: 100.0,
+            open_qty: 0.2,
+            terminal: false,
+        }
+    }
+
+    fn projection_with_pending_place(request_id: &str) -> MakerAccountProjection {
+        let mut projection = MakerAccountProjection::new(1, TEST_RUN_PREFIX, 0.0, 0.005, 0.00005);
+        projection.apply(
+            1,
+            AccountProjectionEvent::PlaceSubmitted(pending_place(request_id)),
+        );
+        projection
+    }
 
     struct JwtGuard {
         original: Option<String>,
@@ -213,6 +358,73 @@ mod tests {
             pnl_freeze: "0".to_string(),
             upnl: "0".to_string(),
         }
+    }
+
+    #[test]
+    fn request_deadline_distinguishes_ack_and_account_order_phases() {
+        let submitted_at = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut projection = projection_with_pending_place("p1");
+        let mut deadlines = OrderRequestDeadlines::default();
+        deadlines.record("p1".to_owned(), OrderRequestKind::Place, submitted_at);
+
+        assert_eq!(
+            deadlines.next_deadline(timeout),
+            Some(submitted_at + timeout)
+        );
+        assert!(deadlines
+            .timed_out(
+                &projection,
+                submitted_at + timeout - Duration::from_millis(1),
+                timeout,
+            )
+            .is_none());
+        assert_eq!(
+            deadlines
+                .timed_out(&projection, submitted_at + timeout, timeout)
+                .unwrap()
+                .phase,
+            OrderRequestTimeoutPhase::Acknowledgement
+        );
+
+        projection.apply(
+            1,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_owned(),
+            },
+        );
+        assert_eq!(
+            deadlines
+                .timed_out(&projection, submitted_at + timeout, timeout)
+                .unwrap()
+                .phase,
+            OrderRequestTimeoutPhase::AccountOrder
+        );
+
+        projection.apply(1, AccountProjectionEvent::OrderObserved(observed_order()));
+        deadlines.retain_pending(&projection);
+        assert_eq!(deadlines.next_deadline(timeout), None);
+        assert!(deadlines
+            .timed_out(&projection, submitted_at + timeout, timeout)
+            .is_none());
+    }
+
+    #[test]
+    fn account_order_before_ack_keeps_ack_deadline_open() {
+        let submitted_at = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let mut projection = projection_with_pending_place("p1");
+        let mut deadlines = OrderRequestDeadlines::default();
+        deadlines.record("p1".to_owned(), OrderRequestKind::Place, submitted_at);
+
+        projection.apply(1, AccountProjectionEvent::OrderObserved(observed_order()));
+        deadlines.retain_pending(&projection);
+
+        let timed_out = deadlines
+            .timed_out(&projection, submitted_at + timeout, timeout)
+            .unwrap();
+        assert_eq!(timed_out.kind, OrderRequestKind::Place);
+        assert_eq!(timed_out.phase, OrderRequestTimeoutPhase::Acknowledgement);
     }
 
     #[test]
