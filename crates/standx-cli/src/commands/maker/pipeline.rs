@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const ACCOUNT_AUDIT_INTERVAL: Duration = Duration::from_secs(30);
+const REST_POSITION_RECHECK_DELAY: Duration = Duration::from_secs(3);
 const BALANCE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const BALANCE_MAX_STALE: Duration = Duration::from_secs(60);
 const BALANCE_REFRESH_RETRY: Duration = Duration::from_secs(5);
@@ -184,6 +185,7 @@ pub(super) struct LiveAccountPollState {
     balance_updated_at: Instant,
     next_balance_refresh_at: Instant,
     next_account_audit_at: Instant,
+    rest_position_recheck_at: Option<Instant>,
 }
 
 impl LiveAccountPollState {
@@ -193,6 +195,7 @@ impl LiveAccountPollState {
             balance_updated_at: now,
             next_balance_refresh_at: now + BALANCE_REFRESH_INTERVAL,
             next_account_audit_at: now + ACCOUNT_AUDIT_INTERVAL,
+            rest_position_recheck_at: None,
         }
     }
 
@@ -219,6 +222,25 @@ impl LiveAccountPollState {
         now >= self.next_account_audit_at
     }
 
+    pub(super) fn rest_position_recheck_pending(&self) -> bool {
+        self.rest_position_recheck_at.is_some()
+    }
+
+    /// Defer the first REST-only position disagreement for one bounded
+    /// confirmation window. Returns true only when a successful audit still
+    /// disagrees at or after the scheduled recheck deadline.
+    pub(super) fn record_rest_position_mismatch(&mut self, now: Instant) -> bool {
+        match self.rest_position_recheck_at {
+            Some(deadline) => now >= deadline,
+            None => {
+                let deadline = now + REST_POSITION_RECHECK_DELAY;
+                self.rest_position_recheck_at = Some(deadline);
+                self.next_account_audit_at = deadline;
+                false
+            }
+        }
+    }
+
     pub(super) fn balance_is_within_stale_limit(&self, now: Instant) -> bool {
         now.duration_since(self.balance_updated_at) <= BALANCE_MAX_STALE
     }
@@ -234,6 +256,7 @@ impl LiveAccountPollState {
     }
 
     pub(super) fn record_account_audit(&mut self, now: Instant) {
+        self.rest_position_recheck_at = None;
         self.next_account_audit_at = now + ACCOUNT_AUDIT_INTERVAL;
     }
 }
@@ -487,6 +510,27 @@ mod tests {
         state.record_balance_refresh(balance(), due);
         assert!(!state.account_audit_due(due + Duration::from_secs(29)));
         assert!(!state.balance_refresh_due(due + Duration::from_secs(29)));
+    }
+
+    #[test]
+    fn rest_position_mismatch_gets_one_three_second_recheck() {
+        let now = Instant::now();
+        let mut state = LiveAccountPollState::new(balance(), now);
+        let first_audit = now + ACCOUNT_AUDIT_INTERVAL;
+
+        assert!(!state.record_rest_position_mismatch(first_audit));
+        assert!(state.rest_position_recheck_pending());
+        assert!(!state.account_audit_due(first_audit + Duration::from_millis(2_999)));
+
+        let recheck = first_audit + REST_POSITION_RECHECK_DELAY;
+        assert!(state.account_audit_due(recheck));
+        assert!(state.record_rest_position_mismatch(recheck));
+        assert!(state.account_audit_due(recheck + Duration::from_secs(1)));
+
+        state.record_account_audit(recheck);
+        assert!(!state.rest_position_recheck_pending());
+        assert!(!state.account_audit_due(recheck + Duration::from_secs(29)));
+        assert!(state.account_audit_due(recheck + ACCOUNT_AUDIT_INTERVAL));
     }
 
     #[test]

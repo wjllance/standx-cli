@@ -182,48 +182,6 @@ pub struct ProjectionOutcome {
     pub request_registry_error: Option<ProjectionRegistryError>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum ProjectionMismatch {
-    Position {
-        projected: f64,
-        observed: f64,
-    },
-    OrderSet {
-        projected: Vec<u64>,
-        observed: Vec<u64>,
-    },
-    OrderQuantity {
-        order_id: u64,
-        projected: f64,
-        observed: f64,
-    },
-}
-
-impl fmt::Display for ProjectionMismatch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Position { projected, observed } => write!(
-                formatter,
-                "projected position {projected:+.8} differs from REST {observed:+.8}"
-            ),
-            Self::OrderSet { projected, observed } => write!(
-                formatter,
-                "projected maker order IDs {projected:?} differ from REST {observed:?}"
-            ),
-            Self::OrderQuantity {
-                order_id,
-                projected,
-                observed,
-            } => write!(
-                formatter,
-                "projected open qty {projected:.8} for order {order_id} differs from REST {observed:.8}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ProjectionMismatch {}
-
 /// One in-flight place/cancel request, tracked in a single registry.
 ///
 /// A request has two independent lifecycles that used to live in two parallel
@@ -957,24 +915,26 @@ impl MakerAccountProjection {
                 })
     }
 
-    pub fn verify_rest_snapshot(
+    /// Return current-run REST open orders that the live projection cannot
+    /// explain as either already projected or still awaiting their account
+    /// order observation.
+    ///
+    /// REST order-set absence and quantity differences are deliberately not
+    /// audited here. The authenticated account stream owns steady-state order
+    /// truth; retaining a projection-only order is conservative because its
+    /// quote slot stays occupied. A REST-only order is safe to tolerate only
+    /// while it matches an active place slot by client-order ID or an active
+    /// cancel slot by venue order ID.
+    pub fn unexpected_rest_open_order_ids(
         &self,
         generation: u64,
-        observed_position: f64,
         observed_orders: &[OrderObservation],
-        qty_tolerance: f64,
-    ) -> Result<(), ProjectionMismatch> {
+    ) -> Vec<u64> {
         if generation != self.generation {
-            return Ok(());
+            return Vec::new();
         }
-        if (self.observed_position - observed_position).abs() > qty_tolerance {
-            return Err(ProjectionMismatch::Position {
-                projected: self.observed_position,
-                observed: observed_position,
-            });
-        }
-        let mut projected = self.orders.keys().copied().collect::<Vec<_>>();
-        let mut observed = observed_orders
+
+        let mut unexpected = observed_orders
             .iter()
             .filter(|order| {
                 !order.terminal
@@ -983,29 +943,28 @@ impl MakerAccountProjection {
                         &self.run_order_prefix,
                     )
             })
+            .filter(|order| {
+                if self.orders.contains_key(&order.order_id) {
+                    return false;
+                }
+                let Some(client_order_id) = order.client_order_id.as_deref() else {
+                    return true;
+                };
+                !self.pending.iter().any(|entry| {
+                    entry.slot_open
+                        && (entry
+                            .place()
+                            .is_some_and(|place| place.client_order_id == client_order_id)
+                            || entry
+                                .cancel()
+                                .is_some_and(|cancel| cancel.order_id == order.order_id))
+                })
+            })
             .map(|order| order.order_id)
             .collect::<Vec<_>>();
-        projected.sort_unstable();
-        observed.sort_unstable();
-        if projected != observed {
-            return Err(ProjectionMismatch::OrderSet {
-                projected,
-                observed,
-            });
-        }
-        for observation in observed_orders {
-            let Some(order) = self.orders.get(&observation.order_id) else {
-                continue;
-            };
-            if (order.open_qty - observation.open_qty).abs() > qty_tolerance {
-                return Err(ProjectionMismatch::OrderQuantity {
-                    order_id: observation.order_id,
-                    projected: order.open_qty,
-                    observed: observation.open_qty,
-                });
-            }
-        }
-        Ok(())
+        unexpected.sort_unstable();
+        unexpected.dedup();
+        unexpected
     }
 }
 
@@ -1210,7 +1169,7 @@ mod tests {
         state.apply(
             1,
             AccountProjectionEvent::PlaceAccepted {
-                request_id: "p1".to_string(),
+                request_id: "p2".to_string(),
             },
         );
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
@@ -1503,20 +1462,114 @@ mod tests {
     }
 
     #[test]
-    fn rest_audit_detects_order_and_position_drift_without_mutation() {
+    fn rest_audit_tolerates_projection_absence_and_known_quantity_drift() {
         let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
         state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
         state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
 
-        assert!(matches!(
-            state.verify_rest_snapshot(1, 0.1, &[order(0.2, false)], 0.001),
-            Err(ProjectionMismatch::Position { .. })
-        ));
-        assert!(matches!(
-            state.verify_rest_snapshot(1, 0.0, &[], 0.001),
-            Err(ProjectionMismatch::OrderSet { .. })
-        ));
+        assert!(state.unexpected_rest_open_order_ids(1, &[]).is_empty());
+        assert!(state
+            .unexpected_rest_open_order_ids(1, &[order(0.1, false)])
+            .is_empty());
         assert_eq!(state.resting_quotes()[0].qty, 0.2);
+    }
+
+    #[test]
+    fn rest_audit_tolerates_projected_order_plus_place_awaiting_account_stream() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.2, false)));
+
+        let mut second = pending("p2");
+        second.client_order_id = format!("{PREFIX}q00000002a0");
+        second.side = OrderSide::Sell;
+        second.price = 101.0;
+        second.level = 1;
+        second.cycle = 2;
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(second.clone()));
+
+        let mut projected = order(0.1, false);
+        let rest_only = OrderObservation {
+            order_id: 8,
+            client_order_id: Some(second.client_order_id),
+            side: second.side,
+            price: second.price,
+            open_qty: second.qty,
+            terminal: false,
+        };
+
+        assert!(state
+            .unexpected_rest_open_order_ids(1, &[projected.clone(), rest_only.clone()])
+            .is_empty());
+
+        state.apply(
+            1,
+            AccountProjectionEvent::PlaceAccepted {
+                request_id: "p1".to_string(),
+            },
+        );
+        projected.open_qty = 0.05;
+        assert!(state
+            .unexpected_rest_open_order_ids(1, &[projected, rest_only])
+            .is_empty());
+    }
+
+    #[test]
+    fn rest_audit_rejects_unexpected_or_retired_current_run_open_order() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        let unexpected = order(0.2, false);
+        assert_eq!(
+            state.unexpected_rest_open_order_ids(1, std::slice::from_ref(&unexpected)),
+            vec![7]
+        );
+
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        state.apply(1, AccountProjectionEvent::OrderObserved(unexpected.clone()));
+        state.apply(1, AccountProjectionEvent::OrderObserved(order(0.0, true)));
+        assert_eq!(
+            state.unexpected_rest_open_order_ids(1, std::slice::from_ref(&unexpected)),
+            vec![7]
+        );
+
+        let mut wrong_run = unexpected;
+        wrong_run.client_order_id = Some("sxmk-other-q00000001b0".to_string());
+        assert!(state
+            .unexpected_rest_open_order_ids(1, &[wrong_run])
+            .is_empty());
+        assert!(state
+            .unexpected_rest_open_order_ids(2, &[order(0.2, false)])
+            .is_empty());
+    }
+
+    #[test]
+    fn rest_audit_tolerates_order_until_pending_cancel_resolves() {
+        let mut state = MakerAccountProjection::new(1, PREFIX, 0.0, 0.005, 0.00005);
+        state.apply(1, AccountProjectionEvent::PlaceSubmitted(pending("p1")));
+        let open = order(0.2, false);
+        state.apply(1, AccountProjectionEvent::OrderObserved(open.clone()));
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelSubmitted(ProjectionPendingCancel {
+                request_id: "c1".to_string(),
+                order_id: open.order_id,
+                side: open.side,
+                level: 0,
+                price: open.price,
+                cycle: 2,
+            }),
+        );
+
+        assert!(state
+            .unexpected_rest_open_order_ids(1, std::slice::from_ref(&open))
+            .is_empty());
+
+        state.apply(
+            1,
+            AccountProjectionEvent::CancelResolved {
+                request_id: "c1".to_string(),
+            },
+        );
+        assert_eq!(state.unexpected_rest_open_order_ids(1, &[open]), vec![7]);
     }
 
     #[test]
