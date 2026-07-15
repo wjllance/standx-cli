@@ -83,8 +83,12 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--alert-webhook-format` | `slack` | webhook 报文格式：`slack` / `feishu` / `telegram` / `raw` |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
-| `--order-response-reconnect-attempts` | `3` | 单次 maker run 内订单回报流的安全重连总预算；每次先清理、换 session 并对账，`0` 禁用 |
+| `--order-response-reconnect-attempts` | `3` | 单次订单回报流事故内的安全重连次数；每次先清理、换 session 并对账，`0` 禁用 |
 | `--order-response-reconnect-backoff` | `2` | 安全重连基础退避秒数，后续失败按上限递增 |
+| `--account-stream-reconnect-attempts` | `3` | 单次账户流事故内的安全重连次数；重连后回放、REST 回补并对账，`0` 禁用 |
+| `--account-stream-reconnect-backoff` | `2` | 账户流重连基础退避秒数，后续失败按上限递增 |
+| `--recovery-incidents-per-window` | `3` | 账户流与订单回报流共用的滚动窗口事故熔断上限 |
+| `--recovery-window-secs` | `3600` | 运输层恢复事故熔断的滚动时间窗（秒） |
 
 启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`；主动退出必须同时设置百分比与数量。
 

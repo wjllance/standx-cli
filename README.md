@@ -418,8 +418,10 @@ ID prefix: manual/API orders are preserved. It cleans up maker-owned orders on
 exit (with retries and verification), stops quoting after 3 consecutive API
 errors, and safely pauses on an asynchronous order-response disconnect. It
 then cleans and verifies the maker book, authenticates a new response session,
-and reconciles orders, position, and fills before quoting can resume; a disabled
-or exhausted reconnect budget still fails closed.
+and reconciles orders, position, and fills before quoting can resume. Reconnect
+attempts are bounded per incident, while account-stream and order-response
+incidents share a rolling-window circuit breaker; a disabled or exhausted
+budget still fails closed.
 Live fill telemetry is sourced from authenticated, maker-order-correlated trade
 history rather than inferred from position changes. Paper mode simulates fills
 when the touch crosses a quote, so position, inventory skew, and PnL telemetry

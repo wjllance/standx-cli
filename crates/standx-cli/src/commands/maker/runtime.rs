@@ -249,6 +249,7 @@ struct AccountEventOutcome {
     latest_position: Option<f64>,
     exit_fill_observed: bool,
     balance_changed: bool,
+    requires_order_reconciliation: bool,
 }
 
 impl AccountEventOutcome {
@@ -259,6 +260,7 @@ impl AccountEventOutcome {
         }
         self.exit_fill_observed |= other.exit_fill_observed;
         self.balance_changed |= other.balance_changed;
+        self.requires_order_reconciliation |= other.requires_order_reconciliation;
     }
 }
 
@@ -420,18 +422,7 @@ fn apply_account_event(
                 generation,
                 AccountProjectionEvent::OrderObserved(observation),
             );
-            if projection_outcome.unknown_current_run_order {
-                return Err(anyhow::anyhow!(
-                    "account stream reported an unknown current-run maker order: order_id={} client_order_id={:?} status={:?} side={:?} price={} qty={} fill_qty={}",
-                    update.order_id,
-                    update.cl_ord_id,
-                    update.status,
-                    update.side,
-                    update.price,
-                    update.qty,
-                    update.fill_qty,
-                ));
-            }
+            let requires_order_reconciliation = projection_outcome.unknown_current_run_order;
             for fill in &fills {
                 if let Some(order_id) = fill.order_id {
                     state.projection.apply(
@@ -449,6 +440,7 @@ fn apply_account_event(
                 latest_position: None,
                 exit_fill_observed,
                 balance_changed: false,
+                requires_order_reconciliation,
             })
         }
         AccountEvent::Position(update) => {
@@ -469,6 +461,7 @@ fn apply_account_event(
                 latest_position: Some(qty),
                 exit_fill_observed: false,
                 balance_changed: false,
+                requires_order_reconciliation: false,
             })
         }
         AccountEvent::Trade(trade) => {
@@ -499,6 +492,7 @@ fn apply_account_event(
                 latest_position: None,
                 exit_fill_observed,
                 balance_changed: false,
+                requires_order_reconciliation: false,
             })
         }
         // A balance update only signals that the REST-backed margin snapshot
@@ -524,6 +518,22 @@ fn accounting_position_mismatch(
     // a bare `>` comparison false and silently pass the invariant, so treat any
     // non-finite value as a mismatch.
     !delta.is_finite() || delta > qty_tolerance
+}
+
+fn recovery_circuit_detail(admission: maker::RecoveryAdmission) -> String {
+    let (incidents, limit, window_secs) = match admission {
+        maker::RecoveryAdmission::Admitted {
+            incidents,
+            limit,
+            window_secs,
+        }
+        | maker::RecoveryAdmission::CircuitOpen {
+            incidents,
+            limit,
+            window_secs,
+        } => (incidents, limit, window_secs),
+    };
+    format!("rolling recovery circuit {incidents}/{limit} incident(s) in {window_secs}s")
 }
 
 async fn accounting_invariant_exit(
@@ -775,6 +785,12 @@ async fn shutdown_report(report: ShutdownReport<'_>) -> Result<()> {
     }
 }
 
+fn new_maker_rest_client() -> Result<StandXClient> {
+    let client = StandXClient::new()?;
+    debug_assert!(client.session_id().is_none());
+    Ok(client)
+}
+
 pub(super) async fn run_maker(
     symbol: String,
     args: MakerRunArgs,
@@ -823,10 +839,21 @@ pub(super) async fn run_maker(
             "--account-stream-reconnect-backoff must be between 1 and 60 seconds when reconnect is enabled"
         ));
     }
-    let mut client = match order_session_id.as_deref() {
-        Some(session_id) => StandXClient::new()?.with_session_id(session_id),
-        None => StandXClient::new()?,
-    };
+    if !(1..=100).contains(&args.recovery_incidents_per_window) {
+        return Err(anyhow::anyhow!(
+            "--recovery-incidents-per-window must be between 1 and 100"
+        ));
+    }
+    if !(60..=86_400).contains(&args.recovery_window_secs) {
+        return Err(anyhow::anyhow!(
+            "--recovery-window-secs must be between 60 and 86400"
+        ));
+    }
+    // REST reads, audits, and fail-safe cleanup must stay outside the
+    // order-response session. Attaching x-session-id to REST cancellation
+    // would route its asynchronous response into the command response stream,
+    // where it has no projection request entry and would look uncorrelated.
+    let client = new_maker_rest_client()?;
 
     // ---- Startup: symbol metadata + invariants (fail fast) ----
     let infos = client.get_symbol_info().await?;
@@ -1226,6 +1253,10 @@ pub(super) async fn run_maker(
                 "│ account-stream recovery: {} attempt(s), {}s base backoff",
                 args.account_stream_reconnect_attempts, args.account_stream_reconnect_backoff
             );
+            println!(
+                "│ transport recovery circuit: {} incident(s) / {}s rolling window",
+                args.recovery_incidents_per_window, args.recovery_window_secs
+            );
         }
         if args.no_ws {
             println!("│ feed: REST polling (--no-ws)");
@@ -1351,9 +1382,13 @@ pub(super) async fn run_maker(
             .with_account_floors(args.alert_equity_below, args.alert_margin_below);
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
-    let mut order_response_reconnect_attempts_used = 0_u32;
-    let mut account_stream_reconnect_attempts_used = 0_u32;
+    let recovery_clock_started = std::time::Instant::now();
+    let mut transport_recovery_breaker = maker::RecoveryCircuitBreaker::new(
+        args.recovery_incidents_per_window,
+        args.recovery_window_secs,
+    );
     let mut account_position_mismatch: Option<f64> = None;
+    let mut account_order_reconciliation_required = false;
     // A wallet-level WS balance update cannot be substituted for the unified
     // REST equity/margin model. Coalesce updates into one immediate
     // authoritative refresh on the next cycle when account floors are active.
@@ -1500,22 +1535,28 @@ pub(super) async fn run_maker(
                         }
                     };
 
-                if account_stream_reconnect_attempts_used >= args.account_stream_reconnect_attempts
-                {
+                if args.account_stream_reconnect_attempts == 0 {
+                    break recovery_failed_exit(
+                        &mut runtime_state,
+                        recovery_token,
+                        format!("account stream disconnected ({detail}); reconnect disabled"),
+                    );
+                }
+                let admission =
+                    transport_recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
+                if !admission.is_admitted() {
                     break recovery_failed_exit(
                         &mut runtime_state,
                         recovery_token,
                         format!(
-                            "account stream disconnected ({detail}); reconnect disabled or budget exhausted ({}/{})",
-                            account_stream_reconnect_attempts_used,
-                            args.account_stream_reconnect_attempts
+                            "account stream disconnected ({detail}); {}; refusing further live orders",
+                            recovery_circuit_detail(admission)
                         ),
                     );
                 }
 
                 let (mut events, health, handle) = match reconnect_account_stream(
                     &mut account_stream_epoch,
-                    &mut account_stream_reconnect_attempts_used,
                     args.account_stream_reconnect_attempts,
                     args.account_stream_reconnect_backoff,
                     &mut ctrl_c_rx,
@@ -1683,6 +1724,24 @@ pub(super) async fn run_maker(
                     }
                 }
 
+                // A current-run order may surface after the first freeze
+                // cleanup while the account stream is authenticating. Require
+                // one final authoritative empty-book verification before the
+                // recovered stream can resume quoting.
+                if let Err(error) =
+                    cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                {
+                    handle.abort();
+                    break recovery_failed_exit(
+                        &mut runtime_state,
+                        recovery_token,
+                        format!(
+                            "account stream reconnect final maker-book verification failed: {error}"
+                        ),
+                    );
+                }
+                projection.clear_orders_preserving_pending_acks();
+
                 account_events = Some(events);
                 account_stream_health = Some(health);
                 account_stream_handle = Some(handle);
@@ -1733,11 +1792,6 @@ pub(super) async fn run_maker(
                         }
                     };
                 let controlled_fault = detail.starts_with("controlled fault injection");
-                let reconnect_available = order_response_reconnect_available(
-                    &detail,
-                    order_response_reconnect_attempts_used,
-                    args.order_response_reconnect_attempts,
-                );
                 // Mirror the account-stream path: the order-response stream was
                 // previously silent on the webhook across disconnect/reconnect.
                 let disconnect_message =
@@ -1784,7 +1838,17 @@ pub(super) async fn run_maker(
                             );
                         }
                     };
-                if reconnect_available {
+                let reconnect_unavailable = if controlled_fault {
+                    Some("controlled fault injection requires fail-safe shutdown".to_string())
+                } else if args.order_response_reconnect_attempts == 0 {
+                    Some("safe reconnect is disabled".to_string())
+                } else {
+                    let admission = transport_recovery_breaker
+                        .admit(recovery_clock_started.elapsed().as_secs());
+                    (!admission.is_admitted())
+                        .then(|| format!("{}; circuit is open", recovery_circuit_detail(admission)))
+                };
+                if reconnect_unavailable.is_none() {
                     if let Some(handle) = order_response_handle.take() {
                         handle.abort();
                     }
@@ -1798,7 +1862,6 @@ pub(super) async fn run_maker(
                         expected_position: ledger.expected_position,
                         qty_tolerance,
                         output_format,
-                        attempts_used: order_response_reconnect_attempts_used,
                         max_attempts: args.order_response_reconnect_attempts,
                         base_backoff: Duration::from_secs(args.order_response_reconnect_backoff),
                         original_failure: &detail,
@@ -1806,13 +1869,11 @@ pub(super) async fn run_maker(
                     })
                     .await
                     {
-                        Ok((reconnected, attempts_used)) => {
-                            client = reconnected.client;
+                        Ok(reconnected) => {
                             order_commands = Some(reconnected.commands);
                             order_responses = Some(reconnected.responses);
                             order_response_health = Some(reconnected.health);
                             order_response_handle = Some(reconnected.handle);
-                            order_response_reconnect_attempts_used = attempts_used;
                             // Cleanup verified an empty maker book. The next
                             // cycle rebuilds exchange state before it may place.
                             resting.clear();
@@ -1923,17 +1984,8 @@ pub(super) async fn run_maker(
                         }
                     }
                 }
-                let reconnect_note = if controlled_fault {
-                    "controlled fault injection requires fail-safe shutdown".to_string()
-                } else if args.order_response_reconnect_attempts == 0 {
-                    "safe reconnect is disabled".to_string()
-                } else {
-                    format!(
-                        "safe reconnect budget exhausted ({}/{})",
-                        order_response_reconnect_attempts_used,
-                        args.order_response_reconnect_attempts
-                    )
-                };
+                let reconnect_note = reconnect_unavailable
+                    .expect("unavailable reconnect must carry a fail-safe reason");
                 let refuse_message =
                     format!("{detail}; {reconnect_note}; refusing further live orders");
                 notifier
@@ -2002,6 +2054,7 @@ pub(super) async fn run_maker(
                 },
             ) {
                 Ok(outcome) => {
+                    account_order_reconciliation_required |= outcome.requires_order_reconciliation;
                     let position = absorb_account_outcome(
                         outcome,
                         OutcomeSink {
@@ -2066,6 +2119,8 @@ pub(super) async fn run_maker(
         // Work phase raced against Ctrl+C so a slow API call can be
         // interrupted (mirrors run_watch_loop).
         let mismatch = account_position_mismatch.take();
+        let order_reconciliation_required =
+            std::mem::take(&mut account_order_reconciliation_required);
         let exit_pending_before = inventory_exit_pending;
         let breaker_halted_before = breaker.halted();
         if runtime_state.pending_effect().is_none() {
@@ -2089,6 +2144,12 @@ pub(super) async fn run_maker(
                 return Err(anyhow::Error::new(PositionReconciliationError {
                     expected: ledger.expected_position,
                     observed,
+                }));
+            }
+            if order_reconciliation_required {
+                return Err(anyhow::Error::new(PositionReconciliationError {
+                    expected: ledger.expected_position,
+                    observed: ledger.expected_position,
                 }));
             }
             let (mark, best_bid, best_ask, src, market_fallback_reason) =
@@ -2255,6 +2316,9 @@ pub(super) async fn run_maker(
                 },
             ) {
                 Ok(outcome) => {
+                    if outcome.requires_order_reconciliation {
+                        cycle_invalidated_by_account = true;
+                    }
                     let position = absorb_account_outcome(
                         outcome,
                         OutcomeSink {
@@ -2698,6 +2762,25 @@ pub(super) async fn run_maker(
                         }
                     }
                     if recovered {
+                        // Requests already accepted by the venue can become
+                        // visible after the initial freeze cleanup. Verify the
+                        // maker book again at the end of the bounded recovery
+                        // window before unfreezing placements.
+                        if let Err(error) =
+                            cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                        {
+                            break 'main recovery_failed_exit(
+                                &mut runtime_state,
+                                recovery_token,
+                                format!(
+                                    "position reconciliation final maker-book verification failed: {error}"
+                                ),
+                            );
+                        }
+                        if let Some(projection) = account_projection.as_mut() {
+                            projection.clear_orders_preserving_pending_acks();
+                        }
+                        account_order_reconciliation_required = false;
                         if let Some(projection) = account_projection.as_mut() {
                             let generation = projection.generation();
                             projection.apply(
@@ -2871,6 +2954,8 @@ pub(super) async fn run_maker(
                         },
                     ) {
                         Ok(outcome) => {
+                            account_order_reconciliation_required |=
+                                outcome.requires_order_reconciliation;
                             let position = absorb_account_outcome(
                                 outcome,
                                 OutcomeSink {
@@ -3027,6 +3112,12 @@ mod tests {
             message: String::new(),
             request_id: request_id.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn maker_rest_client_is_isolated_from_order_response_session() {
+        let client = new_maker_rest_client().expect("maker REST client is constructible");
+        assert_eq!(client.session_id(), None);
     }
 
     fn position_update(symbol: &str, side: Option<OrderSide>, qty: &str) -> PositionUpdate {
@@ -3860,6 +3951,45 @@ mod tests {
         // projection (raw wallet fields are not projected).
         assert!(outcome.balance_changed);
         assert_eq!(stats.fills(), 0);
+    }
+
+    #[test]
+    fn uncorrelated_current_run_order_requires_reconciliation_without_stream_failure() {
+        let mut ledger = MakerLedger::new(0.0);
+        let mut stats = MakerStats::default();
+        let mut projection = MakerAccountProjection::new(1, "sxmk-test-", 0.0, 0.005, 0.00005);
+        let mut state = AccountEventState {
+            ledger: &mut ledger,
+            stats: &mut stats,
+            projection: &mut projection,
+        };
+        let context = AccountEventContext {
+            symbol: "BTC-USD",
+            run_order_prefix: "sxmk-test-",
+            mark: 100.0,
+            cycle: 2,
+            output_format: OutputFormat::Quiet,
+        };
+        let update = OrderUpdate {
+            seq: 1,
+            order_id: 7,
+            cl_ord_id: Some("sxmk-test-q00000001b0".to_string()),
+            symbol: "BTC-USD".to_string(),
+            side: OrderSide::Buy,
+            qty: "0.2".to_string(),
+            fill_qty: "0".to_string(),
+            fill_avg_price: "0".to_string(),
+            price: "100".to_string(),
+            status: standx_sdk::models::OrderStatus::Open,
+            reduce_only: false,
+            updated_at: "2026-07-15T00:00:00Z".to_string(),
+        };
+
+        let outcome = apply_account_event(AccountEvent::Order(update), &mut state, &context)
+            .expect("a late current-run order is a reconciliation trigger, not stream failure");
+
+        assert!(outcome.requires_order_reconciliation);
+        assert_eq!(outcome.fills, 0);
     }
 
     #[test]

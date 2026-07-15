@@ -51,5 +51,10 @@ order_response_reconnect_backoff = 2
 account_stream_reconnect_attempts = 3
 account_stream_reconnect_backoff = 2
 
+# Shared rolling circuit breaker across account-stream and order-response
+# recovery incidents. Attempt counts above reset for every admitted incident.
+recovery_incidents_per_window = 3
+recovery_window_secs = 3600
+
 # Use REST market polling instead of the WebSocket feed (normally false)
 no_ws = false
