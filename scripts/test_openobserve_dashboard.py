@@ -16,6 +16,9 @@ class DashboardContractTests(unittest.TestCase):
             panel["id"]: panel
             for panel in self.tabs["performance-latency"]["panels"]
         }
+        self.overview = {
+            panel["id"]: panel for panel in self.tabs["default"]["panels"]
+        }
         self.runs_and_events = {
             panel["id"]: panel for panel in self.tabs["runs-events"]["panels"]
         }
@@ -27,7 +30,7 @@ class DashboardContractTests(unittest.TestCase):
         return self.runs_and_events[panel_id]["queries"][0]["query"]
 
     def test_phase_one_tab_has_unique_required_panels(self) -> None:
-        self.assertEqual(self.payload["version"], 10)
+        self.assertEqual(self.payload["version"], 8)
         self.assertEqual(
             set(self.phase_one),
             {
@@ -67,12 +70,17 @@ class DashboardContractTests(unittest.TestCase):
             "effective_latency_p95_ms",
         ):
             self.assertIn(field, latency)
-        latency_events = self.query_sql("standx_order_latency_events")
-        for field in ("timeout_phase", "timeout_ms"):
-            self.assertIn(field, latency_events)
         self.assertNotIn("fill_after_cancel", latency)
         self.assertNotIn(
             "fill_after_cancel",
+            self.query_sql("standx_order_latency_events"),
+        )
+        self.assertNotIn(
+            "timeout_phase",
+            self.query_sql("standx_order_latency_events"),
+        )
+        self.assertNotIn(
+            "timeout_ms",
             self.query_sql("standx_order_latency_events"),
         )
         for panel_id in (
@@ -112,6 +120,27 @@ class DashboardContractTests(unittest.TestCase):
         ):
             self.assertIn(field, comparison)
         self.assertNotIn("$run_id", comparison)
+
+    def test_dashboard_uses_roomy_operational_layout_and_recent_default_window(self) -> None:
+        self.assertEqual(
+            self.payload["defaultDatetimeDuration"]["relativeTimePeriod"], "6h"
+        )
+        for panel_id in (
+            "standx_fills",
+            "standx_uptime",
+            "standx_latest_pnl",
+            "standx_max_inventory",
+        ):
+            self.assertEqual(self.overview[panel_id]["layout"]["h"], 8)
+
+        self.assertEqual(self.overview["standx_pnl_trend"]["layout"]["h"], 10)
+        self.assertEqual(self.overview["standx_position_trend"]["layout"]["h"], 10)
+        self.assertEqual(
+            self.runs_and_events["standx_run_comparison"]["layout"]["h"], 13
+        )
+        self.assertEqual(
+            self.runs_and_events["standx_key_events"]["layout"]["h"], 16
+        )
 
     def test_every_panel_query_targets_the_configured_stream(self) -> None:
         for tab in self.payload["tabs"]:
