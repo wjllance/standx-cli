@@ -1,3 +1,4 @@
+use super::feed::WsSnapshotDiagnostics;
 use super::*;
 use standx_maker::{self as maker, Action, MakerConfig, MakerStats};
 use standx_sdk::account_stream::AccountEvent;
@@ -190,6 +191,23 @@ fn optional_ms(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| format!("{value}ms"))
 }
 
+fn ws_snapshot_json(diagnostics: &WsSnapshotDiagnostics) -> serde_json::Value {
+    serde_json::json!({
+        "mark_seq": diagnostics.mark_seq,
+        "book_seq": diagnostics.book_seq,
+        "mark_server_time": diagnostics.mark_server_time,
+        "book_server_time": diagnostics.book_server_time,
+        "mark_envelope_time": diagnostics.mark_envelope_time,
+        "book_envelope_time": diagnostics.book_envelope_time,
+        "mark_payload_time": diagnostics.mark_payload_time,
+        "book_payload_time": diagnostics.book_payload_time,
+        "mark_age_ms": diagnostics.mark_age_ms,
+        "book_age_ms": diagnostics.book_age_ms,
+        "local_skew_ms": diagnostics.local_skew_ms,
+        "server_skew_ms": diagnostics.server_skew_ms,
+    })
+}
+
 /// Per-cycle output: one human line + indented actions, or JSON lines.
 pub(super) struct CycleOutput<'a> {
     pub(super) output_format: OutputFormat,
@@ -201,6 +219,7 @@ pub(super) struct CycleOutput<'a> {
     pub(super) best_ask: Option<f64>,
     pub(super) market_source: &'static str,
     pub(super) market_fallback_reason: Option<&'static str>,
+    pub(super) ws_snapshot: Option<&'a WsSnapshotDiagnostics>,
     pub(super) position: f64,
     pub(super) starting_position: f64,
     pub(super) account: Option<&'a Balance>,
@@ -223,6 +242,7 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
         best_ask,
         market_source,
         market_fallback_reason,
+        ws_snapshot,
         position,
         starting_position,
         account,
@@ -322,6 +342,7 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
                     "best_bid": best_bid, "best_ask": best_ask,
                     "market_source": market_source,
                     "market_fallback_reason": market_fallback_reason,
+                    "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
                     "position": position,
                     "starting_position": starting_position,
                     "account": account.map(account_json),
@@ -959,5 +980,32 @@ mod tests {
         assert_eq!(json["effective_latency_p99_ms"], 30);
         assert_eq!(json["fill_after_cancel_p50_ms"], 10);
         assert_eq!(json["ack"]["p95_ms"], 20);
+    }
+
+    #[test]
+    fn ws_snapshot_json_exposes_raw_times_and_skew_measurements() {
+        let diagnostics = WsSnapshotDiagnostics {
+            mark_seq: Some(10),
+            book_seq: Some(20),
+            mark_server_time: Some("2026-07-15T00:00:01Z".to_string()),
+            book_server_time: Some("2026-07-15T00:00:03Z".to_string()),
+            mark_envelope_time: Some("1752537601000".to_string()),
+            book_envelope_time: Some("1752537603000".to_string()),
+            mark_payload_time: Some("2026-07-15T00:00:01Z".to_string()),
+            book_payload_time: Some("2026-07-15T00:00:02Z".to_string()),
+            mark_age_ms: Some(250),
+            book_age_ms: Some(50),
+            local_skew_ms: Some(200),
+            server_skew_ms: Some(2_000),
+        };
+
+        let json = ws_snapshot_json(&diagnostics);
+
+        assert_eq!(json["mark_seq"], 10);
+        assert_eq!(json["book_seq"], 20);
+        assert_eq!(json["mark_age_ms"], 250);
+        assert_eq!(json["local_skew_ms"], 200);
+        assert_eq!(json["server_skew_ms"], 2_000);
+        assert_eq!(json["book_payload_time"], "2026-07-15T00:00:02Z");
     }
 }

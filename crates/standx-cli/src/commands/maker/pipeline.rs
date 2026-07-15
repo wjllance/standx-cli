@@ -1,3 +1,4 @@
+use super::feed::WsSnapshotDiagnostics;
 use super::{ORDER_HISTORY_LIMIT, TRADE_LOOKBACK_LIMIT};
 use crate::cli::OutputFormat;
 use anyhow::Result;
@@ -122,6 +123,9 @@ pub(super) struct CycleRequest<'a> {
     /// cycle after bounded recovery is grouped separately in latency output.
     pub(super) recovery: bool,
     pub(super) market_fallback_reason: Option<&'static str>,
+    /// Observation-only metadata from the public WS cache. This never feeds
+    /// strategy, safety, or source-selection decisions.
+    pub(super) ws_snapshot: Option<&'a WsSnapshotDiagnostics>,
     pub(super) max_divergence_bps: f64,
     pub(super) inventory_exit_pct: f64,
     pub(super) inventory_exit_qty: f64,

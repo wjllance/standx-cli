@@ -332,7 +332,7 @@ pub(super) async fn run_startup(
             client.get_balance(),
         );
         let positions = positions?;
-        let (mark, _, _, _, _) = startup_market?;
+        let mark = startup_market?.mark;
         let filled_orders = filled_orders?;
         let historical_trades = historical_trades?;
         let balance = balance?;

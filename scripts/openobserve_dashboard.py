@@ -345,7 +345,7 @@ ORDER BY _timestamp DESC LIMIT 1''',
             "Reduce-only inventory-exit events for the selected run.",
             query(
                 stream,
-                f'SELECT count(DISTINCT event_id) AS exits FROM "{stream}" WHERE action = \'inventory_exit\' AND {selected}',
+                f'SELECT count(DISTINCT event_id) AS exits FROM "{stream}" WHERE action = \'inventory_exit_submitted\' AND {selected}',
                 [],
                 [axis("exits", "Exits")],
             ),
@@ -356,18 +356,28 @@ ORDER BY _timestamp DESC LIMIT 1''',
             "standx_run_comparison",
             "table",
             "Run Comparison",
-            "Latest cycle per run in the time range. This table intentionally ignores the run selector.",
+            "Latest cycle per run plus its latest lifecycle detail, including fail-safe stop reasons. This table intentionally ignores the run selector.",
             query(
                 stream,
-                f'''WITH ranked AS (
+                f'''WITH latest_cycles AS (
   SELECT run_id, symbol, mode, config_hash, _timestamp, fills_total, pnl, uptime_pct,
+         position, starting_position,
          row_number() OVER (PARTITION BY run_id ORDER BY _timestamp DESC) AS rn
   FROM "{stream}" WHERE action = 'cycle_summary'
+), latest_lifecycle AS (
+  SELECT run_id, event AS lifecycle_event, message AS lifecycle_message,
+         row_number() OVER (PARTITION BY run_id ORDER BY _timestamp DESC) AS rn
+  FROM "{stream}" WHERE action = 'lifecycle'
 )
-SELECT _timestamp, run_id, symbol, mode, fills_total, pnl, uptime_pct, config_hash
-FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
-                [axis("_timestamp", "Time"), axis("run_id", "Run"), axis("symbol", "Symbol"), axis("mode", "Mode"), axis("config_hash", "Config")],
-                [axis("fills_total", "Fills"), axis("pnl", "PnL"), axis("uptime_pct", "Uptime")],
+SELECT cycles._timestamp, cycles.run_id, cycles.symbol, cycles.mode, cycles.fills_total,
+       cycles.pnl, cycles.uptime_pct, cycles.position, cycles.starting_position,
+       cycles.config_hash, lifecycle.lifecycle_event, lifecycle.lifecycle_message
+FROM latest_cycles AS cycles
+LEFT JOIN latest_lifecycle AS lifecycle
+  ON cycles.run_id = lifecycle.run_id AND lifecycle.rn = 1
+WHERE cycles.rn = 1 ORDER BY cycles._timestamp DESC LIMIT 50''',
+                [axis("_timestamp", "Time"), axis("run_id", "Run"), axis("symbol", "Symbol"), axis("mode", "Mode"), axis("lifecycle_event", "Lifecycle"), axis("lifecycle_message", "Lifecycle detail"), axis("config_hash", "Config")],
+                [axis("fills_total", "Fills"), axis("pnl", "PnL"), axis("uptime_pct", "Uptime"), axis("position", "Position"), axis("starting_position", "Starting position")],
             ),
             (0, 5, 192, 10, 4),
             decimals=None,
@@ -383,7 +393,7 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
        request_id, request_kind, timeout_phase, recovery_target, age_ms, timeout_ms,
        position_delta, expected_position, observed_position, reason, message
 FROM "{stream}" WHERE {selected}
-  AND action IN ('fill', 'cancel', 'alert', 'risk_notification', 'maker_cleanup', 'inventory_exit',
+  AND action IN ('fill', 'cancel', 'alert', 'risk_notification', 'maker_cleanup', 'inventory_exit_submitted',
                  'order_response_reconnect', 'position_reconciliation',
                  'account_trade_shadow', 'ledger_sync', 'inventory_adopted',
                  'startup_rejected', 'lifecycle', 'performance_summary',
@@ -512,15 +522,14 @@ ORDER BY _timestamp DESC LIMIT 1''',
             "standx_order_latency_summary",
             "table",
             "Place / Cancel Latency Summary",
-            "Write, ack and effective p50/p95/p99 with reject and censored timeout rates.",
+            "Write, ack and effective p50/p95/p99 with reject and censored timeout rates. Optional fill-after-cancel fields are omitted until the stream schema has observed them.",
             query(
                 stream,
                 f'''SELECT _timestamp, kind, requests, accepted, rejected, effective, timeout,
        invalidated, process_ended, pending, reject_rate, timeout_rate,
        write_p50_ms, write_p95_ms, write_p99_ms,
        ack_p50_ms, ack_p95_ms, ack_p99_ms,
-       effective_latency_p50_ms, effective_latency_p95_ms, effective_latency_p99_ms,
-       fill_after_cancel_p50_ms, fill_after_cancel_p95_ms, fill_after_cancel_p99_ms
+       effective_latency_p50_ms, effective_latency_p95_ms, effective_latency_p99_ms
 FROM "{stream}" WHERE action = 'order_latency_summary' AND {selected}
 ORDER BY kind, _timestamp DESC LIMIT 10''',
                 [axis("kind", "Kind"), axis("_timestamp", "Time")],
@@ -539,13 +548,13 @@ ORDER BY kind, _timestamp DESC LIMIT 10''',
             "standx_order_latency_events",
             "table",
             "Order Lifecycle Correlation",
-            "Request-level lifecycle including account-order-before-ack, timeout, invalidation and fills during cancel windows.",
+            "Request-level lifecycle including account-order-before-ack, timeout, and invalidation.",
             query(
                 stream,
                 f'''SELECT _timestamp, request_id, kind, generation, cycle, symbol, side, level,
-       market_source, recovery, outcome, timeout_phase, timeout_ms, place_write_ms, place_ack_ms,
-       place_effective_ms, cancel_write_ms, cancel_ack_ms, cancel_effective_ms,
-       fill_after_cancel_ms
+       market_source, recovery, outcome, timeout_phase, timeout_ms,
+       place_write_ms, place_ack_ms, place_effective_ms,
+       cancel_write_ms, cancel_ack_ms, cancel_effective_ms
 FROM "{stream}" WHERE action = 'order_latency' AND {selected}
 ORDER BY _timestamp DESC LIMIT 200''',
                 [
@@ -636,13 +645,11 @@ FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC LIMIT 50''',
                 f'''WITH ranked AS (
   SELECT _timestamp, run_id, config_hash, symbol, kind, requests, reject_rate,
          timeout_rate, write_p95_ms, ack_p95_ms, effective_latency_p95_ms,
-         fill_after_cancel_p95_ms,
          row_number() OVER (PARTITION BY run_id, kind ORDER BY _timestamp DESC) AS rn
   FROM "{stream}" WHERE action = 'order_latency_summary'
 )
 SELECT _timestamp, run_id, config_hash, symbol, kind, requests, reject_rate,
-       timeout_rate, write_p95_ms, ack_p95_ms, effective_latency_p95_ms,
-       fill_after_cancel_p95_ms
+       timeout_rate, write_p95_ms, ack_p95_ms, effective_latency_p95_ms
 FROM ranked WHERE rn = 1 ORDER BY _timestamp DESC, kind LIMIT 100''',
                 [
                     axis("_timestamp", "Time"),
