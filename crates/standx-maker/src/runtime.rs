@@ -76,6 +76,7 @@ pub enum RuntimeStopReason {
     MarketData(String),
     ConsecutiveCycleErrors(String),
     StopLoss(String),
+    AccountingInvariant(String),
     CleanupFailure {
         target: RecoveryTarget,
         reason: String,
@@ -90,7 +91,8 @@ impl RuntimeStopReason {
             | Self::PositionReconciliation(reason)
             | Self::MarketData(reason)
             | Self::ConsecutiveCycleErrors(reason)
-            | Self::StopLoss(reason) => reason.clone(),
+            | Self::StopLoss(reason)
+            | Self::AccountingInvariant(reason) => reason.clone(),
             Self::CleanupFailure { reason, .. } => reason.clone(),
         }
     }
@@ -720,6 +722,7 @@ mod tests {
             RuntimeStopReason::MarketData("boom".to_string()),
             RuntimeStopReason::ConsecutiveCycleErrors("boom".to_string()),
             RuntimeStopReason::StopLoss("boom".to_string()),
+            RuntimeStopReason::AccountingInvariant("boom".to_string()),
             RuntimeStopReason::CleanupFailure {
                 target: RecoveryTarget::OrderResponse,
                 reason: "boom".to_string(),
@@ -784,6 +787,31 @@ mod tests {
                 "{event:?} must not leave stale effects behind cleanup"
             );
         }
+    }
+
+    #[test]
+    fn accounting_invariant_stop_clears_queued_cycle() {
+        let mut state = MakerState::starting();
+        // Leave StartupReady's RunCycle effect *undrained* so the test proves
+        // an accounting-invariant stop clears stale queued work instead of
+        // leaving a placement effect behind the abort/stop pair.
+        state.handle(MakerEvent::StartupReady);
+        let queued = match state.pending_effect() {
+            Some(MakerEffect::RunCycle(token)) => *token,
+            effect => panic!("expected queued cycle, got {effect:?}"),
+        };
+        let reason = RuntimeStopReason::AccountingInvariant("boom".to_string());
+        state.handle(MakerEvent::StopRequested(reason.clone()));
+        assert_eq!(
+            state.next_effect(),
+            Some(MakerEffect::AbortInFlight(queued))
+        );
+        assert_eq!(state.next_effect(), Some(MakerEffect::Stop(reason)));
+        assert_eq!(
+            state.next_effect(),
+            None,
+            "queued RunCycle must not survive the accounting-invariant stop"
+        );
     }
 
     #[test]

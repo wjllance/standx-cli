@@ -115,6 +115,9 @@ impl From<standx_maker::RuntimeStopReason> for MakerExit {
                 Self::ConsecutiveErrors(detail)
             }
             standx_maker::RuntimeStopReason::StopLoss(detail) => Self::StopLoss(detail),
+            standx_maker::RuntimeStopReason::AccountingInvariant(detail) => {
+                Self::AccountingInvariant(detail)
+            }
         }
     }
 }
@@ -284,6 +287,10 @@ mod exit_mapping_tests {
         assert!(matches!(
             MakerExit::from(RuntimeStopReason::StopLoss("boom".to_string())),
             MakerExit::StopLoss(detail) if detail == "boom"
+        ));
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::AccountingInvariant("boom".to_string())),
+            MakerExit::AccountingInvariant(detail) if detail == "boom"
         ));
         assert!(matches!(
             MakerExit::from(RuntimeStopReason::CleanupFailure {

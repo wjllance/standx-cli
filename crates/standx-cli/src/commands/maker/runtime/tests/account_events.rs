@@ -287,7 +287,7 @@ async fn accounting_invariant_mismatch_becomes_fail_safe_exit() {
     assert!(
         accounting_invariant_exit(&notifier, "XAG-USD", 1396, 0.0, -0.2, 0.0005,)
             .await
-            .is_some_and(|exit| matches!(exit, MakerExit::AccountingInvariant(_)))
+            .is_some_and(|detail| detail.contains("differs from ledger expected"))
     );
     assert!(
         accounting_invariant_exit(&notifier, "XAG-USD", 1396, 0.0, 0.00049, 0.0005,)
