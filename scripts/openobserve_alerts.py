@@ -14,7 +14,9 @@ Environment (shares the dashboard script's OpenObserve variables):
 - ``OPENOBSERVE_ORG``           default ``default``
 - ``OPENOBSERVE_STREAM``        default ``standx_maker``
 - ``OPENOBSERVE_USER`` / ``OPENOBSERVE_PASSWORD``   required (Basic auth)
-- ``OPENOBSERVE_ALERT_WEBHOOK`` required; webhook the alert POSTs to
+- ``OPENOBSERVE_ALERT_WEBHOOK`` required; Feishu (Lark) custom-bot webhook the
+  alert POSTs to. The template body is Feishu msg_type=text, so a Slack or
+  generic ``{"text": ...}`` endpoint will reject it.
 - ``OPENOBSERVE_ALERT_MINUTES`` default ``3``; deadman window in minutes
 """
 
@@ -34,17 +36,18 @@ TEMPLATE_NAME = "standx_maker_deadman_template"
 DESTINATION_NAME = "standx_maker_deadman_webhook"
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
-# Slack/Feishu-agnostic text payload. OpenObserve substitutes the {var}
-# placeholders at send time; keep it plain text so generic webhooks accept it.
+# Feishu (Lark) custom-bot text payload. OpenObserve substitutes the {var}
+# placeholders at send time; the JSON structure braces are left untouched
+# because only recognized variable names are replaced. Feishu requires the
+# msg_type/content envelope rather than a bare {"text": ...} body.
+_DEADMAN_TEXT = (
+    "\U0001f6d1 StandX maker DEADMAN: no cycle_summary in the "
+    "{stream_name} stream for the deadman window. The maker may have "
+    "died silently (SIGKILL/OOM/panic/host down) and could be leaving "
+    "resting orders on the venue. Alert: {alert_name} org: {org_name}"
+)
 TEMPLATE_BODY = json.dumps(
-    {
-        "text": (
-            "\U0001f6d1 StandX maker DEADMAN: no cycle_summary in the "
-            "{stream_name} stream for the deadman window. The maker may have "
-            "died silently (SIGKILL/OOM/panic/host down) and could be leaving "
-            "resting orders on the venue. Alert: {alert_name} org: {org_name}"
-        )
-    }
+    {"msg_type": "text", "content": {"text": _DEADMAN_TEXT}}
 )
 
 
