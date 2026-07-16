@@ -29,7 +29,7 @@ interval = 3
 # Inventory and market-data guards
 max_position = 0.8
 skew_bps = 8.0
-max_divergence_bps = 6.0
+max_divergence_bps = 15.0
 vol_pause_bps = 30.0
 vol_window = 20
 
