@@ -52,7 +52,11 @@ RUN set -eu; \
 
 # Credentials come from a read-only mount at $XDG_DATA_HOME/standx/credentials.enc.
 ENV XDG_DATA_HOME=/opt/standx/state
-RUN mkdir -p /opt/standx/state/standx /opt/standx/var/standx
+# var/lock is where STANDX_MAKER_LOCK_PATH / STANDX_STAGE2_AB_LOCK_PATH should
+# point by default — container-local, not the host's /run/lock (see
+# docker-compose.yml). The app also create_dir_all()s the lock's parent at
+# runtime, but this keeps the image's writable layout explicit.
+RUN mkdir -p /opt/standx/state/standx /opt/standx/var/standx /opt/standx/var/lock
 
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

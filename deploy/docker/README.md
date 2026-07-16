@@ -22,8 +22,19 @@ recorded and the exact authorization text is in the release record.
    (`~/.local/share/standx/credentials.enc`), mounted read-only.
 3. A root-owned `0600` `/etc/standx/maker-stage2-ab.env` — copy
    [`deploy/systemd/maker-stage2-ab.env.example`](../systemd/maker-stage2-ab.env.example),
-   fill secrets and the three `STANDX_BASELINE_*` metadata values. The in-container
-   paths it already targets (`/opt/standx`, `/run/lock/...`) are correct as-is.
+   fill secrets and the three `STANDX_BASELINE_*` metadata values. The
+   `/opt/standx` paths it targets are correct as-is, but **override the two
+   lock paths** for docker (the example's `/run/lock/...` defaults are for the
+   systemd deployment, which shares them with the host):
+   ```
+   STANDX_MAKER_LOCK_PATH=/opt/standx/var/lock/standx-maker-live.lock
+   STANDX_STAGE2_AB_LOCK_PATH=/opt/standx/var/lock/standx-maker-stage2-ab.lock
+   ```
+   Only keep the `/run/lock/...` defaults (and re-add the `/run/lock` bind
+   mount removed from `docker-compose.yml`) if a host-run
+   `standx-maker.service` / `standx-maker-stage2-ab.service` runs at the same
+   time as this container and must be mutually exclusive with it. See "Do not"
+   below.
 4. The frozen `examples/maker-stage2-xag-{baseline,candidate}.toml` (shipped in
    the image).
 
@@ -64,7 +75,7 @@ only launches when you pass `--profile ab` explicitly.
 | `ExecStart=run_maker_stage2_ab.sh` | entrypoint `exec`s it | unchanged orchestrator |
 | `ExecStartPre=openobserve_alerts.py` | entrypoint, fail-closed | deadman alert installed before any order |
 | `Restart=on-failure` + `RestartPreventExitStatus=75` | `restart: "no"` | **behavior change — see below** |
-| `Conflicts=standx-maker.service` | shared `/run/lock` bind mount | flock keeps host maker + container mutually exclusive |
+| `Conflicts=standx-maker.service` | not enforced by default | see "Changed" below — container uses container-local locks unless you opt in to sharing `/run/lock` |
 | `KillSignal=SIGTERM` / `TimeoutStopSec=90` | `stop_signal` + `stop_grace_period: 120s` | plus a new orchestrator SIGTERM trap |
 | `EnvironmentFile=/etc/standx/maker-stage2-ab.env` | `env_file` | same file |
 | `OnFailure=standx-notify@…` | `STANDX_SUPERVISOR_WEBHOOK` critical post | orchestrator already webhooks on critical stop |
@@ -75,8 +86,6 @@ only launches when you pass `--profile ab` explicitly.
 - Exit 75 critical stop, no automatic flatten, arm invalidation, manifest +
   venue empty-order/empty-position gates between arms — all in the unchanged
   orchestrator.
-- Host-wide single-live-maker guarantee, via the shared `/run/lock` mount and
-  the existing `flock` guard/maker locks.
 - Deadman alert installed before the first live order (fail-closed entrypoint).
 - Clean shutdown: a **new SIGTERM/SIGINT trap** in `run_maker_stage2_ab.sh`
   forwards the signal to the active arm so `docker stop` triggers the normal
@@ -89,15 +98,26 @@ only launches when you pass `--profile ab` explicitly.
   an exit code, so auto-restart would relaunch after a critical stop that may
   have left an open position — unacceptable. Every stop here (critical or
   transient) requires a human to clear per the runbook emergency procedure.
-- **Host networking + root in container** for lock/telemetry/venue parity. This
+- **Host networking + root in container** for telemetry/venue parity. This
   is dedicated-host infra, matching the current host-process deployment; it is
   not isolated the way a bridged, unprivileged container would be.
+- **Locks are container-local by default, not shared with `/run/lock`.**
+  Bind-mounting a system directory like the host's `/run/lock` hit
+  environment-specific failures in practice (permission/SELinux denials on
+  some hosts) for no benefit when nothing else on the host is running a live
+  maker. `STANDX_MAKER_LOCK_PATH` / `STANDX_STAGE2_AB_LOCK_PATH` should point
+  under `/opt/standx/var/lock` (see Prerequisites). **This means the
+  container no longer guarantees mutual exclusion with a host-run
+  `standx-maker.service`.** If you do run one alongside this container, bind
+  mount a shared host lock directory into both and point both deployments'
+  lock env vars at it.
 
 ## Do not
 
 - Do not pass `--controlled-disconnect-after` through this path — it forces a
   fail-safe shutdown, which the orchestrator treats as an arm exiting early
   (critical stop). Run that canary drill manually per the runbook.
-- Do not run this container and the host `standx-maker.service` at the same
-  time; the shared lock will reject the second, but do not rely on it — stop
-  one first.
+- Do not run this container and a host `standx-maker.service` at the same
+  time unless you've bind-mounted a shared lock directory into both (see
+  "Locks are container-local by default" above) — with container-local locks,
+  nothing stops the two from trading the same symbol concurrently.
