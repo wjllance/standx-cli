@@ -415,7 +415,7 @@ impl MakerRuntime {
                                     severity,
                                     event,
                                     message: &message,
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: None,
@@ -441,21 +441,21 @@ impl MakerRuntime {
         let market_data_health_started = self.market.health_started;
         let recovery_clock_started = self.recovery.clock_started;
         let feed = &self.market.feed;
-        let exit = 'phase: loop {
+        let exit = 'phase: {
             if let Some(detail) = self.market.pending_degradation.take() {
                 let frozen_message =
                     format!("{detail}; placements frozen and maker cleanup starting");
                 let recovery_token = match freeze_and_cleanup_for_recovery(
                     &mut RecoveryIo {
                         runtime_state: &mut self.recovery.runtime_state,
-                        notifier: &notifier,
-                        client: &client,
+                        notifier,
+                        client,
                         session: self.live_session.as_mut(),
                         resting: &mut self.loop_state.resting,
                         inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                         consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                         next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                        symbol: &symbol,
+                        symbol,
                         cycle,
                         output_format,
                     },
@@ -474,7 +474,7 @@ impl MakerRuntime {
                             severity: "warning",
                             event: "degraded_frozen",
                             message: &frozen_message,
-                            symbol: &symbol,
+                            symbol,
                             cycle,
                             position_before: None,
                             position_after: Some(self.loop_state.ledger.expected_position),
@@ -523,8 +523,8 @@ impl MakerRuntime {
                     result = tokio::time::timeout(
                         MARKET_DATA_RECOVERY_TIMEOUT,
                         recover_market_data(MarketDataRecovery {
-                            client: &client,
-                            symbol: &symbol,
+                            client,
+                            symbol,
                             output_format,
                             live: args.live,
                             feed: feed.as_ref(),
@@ -561,14 +561,14 @@ impl MakerRuntime {
                 resume_quoting_after_recovery(
                     &mut RecoveryIo {
                         runtime_state: &mut self.recovery.runtime_state,
-                        notifier: &notifier,
-                        client: &client,
+                        notifier,
+                        client,
                         session: self.live_session.as_mut(),
                         resting: &mut self.loop_state.resting,
                         inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                         consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                         next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                        symbol: &symbol,
+                        symbol,
                         cycle,
                         output_format,
                     },
@@ -583,7 +583,7 @@ impl MakerRuntime {
                             severity: "resolved",
                             event: "recovered",
                             message: "market data recovered with consecutive coherent snapshots and a verified empty maker book; quoting may resume",
-                            symbol: &symbol,
+                            symbol,
                             cycle,
                             position_before: None,
                             position_after: Some(observed),
@@ -613,7 +613,7 @@ impl MakerRuntime {
         let session_started_at = self.deps.session_started_at;
         let cycle = self.loop_state.counters.cycle;
         let recovery_clock_started = self.recovery.clock_started;
-        let exit = 'phase: loop {
+        let exit = 'phase: {
             if let Some(session) = self.live_session.as_mut() {
                 if !session.account_stream_health.is_healthy() {
                     let detail = session
@@ -643,7 +643,7 @@ impl MakerRuntime {
                                 severity: "warning",
                                 event: "disconnected_frozen",
                                 message: &message,
-                                symbol: &symbol,
+                                symbol,
                                 cycle,
                                 position_before: None,
                                 position_after: None,
@@ -655,7 +655,7 @@ impl MakerRuntime {
                             FreezeNotice::RequestTimeout(request_timeout_notice(
                                 timeout,
                                 &detail,
-                                &symbol,
+                                symbol,
                                 cycle,
                                 self.loop_state.ledger.expected_position,
                             ))
@@ -668,14 +668,14 @@ impl MakerRuntime {
                     let recovery_token = match freeze_and_cleanup_for_recovery(
                         &mut RecoveryIo {
                             runtime_state: &mut self.recovery.runtime_state,
-                            notifier: &notifier,
-                            client: &client,
+                            notifier,
+                            client,
                             session: Some(&mut *session),
                             resting: &mut self.loop_state.resting,
                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                             consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                             next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                            symbol: &symbol,
+                            symbol,
                             cycle,
                             output_format,
                         },
@@ -769,8 +769,8 @@ impl MakerRuntime {
                             projection,
                         },
                         &AccountEventContext {
-                            symbol: &symbol,
-                            run_order_prefix: &run_order_prefix,
+                            symbol,
+                            run_order_prefix,
                             mark: self.market.last_mark.unwrap_or(baseline_mark),
                             cycle,
                             output_format,
@@ -791,7 +791,7 @@ impl MakerRuntime {
                     self.loop_state.account_balance_refresh_requested |=
                         reconnect_outcome.balance_changed;
                     let mut reconnect_fills = reconnect_outcome.fills;
-                    let positions = match client.get_positions(Some(&symbol)).await {
+                    let positions = match client.get_positions(Some(symbol)).await {
                         Ok(positions) => positions,
                         Err(error) => {
                             handle.abort();
@@ -802,7 +802,7 @@ impl MakerRuntime {
                             );
                         }
                     };
-                    let mut observed = match position_for_symbol(&positions, &symbol) {
+                    let mut observed = match position_for_symbol(&positions, symbol) {
                         Ok(position) => position,
                         Err(error) => {
                             handle.abort();
@@ -841,8 +841,8 @@ impl MakerRuntime {
                                     projection,
                                 },
                                 &AccountEventContext {
-                                    symbol: &symbol,
-                                    run_order_prefix: &run_order_prefix,
+                                    symbol,
+                                    run_order_prefix,
                                     mark: self.market.last_mark.unwrap_or(baseline_mark),
                                     cycle,
                                     output_format,
@@ -865,11 +865,11 @@ impl MakerRuntime {
                                 }
                             }
                             match probe_position_convergence(
-                                &client,
+                                client,
                                 ReconcileRequest {
-                                    symbol: &symbol,
+                                    symbol,
                                     session_started_at,
-                                    run_order_prefix: &run_order_prefix,
+                                    run_order_prefix,
                                     qty_tolerance,
                                     mark: self.market.last_mark.unwrap_or(baseline_mark),
                                 },
@@ -910,7 +910,7 @@ impl MakerRuntime {
                     // one final authoritative empty-book verification before the
                     // recovered stream can resume quoting.
                     if let Err(error) =
-                        cancel_maker_orders_with_retry(&client, &symbol, 3, output_format).await
+                        cancel_maker_orders_with_retry(client, symbol, 3, output_format).await
                     {
                         handle.abort();
                         break recovery_failed_exit(
@@ -928,14 +928,14 @@ impl MakerRuntime {
                     resume_quoting_after_recovery(
                         &mut RecoveryIo {
                             runtime_state: &mut self.recovery.runtime_state,
-                            notifier: &notifier,
-                            client: &client,
+                            notifier,
+                            client,
                             session: Some(&mut *session),
                             resting: &mut self.loop_state.resting,
                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                             consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                             next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                            symbol: &symbol,
+                            symbol,
                             cycle,
                             output_format,
                         },
@@ -950,7 +950,7 @@ impl MakerRuntime {
                                 severity: "resolved",
                                 event: "reconnected",
                                 message: "account stream reauthenticated; buffered events and REST trades reconciled against the venue position",
-                                symbol: &symbol,
+                                symbol,
                                 cycle,
                                 position_before: None,
                                 position_after: None,
@@ -980,7 +980,7 @@ impl MakerRuntime {
         let session_started_at = self.deps.session_started_at;
         let cycle = self.loop_state.counters.cycle;
         let recovery_clock_started = self.recovery.clock_started;
-        let exit = loop {
+        let exit = 'phase: {
             if let Some(session) = self.live_session.as_mut() {
                 if !session.order_response_health.is_healthy() {
                     let detail = session
@@ -1013,7 +1013,7 @@ impl MakerRuntime {
                                 severity: "warning",
                                 event: "disconnected_frozen",
                                 message: &disconnect_message,
-                                symbol: &symbol,
+                                symbol,
                                 cycle,
                                 position_before: None,
                                 position_after: None,
@@ -1025,7 +1025,7 @@ impl MakerRuntime {
                             FreezeNotice::RequestTimeout(request_timeout_notice(
                                 timeout,
                                 &detail,
-                                &symbol,
+                                symbol,
                                 cycle,
                                 self.loop_state.ledger.expected_position,
                             ))
@@ -1034,14 +1034,14 @@ impl MakerRuntime {
                     let recovery_token = match freeze_and_cleanup_for_recovery(
                         &mut RecoveryIo {
                             runtime_state: &mut self.recovery.runtime_state,
-                            notifier: &notifier,
-                            client: &client,
+                            notifier,
+                            client,
                             session: Some(&mut *session),
                             resting: &mut self.loop_state.resting,
                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                             consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                             next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                            symbol: &symbol,
+                            symbol,
                             cycle,
                             output_format,
                         },
@@ -1062,7 +1062,7 @@ impl MakerRuntime {
                     .await
                     {
                         Ok(token) => token,
-                        Err(exit) => break exit,
+                        Err(exit) => break 'phase exit,
                     };
                     let reconnect_unavailable = if controlled_fault {
                         Some("controlled fault injection requires fail-safe shutdown".to_string())
@@ -1085,9 +1085,9 @@ impl MakerRuntime {
                         match reconnect_order_response(
                             ReconnectRequest {
                                 cleanup_client: client.clone(),
-                                symbol: &symbol,
+                                symbol,
                                 session_started_at,
-                                run_order_prefix: &run_order_prefix,
+                                run_order_prefix,
                                 qty_tolerance,
                                 mark: self.market.last_mark.unwrap_or(baseline_mark),
                                 output_format,
@@ -1107,7 +1107,7 @@ impl MakerRuntime {
                                 self.loop_state.counters.total_fills +=
                                     reconnected.fills.len() as u64;
                                 for fill in &reconnected.fills {
-                                    emit_live_fill(fill, &symbol, cycle, output_format);
+                                    emit_live_fill(fill, symbol, cycle, output_format);
                                     if let Some(order_id) = fill.order_id {
                                         let at_ms = u64::try_from(
                                             session.latency_started.elapsed().as_millis(),
@@ -1135,14 +1135,14 @@ impl MakerRuntime {
                                 resume_quoting_after_recovery(
                                     &mut RecoveryIo {
                                         runtime_state: &mut self.recovery.runtime_state,
-                                        notifier: &notifier,
-                                        client: &client,
+                                        notifier,
+                                        client,
                                         session: Some(&mut *session),
                                         resting: &mut self.loop_state.resting,
                                         inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                                         consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                                         next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                                        symbol: &symbol,
+                                        symbol,
                                         cycle,
                                         output_format,
                                     },
@@ -1157,7 +1157,7 @@ impl MakerRuntime {
                                             severity: "resolved",
                                             event: "reconnected",
                                             message: "order-response stream reconnected; maker book verified empty before quoting resumes",
-                                            symbol: &symbol,
+                                            symbol,
                                             cycle,
                                             position_before: None,
                                             position_after: None,
@@ -1176,7 +1176,7 @@ impl MakerRuntime {
                                         .handle(MakerEvent::StopRequested(
                                             RuntimeStopReason::CtrlC,
                                         ));
-                                    break take_stop_effect(
+                                    break 'phase take_stop_effect(
                                         &mut self.recovery.runtime_state,
                                         MakerExit::OrderResponse,
                                     );
@@ -1208,7 +1208,7 @@ impl MakerRuntime {
                                                 severity: "critical",
                                                 event: "reconnect_failed",
                                                 message: &reconciliation_message,
-                                                symbol: &symbol,
+                                                symbol,
                                                 cycle,
                                                 position_before: None,
                                                 position_after: None,
@@ -1226,7 +1226,7 @@ impl MakerRuntime {
                                             reason: error.to_string(),
                                         },
                                     );
-                                    break take_stop_effect(
+                                    break 'phase take_stop_effect(
                                         &mut self.recovery.runtime_state,
                                         MakerExit::PositionReconciliation,
                                     );
@@ -1241,7 +1241,7 @@ impl MakerRuntime {
                                             severity: "critical",
                                             event: "reconnect_failed",
                                             message: &reconnect_failed_message,
-                                            symbol: &symbol,
+                                            symbol,
                                             cycle,
                                             position_before: None,
                                             position_after: None,
@@ -1259,7 +1259,7 @@ impl MakerRuntime {
                                         token: recovery_token,
                                         reason: reconnect_failed_message,
                                     });
-                                break take_stop_effect(
+                                break 'phase take_stop_effect(
                                     &mut self.recovery.runtime_state,
                                     MakerExit::OrderResponse,
                                 );
@@ -1277,7 +1277,7 @@ impl MakerRuntime {
                                 severity: "critical",
                                 event: "reconnect_unavailable",
                                 message: &refuse_message,
-                                symbol: &symbol,
+                                symbol,
                                 cycle,
                                 position_before: None,
                                 position_after: None,
@@ -1293,7 +1293,7 @@ impl MakerRuntime {
                             token: recovery_token,
                             reason: refuse_message,
                         });
-                    break take_stop_effect(
+                    break 'phase take_stop_effect(
                         &mut self.recovery.runtime_state,
                         MakerExit::OrderResponse,
                     );
@@ -1321,7 +1321,7 @@ impl MakerRuntime {
                 &mut self.recovery.runtime_state,
                 OrderResponseObservation {
                     output_format,
-                    symbol: &symbol,
+                    symbol,
                     cycle,
                     price_decimals: cfg.price_decimals,
                     latency: Some(&mut session.order_latency),
@@ -1341,8 +1341,8 @@ impl MakerRuntime {
                     projection: &mut session.projection,
                 },
                 &AccountEventContext {
-                    symbol: &symbol,
-                    run_order_prefix: &run_order_prefix,
+                    symbol,
+                    run_order_prefix,
                     mark: self.market.last_mark.unwrap_or(baseline_mark),
                     cycle,
                     output_format,
@@ -1359,13 +1359,13 @@ impl MakerRuntime {
                                 .loop_state
                                 .account_balance_refresh_requested,
                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                            notifier: &notifier,
+                            notifier,
                             position_alert_anchor: &mut self.loop_state.position_alert_anchor,
                             expected_position: self.loop_state.ledger.expected_position,
                             max_position: cfg.max_position,
                             inventory_exit_pct: args.inventory_exit_pct,
                             qty_tolerance,
-                            symbol: &symbol,
+                            symbol,
                             cycle,
                             order_latency: Some(&mut session.order_latency),
                             latency_started: Some(session.latency_started),
@@ -1434,7 +1434,7 @@ impl MakerRuntime {
         let notifier = &self.deps.notifier;
         let qty_tolerance = self.deps.qty_tolerance;
         let cycle = self.loop_state.counters.cycle;
-        let exit = 'phase: loop {
+        let exit = 'phase: {
             if self
                 .recovery
                 .account_position_mismatch
@@ -1446,8 +1446,8 @@ impl MakerRuntime {
             }
             if args.live {
                 if let Some(exit) = accounting_invariant_exit(
-                    &notifier,
-                    &symbol,
+                    notifier,
+                    symbol,
                     cycle,
                     self.loop_state.ledger.expected_position,
                     self.loop_state.stats.position(),
