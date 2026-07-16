@@ -86,7 +86,12 @@ missing webhook or non-zero terminal position:
 After confirming `orders=[]` and `positions=[]`, execute the venue-minimum
 `ws-command-canary` and retain its full create/cancel correlation chain. Then
 start the final candidate config with a single controlled order-response
-disconnect at 15 seconds:
+disconnect at 15 seconds. `--controlled-disconnect-after` is a fail-safe
+shutdown drill: it does **not** reconnect or resume quoting. It forces the
+fail-closed path so the gate can confirm the maker freezes, cancels only its
+own orders, and shuts down cleanly on an order-response fault. Exercising the
+reconnect/reconcile/resume path is left to an organic disconnect, not this
+flag.
 
 ```bash
 cd /opt/standx
@@ -100,11 +105,17 @@ scripts/run_maker_observed.sh bin/standx --output json maker run XAG-USD \
   --controlled-disconnect-after 15
 ```
 
-Verify the sequence `frozen → maker cleanup/empty book → reconnect → REST
-fills and position reconciliation → resumed quoting`. Let the recovered run
-remain stable for at least ten minutes, send SIGTERM, wait for normal cleanup,
-validate its manifest, and independently require `orders=[]` and
-`positions=[]`. Any failure condition invokes the emergency procedure.
+Verify the sequence `order-response fault observed → frozen → maker
+cleanup/empty book → fail-safe shutdown`. The run stops with a critical
+`fail_safe` risk notification and a non-zero exit; that non-zero exit is the
+expected drill outcome, not a failure. Then validate its manifest and
+independently require `orders=[]` and `positions=[]`. Any deviation from this
+sequence — residual maker order, non-zero terminal position, or failed cleanup
+— invokes the emergency procedure.
+
+Because this drill always fails safe, do not pass `--controlled-disconnect-after`
+to the automatic A/B orchestrator: it treats an arm that exits before its
+scheduled window as a critical stop.
 
 ## Two-hour automatic A/B
 
