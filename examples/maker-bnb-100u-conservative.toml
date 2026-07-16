@@ -1,0 +1,59 @@
+# Conservative BNB-USD maker profile for a 100 DUSD account at isolated 2x.
+#
+# Run with STANDX_SUPERVISOR_WEBHOOK configured in .env.local:
+#   standx --output json maker run BNB-USD \
+#     --maker-config examples/maker-bnb-100u-conservative.toml \
+#     --live --yes
+#
+# Set isolated 2x leverage separately. This profile scales the XAG-USD
+# conservative geometry to the venue's 0.01 BNB quantity tick. Around a
+# 580 DUSD mark, each 0.02 BNB quote is ~12 DUSD notional and the full 0.08
+# BNB inventory is ~46 DUSD notional, using ~23 DUSD isolated margin before
+# resting-order margin.
+#
+# This exact BNB-USD profile has NOT been validated live. Run it in paper mode
+# first and obtain explicit authorization before any supervised live exercise.
+# Pre-existing BNB inventory up to max_position is adopted automatically at
+# the startup mark. Larger inventory is rejected after maker-order cleanup.
+
+# Quote geometry
+spread_bps = 7.0
+band_bps = 9.0
+size = 0.02
+levels = 1
+level_step_bps = 0.0
+refresh_bps = 2.0
+interval = 3
+
+# Inventory and market-data guards
+max_position = 0.08
+skew_bps = 8.0
+max_divergence_bps = 6.0
+vol_pause_bps = 30.0
+vol_window = 20
+
+# Supervised active inventory exit (not live-validated for BNB-USD)
+inventory_exit_pct = 50.0
+inventory_exit_qty = 0.02
+
+# Financial brakes: alert at 2% of the account, hard-stop at 4%.
+stop_loss = 4.0
+alert_loss = 2.0
+alert_equity_below = 94.0
+alert_margin_below = 30.0
+
+# Remaining alert thresholds (live mode requires at least one non-zero)
+alert_inventory_pct = 70.0
+alert_position_change_pct = 20.0
+alert_uptime = 60.0
+
+# Bounded safe recovery for both authenticated streams.
+account_stream_reconnect_attempts = 3
+account_stream_reconnect_backoff = 2
+order_response_reconnect_attempts = 3
+order_response_reconnect_backoff = 2
+recovery_incidents_per_window = 3
+recovery_window_secs = 3600
+
+# Use the WebSocket market feed, with REST fallback handled by the CLI.
+no_ws = false
