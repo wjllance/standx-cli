@@ -44,6 +44,7 @@ VALUE_OVERRIDES = {
     "--max-divergence-bps",
     "--vol-pause-bps",
     "--vol-window",
+    "--adaptive-spread",
     "--stop-loss",
     "--alert-loss",
     "--alert-inventory-pct",
@@ -58,7 +59,7 @@ VALUE_OVERRIDES = {
     "--recovery-incidents-per-window",
     "--recovery-window-secs",
 }
-BOOLEAN_OVERRIDES = {"--no-ws"}
+BOOLEAN_OVERRIDES = {"--no-ws", "--adaptive-spread"}
 REQUIRED_CHECKS = {
     "git_sha_present",
     "strategy_source_clean",
@@ -249,6 +250,7 @@ def classify_regime(metrics: dict[str, Any], cycles: int, duration_seconds: floa
 def analyze_log(path: Path) -> dict[str, Any]:
     cycles: set[int] = set()
     cycle_counts: dict[int, int] = {}
+    observed_cycles: set[int] = set()
     lifecycle_events: list[str] = []
     symbols: set[str] = set()
     market_sources: set[str] = set()
@@ -264,6 +266,7 @@ def analyze_log(path: Path) -> dict[str, Any]:
     halted_cycles = 0
     fallback_cycles = 0
     max_vol_bps: float | None = None
+    final_position: float | None = None
     market_source_counts: dict[str, int] = {}
     fallback_reason_counts: dict[str, int] = {}
     json_lines = 0
@@ -301,6 +304,11 @@ def analyze_log(path: Path) -> dict[str, Any]:
             if isinstance(source, str) and source:
                 market_sources.add(source)
                 market_source_counts[source] = market_source_counts.get(source, 0) + 1
+            if event.get("action") in {"cycle_summary", "skip"} and isinstance(
+                event.get("cycle"), int
+            ):
+                observed_cycle = event["cycle"]
+                observed_cycles.add(observed_cycle)
             if event.get("action") == "cycle_summary" and isinstance(event.get("cycle"), int):
                 cycle = event["cycle"]
                 cycles.add(cycle)
@@ -322,16 +330,25 @@ def analyze_log(path: Path) -> dict[str, Any]:
                     fallback_reason_counts[fallback_reason] = (
                         fallback_reason_counts.get(fallback_reason, 0) + 1
                     )
-                vol_bps = finite_float(event.get("vol_bps"))
+                vol_bps = finite_float(event.get("rolling_vol_bps"))
+                if vol_bps is None:
+                    vol_bps = finite_float(event.get("vol_bps"))
                 if vol_bps is not None:
                     max_vol_bps = vol_bps if max_vol_bps is None else max(max_vol_bps, vol_bps)
+                position = finite_float(event.get("position"))
+                if position is not None:
+                    final_position = position
             if event.get("action") == "lifecycle" and isinstance(event.get("event"), str):
                 lifecycle_events.append(event["event"])
+            if event.get("action") == "performance_summary":
+                position = finite_float(event.get("position"))
+                if position is not None:
+                    final_position = position
 
-    cycle_min = min(cycles) if cycles else None
-    cycle_max = max(cycles) if cycles else None
+    cycle_min = min(observed_cycles) if observed_cycles else None
+    cycle_max = max(observed_cycles) if observed_cycles else None
     missing_cycles = (
-        sorted(set(range(cycle_min, cycle_max + 1)) - cycles)
+        sorted(set(range(cycle_min, cycle_max + 1)) - observed_cycles)
         if cycle_min is not None and cycle_max is not None
         else []
     )
@@ -400,6 +417,7 @@ def analyze_log(path: Path) -> dict[str, Any]:
         "comparison_window_eligible": len(cycles) >= 300
         and duration_seconds is not None
         and duration_seconds >= 600,
+        "final_position": final_position,
     }
 
 
@@ -486,6 +504,19 @@ def finalize_manifest(args: argparse.Namespace) -> int:
     return 0
 
 
+def invalidate_manifest(args: argparse.Namespace) -> int:
+    payload = json.loads(args.manifest.read_text(encoding="utf-8"))
+    validation = payload.setdefault("validation", {})
+    validation["baseline_eligible"] = False
+    reasons = validation.setdefault("invalid_reasons", [])
+    if args.reason not in reasons:
+        reasons.append(args.reason)
+    payload["status"] = "invalid"
+    payload["invalidated_at"] = utc_now()
+    atomic_write(args.manifest, payload)
+    return 0
+
+
 def validate_manifest(args: argparse.Namespace) -> int:
     payload = json.loads(args.manifest.read_text(encoding="utf-8"))
     errors: list[str] = []
@@ -545,6 +576,11 @@ def parser() -> argparse.ArgumentParser:
     finalize.add_argument("--log", type=Path, required=True)
     finalize.add_argument("--exit-status", type=int, required=True)
     finalize.set_defaults(handler=finalize_manifest)
+
+    invalidate = subparsers.add_parser("invalidate")
+    invalidate.add_argument("--manifest", type=Path, required=True)
+    invalidate.add_argument("--reason", required=True)
+    invalidate.set_defaults(handler=invalidate_manifest)
 
     validate = subparsers.add_parser("validate")
     validate.add_argument("--manifest", type=Path, required=True)

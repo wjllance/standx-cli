@@ -1,0 +1,25 @@
+[Unit]
+Description=StandX maker Stage 2 baseline/candidate A/B orchestrator
+Documentation=file:/opt/standx/docs/19-maker-stage2-live-ab-runbook.md
+After=network-online.target standx-openobserve-catchup.service
+Wants=network-online.target standx-openobserve-catchup.service
+Conflicts=standx-maker.service
+OnFailure=standx-notify@%n.service
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/standx/maker-stage2-ab.env
+WorkingDirectory=/opt/standx
+ExecStartPre=/usr/bin/python3 /opt/standx/scripts/openobserve_alerts.py
+ExecStart=/opt/standx/scripts/run_maker_stage2_ab.sh
+SuccessExitStatus=0
+RestartPreventExitStatus=75
+Restart=on-failure
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

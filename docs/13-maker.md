@@ -74,8 +74,9 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--inventory-exit-pct` | `0` | 主动减仓触发线：仓位达到 `--max-position` 的此百分比时启动退出流程；需同时设置 `--inventory-exit-qty`，0 关闭 |
 | `--inventory-exit-qty` | `0` | 单次 reduce-only 主动退出的最大数量；先确认 maker 空簿再下市价单，提交后未确认会 fail-safe，0 关闭 |
 | `--max-divergence-bps` | `25` | 当 mark 价与盘口中价背离超过此值时跳过该轮（不动挂单） |
-| `--vol-pause-bps` | `0` | 波动率熔断：mark 在 `--vol-window` 轮内的极差达到此值（bps）即撤掉全部报价暂停，回落到一半以下才恢复。0 关闭。见 [13.3](#波动率熔断) |
+| `--vol-pause-bps` | `0` | 波动率熔断：mark 在配置窗口内的极差达到此值（bps）即撤掉全部报价暂停，回落到一半以下才恢复。0 关闭。见 [13.3](#波动率熔断) |
 | `--vol-window` | `12` | 波动率熔断测量极差的窗口（最近 N 轮） |
+| `--adaptive-spread[=true\|false]` | 文件值/关 | 只覆盖 TOML `[adaptive_spread].enabled`；档位和边界仅在 TOML 中配置 |
 | `--stop-loss` | `0` | 会话 PnL 跌到负阈值时 fail-safe：冻结、撤销 maker 单、等待 critical webhook 后停机；不会自动平仓。0 关闭 |
 | `--alert-loss` | `0` | 风险告警：mark-to-market PnL 跌到 −此值（计价单位）时告警。0 关闭 |
 | `--alert-inventory-pct` | `0` | 风险告警：\|仓位\| 达到 `--max-position` 的此百分比时告警。0 关闭 |
@@ -117,11 +118,31 @@ max_position = 0.01
 skew_bps = 6.0
 max_divergence_bps = 25.0
 vol_pause_bps = 40.0
-vol_window = 12
+vol_window_secs = 60
 alert_inventory_pct = 80.0
 alert_position_change_pct = 20.0
 no_ws = false
+
+[adaptive_spread]
+enabled = true
+min_spread_bps = 8.0
+max_spread_bps = 18.0
+
+[[adaptive_spread.tiers]]
+spread_bps = 8.0
+refresh_bps = 4.0
+
+[[adaptive_spread.tiers]]
+enter_vol_bps = 10.0
+exit_vol_bps = 7.0
+spread_bps = 12.0
+refresh_bps = 5.0
 ```
+
+`vol_window_secs` 是 TOML-only 时间窗字段，与 CLI `--vol-window` 冲突，adaptive 开启时
+必须配置。Adaptive spread 接受 2–3 档。基础档必须与顶层 spread/refresh 相同；更高档定义升档和
+回落阈值。每轮只派生 effective spread/refresh。升档不会立刻撤掉已有窄单，仍由原
+anti-flicker ref-center 漂移或安全条件触发自然换价。关闭时与静态 planner 等价。
 
 ```bash
 # 文件值生效
@@ -177,7 +198,7 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 
 ### 波动率熔断
 
-快速行情里被动做市最容易被"扫单"（逆向选择）。`--vol-pause-bps` 开启后，机器人跟踪 mark 在最近 `--vol-window` 轮内的极差（(max−min)/min，bps）：
+快速行情里被动做市最容易被"扫单"（逆向选择）。`--vol-pause-bps` 开启后，机器人跟踪 mark 在样本窗或 `--vol-window-secs` 时间窗内的极差（(max−min)/min，bps）：
 
 - 极差 **达到 `--vol-pause-bps`** → **熔断**：撤掉全部挂单、暂停报价（`⚡HALT`）。
 - 极差 **回落到阈值一半以下** → 恢复报价。
@@ -193,7 +214,7 @@ center = mark × (1 − skew_bps × clamp(position / max_position, ±1) / 1e4)
 三种输出格式：
 
 - **表格（默认）**：每轮一行 `[时间] #轮次 mark= bid= ask= pos= pnl= | hold= place= cancel=`，其下缩进列出 PLACE / CANCEL / HOLD / FILL 明细。Live 模式还会打印 `ACCOUNT balance= equity= available= upnl=`，数据来自最近一次 REST 账户快照（正常每 30 秒刷新；启用 equity/margin floor 时，account-stream `balance` 更新会立即触发一次权威 REST 刷新；短暂失败时最多复用 60 秒）；这里的账户 `upnl` 与机器人本次会话的 `pnl` 是两个不同口径。
-- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，保留原字段并新增可选 `performance` 对象，包含 passive/exit 数量与现金流、数量加权 capture、净 PnL 归因、1s/5s/30s markout、时间加权双边 uptime、合格深度时间积分和库存持有时间。启用公共 WS 时，`cycle_summary.ws_snapshot` 以观察字段记录 mark/book 的 seq、统一/原始 envelope/payload 时间、本地 age，以及 server/local skew；这些字段不参与策略、风控或行情源选择。停机时另有 `performance_summary`、逐请求 `order_latency`、place/cancel 分位数 `order_latency_summary`；账户 typed event 产生 `account_event_lag`。逐请求延迟保留 `generation/cycle/symbol/side/level/market_source/recovery`，自动恢复完成后的首个成功周期标为 `recovery=true`；socket write、venue ack 与 account effective 始终分开，超时请求另有 `timeout_phase` 和从 intent 起算的 `timeout_ms`。旧消费者可以忽略这些新 action/可选字段。`funding_available=false` 或 `execution_costs_unavailable>0` 时，`net_pnl_complete=false`，数值字段仍可用于已知部分但不能被解释为完整净收益。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live session PnL 使用 current-run ledger 的权威仓位；每个去重后的增量成交会原子更新现金流与统计仓位。live fill 还包含 `trade_id`、`order_id`、`trade_ts`、`origin`、`role`、成交时 mark/事件时间，以及可换算时的 `fee_quote` / `rebate_quote`。
+- **JSON（`--output json` 或 `--openclaw`）**：每个动作一行 JSON；每轮末尾一条 `cycle_summary`，保留原字段并新增可选 `rolling_vol_bps`、`adaptive_spread_enabled`、`adaptive_spread_tier`、`effective_spread_bps`、`effective_refresh_bps` 与 `performance` 对象。`vol_bps` 仍只在 halted 时出现，旧语义不变。performance 包含 passive/exit 数量与现金流、数量加权 capture、净 PnL 归因、1s/5s/30s markout、时间加权双边 uptime、合格深度时间积分和库存持有时间。启用公共 WS 时，`cycle_summary.ws_snapshot` 以观察字段记录 mark/book 的 seq、统一/原始 envelope/payload 时间、本地 age，以及 server/local skew；这些字段不参与策略、风控或行情源选择。停机时另有 `performance_summary`、逐请求 `order_latency`、place/cancel 分位数 `order_latency_summary`；账户 typed event 产生 `account_event_lag`。逐请求延迟保留 `generation/cycle/symbol/side/level/market_source/recovery`，自动恢复完成后的首个成功周期标为 `recovery=true`；socket write、venue ack 与 account effective 始终分开，超时请求另有 `timeout_phase` 和从 intent 起算的 `timeout_ms`。旧消费者可以忽略这些新 action/可选字段。`funding_available=false` 或 `execution_costs_unavailable>0` 时，`net_pnl_complete=false`，数值字段仍可用于已知部分但不能被解释为完整净收益。`pnl` 和 `fills_total` 只属于当前 maker session：已有仓位按启动 mark 自动接管并把 session PnL 归零，历史交易所盈亏仍看 `account.upnl`。live session PnL 使用 current-run ledger 的权威仓位；每个去重后的增量成交会原子更新现金流与统计仓位。live fill 还包含 `trade_id`、`order_id`、`trade_ts`、`origin`、`role`、成交时 mark/事件时间，以及可换算时的 `fee_quote` / `rebate_quote`。
 
 live 启动时会先清理旧 `sxmk-` 订单并同步账本，再认证 `order + position + trade + balance` account stream 和 Order Response Stream。绝对仓位不超过 `max_position` 时自动接管，输出 `ledger_sync` / `inventory_adopted`；超过上限（允许半个数量 tick 误差）则输出 `startup_rejected` 并退出。带稳定 `trade_id`/`order_id` 的 account-stream trade 与 REST backfill trade 走同一账本入口并按 `trade_id` exactly-once 去重；order 回调只确认订单归属与生命周期，不能单独记账。健康运行时订单、pending 命令、仓位和原始余额由本地 typed-event 投影维护，普通 maker cycle 不读取账户 REST；每 30 秒并发读取 open orders、positions、order history 和 trades 做完整审计，derived balance 默认按 30 秒 REST 快照刷新。WS `balance` 只包含钱包级 `free/total/locked/occupied`，不能冒充统一余额的 `equity/cross_available`；配置账户风险 floor 后，该事件会合并触发下一轮立即读取权威 REST balance，并复用同一 edge-triggered 告警状态机。account stream 断开、投影审计不一致或仓位不一致时立即冻结 placements、撤净 maker 订单，并在约 0.5s、1.5s、3.0s 结合 WS 与 REST 核对；恢复后从空 maker book 继续，3 秒仍不一致则 fail-safe 停机。
 
@@ -332,7 +353,8 @@ live 模式的安全栏：
   查询挂单、仓位、已成交订单及会话成交。只有全部对账通过才恢复报价。
 - **fail-safe 停机**：安全重连关闭、清理/对账失败、终态鉴权错误，或连续 3 次其他瞬时
   cycle 错误时停机并再次清理。单轮重连次数耗尽只会保持冻结、重新验证空簿并退避进入
-  下一轮。`--controlled-disconnect-after` 仍强制走停机演练，不会因重连而变成持续实盘。
+  下一轮。隐藏的 `--controlled-disconnect-after` 用于受监督 gate：它注入一次本地断流，
+  验证冻结、清理、重连和对账后恢复报价；仅可按 live runbook 使用。
 - **退出必清理**:所有退出路径都会 cancel-all(3 次重试 + 校验),有残留会大字告警并给出手动撤单命令。
 
 ---

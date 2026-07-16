@@ -6,7 +6,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-EnvironmentFile=/etc/standx/maker.env
+EnvironmentFile=-/etc/standx/maker.env
+# When installed, the Stage 2 file overrides the same OpenObserve/log values so
+# boot catch-up follows the A/B service's frozen deployment environment.
+EnvironmentFile=-/etc/standx/maker-stage2-ab.env
 WorkingDirectory=/opt/standx
 # Idempotent: resumes each run's incremental checkpoint, so already-ingested
 # events are not re-sent. The script always exits 0 (best-effort), so a down

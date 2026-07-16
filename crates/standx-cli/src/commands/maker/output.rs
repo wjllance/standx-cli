@@ -227,6 +227,7 @@ pub(super) struct CycleOutput<'a> {
     pub(super) fills: &'a [MakerFill],
     pub(super) stats: &'a MakerStats,
     pub(super) halt_vol_bps: Option<f64>,
+    pub(super) spread_decision: &'a maker::SpreadDecision,
     pub(super) cfg: &'a MakerConfig,
     pub(super) performance: Option<&'a maker::PerformanceSummary>,
 }
@@ -250,6 +251,7 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
         fills,
         stats,
         halt_vol_bps,
+        spread_decision,
         cfg,
         performance,
     } = output;
@@ -335,27 +337,30 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
             }
             println!(
                 "{}",
-                serde_json::json!({
-                    "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
-                    "action": "cycle_summary",
-                    "mark": format_decimals(mark, cfg.price_decimals),
-                    "best_bid": best_bid, "best_ask": best_ask,
-                    "market_source": market_source,
-                    "market_fallback_reason": market_fallback_reason,
-                    "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
-                    "position": position,
-                    "starting_position": starting_position,
-                    "account": account.map(account_json),
-                    "holds": holds, "places": places, "cancels": cancels,
-                    "fills": fills.len(),
-                    "pnl": (pnl * 1e6).round() / 1e6,
-                    "fills_total": stats.fills(),
-                    "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
-                    "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
-                    "performance": performance.map(performance_json),
-                    "halted": halt_vol_bps.is_some(),
-                    "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
-                })
+                with_spread_fields(
+                    serde_json::json!({
+                        "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                        "action": "cycle_summary",
+                        "mark": format_decimals(mark, cfg.price_decimals),
+                        "best_bid": best_bid, "best_ask": best_ask,
+                        "market_source": market_source,
+                        "market_fallback_reason": market_fallback_reason,
+                        "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
+                        "position": position,
+                        "starting_position": starting_position,
+                        "account": account.map(account_json),
+                        "holds": holds, "places": places, "cancels": cancels,
+                        "fills": fills.len(),
+                        "pnl": (pnl * 1e6).round() / 1e6,
+                        "fills_total": stats.fills(),
+                        "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
+                        "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
+                        "performance": performance.map(performance_json),
+                        "halted": halt_vol_bps.is_some(),
+                        "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
+                    }),
+                    spread_decision
+                )
             );
         }
         OutputFormat::Quiet => {
@@ -480,6 +485,36 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
     }
 }
 
+fn with_spread_fields(
+    mut summary: serde_json::Value,
+    decision: &maker::SpreadDecision,
+) -> serde_json::Value {
+    let object = summary
+        .as_object_mut()
+        .expect("cycle summary JSON must be an object");
+    object.insert(
+        "rolling_vol_bps".to_string(),
+        serde_json::json!((decision.rolling_vol_bps * 100.0).round() / 100.0),
+    );
+    object.insert(
+        "adaptive_spread_enabled".to_string(),
+        serde_json::json!(decision.enabled),
+    );
+    object.insert(
+        "adaptive_spread_tier".to_string(),
+        serde_json::json!(decision.tier),
+    );
+    object.insert(
+        "effective_spread_bps".to_string(),
+        serde_json::json!(decision.effective_spread_bps),
+    );
+    object.insert(
+        "effective_refresh_bps".to_string(),
+        serde_json::json!(decision.effective_refresh_bps),
+    );
+    summary
+}
+
 fn performance_json(summary: &maker::PerformanceSummary) -> serde_json::Value {
     serde_json::json!({
         "passive_fills": summary.passive_fills,
@@ -499,6 +534,7 @@ fn performance_json(summary: &maker::PerformanceSummary) -> serde_json::Value {
         "exit_cost_quote": summary.exit_cost_quote,
         "inventory_mtm_change_quote": summary.inventory_mtm_change_quote,
         "net_pnl_quote": summary.net_pnl_quote,
+        "position": summary.position,
         "markout_1s_bps": summary.markouts[0].avg_bps,
         "markout_5s_bps": summary.markouts[1].avg_bps,
         "markout_30s_bps": summary.markouts[2].avg_bps,
@@ -943,6 +979,7 @@ mod tests {
 
         assert_eq!(json["passive_cashflow_quote"], -99.0);
         assert!(json["passive_capture_bps"].as_f64().unwrap() > 100.0);
+        assert_eq!(json["position"], 1.0);
         assert_eq!(json["inventory_nonzero_ms"], 1_000);
         assert_eq!(json["inventory_abs_qty_ms"], 1_000.0);
     }
@@ -1007,5 +1044,28 @@ mod tests {
         assert_eq!(json["local_skew_ms"], 200);
         assert_eq!(json["server_skew_ms"], 2_000);
         assert_eq!(json["book_payload_time"], "2026-07-15T00:00:02Z");
+    }
+
+    #[test]
+    fn cycle_summary_adaptive_fields_are_additive_and_top_level() {
+        let decision = maker::SpreadDecision {
+            enabled: true,
+            tier: 2,
+            rolling_vol_bps: 20.126,
+            effective_spread_bps: 18.0,
+            effective_refresh_bps: 6.0,
+        };
+        let json = with_spread_fields(
+            serde_json::json!({"action": "cycle_summary", "vol_bps": null}),
+            &decision,
+        );
+
+        assert_eq!(json["action"], "cycle_summary");
+        assert!(json["vol_bps"].is_null());
+        assert_eq!(json["rolling_vol_bps"], 20.13);
+        assert_eq!(json["adaptive_spread_enabled"], true);
+        assert_eq!(json["adaptive_spread_tier"], 2);
+        assert_eq!(json["effective_spread_bps"], 18.0);
+        assert_eq!(json["effective_refresh_bps"], 6.0);
     }
 }

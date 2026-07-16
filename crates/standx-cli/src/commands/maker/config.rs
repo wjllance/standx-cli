@@ -5,6 +5,47 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdaptiveSpreadTierFileConfig {
+    pub enter_vol_bps: Option<f64>,
+    pub exit_vol_bps: Option<f64>,
+    pub spread_bps: f64,
+    pub refresh_bps: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AdaptiveSpreadFileConfig {
+    pub enabled: Option<bool>,
+    pub min_spread_bps: f64,
+    pub max_spread_bps: f64,
+    pub tiers: Vec<AdaptiveSpreadTierFileConfig>,
+}
+
+impl AdaptiveSpreadFileConfig {
+    pub(super) fn into_domain(
+        self,
+        enabled_override: Option<bool>,
+    ) -> standx_maker::AdaptiveSpreadConfig {
+        standx_maker::AdaptiveSpreadConfig {
+            enabled: enabled_override.or(self.enabled).unwrap_or(false),
+            min_spread_bps: self.min_spread_bps,
+            max_spread_bps: self.max_spread_bps,
+            tiers: self
+                .tiers
+                .into_iter()
+                .map(|tier| standx_maker::SpreadTier {
+                    enter_vol_bps: tier.enter_vol_bps,
+                    exit_vol_bps: tier.exit_vol_bps,
+                    spread_bps: tier.spread_bps,
+                    refresh_bps: tier.refresh_bps,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Values are optional so an explicit CLI flag can override one field without
 /// requiring every strategy default to be repeated in TOML.
 #[derive(Debug, Default, Deserialize)]
@@ -24,6 +65,8 @@ pub(super) struct MakerFileConfig {
     pub max_divergence_bps: Option<f64>,
     pub vol_pause_bps: Option<f64>,
     pub vol_window: Option<u32>,
+    pub vol_window_secs: Option<u64>,
+    pub adaptive_spread: Option<AdaptiveSpreadFileConfig>,
     pub stop_loss: Option<f64>,
     pub alert_loss: Option<f64>,
     pub alert_inventory_pct: Option<f64>,
@@ -94,6 +137,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_structured_adaptive_spread_tiers() {
+        let config: MakerFileConfig = toml::from_str(
+            r#"
+vol_window_secs = 60
+[adaptive_spread]
+enabled = true
+min_spread_bps = 8
+max_spread_bps = 18
+
+[[adaptive_spread.tiers]]
+spread_bps = 8
+refresh_bps = 4
+
+[[adaptive_spread.tiers]]
+enter_vol_bps = 10
+exit_vol_bps = 7
+spread_bps = 12
+refresh_bps = 5
+"#,
+        )
+        .unwrap();
+        let adaptive = config.adaptive_spread.unwrap().into_domain(Some(false));
+        assert!(!adaptive.enabled);
+        assert_eq!(adaptive.tiers.len(), 2);
+        assert_eq!(adaptive.tiers[1].enter_vol_bps, Some(10.0));
+    }
+
+    #[test]
     fn example_keeps_active_inventory_exit_disabled() {
         let config: MakerFileConfig = toml::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -160,5 +231,29 @@ mod tests {
         assert_eq!(config.max_position, Some(0.12));
         assert_eq!(config.inventory_exit_pct, Some(50.0));
         assert_eq!(config.inventory_exit_qty, Some(0.03));
+    }
+
+    #[test]
+    fn stage2_live_arms_only_differ_by_adaptive_enable_switch() {
+        let baseline = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-stage2-xag-baseline.toml"
+        ));
+        let candidate = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-stage2-xag-candidate.toml"
+        ));
+        assert_eq!(
+            baseline.replace("enabled = false", "enabled = true"),
+            candidate
+        );
+
+        let baseline: MakerFileConfig = toml::from_str(baseline).unwrap();
+        let candidate: MakerFileConfig = toml::from_str(candidate).unwrap();
+        assert_eq!(baseline.vol_window_secs, Some(60));
+        assert_eq!(baseline.size, Some(0.01));
+        assert_eq!(baseline.max_position, Some(0.2));
+        assert!(!baseline.adaptive_spread.unwrap().enabled.unwrap());
+        assert!(candidate.adaptive_spread.unwrap().enabled.unwrap());
     }
 }

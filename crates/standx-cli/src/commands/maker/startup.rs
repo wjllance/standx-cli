@@ -66,6 +66,7 @@ pub(super) fn validate_alert_thresholds(
 /// config, canonical symbol casing, the notifier, and — in live mode — the
 /// initialized [`LiveSession`] plus the adopted ledger baseline.
 pub(super) struct MakerStartup {
+    pub(super) live_process_lock: Option<super::process_lock::LiveProcessLock>,
     pub(super) client: StandXClient,
     pub(super) cfg: MakerConfig,
     pub(super) symbol: String,
@@ -89,6 +90,10 @@ pub(super) async fn run_startup(
     args: &MakerRunArgs,
     output_format: OutputFormat,
 ) -> Result<MakerStartup> {
+    let live_process_lock = args
+        .live
+        .then(super::process_lock::LiveProcessLock::acquire)
+        .transpose()?;
     let order_session_id = args.live.then(|| uuid::Uuid::new_v4().to_string());
     let run_uuid = uuid::Uuid::new_v4().simple().to_string();
     let run_order_prefix = format!("{}{}-", MAKER_CL_ORD_ID_PREFIX, &run_uuid[..12]);
@@ -187,6 +192,14 @@ pub(super) async fn run_startup(
     if cfg.spread_bps <= 0.0 {
         return Err(anyhow::anyhow!("--spread-bps must be > 0"));
     }
+    if args.interval == 0 {
+        return Err(anyhow::anyhow!("--interval must be at least 1 second"));
+    }
+    if args.vol_window_secs == Some(0) {
+        return Err(anyhow::anyhow!(
+            "vol_window_secs in TOML must be greater than 0"
+        ));
+    }
     if cfg.skew_bps < 0.0 {
         return Err(anyhow::anyhow!("--skew-bps must be >= 0"));
     }
@@ -213,6 +226,8 @@ pub(super) async fn run_startup(
             cfg.spread_bps
         ));
     }
+    maker::SpreadController::new(args.adaptive_spread.clone(), &cfg)
+        .map_err(|error| anyhow::anyhow!("invalid adaptive spread config: {error}"))?;
     let rounded_size = maker::round_to_decimals(cfg.size, cfg.qty_decimals);
     if rounded_size < cfg.min_order_qty || rounded_size <= 0.0 {
         return Err(anyhow::anyhow!(
@@ -244,6 +259,14 @@ pub(super) async fn run_startup(
 
     // Half a qty tick: the adoption/mismatch tolerance used throughout the run.
     let qty_tolerance = 10_f64.powi(-(cfg.qty_decimals as i32)) / 2.0;
+
+    // Performance attribution needs a positive session baseline in paper mode
+    // too. Live establishes it alongside the authoritative position snapshot
+    // below; paper has no account snapshot, so seed it from a public mark
+    // before constructing the runtime ledger.
+    if !args.live {
+        baseline_mark = market_snapshot(&client, &symbol, None).await?.mark;
+    }
 
     // ---- Live gating & clean start ----
     // `order_session_id` is `Some` iff `args.live`, so this block is the live
@@ -431,8 +454,8 @@ pub(super) async fn run_startup(
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(after)).await;
                 // Aborting drops the local WebSocket halves; set health first
-                // so the maker exits through its existing fail-safe path even
-                // if the runtime delays observing the socket close.
+                // so the runtime enters its existing freeze/cleanup/reconnect
+                // path even if it delays observing the socket close.
                 health_for_fault.mark_unhealthy(format!(
                     "controlled fault injection closed the order-response stream after {after}s"
                 ));
@@ -494,6 +517,7 @@ pub(super) async fn run_startup(
     }
 
     Ok(MakerStartup {
+        live_process_lock,
         client,
         cfg,
         symbol,

@@ -238,6 +238,7 @@ pub(super) async fn run_ws_command_canary(
             LIVE_MAKER_ENV
         ));
     }
+    let _live_process_lock = super::process_lock::LiveProcessLock::acquire()?;
     let credentials = Credentials::load()?;
     if credentials.is_expired() || credentials.private_key.is_empty() {
         return Err(anyhow::anyhow!(
