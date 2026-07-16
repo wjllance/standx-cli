@@ -1,9 +1,8 @@
 //! Pure market-data degradation and recovery policy.
 
-/// Consecutive unhealthy observations tolerated before quoting is frozen.
+/// Consecutive unhealthy observations required before quoting may be frozen.
 pub const MARKET_DATA_BAD_OBSERVATIONS_TO_DEGRADE: u32 = 3;
-/// A sparse sequence of unhealthy observations may not retain quotes beyond
-/// this wall-clock grace period.
+/// Unhealthy observations must also persist for this wall-clock grace period.
 pub const MARKET_DATA_BAD_GRACE_MS: u64 = 15_000;
 /// Distinct coherent snapshots required before recovery may be confirmed.
 pub const MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER: u32 = 3;
@@ -130,8 +129,8 @@ impl MarketDataHealth {
                 let consecutive = consecutive.saturating_add(1);
                 let bad_for_ms = now_ms.saturating_sub(first_bad_ms);
                 if issue == MarketDataObservation::FeedIdle
-                    || consecutive >= self.bad_observations_to_degrade
-                    || bad_for_ms >= self.bad_grace_ms
+                    || (consecutive >= self.bad_observations_to_degrade
+                        && bad_for_ms >= self.bad_grace_ms)
                 {
                     self.phase = MarketDataPhase::Degraded { issue, coherent: 0 };
                     MarketDataTransition::EnteredDegraded {
@@ -191,8 +190,7 @@ impl MarketDataHealth {
 
     fn begin_bad(&mut self, now_ms: u64, issue: MarketDataObservation) -> MarketDataTransition {
         if issue == MarketDataObservation::FeedIdle
-            || self.bad_observations_to_degrade == 1
-            || self.bad_grace_ms == 0
+            || (self.bad_observations_to_degrade == 1 && self.bad_grace_ms == 0)
         {
             self.phase = MarketDataPhase::Degraded { issue, coherent: 0 };
             return MarketDataTransition::EnteredDegraded {
@@ -233,25 +231,55 @@ mod tests {
     }
 
     #[test]
-    fn third_bad_observation_or_elapsed_grace_degrades() {
+    fn bad_observations_require_count_and_elapsed_grace_to_degrade() {
         let mut health = MarketDataHealth::default();
         let _ = health.observe(0, MarketDataObservation::RestFallback);
         let _ = health.observe(1_000, MarketDataObservation::MarkMidDivergence);
         assert!(matches!(
             health.observe(2_000, MarketDataObservation::RestFallback),
-            MarketDataTransition::EnteredDegraded { consecutive: 3, .. }
+            MarketDataTransition::Grace {
+                consecutive: 3,
+                bad_for_ms: 2_000,
+                ..
+            }
+        ));
+        assert!(!health.is_degraded());
+        assert!(matches!(
+            health.observe(15_000, MarketDataObservation::RestFallback),
+            MarketDataTransition::EnteredDegraded {
+                consecutive: 4,
+                bad_for_ms: 15_000,
+                ..
+            }
         ));
 
         let mut sparse = MarketDataHealth::default();
         let _ = sparse.observe(0, MarketDataObservation::RestFallback);
         assert!(matches!(
             sparse.observe(15_000, MarketDataObservation::RestFallback),
-            MarketDataTransition::EnteredDegraded {
+            MarketDataTransition::Grace {
                 consecutive: 2,
                 bad_for_ms: 15_000,
                 ..
             }
         ));
+        assert!(!sparse.is_degraded());
+    }
+
+    #[test]
+    fn rapid_divergence_updates_do_not_bypass_grace() {
+        let mut health = MarketDataHealth::default();
+        let _ = health.observe(0, MarketDataObservation::MarkMidDivergence);
+        let _ = health.observe(100, MarketDataObservation::MarkMidDivergence);
+        assert!(matches!(
+            health.observe(251, MarketDataObservation::MarkMidDivergence),
+            MarketDataTransition::Grace {
+                consecutive: 3,
+                bad_for_ms: 251,
+                ..
+            }
+        ));
+        assert!(!health.is_degraded());
     }
 
     #[test]
@@ -268,7 +296,7 @@ mod tests {
 
     #[test]
     fn recovery_requires_three_coherent_observations_and_explicit_confirmation() {
-        let mut health = MarketDataHealth::new(1, 15_000, 3);
+        let mut health = MarketDataHealth::new(1, 0, 3);
         let _ = health.observe(0, MarketDataObservation::RestFallback);
         assert!(health.is_degraded());
         assert!(matches!(
@@ -287,7 +315,7 @@ mod tests {
 
     #[test]
     fn bad_observation_resets_recovery_streak() {
-        let mut health = MarketDataHealth::new(1, 15_000, 3);
+        let mut health = MarketDataHealth::new(1, 0, 3);
         let _ = health.observe(0, MarketDataObservation::RestFallback);
         let _ = health.observe(1, MarketDataObservation::Coherent);
         let _ = health.observe(2, MarketDataObservation::Coherent);

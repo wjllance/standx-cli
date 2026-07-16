@@ -37,7 +37,7 @@ use startup::new_maker_rest_client;
 use startup::{run_startup, LiveSession, MakerStartup};
 
 use cycle::maker_cycle;
-use feed::{fresh_ws_snapshot, market_snapshot, spawn_market_feed, ws_snapshot_issue};
+use feed::{fresh_ws_sample, market_snapshot, spawn_market_feed, ws_snapshot_issue};
 use market_data::{
     degradation_detail, observe_acquired_market_health, recover_market_data, AcquiredMarketHealth,
     MarketDataDegradedError, MarketDataRecovery, MARKET_DATA_RECOVERY_TIMEOUT,

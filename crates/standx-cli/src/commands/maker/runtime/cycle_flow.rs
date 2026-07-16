@@ -1107,6 +1107,16 @@ impl MakerRuntime {
             // this a bounded safety replan rather than a per-tick cancel loop.
             let deadline = tokio::time::Instant::now() + Duration::from_secs(args.interval);
             let min_gap = tokio::time::Instant::now() + Duration::from_secs(1);
+            // Price and book are published independently. Start from the
+            // current pair so repeated updates from only one channel cannot
+            // be miscounted as multiple distinct health observations.
+            let mut health_version = match feed.as_ref() {
+                Some(feed) => {
+                    let state = feed.read().await;
+                    fresh_ws_sample(&state).map(|(_, _, _, version)| version)
+                }
+                None => None,
+            };
             loop {
                 let request_deadline = self.live_session.as_ref().and_then(|session| {
                     session
@@ -1231,8 +1241,8 @@ impl MakerRuntime {
                         };
                         let (observation, observation_detail, requires_replan) = {
                             let s = feed.read().await;
-                            match fresh_ws_snapshot(&s) {
-                                Some((mark, best_bid, best_ask)) => {
+                            match fresh_ws_sample(&s) {
+                                Some((mark, best_bid, best_ask, version)) => {
                                     let observation = if matches!(
                                         maker::touch_skip(
                                             mark,
@@ -1257,6 +1267,12 @@ impl MakerRuntime {
                                             args.max_divergence_bps,
                                         )
                                     });
+                                    let observation = if version.both_advanced_from(health_version) {
+                                        health_version = Some(version);
+                                        Some(observation)
+                                    } else {
+                                        None
+                                    };
                                     (
                                         observation,
                                         "websocket cache update".to_string(),
@@ -1271,7 +1287,7 @@ impl MakerRuntime {
                                         maker::MarketDataObservation::RestFallback
                                     };
                                     (
-                                        observation,
+                                        Some(observation),
                                         format!(
                                             "websocket cache unavailable: {}",
                                             issue.map_or("unknown", |issue| issue.as_str())
@@ -1281,14 +1297,16 @@ impl MakerRuntime {
                                 }
                             }
                         };
-                        let now_ms = duration_ms(market_data_health_started.elapsed());
-                        if let Some(detail) = degradation_detail(
-                            self.market.health.observe(now_ms, observation),
-                            &observation_detail,
-                        ) {
-                            self.recovery.runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
-                            self.market.pending_degradation = Some(detail);
-                            break;
+                        if let Some(observation) = observation {
+                            let now_ms = duration_ms(market_data_health_started.elapsed());
+                            if let Some(detail) = degradation_detail(
+                                self.market.health.observe(now_ms, observation),
+                                &observation_detail,
+                            ) {
+                                self.recovery.runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
+                                self.market.pending_degradation = Some(detail);
+                                break;
+                            }
                         }
                         if tokio::time::Instant::now() < min_gap {
                             continue;
