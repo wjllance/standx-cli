@@ -202,6 +202,7 @@ pub(super) async fn maker_cycle(
         mark,
         best_bid,
         best_ask,
+        market_data_mode,
         market_source,
         recovery,
         market_fallback_reason,
@@ -275,7 +276,10 @@ pub(super) async fn maker_cycle(
                 max_divergence_bps,
                 skip,
             );
-            return Ok(CycleResult::default());
+            if market_data_mode == maker::MarketDataMode::Active {
+                return Ok(CycleResult::default());
+            }
+            preflight.halted
         }
         None => preflight.halted,
     };
@@ -440,7 +444,7 @@ pub(super) async fn maker_cycle(
         // taken off the book and its signed qty folded into the position; the
         // reconcile below then re-quotes the vacated level.
         let mut i = 0;
-        while i < resting.len() {
+        while market_data_mode == maker::MarketDataMode::Active && i < resting.len() {
             if paper_quote_filled(resting[i].side, resting[i].price, best_bid, best_ask) {
                 let q = resting.remove(i);
                 *sim_position += match q.side {
@@ -513,6 +517,7 @@ pub(super) async fn maker_cycle(
             position,
             resting: active_resting,
             pending_slots: &pending_slots,
+            market_data_mode,
             active_exit_enabled: live,
             inventory_exit_pct,
             inventory_exit_qty,
@@ -532,7 +537,8 @@ pub(super) async fn maker_cycle(
         ));
     }
 
-    let create_orders_allowed = order_creation_allowed(live, rest_position_recheck_pending);
+    let create_orders_allowed = market_data_mode == maker::MarketDataMode::Active
+        && order_creation_allowed(live, rest_position_recheck_pending);
     let inventory_exit = if create_orders_allowed {
         plan.inventory_exit
     } else {

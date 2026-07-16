@@ -40,8 +40,9 @@ pub use latency::{
 };
 pub use ledger::{LedgerError, LedgerTrade, MakerFill, MakerLedger, TradeSource};
 pub use market_data::{
-    MarketDataHealth, MarketDataObservation, MarketDataTransition, MARKET_DATA_BAD_GRACE_MS,
-    MARKET_DATA_BAD_OBSERVATIONS_TO_DEGRADE, MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
+    MarketDataFaultClass, MarketDataHealth, MarketDataMode, MarketDataObservation,
+    MarketDataTransition, MARKET_DATA_BAD_GRACE_MS, MARKET_DATA_BAD_OBSERVATIONS_TO_DEGRADE,
+    MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
 };
 pub use ownership::{
     exit_client_order_id, is_current_run_client_order_id, is_maker_client_order_id,
@@ -611,6 +612,7 @@ pub struct CycleInput<'a> {
     pub resting: &'a [RestingQuote],
     /// Submitted orders that have not become visible in the venue order book.
     pub pending_slots: &'a [(OrderSide, u32)],
+    pub market_data_mode: MarketDataMode,
     pub active_exit_enabled: bool,
     pub inventory_exit_pct: f64,
     pub inventory_exit_qty: f64,
@@ -637,8 +639,8 @@ pub struct CyclePlan {
 /// acknowledgements) and must run [`preflight_cycle`] first. This function
 /// deliberately cannot perform I/O.
 pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> CyclePlan {
-    let requested_inventory_exit = input
-        .active_exit_enabled
+    let market_active = input.market_data_mode == MarketDataMode::Active;
+    let requested_inventory_exit = (market_active && input.active_exit_enabled)
         .then(|| {
             inventory_exit_plan(
                 input.position,
@@ -651,10 +653,10 @@ pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> Cyc
 
     // During a volatility halt, pull resting liquidity but never send an
     // opt-in taker exit: emergency execution needs a separate explicit policy.
-    let inventory_exit = (!halted)
+    let inventory_exit = (!halted && market_active)
         .then_some(requested_inventory_exit.clone())
         .flatten();
-    let desired = if halted || inventory_exit.is_some() {
+    let desired = if halted || !market_active || inventory_exit.is_some() {
         Vec::new()
     } else {
         let raw = compute_desired_quotes(
@@ -1952,6 +1954,7 @@ mod tests {
             position: c.max_position,
             resting: &resting,
             pending_slots: &[],
+            market_data_mode: MarketDataMode::Active,
             active_exit_enabled: true,
             inventory_exit_pct: 80.0,
             inventory_exit_qty: 0.01,
@@ -2003,6 +2006,7 @@ mod tests {
                 position: 0.01,
                 resting: &[],
                 pending_slots: &pending_slots,
+                market_data_mode: MarketDataMode::Active,
                 active_exit_enabled: false,
                 inventory_exit_pct: 0.0,
                 inventory_exit_qty: 0.0,
@@ -2019,6 +2023,48 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(buy_places.is_empty());
+    }
+
+    #[test]
+    fn paused_market_data_cancels_without_placing_or_exiting() {
+        let c = cfg();
+        let resting = vec![
+            resting(OrderSide::Buy, 0, 99.9, 100.0),
+            resting(OrderSide::Sell, 0, 100.1, 100.0),
+        ];
+        let plan = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 5,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.9),
+                    best_ask: Some(100.1),
+                },
+                position: c.max_position,
+                resting: &resting,
+                pending_slots: &[],
+                market_data_mode: MarketDataMode::Paused,
+                active_exit_enabled: true,
+                inventory_exit_pct: 80.0,
+                inventory_exit_qty: 0.01,
+            },
+            false,
+        );
+
+        assert_eq!(plan.requested_inventory_exit, None);
+        assert_eq!(plan.inventory_exit, None);
+        assert_eq!(
+            plan.actions
+                .iter()
+                .filter(|action| matches!(action, Action::Cancel { .. }))
+                .count(),
+            resting.len()
+        );
+        assert!(!plan
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(_))));
     }
 
     // 28. Alert monitor: disabled emits nothing.

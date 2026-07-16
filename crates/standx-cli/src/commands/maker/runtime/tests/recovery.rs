@@ -369,3 +369,30 @@ fn finish_verified_cleanup_preserves_or_drops_pending_requests() {
         "Replaced continuity must clear pending request lifecycles"
     );
 }
+
+#[test]
+fn transport_deadline_starts_on_escalation_and_clears_on_market_state() {
+    let now = std::time::Instant::now();
+    let deadline =
+        next_market_transport_deadline(Some(maker::MarketDataFaultClass::Transport), None, now)
+            .expect("transport faults must have a deadline");
+    assert_eq!(deadline, now + MARKET_DATA_TRANSPORT_TIMEOUT);
+    assert_eq!(
+        next_market_transport_deadline(
+            Some(maker::MarketDataFaultClass::Transport),
+            Some(deadline),
+            now + Duration::from_secs(1),
+        ),
+        Some(deadline),
+        "repeated transport observations must not extend the deadline"
+    );
+    assert_eq!(
+        next_market_transport_deadline(
+            Some(maker::MarketDataFaultClass::MarketState),
+            Some(deadline),
+            now + Duration::from_secs(61),
+        ),
+        None,
+        "market-state standby must remain non-terminal beyond sixty seconds"
+    );
+}

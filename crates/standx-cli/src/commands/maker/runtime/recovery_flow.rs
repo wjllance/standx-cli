@@ -353,6 +353,27 @@ pub(super) async fn accounting_invariant_exit(
     Some(MakerExit::AccountingInvariant(detail))
 }
 
+pub(super) fn next_market_transport_deadline(
+    class: Option<maker::MarketDataFaultClass>,
+    current: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Instant> {
+    match class {
+        Some(maker::MarketDataFaultClass::Transport) => {
+            current.or(Some(now + MARKET_DATA_TRANSPORT_TIMEOUT))
+        }
+        Some(maker::MarketDataFaultClass::MarketState) | None => None,
+    }
+}
+
+fn sync_market_transport_deadline(market: &mut RuntimeMarketState, now: std::time::Instant) {
+    market.transport_deadline = next_market_transport_deadline(
+        market.health.degraded_class(),
+        market.transport_deadline,
+        now,
+    );
+}
+
 impl MakerRuntime {
     pub(super) async fn pre_cycle_phase(&mut self) -> LoopDirective {
         self.monitor_token_expiry().await;
@@ -376,11 +397,11 @@ impl MakerRuntime {
     }
 
     async fn monitor_token_expiry(&mut self) {
-        let args = &self.deps.args;
+        let live = self.deps.args.live;
         let symbol = &self.deps.symbol;
         let notifier = &self.deps.notifier;
         let cycle = self.loop_state.counters.cycle;
-        if args.live {
+        if live {
             // JWT expiry monitor. There is no renewal endpoint, so we can only
             // warn: escalate through Warning → Critical and alert once per band.
             let due = self
@@ -432,15 +453,14 @@ impl MakerRuntime {
     }
 
     async fn recover_market_data_phase(&mut self) -> LoopDirective {
-        let args = &self.deps.args;
+        let live = self.deps.args.live;
+        let max_divergence_bps = self.deps.args.max_divergence_bps;
         let output_format = self.deps.output_format;
         let client = &self.deps.client;
         let symbol = &self.deps.symbol;
         let notifier = &self.deps.notifier;
         let cycle = self.loop_state.counters.cycle;
-        let market_data_health_started = self.market.health_started;
         let recovery_clock_started = self.recovery.clock_started;
-        let feed = &self.market.feed;
         let exit = 'phase: {
             if let Some(detail) = self.market.pending_degradation.take() {
                 let frozen_message =
@@ -484,7 +504,7 @@ impl MakerRuntime {
                         frozen_note: None,
                         abort_account_stream_handle: false,
                         continuity: OrderResponseContinuity::Preserved,
-                        cancel_venue_orders: args.live,
+                        cancel_venue_orders: live,
                     },
                 )
                 .await
@@ -492,7 +512,7 @@ impl MakerRuntime {
                     Ok(token) => token,
                     Err(exit) => break 'phase exit,
                 };
-                if args.live {
+                if live {
                     let admission = self
                         .recovery
                         .breaker
@@ -509,92 +529,168 @@ impl MakerRuntime {
                     }
                 }
 
+                // Cleanup closes the reducer's frozen generation. Market data
+                // remains paused in the pure health gate, so normal account and
+                // order ingestion can resume without allowing new orders.
+                self.recovery
+                    .runtime_state
+                    .handle(MakerEvent::RecoverySucceeded(recovery_token));
+                let now = std::time::Instant::now();
+                self.market.standby_started = Some(now);
+                self.market.next_heartbeat = Some(now + MARKET_DATA_STANDBY_HEARTBEAT);
+                self.market.maker_book_verified_empty = true;
+                sync_market_transport_deadline(&mut self.market, now);
                 eprintln!(
-                    "⚠️  market data degraded; waiting for {} distinct coherent WS snapshots before re-quoting",
+                    "⚠️  market data paused; waiting for {} paired quoteable WS snapshots before re-quoting",
                     maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER
                 );
-                let recovery_result = tokio::select! {
-                    _ = ctrl_c_latched(&mut self.ctrl_c_rx) => {
-                        break 'phase stop_requested_exit(
-                            &mut self.recovery.runtime_state,
-                            RuntimeStopReason::CtrlC,
-                        );
-                    }
-                    result = tokio::time::timeout(
-                        MARKET_DATA_RECOVERY_TIMEOUT,
-                        recover_market_data(MarketDataRecovery {
-                            client,
-                            symbol,
-                            output_format,
-                            live: args.live,
-                            feed: feed.as_ref(),
-                            updates: self.market.updates.as_mut(),
-                            health: &mut self.market.health,
-                            health_started: market_data_health_started,
-                            max_divergence_bps: args.max_divergence_bps,
-                        }),
-                    ) => result,
-                };
-                match recovery_result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        break 'phase recovery_failed_exit(
-                            &mut self.recovery.runtime_state,
-                            recovery_token,
-                            format!("market data recovery failed: {error}"),
-                        );
-                    }
-                    Err(_) => {
-                        break 'phase recovery_failed_exit(
-                            &mut self.recovery.runtime_state,
-                            recovery_token,
-                            format!(
-                                "market data did not produce {} coherent snapshots and a verified empty maker book within {}s",
-                                maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
-                                MARKET_DATA_RECOVERY_TIMEOUT.as_secs(),
-                            ),
-                        );
-                    }
-                }
+                return LoopDirective::Restart;
+            }
 
-                let observed = self.loop_state.ledger.expected_position;
-                resume_quoting_after_recovery(
-                    &mut RecoveryIo {
-                        runtime_state: &mut self.recovery.runtime_state,
-                        notifier,
-                        client,
-                        session: self.live_session.as_mut(),
-                        resting: &mut self.loop_state.resting,
-                        inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                        consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
-                        next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                        symbol,
-                        cycle,
-                        output_format,
-                    },
-                    ResumeSpec {
-                        recovery_token,
-                        observed,
-                        continuity: OrderResponseContinuity::Preserved,
-                        clear_resting: true,
-                        recovered_note: None,
-                        notice: RiskNotice {
+            if !self.market.health.is_degraded() {
+                return LoopDirective::Proceed;
+            }
+
+            let now = std::time::Instant::now();
+            sync_market_transport_deadline(&mut self.market, now);
+            if self
+                .market
+                .transport_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                break 'phase stop_requested_exit(
+                    &mut self.recovery.runtime_state,
+                    RuntimeStopReason::MarketData(format!(
+                        "market data transport did not produce {} structurally valid paired snapshots within {}s",
+                        maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
+                        MARKET_DATA_TRANSPORT_TIMEOUT.as_secs(),
+                    )),
+                );
+            }
+
+            if self.market.health.degraded_class() == Some(maker::MarketDataFaultClass::MarketState)
+                && self
+                    .market
+                    .next_heartbeat
+                    .is_some_and(|deadline| now >= deadline)
+            {
+                let standby_secs = self.market.standby_started.map_or(0, |started| {
+                    now.saturating_duration_since(started).as_secs()
+                });
+                let divergence = self
+                    .market
+                    .last_divergence_bps
+                    .map_or_else(|| "n/a".to_string(), |bps| format!("{bps:.2}bps"));
+                let message = format!(
+                    "market-state standby: divergence={divergence} threshold={:.2}bps paused={}s quoteable_streak={}/{} maker_book_empty={}",
+                    max_divergence_bps,
+                    standby_secs,
+                    self.market.health.quoteable_streak(),
+                    maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
+                    self.market.maker_book_verified_empty,
+                );
+                notifier
+                    .risk(
+                        RiskNotice {
                             kind: "market_data",
-                            severity: "resolved",
-                            event: "recovered",
-                            message: "market data recovered with consecutive coherent snapshots and a verified empty maker book; quoting may resume",
+                            severity: "warning",
+                            event: "divergence_standby",
+                            message: &message,
                             symbol,
                             cycle,
                             position_before: None,
-                            position_after: Some(observed),
-                            expected: Some(observed),
-                            observed: Some(observed),
+                            position_after: Some(self.loop_state.ledger.expected_position),
+                            expected: Some(self.loop_state.ledger.expected_position),
+                            observed: None,
                         },
-                    },
-                )
-                .await;
-                self.market.last_src = None;
-                return LoopDirective::Restart;
+                        false,
+                    )
+                    .await;
+                self.market.next_heartbeat = Some(now + MARKET_DATA_STANDBY_HEARTBEAT);
+            }
+
+            if self.market.health.recovery_ready() {
+                self.market.maker_book_verified_empty = false;
+                if live {
+                    if let Err(error) =
+                        cancel_maker_orders_with_retry(client, symbol, 3, output_format).await
+                    {
+                        break 'phase stop_requested_exit(
+                            &mut self.recovery.runtime_state,
+                            RuntimeStopReason::MarketData(format!(
+                                "market data recovery book verification failed: {error}"
+                            )),
+                        );
+                    }
+                }
+                self.loop_state.resting.clear();
+                if let Some(session) = self.live_session.as_mut() {
+                    invalidate_session_latency(session);
+                    session
+                        .projection
+                        .finish_verified_cleanup(OrderResponseContinuity::Preserved);
+                }
+                self.market.maker_book_verified_empty = true;
+
+                let latest = match self.market.feed.as_ref() {
+                    Some(feed) => {
+                        let state = feed.read().await;
+                        fresh_ws_sample(&state).map(|(mark, bid, ask, _)| {
+                            classify_market_health(mark, bid, ask, max_divergence_bps)
+                        })
+                    }
+                    None => None,
+                };
+                let Some(latest) = latest else {
+                    let now_ms = duration_ms(self.market.health_started.elapsed());
+                    let _ = self
+                        .market
+                        .health
+                        .observe(now_ms, maker::MarketDataObservation::InvalidSnapshot);
+                    self.market.maker_book_verified_empty = false;
+                    sync_market_transport_deadline(&mut self.market, std::time::Instant::now());
+                    return LoopDirective::Restart;
+                };
+                self.market.last_divergence_bps = latest.divergence_bps;
+                if latest.observation != maker::MarketDataObservation::Coherent {
+                    let now_ms = duration_ms(self.market.health_started.elapsed());
+                    let _ = self.market.health.observe(now_ms, latest.observation);
+                    self.market.maker_book_verified_empty = false;
+                    sync_market_transport_deadline(&mut self.market, std::time::Instant::now());
+                    return LoopDirective::Restart;
+                }
+
+                if matches!(
+                    self.market.health.confirm_recovered(),
+                    maker::MarketDataTransition::Recovered
+                ) {
+                    let observed = self.loop_state.ledger.expected_position;
+                    self.market.standby_started = None;
+                    self.market.transport_deadline = None;
+                    self.market.next_heartbeat = None;
+                    self.market.last_divergence_bps = None;
+                    self.market.last_src = None;
+                    self.loop_state.counters.consecutive_errors = 0;
+                    self.loop_state.next_cycle_is_recovery = true;
+                    notifier
+                        .risk(
+                            RiskNotice {
+                                kind: "market_data",
+                                severity: "resolved",
+                                event: "recovered",
+                                message: "market data recovered with consecutive quoteable snapshots and a verified empty maker book; quoting may resume",
+                                symbol,
+                                cycle,
+                                position_before: None,
+                                position_after: Some(observed),
+                                expected: Some(observed),
+                                observed: Some(observed),
+                            },
+                            false,
+                        )
+                        .await;
+                    return LoopDirective::Restart;
+                }
             }
             return LoopDirective::Proceed;
         };

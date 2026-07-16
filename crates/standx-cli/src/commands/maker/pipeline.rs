@@ -3,8 +3,8 @@ use super::{ORDER_HISTORY_LIMIT, TRADE_LOOKBACK_LIMIT};
 use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{
-    MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, OrderLatencyTracker,
-    RequestTimeoutPhase, RestingQuote, VolBreaker,
+    MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, MarketDataMode,
+    OrderLatencyTracker, RequestTimeoutPhase, RestingQuote, VolBreaker,
 };
 use standx_sdk::account_stream::AccountStreamHealth;
 use standx_sdk::client::StandXClient;
@@ -119,6 +119,7 @@ pub(super) struct CycleRequest<'a> {
     pub(super) mark: f64,
     pub(super) best_bid: Option<f64>,
     pub(super) best_ask: Option<f64>,
+    pub(super) market_data_mode: MarketDataMode,
     pub(super) market_source: &'static str,
     /// Observation-only classification. The first successfully committed
     /// cycle after bounded recovery is grouped separately in latency output.

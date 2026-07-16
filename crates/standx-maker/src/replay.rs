@@ -130,6 +130,7 @@ pub fn run_replay(
                             position: cycle.position,
                             resting: &cycle.resting,
                             pending_slots: &cycle.pending_slots,
+                            market_data_mode: crate::MarketDataMode::Active,
                             active_exit_enabled: settings.active_exit_enabled,
                             inventory_exit_pct: settings.inventory_exit_pct,
                             inventory_exit_qty: settings.inventory_exit_qty,
