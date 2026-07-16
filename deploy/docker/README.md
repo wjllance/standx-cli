@@ -121,3 +121,34 @@ only launches when you pass `--profile ab` explicitly.
   time unless you've bind-mounted a shared lock directory into both (see
   "Locks are container-local by default" above) — with container-local locks,
   nothing stops the two from trading the same symbol concurrently.
+
+## Troubleshooting
+
+Issues hit (and fixed) during the first real rollout, in the order they
+surface:
+
+- **`docker build` fails: `feature \`edition2024\` is required`** — the
+  builder image was pinned below Rust 1.85 (where `edition2024` stabilized),
+  and `Cargo.lock`'s transitive deps now need it. Fixed by pinning the
+  builder to a current `rustN.N-bookworm` tag; if it recurs after a
+  `Cargo.lock` update, bump the Dockerfile's `FROM rust:...` further.
+- **`openobserve alerts error: ... GET /api/{org}/{stream}/alerts returned
+  HTTP 404`** — OpenObserve's alerts API moved to `/api/v2/{org}/alerts`
+  (org-scoped, keyed by `alert_id`) in current builds; this is not a
+  stream-existence problem (creating the stream first does not help — the
+  old endpoint is simply gone). Fixed in `scripts/openobserve_alerts.py`.
+  If you pull a much newer OpenObserve image and this recurs, the API may
+  have moved again — check its own `/api-doc/openapi.json` for the current
+  alerts paths rather than guessing.
+- **`failed to open live lock /run/lock/standx-maker-stage2-ab.lock`** — the
+  container bind-mounted the host's `/run/lock`, which failed to open on some
+  hosts (permission/SELinux denial, host-specific). Fixed by moving to
+  container-local locks under `/opt/standx/var/lock` (see "Locks are
+  container-local by default" above); make sure
+  `/etc/standx/maker-stage2-ab.env` sets `STANDX_MAKER_LOCK_PATH` /
+  `STANDX_STAGE2_AB_LOCK_PATH` there, not under `/run/lock`.
+- **Stale image after a code/script change** — `docker compose run`/`up`
+  reuse an existing local image tag and do **not** rebuild automatically. If
+  a fix doesn't seem to take effect, rebuild explicitly:
+  `docker compose --profile ab build --no-cache` (or add `--build` to the
+  `run`/`up` command).

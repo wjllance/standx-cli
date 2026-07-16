@@ -19,11 +19,18 @@ active inventory exit or automatic flatten.
   `adaptive_spread.enabled` and record both hashes.
 - Install `standx-maker-stage2-ab.service`, `run_maker_stage2_ab.sh`, the
   observed-run/OpenObserve tools, and a root-owned `0600`
-  `/etc/standx/maker-stage2-ab.env`.
+  `/etc/standx/maker-stage2-ab.env`. A containerized alternative to this unit
+  is available at [`deploy/docker/`](../deploy/docker/README.md)
+  (docker-compose, same authorization gate); its lock paths default to a
+  container-local directory rather than `/run/lock` — see that README before
+  using it.
 - Keep both ordinary-maker and A/B environment files on the same
   `/run/lock/standx-maker-live.lock` and
   `/run/lock/standx-maker-stage2-ab.lock` paths. A manual live process that
   cannot open those production locks must fail closed, not select another lock.
+  (This host-shared-lock requirement is specific to the systemd deployment;
+  the docker deployment's container-local locks trade away this guarantee —
+  see its README.)
 - Read current XAG symbol info and fill the three
   `STANDX_BASELINE_*` metadata values in that environment file. Blank or stale
   metadata is a gate failure; the orchestrator refuses to switch arms when
