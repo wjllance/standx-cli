@@ -15,26 +15,42 @@
 - 新能力默认关闭；关闭时必须与当前策略行为等价。
 - 保留已有 JSON action 名称和字段；新增指标只能增加可选字段或新 action。
 - WS/REST 成交继续走同一账本入口，以稳定 `trade_id` exactly-once 去重。
-- 所有策略比较先经过 deterministic replay，再进入 paper/shadow；live canary 必须单独授权。
+- 所有策略比较先经过 deterministic replay 等价验证；统计比较通过小额实盘时间片 A/B
+  进行，授权边界见"轨道与执行顺序"的风险预算；超出该边界的 live 变更仍须单独授权。
 - 策略、风险控制或交易所命令路径发生变化后，按
   [14-maker-live-gate.md](14-maker-live-gate.md) 重新锁定并补充证据。
 
 ## 轨道与执行顺序
 
-阶段 0/1 已完成。其余阶段不再单链排队，按两条并行轨道执行：
+阶段 0/1 已完成。小额实盘被授权为主要数据通道（授权边界见下方风险预算），其余工作
+按以下顺序执行：
 
-- **安全轨（立即启动）：阶段 5。** 分级背离处理已在 main 落地（见阶段 5 的现状清单），
-  剩余范围收缩为退出政策分离、残余仓位 handoff 和受监督 canary。它与 alpha 轨的报价
-  几何改动在代码上基本不相交，可并行推进；其 canary 通过后，live 验证通道对 alpha
-  阶段开放。
-- **Alpha 轨（顺序不变）：阶段 2 → 3 → 4。** 每阶段先 replay 等价性 + plan-diff，再
-  paper/shadow 积累样本外证据；安全轨 canary 通过后，各阶段可独立申请小规模 live
-  canary，无需等待整条 alpha 轨完成。
+- **L0 基线实盘（最先启动，零策略代码改动）**：现有静态策略、小额、单 symbol 连续
+  运行，作为全部后续比较的真实数据基线。唯一前置是按
+  [14-maker-live-gate.md](14-maker-live-gate.md) 重验一次受监督 canary——gate 于
+  2026-07-10 解锁过，但其后恢复与 stop-loss 路径已重构，按 gate 规则需要一次新的
+  canary 记录。
+- **安全轨收缩为两级**：小额实盘的前置只保留运维件——emergency cancel 操作人、
+  runbook（含 stop-loss 停机后残余仓位的手动处置流程）、webhook 告警可达。阶段 5
+  的 typed trim/emergency 分离、自动 flatten、alert/hard floor 配置拆名，全部推迟到
+  扩大规模（加大 size/max_position 或多 symbol）之前完成。
+- **Alpha 轨：阶段 2 v0 → 阶段 3 v0，比较方法为实盘时间片 A/B**：基线与 candidate
+  配置按固定时段交替（如 4–8 小时轮换），用阶段 1 已有的 `run_id/config_hash` 对比
+  能力直接出报告，不再建设 shadow plan-diff 设施。每个阶段的策略代码合并后按 gate
+  规则做一次 canary 重验；之后的纯配置调参（档位阈值、系数）不重锁。
+- **阶段 4 整体推迟**：是否启动由 L0/阶段 2 积累的真实 markout 数据决定；在此之前
+  其章节仅作设计参考保留。
 
-**最简先行**：每个 alpha 阶段先以最简可行模型（v0）走完 replay → shadow → paper 的
-完整流程和验收，目标是尽快用最少的代码把全链路和证据管道打通。复杂度（v1 项）只有在
-v0 的 shadow/paper 证据明确定位不足时才引入，并作为同阶段的增量候选重新走同一验收，
-不新开阶段。v0 未达专项门槛时，先排查参数与数据窗口，再考虑升级模型。
+**风险预算（小额实盘的授权边界）**：已知最坏路径是趋势市库存满仓后 stop-loss 停机
+持仓，损失上界约为 `max_position × 不利变动幅度` 加退出成本。授权边界沿用 canary
+口径：单 symbol、一个 level、最小有效数量、`max_position` 不超过一个已批准的 exit
+chunk。在此边界内，实盘数据采集不再需要逐阶段的 paper 长跑授权；超出边界（扩大
+规模）前必须先完成安全轨第二级。
+
+**最简先行**：每个 alpha 阶段先以最简可行模型（v0）走完 replay 等价验证 → 实盘时间
+片 A/B 的完整流程和验收，目标是尽快用最少的代码把全链路和证据管道打通。复杂度
+（v1 项）只有在 v0 的 A/B 证据明确定位不足时才引入，并作为同阶段的增量候选重新走
+同一验收，不新开阶段。v0 未达专项门槛时，先排查参数与数据窗口，再考虑升级模型。
 
 | 阶段 | v0 最简模型 | 显式推迟到 v1 的项 |
 |---|---|---|
@@ -42,22 +58,22 @@ v0 的 shadow/paper 证据明确定位不足时才引入，并作为同阶段的
 | 3 | 仅 size skew（单一加仓侧缩减系数），现有线性 price skew 不动 | 非线性 price skew、level skew、inventory age |
 | 4 | 仅 top-of-book microprice + 质量分回退 | 多档深度、depth imbalance、OFI |
 
-| 阶段 | 轨道 | 主题 | 主要产物 | 晋级核心条件 |
+| 步骤 | 轨道 | 主题 | 主要产物 | 晋级核心条件 |
 |---|---|---|---|---|
 | 0 | 已完成 | 基线与证据校准 | 冻结基线、配置/文档对齐、数据集清单 | 基线可复现，配置与 live 证据无冲突 |
 | 1 | 已完成 | 绩效账本与回放 | 净 PnL 归因、markout、订单延迟、时间加权 uptime、replay runner | 同一 trace 确定性重放，指标守恒且可查询 |
-| 5 | 安全轨 | 分级异常与退出政策（剩余范围） | trim/emergency typed 分离、residual handoff、受监督 canary | 冻结/清理/恢复证据复核完成，canary 通过并开放 live 通道 |
-| 2 | alpha | 波动驱动 spread / refresh（v0 单因子） | spread 控制器、时间窗波动、通用 shadow plan-diff 设施 | 样本外风险改善，收益/uptime 不越过退化线 |
-| 3 | alpha | 库存控制器 | 非线性 price/size/level skew、库存年龄 | 尾部库存显著下降，退出成本和敞口不恶化 |
-| 4 | alpha | 公平价与订单流 | typed depth 归一化、microprice、OFI、信号质量降级 | shadow/replay 中 markout 改善，坏数据安全回退 |
+| L0 | 数据通道 | 基线小额实盘常跑 | canary 重验记录、运维 runbook、真实基线数据集 | canary 通过，基线数据持续积累 |
+| 5-a | 安全轨一级 | 实盘运维件 | emergency cancel 操作人、残余仓位手动处置流程 | 与 L0 canary 一并完成 |
+| 2 | alpha | 波动驱动 spread / refresh（v0 阶梯） | spread 控制器、时间窗波动 | 时间片 A/B 风险改善，收益/uptime 不越过退化线 |
+| 3 | alpha | 库存控制器（v0 size skew） | 加仓侧数量缩减 | 尾部库存显著下降，退出成本和敞口不恶化 |
+| 5-b | 安全轨二级 | 分级异常与退出政策（剩余范围） | trim/emergency typed 分离、flatten（默认关）、配置拆名 | 扩大规模的前置 |
+| 4 | 推迟 | 公平价与订单流 | typed depth 归一化、microprice | 由真实 markout 数据决定是否启动 |
 
 ## 统一验收口径
 
-阶段 1 完成后，后续策略阶段统一以至少三类互不重叠的数据窗口验收：
-
-1. 平静/窄幅市场；
-2. 单边趋势/库存持续累积市场；
-3. 快速波动、盘口稀疏或行情源短暂异常市场。
+数据窗口不再预先策展：L0 起小额实盘连续采集，按阶段 0 的分类口径事后标注为平静、
+趋势、快速波动或 unclassified。alpha 阶段的晋级比较窗口至少包含一段平静时段和一段
+趋势时段，且 A/B 两臂在同类时段的 quote-hours 大致平衡；未覆盖趋势时段前不晋级。
 
 参数只允许在训练窗口调整，验收必须使用冻结参数和未参与调参的样本外窗口。比较报告至少
 包含：净 PnL、最大回撤、1s/5s/30s markout、下单/撤单 effective latency、时间加权双边
@@ -70,11 +86,13 @@ alpha 轨各阶段还统一遵守：
   能力），不是原始静态策略；同时每个阶段必须保留"全部自适应能力关闭 ≡ 原始静态策略"的
   逐 action 等价测试，防止组合状态漂移。
 - **证据分工**：deterministic replay 是 open-loop 重放（resting/fills 来自录制事件），
-  无法生成 candidate 策略的反事实成交。replay 只承担"关闭时等价"与 plan-diff 的确定性
-  验证；净 PnL、markout、撤单率等专项门槛全部由 paper/shadow 样本外窗口承担。
-- **shadow 设施复用**：阶段 2 建立的通用 shadow plan-diff 设施（同 cycle 计算
-  legacy/candidate 两个 plan、只执行 legacy、记录差异）是各阶段共享的证据积累通道；
-  新阶段代码可用当天即应开启 shadow 记录，因为样本外数据窗口是全路线的关键路径。
+  无法生成 candidate 策略的反事实成交。replay 只承担"关闭时等价"的确定性验证；净
+  PnL、markout、撤单率等专项门槛由小额实盘时间片 A/B 承担。paper 降级为合并前的
+  冒烟测试（多小时无 panic/不变量违规），不再作为晋级证据。
+- **时间片 A/B 规程**：基线与 candidate 按固定时段交替（如 4–8 小时轮换），两臂使用
+  相同的 size/max_position/风控配置，只差被验收的策略参数；每臂每段是独立
+  `run_id + config_hash`，直接用阶段 1 的对比查询出报告。轮换切换必须经过正常停机
+  （空簿、仓位对账），带着仓位切换配置的时段作废。
 
 除各阶段的专项门槛外，所有阶段还必须满足：
 
@@ -207,7 +225,7 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 v0 刻意收缩为单因子：只使用核心已有的滚动波动（`VolBreaker` 每 cycle 计算的
 peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 latency summary
-输入推迟到 v1（阶段 2.5），仅当 v0 的 shadow 证据表明单因子不足时再引入——两者都需要
+输入推迟到 v1（阶段 2.5），仅当 v0 的 A/B 证据表明单因子不足时再引入——两者都需要
 新增滚动统计管道，且 markout 依赖自身成交，样本稀疏时噪声大，并引入报价→成交→信号的
 反馈回路。费用下限不建 fee 模型，用 `min_spread_bps` 配置项由操作者按已知费率设置。
 
@@ -226,9 +244,7 @@ peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 l
 - 显式政策：spread 变宽时不主动撤已挂的窄单，依靠 refresh 自然轮换与 vol halt 兜底。
   reconcile 按 `(side, level)` + ref_center 漂移持有报价，spread 变化只在自然 re-quote
   边界生效——这是有意保留的 anti-flicker 行为，不是遗漏。
-- 建立通用 shadow plan-diff 设施：同一 cycle 同时计算 legacy 与 candidate plan，只执行
-  legacy，按 cycle 记录差异。对 candidate planner 泛化，供阶段 3/4 直接复用。
-- `run_replay` 接入控制器，用于关闭等价与 plan-diff 的确定性验证。
+- `run_replay` 接入控制器，用于关闭等价的确定性验证。
 
 ### 验收标准
 
@@ -238,15 +254,14 @@ peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 l
 - [ ] 有效 spread 不低于 `min_spread_bps`，不高于 band 可容纳的安全上限。
 - [ ] 任意输入下都不会生成穿 touch、出 band、低于最小数量或突破敞口预算的报价。
 - [ ] 波动单调恶化时 spread 不收窄；恢复时通过 hysteresis 回落；档位切换在阈值附近无振荡。
-- [ ] shadow 模式下 candidate plan 的计算不产生任何真实订单差异。
 
-paper/shadow 样本外窗口（按统一验收口径的证据分工）：
+实盘时间片 A/B（按统一验收口径）：
 
-- [ ] 三类样本外窗口合计 net PnL 不低于静态基线的 95%。
+- [ ] 代码合并后完成一次 canary 重验，A/B 在风险预算边界内运行。
+- [ ] 比较窗口（含平静与趋势时段）合计 net PnL 不低于静态基线的 95%。
 - [ ] 最大回撤绝对值不得大于基线；5s 负向 markout 绝对值至少改善 10%，否则不晋级。
 - [ ] 时间加权双边 uptime 相对基线下降不超过 3 个百分点。
 - [ ] 每 quote-hour 撤单数相对基线增加不超过 20%。
-- [ ] live canary 走安全轨（阶段 5）开放的通道，且须单独授权。
 
 ## 阶段 3：非线性库存控制
 
@@ -261,12 +276,12 @@ paper/shadow 样本外窗口（按统一验收口径的证据分工）：
 - v0 只做 size skew：`|position|` 超过配置阈值后，按单一系数缩减加仓侧数量；缩减后
   必须 tick 对齐，低于 venue minimum 时丢弃该档而不是提交非法数量。现有线性 price
   skew（`skew_bps`）保持不变。
-- v1（凭 v0 的 shadow/paper 证据引入）：price skew 靠近上限时的非线性增强、level
+- v1（凭 v0 的 A/B 证据引入）：price skew 靠近上限时的非线性增强、level
   skew（高库存减少加仓侧档数）、inventory age（长期未回中逐步提高减仓强度；所需
   时间由 CLI 归一化后作为 typed input 传入，core 保持不读时钟的既有边界）。
-- 主动退出继续是独立策略；vol halt 期间的退出语义遵循安全轨（阶段 5）已定政策，
-  不在本阶段隐式改变市价退出或波动熔断行为。
-- shadow 证据通过阶段 2 建立的通用 plan-diff 设施积累。
+- 主动退出继续是独立策略；vol halt 期间的退出语义在扩大规模前由安全轨二级定稿，
+  本阶段不隐式改变市价退出或波动熔断行为。
+- 统计证据通过实盘时间片 A/B 积累（同阶段 2 规程）。
 
 ### 验收标准
 
@@ -279,7 +294,10 @@ paper/shadow 样本外窗口（按统一验收口径的证据分工）：
 - [ ] net PnL 不低于基线的 95%，时间加权双边 uptime 下降不超过 3 个百分点。
 - [ ] 覆盖数量 tick 边界、方向翻转、阈值跨越、部分成交、pending reservation 和 wrong-run 事件测试。
 
-## 阶段 4：公平价与订单流信号
+## 阶段 4（推迟，凭数据启动）：公平价与订单流信号
+
+本阶段整体推迟：是否启动由 L0 与阶段 2 积累的真实 markout 数据决定——只有当被动成交
+的负向 markout 被证实为主要损耗来源时才立项。以下内容仅作设计参考保留。
 
 ### 目标
 
@@ -292,10 +310,10 @@ paper/shadow 样本外窗口（按统一验收口径的证据分工）：
 - SDK 已提供 `depth_book` WS 频道与 `OrderBook` 模型。v0 只用 top-of-book：归一化
   最优 bid/ask 的价格与数量为 typed input，在 `standx-maker` 中纯计算 microprice
   （数量加权 mid）和信号新鲜度；不解析多档、不计算 OFI。
-- v1（凭 v0 的 shadow 证据引入）：多档深度归一化、depth imbalance、OFI。
+- v1（凭 v0 证据引入）：多档深度归一化、depth imbalance、OFI。
 - fair-price adjustment 必须有边界、过期时间和质量分；数据不足时回退到当前 mark 策略。
-- 第一轮只做 shadow：复用阶段 2 的通用 plan-diff 设施，同时计算 legacy/fair-price
-  plan，但执行 legacy plan。
+- 验证方式届时再定：可沿用实盘时间片 A/B；若认为公平价改动风险更高，届时补建
+  plan-diff shadow 记录（同 cycle 计算 legacy/fair-price plan，只执行 legacy）。
 
 ### 验收标准
 
@@ -303,21 +321,22 @@ paper/shadow 样本外窗口（按统一验收口径的证据分工）：
 - [ ] 乱序、重复、缺档、负数量、非有限值和 stale depth 均被拒绝或安全降级。
 - [ ] 信号关闭、低质量或过期时，最终 plan 与 legacy mark-centered plan 等价。
 - [ ] fair price 及最终报价始终受 mark band、no-cross、tick 和 exposure cap 约束。
-- [ ] 至少一轮完整 paper/shadow 只记录 plan 差异，确认不会触发真实订单差异。
+- [ ] 若采用 shadow 验证：至少一轮完整运行只记录 plan 差异，确认不触发真实订单差异。
 - [ ] 冻结参数的样本外窗口中，passive fills 的 5s 负向 markout 绝对值至少改善 10%。
 - [ ] net PnL 不低于 legacy 基线的 95%，最大回撤和高库存时间均不得恶化。
 - [ ] 改善不能只来自大幅减少成交：成交数量下降超过 20% 时必须单独评审 SIP-5A 收益/uptime 影响。
 
-## 阶段 5（安全轨，与阶段 2 并行启动）：分级异常与退出政策
+## 阶段 5（安全轨，分两级执行）：分级异常与退出政策
 
 ### 目标
 
 明确区分短暂数据不一致、持续行情异常、正常库存修剪和紧急风险处置，避免“坏数据时永久
 保留挂单”或“波动最大时只能停机持仓”的隐含政策。
 
-本阶段提前到安全轨执行的原因：它修复的正是上面点名的最大已知风险（趋势库存 +
-stop-loss 只停机不平仓），且它产出的受监督 canary 是所有 alpha 阶段 live 验证的
-前置通道；排在队尾会让整条路线的 live 证据最晚到达。
+本阶段拆为两级：一级是小额实盘（L0）的运维前置，随 L0 canary 一并完成；二级是扩大
+规模（加大 size/max_position 或多 symbol）的代码级前置。canary 重验由 L0 承担，本阶段
+验收中涉及 canary 的条款以 L0 的记录为准。已知最大风险（趋势库存 + stop-loss 只停机
+不平仓）在小额边界内由风险预算覆盖，在扩大规模前由二级修复。
 
 ### 现状（2026-07-16 对照 main）
 
@@ -329,14 +348,22 @@ stop-loss 只停机不平仓），且它产出的受监督 canary 是所有 alph
 - 冻结后的清理、空簿对账、恢复入场与恢复熔断计量已在 recovery flow 中实现。
 - stop-loss 生命周期已重构为经由 core reducer 的统一路径。
 
-### 剩余范围
+### 剩余范围（分两级）
+
+一级（小额实盘前置，运维件而非代码，随 L0 canary 一并完成）：
+
+- 指定 emergency cancel 操作人；形成 runbook：stop-loss 停机后残余仓位的手动处置
+  流程、告警响应时限、venue 侧手动撤单路径。
+- 验证 webhook 告警（stop-loss、position risk、equity/margin alert）实际送达。
+
+二级（扩大规模的代码级前置）：
 
 - 正常 inventory trim 与 emergency risk exit 使用不同 typed policy/effect。
 - 明确 volatility halt 期间是否允许紧急退出；默认不得自动继承正常退出行为。该决定
-  必须先于阶段 3 定稿，作为库存控制器"不改变退出语义"边界的依据。
+  须在阶段 3 v1（非线性控制器）前定稿；v0 size skew 不触碰退出语义，不受此阻塞。
 - stop-loss 后残余仓位输出明确 handoff；自动 flatten 必须是默认关闭、单独授权的 live policy。
 - equity/margin 的 alert 与 hard floor 使用不同配置名和不同 typed outcome。
-- 背离恢复迟滞、熔断豁免等剩余硬化项按需纳入，不阻塞 canary。
+- 背离恢复迟滞、熔断豁免等剩余硬化项按需纳入。
 
 ### 验收标准
 
@@ -358,7 +385,7 @@ stop-loss 只停机不平仓），且它产出的受监督 canary 是所有 alph
 
 ```text
 阶段：
-状态：planned | implementing | replay | paper/shadow | canary | accepted | rejected
+状态：planned | implementing | replay | canary | live_ab | accepted | rejected
 baseline_git_sha：
 candidate_git_sha：
 baseline_config_hash：
@@ -373,5 +400,5 @@ release owner 决定：
 ```
 
 只有所有必选验收项都有可复查证据时，阶段状态才能改为 `accepted`。收益指标改善但安全门槛
-失败时必须判定为 `rejected`；安全通过但收益/风险没有达到专项门槛时继续保持 shadow，不能
-仅凭主观观察晋级。
+失败时必须判定为 `rejected`；安全通过但收益/风险没有达到专项门槛时继续保持 A/B 观察，
+不能仅凭主观观察晋级。
