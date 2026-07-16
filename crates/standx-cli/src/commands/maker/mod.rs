@@ -39,8 +39,9 @@ use startup::{run_startup, LiveSession, MakerStartup};
 use cycle::maker_cycle;
 use feed::{fresh_ws_sample, market_snapshot, spawn_market_feed, ws_snapshot_issue};
 use market_data::{
-    degradation_detail, observe_acquired_market_health, recover_market_data, AcquiredMarketHealth,
-    MarketDataDegradedError, MarketDataRecovery, MARKET_DATA_RECOVERY_TIMEOUT,
+    classify_market_health, degradation_detail, observe_acquired_market_health,
+    AcquiredMarketHealth, ClassifiedMarketHealth, MarketDataDegradedError,
+    MARKET_DATA_STANDBY_HEARTBEAT, MARKET_DATA_TRANSPORT_TIMEOUT,
 };
 use model::{is_maker_order, position_for_symbol, MakerExit};
 pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};

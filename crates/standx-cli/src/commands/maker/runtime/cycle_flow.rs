@@ -102,6 +102,7 @@ impl MakerRuntime {
             let exit_pending_before = self.loop_state.inventory_exit_pending;
             let breaker_halted_before = self.loop_state.breaker.halted();
             let recovery_cycle = self.loop_state.next_cycle_is_recovery;
+            let market_paused_before_cycle = self.market.health.is_degraded();
             let cycle_work_token = match take_cycle_work(&mut self.recovery.runtime_state) {
                 Ok(Some(token)) => token,
                 Ok(None) => return Err(LoopDirective::Restart),
@@ -172,9 +173,9 @@ impl MakerRuntime {
                 let best_ask = market.best_ask;
                 let src = market.source;
                 let market_fallback_reason = market.fallback_reason;
-                if feed.is_some() {
+                if feed.is_some() && !self.market.health.is_degraded() {
                     let health_now_ms = duration_ms(market_data_health_started.elapsed());
-                    if let Some(detail) = observe_acquired_market_health(
+                    let update = observe_acquired_market_health(
                         &mut self.market.health,
                         AcquiredMarketHealth {
                             now_ms: health_now_ms,
@@ -185,10 +186,17 @@ impl MakerRuntime {
                             best_ask,
                             max_divergence_bps: args.max_divergence_bps,
                         },
-                    ) {
+                    );
+                    self.market.last_divergence_bps = update.divergence_bps;
+                    if let Some(detail) = update.degradation_detail() {
                         return Err(anyhow::Error::new(MarketDataDegradedError { detail }));
                     }
                 }
+                let market_data_mode = if self.market.health.is_degraded() {
+                    maker::MarketDataMode::Paused
+                } else {
+                    maker::MarketDataMode::Active
+                };
                 let result = maker_cycle(
                     CycleRequest {
                         client,
@@ -199,6 +207,7 @@ impl MakerRuntime {
                         mark,
                         best_bid,
                         best_ask,
+                        market_data_mode,
                         market_source: src,
                         recovery: recovery_cycle,
                         market_fallback_reason,
@@ -329,7 +338,9 @@ impl MakerRuntime {
                                 }
                                 None => None,
                             };
-                            if let Some(issue) = idle_issue {
+                            if let (false, Some(issue)) =
+                                (market_paused_before_cycle, idle_issue)
+                            {
                                 cycle_invalidated_by_market = Some(format!(
                                     "market feed effective-update watchdog fired during maker cycle: {}",
                                     issue.as_str(),
@@ -346,11 +357,12 @@ impl MakerRuntime {
                     .market
                     .health
                     .observe(now_ms, maker::MarketDataObservation::FeedIdle);
-                let detail = degradation_detail(transition, &detail).unwrap_or(detail);
-                self.recovery
-                    .runtime_state
-                    .handle(MakerEvent::MarketDataDegraded(detail.clone()));
-                self.market.pending_degradation = Some(detail);
+                if let Some(detail) = degradation_detail(transition, &detail) {
+                    self.recovery
+                        .runtime_state
+                        .handle(MakerEvent::MarketDataDegraded(detail.clone()));
+                    self.market.pending_degradation = Some(detail);
+                }
             }
             // The buffers are only fed from live-session receivers, so both are
             // empty in paper mode.
@@ -1131,6 +1143,20 @@ impl MakerRuntime {
                         None => std::future::pending().await,
                     }
                 };
+                let market_wakeup_at = self.market.transport_deadline.or_else(|| {
+                    (self.market.health.degraded_class()
+                        == Some(maker::MarketDataFaultClass::MarketState))
+                    .then_some(self.market.next_heartbeat)
+                    .flatten()
+                });
+                let market_wakeup = async {
+                    match market_wakeup_at {
+                        Some(deadline) => {
+                            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
                 let update = async {
                     match self.market.updates.as_mut() {
                         Some(rx) => rx.changed().await.is_ok(),
@@ -1150,6 +1176,7 @@ impl MakerRuntime {
                     },
                     _ = tokio::time::sleep_until(deadline) => break,
                     _ = request_timeout => break,
+                    _ = market_wakeup => break,
                     event = account_update => {
                         // The branch futures are dropped before select! handlers
                         // run, so the session can be re-borrowed here. An event
@@ -1216,15 +1243,23 @@ impl MakerRuntime {
                     ok = update => {
                         if !ok {
                             let now_ms = duration_ms(market_data_health_started.elapsed());
-                            if let Some(detail) = degradation_detail(
-                                self.market.health.observe(
-                                    now_ms,
-                                    maker::MarketDataObservation::RestFallback,
-                                ),
-                                "market feed task ended",
-                            ) {
+                            let transition = self.market.health.observe(
+                                now_ms,
+                                maker::MarketDataObservation::RestFallback,
+                            );
+                            if let Some(detail) =
+                                degradation_detail(transition, "market feed task ended")
+                            {
                                 self.recovery.runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
                                 self.market.pending_degradation = Some(detail);
+                                break;
+                            }
+                            if matches!(
+                                transition,
+                                maker::MarketDataTransition::ClassChanged { .. }
+                                    | maker::MarketDataTransition::RecoveryReady
+                            ) {
+                                self.market.updates = None;
                                 break;
                             }
                             // The next interval cycle records another REST
@@ -1239,23 +1274,16 @@ impl MakerRuntime {
                             Some(session) => session.projection.resting_quotes(),
                             None => self.loop_state.resting.clone(),
                         };
-                        let (observation, observation_detail, requires_replan) = {
+                        let (classified, requires_replan) = {
                             let s = feed.read().await;
                             match fresh_ws_sample(&s) {
                                 Some((mark, best_bid, best_ask, version)) => {
-                                    let observation = if matches!(
-                                        maker::touch_skip(
-                                            mark,
-                                            best_bid,
-                                            best_ask,
-                                            args.max_divergence_bps,
-                                        ),
-                                        Some(maker::CycleSkip::MarkMidDivergence { .. })
-                                    ) {
-                                        maker::MarketDataObservation::MarkMidDivergence
-                                    } else {
-                                        maker::MarketDataObservation::Coherent
-                                    };
+                                    let classified = classify_market_health(
+                                        mark,
+                                        best_bid,
+                                        best_ask,
+                                        args.max_divergence_bps,
+                                    );
                                     let requires_replan = self.market.last_mark.is_some_and(|prev| {
                                         market_update_requires_replan(
                                             prev,
@@ -1267,17 +1295,13 @@ impl MakerRuntime {
                                             args.max_divergence_bps,
                                         )
                                     });
-                                    let observation = if version.both_advanced_from(health_version) {
+                                    let classified = if version.both_advanced_from(health_version) {
                                         health_version = Some(version);
-                                        Some(observation)
+                                        Some(classified)
                                     } else {
                                         None
                                     };
-                                    (
-                                        observation,
-                                        "websocket cache update".to_string(),
-                                        requires_replan,
-                                    )
+                                    (classified, requires_replan)
                                 }
                                 None => {
                                     let issue = ws_snapshot_issue(&s, std::time::Instant::now());
@@ -1286,25 +1310,35 @@ impl MakerRuntime {
                                     } else {
                                         maker::MarketDataObservation::RestFallback
                                     };
-                                    (
-                                        Some(observation),
-                                        format!(
+                                    let classified = ClassifiedMarketHealth {
+                                        observation,
+                                        detail: format!(
                                             "websocket cache unavailable: {}",
                                             issue.map_or("unknown", |issue| issue.as_str())
                                         ),
-                                        false,
-                                    )
+                                        divergence_bps: None,
+                                    };
+                                    (Some(classified), false)
                                 }
                             }
                         };
-                        if let Some(observation) = observation {
+                        if let Some(classified) = classified {
                             let now_ms = duration_ms(market_data_health_started.elapsed());
-                            if let Some(detail) = degradation_detail(
-                                self.market.health.observe(now_ms, observation),
-                                &observation_detail,
-                            ) {
+                            self.market.last_divergence_bps = classified.divergence_bps;
+                            let transition = self
+                                .market
+                                .health
+                                .observe(now_ms, classified.observation);
+                            if let Some(detail) = degradation_detail(transition, &classified.detail) {
                                 self.recovery.runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
                                 self.market.pending_degradation = Some(detail);
+                                break;
+                            }
+                            if matches!(
+                                transition,
+                                maker::MarketDataTransition::ClassChanged { .. }
+                                    | maker::MarketDataTransition::RecoveryReady
+                            ) {
                                 break;
                             }
                         }
