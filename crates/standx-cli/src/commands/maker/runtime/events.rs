@@ -268,7 +268,6 @@ pub(super) struct AccountEventState<'a> {
 #[derive(Debug, Default)]
 pub(super) struct AccountEventOutcome {
     pub(super) fills: u64,
-    pub(super) latest_position: Option<f64>,
     pub(super) position_observations: Vec<f64>,
     pub(super) exit_fill_observed: bool,
     pub(super) balance_changed: bool,
@@ -281,7 +280,6 @@ impl AccountEventOutcome {
     fn merge(&mut self, other: Self) {
         let Self {
             fills,
-            latest_position,
             position_observations,
             exit_fill_observed,
             balance_changed,
@@ -290,9 +288,6 @@ impl AccountEventOutcome {
             fill_order_ids,
         } = other;
         self.fills += fills;
-        if latest_position.is_some() {
-            self.latest_position = latest_position;
-        }
         self.position_observations.extend(position_observations);
         self.exit_fill_observed |= exit_fill_observed;
         self.balance_changed |= balance_changed;
@@ -363,7 +358,7 @@ pub(super) async fn absorb_account_outcome(
     if outcome.exit_fill_observed {
         *sink.inventory_exit_pending = false;
     }
-    let position = outcome.latest_position;
+    let position = outcome.position_observations.last().copied();
     for observed in outcome.position_observations {
         sink.notifier
             .position_jump(
@@ -498,7 +493,6 @@ pub(super) fn apply_account_event(
             }
             Ok(AccountEventOutcome {
                 fills: fills.len() as u64,
-                latest_position: None,
                 position_observations: Vec::new(),
                 exit_fill_observed,
                 balance_changed: false,
@@ -525,7 +519,6 @@ pub(super) fn apply_account_event(
             );
             Ok(AccountEventOutcome {
                 fills: 0,
-                latest_position: Some(qty),
                 position_observations: vec![qty],
                 exit_fill_observed: false,
                 balance_changed: false,
@@ -559,7 +552,6 @@ pub(super) fn apply_account_event(
             }
             Ok(AccountEventOutcome {
                 fills: fills.len() as u64,
-                latest_position: None,
                 position_observations: Vec::new(),
                 exit_fill_observed,
                 balance_changed: false,

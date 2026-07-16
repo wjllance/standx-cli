@@ -30,7 +30,7 @@ fn apply_account_events_records_position_mismatch_with_sign() {
         Some(OrderSide::Buy),
         "0.5",
     ))]);
-    assert_eq!(buy.latest_position, Some(0.5));
+    assert_eq!(buy.position_observations.last().copied(), Some(0.5));
 
     let sell = drain_positions(vec![AccountEvent::Position(position_update(
         "BTC-USD",
@@ -38,7 +38,7 @@ fn apply_account_events_records_position_mismatch_with_sign() {
         "0.5",
     ))]);
     assert_eq!(
-        sell.latest_position,
+        sell.position_observations.last().copied(),
         Some(-0.5),
         "sell position is negative"
     );
@@ -66,7 +66,7 @@ fn apply_account_events_applies_buffered_events_in_order() {
     assert_eq!(outcome.fills, 0);
     assert_eq!(outcome.position_observations, vec![0.2, -0.9]);
     assert_eq!(
-        outcome.latest_position,
+        outcome.position_observations.last().copied(),
         Some(-0.9),
         "latest position reflects last update"
     );
@@ -185,7 +185,7 @@ fn typed_trade_event_is_booked_once_after_order_ownership() {
         AccountEvent::Trade(trade),
     ]);
     assert_eq!(outcome.fills, 1);
-    assert_eq!(outcome.latest_position, None);
+    assert_eq!(outcome.position_observations.last().copied(), None);
 }
 
 #[test]
@@ -197,7 +197,8 @@ fn apply_account_events_ignores_other_symbols() {
     ))]);
     assert_eq!(outcome.fills, 0);
     assert_eq!(
-        outcome.latest_position, None,
+        outcome.position_observations.last().copied(),
+        None,
         "position updates for other symbols are ignored"
     );
 }

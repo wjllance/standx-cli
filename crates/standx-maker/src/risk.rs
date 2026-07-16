@@ -15,7 +15,6 @@ pub struct PositionRiskEvent {
     pub kind: PositionRiskKind,
     pub before: f64,
     pub after: f64,
-    pub delta: f64,
 }
 
 /// Tracks consecutive position observations independently from the
@@ -63,14 +62,9 @@ impl PositionAlertAnchor {
         let jump = self.change_pct > 0.0
             && notification_delta.abs() > qty_tolerance
             && notification_delta.abs() + qty_tolerance >= jump_threshold;
-        let direction_flip = matches!(
-            (
-                position_direction(observed_before, self.neutral_deadband),
-                position_direction(observed, self.neutral_deadband),
-            ),
-            (PositionDirection::Short, PositionDirection::Long)
-                | (PositionDirection::Long, PositionDirection::Short)
-        );
+        let direction_flip = (observed_before < -self.neutral_deadband
+            && observed > self.neutral_deadband)
+            || (observed_before > self.neutral_deadband && observed < -self.neutral_deadband);
         let crossed_max = observed_before.abs() + qty_tolerance < max_position
             && observed.abs() + qty_tolerance >= max_position;
         let exit_threshold = max_position * inventory_exit_pct / 100.0;
@@ -94,25 +88,7 @@ impl PositionAlertAnchor {
             kind,
             before,
             after: observed,
-            delta: observed - before,
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PositionDirection {
-    Short,
-    Neutral,
-    Long,
-}
-
-fn position_direction(position: f64, neutral_deadband: f64) -> PositionDirection {
-    if position < -neutral_deadband {
-        PositionDirection::Short
-    } else if position > neutral_deadband {
-        PositionDirection::Long
-    } else {
-        PositionDirection::Neutral
     }
 }
 
@@ -126,7 +102,7 @@ mod tests {
         assert!(anchor.evaluate(0.10, 0.8, 25.0, 0.0005).is_none());
         let event = anchor.evaluate(0.161, 0.8, 25.0, 0.0005).unwrap();
         assert_eq!(event.kind, PositionRiskKind::Jump);
-        assert!((event.delta - 0.160).abs() < 1e-9);
+        assert!((event.after - event.before - 0.160).abs() < 1e-9);
         assert!(anchor.evaluate(0.161, 0.8, 25.0, 0.0005).is_none());
     }
 

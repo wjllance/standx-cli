@@ -196,7 +196,7 @@ impl MakerNotifier {
         };
         let before = event.before;
         let after = event.after;
-        let delta = event.delta;
+        let delta = after - before;
         let (kind, severity) = risk_kind_descriptor(event.kind);
         let attribution = if (change.observed - change.expected).abs() <= change.qty_tolerance {
             "current-run maker fills"
