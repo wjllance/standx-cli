@@ -19,16 +19,37 @@
 - 策略、风险控制或交易所命令路径发生变化后，按
   [14-maker-live-gate.md](14-maker-live-gate.md) 重新锁定并补充证据。
 
-## 阶段总览
+## 轨道与执行顺序
 
-| 阶段 | 主题 | 主要产物 | 进入下一阶段的核心条件 |
-|---|---|---|---|
-| 0 | 基线与证据校准 | 冻结基线、配置/文档对齐、数据集清单 | 基线可复现，配置与 live 证据无冲突 |
-| 1 | 绩效账本与回放 | 净 PnL 归因、markout、订单延迟、时间加权 uptime、replay runner | 同一 trace 确定性重放，指标守恒且可查询 |
-| 2 | 自适应 spread / refresh | 波动与逆向选择驱动的动态报价宽度 | 样本外风险改善，收益/uptime 不越过退化线 |
-| 3 | 库存控制器 | 非线性 price/size/level skew、库存年龄 | 尾部库存显著下降，退出成本和敞口不恶化 |
-| 4 | 公平价与订单流 | 深度数量、microprice、OFI、信号质量降级 | shadow/replay 中 markout 改善，坏数据安全回退 |
-| 5 | 异常与退出政策 | 分级背离处理、正常/紧急退出分离 | 冻结/清理/恢复全覆盖，受监督 canary 通过 |
+阶段 0/1 已完成。其余阶段不再单链排队，按两条并行轨道执行：
+
+- **安全轨（立即启动）：阶段 5。** 分级背离处理已在 main 落地（见阶段 5 的现状清单），
+  剩余范围收缩为退出政策分离、残余仓位 handoff 和受监督 canary。它与 alpha 轨的报价
+  几何改动在代码上基本不相交，可并行推进；其 canary 通过后，live 验证通道对 alpha
+  阶段开放。
+- **Alpha 轨（顺序不变）：阶段 2 → 3 → 4。** 每阶段先 replay 等价性 + plan-diff，再
+  paper/shadow 积累样本外证据；安全轨 canary 通过后，各阶段可独立申请小规模 live
+  canary，无需等待整条 alpha 轨完成。
+
+**最简先行**：每个 alpha 阶段先以最简可行模型（v0）走完 replay → shadow → paper 的
+完整流程和验收，目标是尽快用最少的代码把全链路和证据管道打通。复杂度（v1 项）只有在
+v0 的 shadow/paper 证据明确定位不足时才引入，并作为同阶段的增量候选重新走同一验收，
+不新开阶段。v0 未达专项门槛时，先排查参数与数据窗口，再考虑升级模型。
+
+| 阶段 | v0 最简模型 | 显式推迟到 v1 的项 |
+|---|---|---|
+| 2 | 2–3 档阶梯 spread/refresh（阈值 + 迟滞，与 VolBreaker 同模式） | 连续映射、markout/toxicity 输入、latency 输入 |
+| 3 | 仅 size skew（单一加仓侧缩减系数），现有线性 price skew 不动 | 非线性 price skew、level skew、inventory age |
+| 4 | 仅 top-of-book microprice + 质量分回退 | 多档深度、depth imbalance、OFI |
+
+| 阶段 | 轨道 | 主题 | 主要产物 | 晋级核心条件 |
+|---|---|---|---|---|
+| 0 | 已完成 | 基线与证据校准 | 冻结基线、配置/文档对齐、数据集清单 | 基线可复现，配置与 live 证据无冲突 |
+| 1 | 已完成 | 绩效账本与回放 | 净 PnL 归因、markout、订单延迟、时间加权 uptime、replay runner | 同一 trace 确定性重放，指标守恒且可查询 |
+| 5 | 安全轨 | 分级异常与退出政策（剩余范围） | trim/emergency typed 分离、residual handoff、受监督 canary | 冻结/清理/恢复证据复核完成，canary 通过并开放 live 通道 |
+| 2 | alpha | 波动驱动 spread / refresh（v0 单因子） | spread 控制器、时间窗波动、通用 shadow plan-diff 设施 | 样本外风险改善，收益/uptime 不越过退化线 |
+| 3 | alpha | 库存控制器 | 非线性 price/size/level skew、库存年龄 | 尾部库存显著下降，退出成本和敞口不恶化 |
+| 4 | alpha | 公平价与订单流 | typed depth 归一化、microprice、OFI、信号质量降级 | shadow/replay 中 markout 改善，坏数据安全回退 |
 
 ## 统一验收口径
 
@@ -42,6 +63,18 @@
 包含：净 PnL、最大回撤、1s/5s/30s markout、下单/撤单 effective latency、时间加权双边
 uptime、合格深度时间积分、成交率、撤单率、`p95 |position|`、高库存持续时间和主动退出
 成本。
+
+alpha 轨各阶段还统一遵守：
+
+- **基线继承**：阶段 N 的基线是上一 alpha 阶段 accepted 后的冻结配置（含已启用的自适应
+  能力），不是原始静态策略；同时每个阶段必须保留"全部自适应能力关闭 ≡ 原始静态策略"的
+  逐 action 等价测试，防止组合状态漂移。
+- **证据分工**：deterministic replay 是 open-loop 重放（resting/fills 来自录制事件），
+  无法生成 candidate 策略的反事实成交。replay 只承担"关闭时等价"与 plan-diff 的确定性
+  验证；净 PnL、markout、撤单率等专项门槛全部由 paper/shadow 样本外窗口承担。
+- **shadow 设施复用**：阶段 2 建立的通用 shadow plan-diff 设施（同 cycle 计算
+  legacy/candidate 两个 plan、只执行 legacy、记录差异）是各阶段共享的证据积累通道；
+  新阶段代码可用当天即应开启 shadow 记录，因为样本外数据窗口是全路线的关键路径。
 
 除各阶段的专项门槛外，所有阶段还必须满足：
 
@@ -166,34 +199,54 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 - [x] dashboard 能按 `run_id/config_hash` 对比上述指标，区分 passive fill 与 inventory exit，
   并展示 place/cancel latency 分位数、超时率和撤单后晚到成交。
 
-## 阶段 2：自适应 Spread 与 Refresh
+## 阶段 2：波动驱动的自适应 Spread 与 Refresh（v0 单因子）
 
 ### 目标
 
-让报价宽度和重报阈值响应市场风险，同时保持 SIP-5A band、post-only 和 anti-flicker 约束。
+让报价宽度和重报阈值响应短窗波动，同时保持 SIP-5A band、post-only 和 anti-flicker 约束。
 
-建议的纯策略输入包括短窗 realized volatility、当前 touch spread、近期 markout/toxicity、
-阶段 1 产出的滚动 latency summary 和可换算的手续费下限。输出仍只是目标 spread/refresh
-或 typed quote intent。
+v0 刻意收缩为单因子：只使用核心已有的滚动波动（`VolBreaker` 每 cycle 计算的
+peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 latency summary
+输入推迟到 v1（阶段 2.5），仅当 v0 的 shadow 证据表明单因子不足时再引入——两者都需要
+新增滚动统计管道，且 markout 依赖自身成交，样本稀疏时噪声大，并引入报价→成交→信号的
+反馈回路。费用下限不建 fee 模型，用 `min_spread_bps` 配置项由操作者按已知费率设置。
 
 ### 范围
 
-- 新增可关闭的 adaptive quote policy；关闭时使用现有静态 `spread_bps/refresh_bps`。
-- 建立 spread 下限、上限、变化速率和 hysteresis，避免逐 tick 撤挂。
-- 保持 band/no-cross/tick rounding/exposure cap 作为最终不可绕过的约束。
-- 将策略使用的 volatility 改为明确的时间窗口，避免 cycle 频率改变统计周期。
+- 新增可关闭的纯函数 spread 控制器，v0 为 2–3 档阶梯模型：每档一组
+  `(spread_bps, refresh_bps)`，档位由时间窗 `vol_bps` 的阈值切换，并带升快降慢的
+  不对称 hysteresis——与 `VolBreaker` 已验证的"阈值 + 迟滞"模式同构，只是输出从
+  halt 变成加宽。`min_spread_bps`/`max_spread_bps` 仍是硬边界；连续映射留给 v1。
+  阶梯模型天然离散，逐 tick 变化的问题不存在。
+- 将 `VolBreaker` 窗口从"最近 N 个 cycle"改为明确时间窗（按时长驱逐 `(ts, mark)`），
+  使 cycle 频率变化不再改变统计周期。
+- 接入方式：每 cycle 派生 effective `MakerConfig`（仅调整 `spread_bps`/`refresh_bps`）
+  后传入 `plan_cycle`。策略关闭时派生为恒等，逐 action 等价自动成立；band、no-cross、
+  tick rounding、exposure cap 均不改动即天然生效。
+- 显式政策：spread 变宽时不主动撤已挂的窄单，依靠 refresh 自然轮换与 vol halt 兜底。
+  reconcile 按 `(side, level)` + ref_center 漂移持有报价，spread 变化只在自然 re-quote
+  边界生效——这是有意保留的 anti-flicker 行为，不是遗漏。
+- 建立通用 shadow plan-diff 设施：同一 cycle 同时计算 legacy 与 candidate plan，只执行
+  legacy，按 cycle 记录差异。对 candidate planner 泛化，供阶段 3/4 直接复用。
+- `run_replay` 接入控制器，用于关闭等价与 plan-diff 的确定性验证。
 
 ### 验收标准
 
-- [ ] adaptive policy 对同一 typed input 始终返回相同结果；关闭时与旧 planner action 等价。
-- [ ] 有效 spread 不低于配置的费用/风险下限，不高于 band 可容纳的安全上限。
+确定性（replay / 单测）：
+
+- [ ] 控制器对同一 typed input 始终返回相同结果；关闭时与旧 planner 逐 action 等价。
+- [ ] 有效 spread 不低于 `min_spread_bps`，不高于 band 可容纳的安全上限。
 - [ ] 任意输入下都不会生成穿 touch、出 band、低于最小数量或突破敞口预算的报价。
-- [ ] 波动或负向 markout 单调恶化时 spread 不收窄；恢复时通过 hysteresis 平滑回落。
+- [ ] 波动单调恶化时 spread 不收窄；恢复时通过 hysteresis 回落；档位切换在阈值附近无振荡。
+- [ ] shadow 模式下 candidate plan 的计算不产生任何真实订单差异。
+
+paper/shadow 样本外窗口（按统一验收口径的证据分工）：
+
 - [ ] 三类样本外窗口合计 net PnL 不低于静态基线的 95%。
 - [ ] 最大回撤绝对值不得大于基线；5s 负向 markout 绝对值至少改善 10%，否则不晋级。
 - [ ] 时间加权双边 uptime 相对基线下降不超过 3 个百分点。
-- [ ] 每 quote-hour 撤单数相对基线增加不超过 20%，且不出现阈值附近振荡。
-- [ ] 先完成 replay 和 paper/shadow 报告；未单独授权前不进行 live canary。
+- [ ] 每 quote-hour 撤单数相对基线增加不超过 20%。
+- [ ] live canary 走安全轨（阶段 5）开放的通道，且须单独授权。
 
 ## 阶段 3：非线性库存控制
 
@@ -204,11 +257,16 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 ### 范围
 
-- price skew：保留方向正确性，但允许靠近上限时非线性增强。
-- size skew：缩小加仓侧数量，必要时增加减仓侧的安全 maker 数量。
-- level skew：高库存时减少加仓侧档数，优先保留减仓侧流动性。
-- inventory age：库存长时间未回中时逐步提高减仓强度。
-- 主动退出继续是独立策略；不在本阶段隐式改变市价退出或波动熔断语义。
+- 基线为阶段 2 accepted 后的冻结配置（见统一验收口径的基线继承规则）。
+- v0 只做 size skew：`|position|` 超过配置阈值后，按单一系数缩减加仓侧数量；缩减后
+  必须 tick 对齐，低于 venue minimum 时丢弃该档而不是提交非法数量。现有线性 price
+  skew（`skew_bps`）保持不变。
+- v1（凭 v0 的 shadow/paper 证据引入）：price skew 靠近上限时的非线性增强、level
+  skew（高库存减少加仓侧档数）、inventory age（长期未回中逐步提高减仓强度；所需
+  时间由 CLI 归一化后作为 typed input 传入，core 保持不读时钟的既有边界）。
+- 主动退出继续是独立策略；vol halt 期间的退出语义遵循安全轨（阶段 5）已定政策，
+  不在本阶段隐式改变市价退出或波动熔断行为。
+- shadow 证据通过阶段 2 建立的通用 plan-diff 设施积累。
 
 ### 验收标准
 
@@ -230,10 +288,14 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 ### 范围
 
-- SDK/CLI adapter 解析前若干档价格和数量，归一化为 maker domain depth input。
-- 在 `standx-maker` 中纯计算 microprice、depth imbalance、OFI 和信号新鲜度。
+- 基线为阶段 3 accepted 后的冻结配置。
+- SDK 已提供 `depth_book` WS 频道与 `OrderBook` 模型。v0 只用 top-of-book：归一化
+  最优 bid/ask 的价格与数量为 typed input，在 `standx-maker` 中纯计算 microprice
+  （数量加权 mid）和信号新鲜度；不解析多档、不计算 OFI。
+- v1（凭 v0 的 shadow 证据引入）：多档深度归一化、depth imbalance、OFI。
 - fair-price adjustment 必须有边界、过期时间和质量分；数据不足时回退到当前 mark 策略。
-- 第一轮只做 shadow：同时计算 legacy/fair-price plan，但执行 legacy plan。
+- 第一轮只做 shadow：复用阶段 2 的通用 plan-diff 设施，同时计算 legacy/fair-price
+  plan，但执行 legacy plan。
 
 ### 验收标准
 
@@ -246,22 +308,39 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 - [ ] net PnL 不低于 legacy 基线的 95%，最大回撤和高库存时间均不得恶化。
 - [ ] 改善不能只来自大幅减少成交：成交数量下降超过 20% 时必须单独评审 SIP-5A 收益/uptime 影响。
 
-## 阶段 5：分级异常与退出政策
+## 阶段 5（安全轨，与阶段 2 并行启动）：分级异常与退出政策
 
 ### 目标
 
 明确区分短暂数据不一致、持续行情异常、正常库存修剪和紧急风险处置，避免“坏数据时永久
 保留挂单”或“波动最大时只能停机持仓”的隐含政策。
 
-### 范围
+本阶段提前到安全轨执行的原因：它修复的正是上面点名的最大已知风险（趋势库存 +
+stop-loss 只停机不平仓），且它产出的受监督 canary 是所有 alpha 阶段 live 验证的
+前置通道；排在队尾会让整条路线的 live 证据最晚到达。
 
-- mark/mid 背离分级：短暂 hold、持续 freeze/cleanup、恢复后空簿对账。
+### 现状（2026-07-16 对照 main）
+
+背离分级的主体已经落地，本阶段不重复建设，对应验收项的工作方式是证据复核而非新实现：
+
+- 短暂 hold / 持续 freeze / 恢复对账：`standx-maker/src/market_data.rs` 已实现
+  grace（连续 3 次不健康观察且持续 15s）→ Degraded/Paused → 连续 coherent 快照
+  确认恢复的状态机，并区分 market-state 与 transport 故障类别。
+- 冻结后的清理、空簿对账、恢复入场与恢复熔断计量已在 recovery flow 中实现。
+- stop-loss 生命周期已重构为经由 core reducer 的统一路径。
+
+### 剩余范围
+
 - 正常 inventory trim 与 emergency risk exit 使用不同 typed policy/effect。
-- 明确 volatility halt 期间是否允许紧急退出；默认不得自动继承正常退出行为。
+- 明确 volatility halt 期间是否允许紧急退出；默认不得自动继承正常退出行为。该决定
+  必须先于阶段 3 定稿，作为库存控制器"不改变退出语义"边界的依据。
 - stop-loss 后残余仓位输出明确 handoff；自动 flatten 必须是默认关闭、单独授权的 live policy。
 - equity/margin 的 alert 与 hard floor 使用不同配置名和不同 typed outcome。
+- 背离恢复迟滞、熔断豁免等剩余硬化项按需纳入，不阻塞 canary。
 
 ### 验收标准
+
+前三项针对已落地行为，验收方式为复核并在 evidence 文档中补引用，不要求新代码：
 
 - [ ] 短暂背离在配置宽限期内保留当前兼容行为，不盲目 cancel/re-place。
 - [ ] 背离超过持续时间或严重度阈值后，generation 失效、placement 冻结、queued action 清空并安排 maker cleanup。
