@@ -226,6 +226,13 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 [19-maker-stage2-live-ab-runbook.md](19-maker-stage2-live-ab-runbook.md)，实现证据见
 [maker-strategy-stage-2-v0-implementation-2026-07-16.md](evidence/maker-strategy-stage-2-v0-implementation-2026-07-16.md)。
 
+运维件现有两条部署路径：systemd（`deploy/systemd/standx-maker-stage2-ab.service`）与容器化
+（`deploy/docker/`，docker-compose，同一 runbook 授权门槛）。容器化路径已在 2026-07-16 完成首次
+真实部署联调，修复过三处环境问题（builder 工具链 MSRV、OpenObserve alerts API 版本迁移、
+host `/run/lock` 挂载权限 → 容器本地锁），细节见 `deploy/docker/README.md` 的 Troubleshooting。
+这只解决了部署可用性，不构成 canary 或 live A/B 证据；renewed canary 记录与 A/B 验收仍按本节
+标准和 runbook 执行，需操作员自行完成并记录。
+
 ### 目标
 
 让报价宽度和重报阈值响应短窗波动，同时保持 SIP-5A band、post-only 和 anti-flicker 约束。

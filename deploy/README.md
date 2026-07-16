@@ -123,3 +123,9 @@ maker service, installs the deadman alert before start, and runs the guarded
 baseline/candidate orchestrator. See
 `docs/19-maker-stage2-live-ab-runbook.md`; do not start it without the exact
 authorization recorded there.
+
+A containerized equivalent of the Stage 2 A/B orchestrator is available at
+[`deploy/docker/`](docker/README.md) (docker-compose, gated behind the `ab`
+profile). Same runbook and authorization gate apply; see that README for the
+systemd→compose mapping and the safety semantics that differ (no
+auto-restart, container-local locks by default).
