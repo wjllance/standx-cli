@@ -41,7 +41,7 @@ use feed::{fresh_ws_sample, market_snapshot, spawn_market_feed, ws_snapshot_issu
 use market_data::{
     classify_market_health, degradation_detail, observe_acquired_market_health,
     AcquiredMarketHealth, ClassifiedMarketHealth, MarketDataDegradedError,
-    MARKET_DATA_STANDBY_HEARTBEAT, MARKET_DATA_TRANSPORT_TIMEOUT,
+    MARKET_DATA_STANDBY_HEARTBEAT,
 };
 use model::{is_maker_order, position_for_symbol, MakerExit};
 pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
@@ -58,7 +58,7 @@ use recovery::{
     cancel_maker_orders_with_retry, ctrl_c_latched, probe_position_convergence,
     reconnect_account_stream, reconnect_order_response, AccountStreamReconnect, ConvergenceProbe,
     PositionReconciliationCause, PositionReconciliationError, ReconcileRequest,
-    ReconnectInterrupted, ReconnectRequest,
+    ReconnectCleanupFailed, ReconnectInterrupted, ReconnectRequest, TransportReconnectExhausted,
 };
 #[cfg(test)]
 use recovery::{
@@ -159,6 +159,13 @@ pub async fn handle_maker(
             controlled_disconnect_after,
         } => {
             let file = config::load(maker_config.as_deref())?;
+            // Keep accepting the removed rolling-circuit knobs for one
+            // compatibility window so existing production commands/configs do
+            // not fail to parse. They deliberately do not enter MakerRunArgs.
+            let _legacy_recovery_circuit = (
+                recovery_incidents_per_window.or(file.recovery_incidents_per_window),
+                recovery_window_secs.or(file.recovery_window_secs),
+            );
             runtime::run_maker(
                 symbol,
                 MakerRunArgs {
@@ -210,16 +217,6 @@ pub async fn handle_maker(
                         account_stream_reconnect_backoff,
                         file.account_stream_reconnect_backoff,
                         2,
-                    ),
-                    recovery_incidents_per_window: choose(
-                        recovery_incidents_per_window,
-                        file.recovery_incidents_per_window,
-                        3,
-                    ),
-                    recovery_window_secs: choose(
-                        recovery_window_secs,
-                        file.recovery_window_secs,
-                        3600,
                     ),
                     controlled_disconnect_after,
                     verbose,
@@ -285,8 +282,6 @@ struct MakerRunArgs {
     order_response_reconnect_backoff: u64,
     account_stream_reconnect_attempts: u32,
     account_stream_reconnect_backoff: u64,
-    recovery_incidents_per_window: u32,
-    recovery_window_secs: u64,
     controlled_disconnect_after: Option<u64>,
     verbose: bool,
 }

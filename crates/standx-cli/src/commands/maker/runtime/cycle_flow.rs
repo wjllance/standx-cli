@@ -527,7 +527,6 @@ impl MakerRuntime {
         let baseline_mark = self.deps.baseline_mark;
         let session_started_at = self.deps.session_started_at;
         let cycle = self.loop_state.counters.cycle;
-        let recovery_clock_started = self.recovery.clock_started;
         let CycleAttempt {
             work_token: cycle_work_token,
             exit_pending_before,
@@ -806,27 +805,6 @@ impl MakerRuntime {
                             Ok(token) => token,
                             Err(exit) => break 'phase exit,
                         };
-                        // Genuine mismatch/projection anomalies share the same
-                        // rolling budget as transport reconnects. A normal account
-                        // event that invalidated in-flight cycle work is unmetered,
-                        // but still follows the complete cleanup + REST reconcile +
-                        // empty-book verification path below.
-                        if let Some(admission) = reconciliation_recovery_admission(
-                            mismatch,
-                            &mut self.recovery.breaker,
-                            recovery_clock_started.elapsed().as_secs(),
-                        ) {
-                            if !admission.is_admitted() {
-                                break 'phase recovery_failed_exit(
-                                    &mut self.recovery.runtime_state,
-                                    recovery_token,
-                                    format!(
-                                        "{mismatch}; {}; refusing further live orders",
-                                        recovery_circuit_detail(admission)
-                                    ),
-                                );
-                            }
-                        }
                         let mut recovered = false;
                         let mut last_observed = mismatch.observed;
                         for delay in [500_u64, 1_000, 1_500] {
@@ -1144,12 +1122,12 @@ impl MakerRuntime {
                         None => std::future::pending().await,
                     }
                 };
-                let market_wakeup_at = self.market.transport_deadline.or_else(|| {
-                    (self.market.health.degraded_class()
-                        == Some(maker::MarketDataFaultClass::MarketState))
+                let market_wakeup_at = self
+                    .market
+                    .health
+                    .is_degraded()
                     .then_some(self.market.next_heartbeat)
-                    .flatten()
-                });
+                    .flatten();
                 let market_wakeup = async {
                     match market_wakeup_at {
                         Some(deadline) => {

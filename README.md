@@ -419,9 +419,11 @@ exit (with retries and verification), stops quoting after 3 consecutive API
 errors, and safely pauses on an asynchronous order-response disconnect. It
 then cleans and verifies the maker book, authenticates a new response session,
 and reconciles orders, position, and fills before quoting can resume. Reconnect
-attempts are bounded per incident, while account-stream and order-response
-incidents share a rolling-window circuit breaker; a disabled or exhausted
-budget still fails closed.
+attempts are bounded per round. If a round exhausts only retryable transport
+errors, the maker re-verifies its empty book, remains frozen, and retries with
+bounded exponential backoff. Cleanup failure, unexplained position mismatch,
+terminal authentication failure, or explicitly disabled reconnect still fails
+closed.
 Live fill telemetry is sourced from authenticated, maker-order-correlated trade
 history rather than inferred from position changes. Paper mode simulates fills
 when the touch crosses a quote, so position, inventory skew, and PnL telemetry

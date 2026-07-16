@@ -20,9 +20,9 @@ use events::{
     apply_account_event, apply_account_events, apply_order_response,
     apply_order_responses_observed, duration_ms, invalidate_session_latency,
     market_update_requires_replan, observe_order_ack, order_request_timeout_detail,
-    order_response_failure, reconciliation_error_for_cycle, reconciliation_recovery_admission,
-    request_timeout_notice, schedule_account_balance_refresh, AccountEventContext,
-    AccountEventState, OrderResponseObservation, OutcomeSink, ORDER_REQUEST_TIMEOUT,
+    order_response_failure, reconciliation_error_for_cycle, request_timeout_notice,
+    schedule_account_balance_refresh, AccountEventContext, AccountEventState,
+    OrderResponseObservation, OutcomeSink, ORDER_REQUEST_TIMEOUT,
 };
 #[cfg(test)]
 use events::{order_response_correlation_failed, AccountEventOutcome, CancelRejection};

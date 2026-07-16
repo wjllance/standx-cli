@@ -422,18 +422,6 @@ pub(super) fn reconciliation_error_for_cycle(
     }
 }
 
-pub(super) fn reconciliation_recovery_admission(
-    reconciliation: &PositionReconciliationError,
-    breaker: &mut maker::RecoveryCircuitBreaker,
-    now_secs: u64,
-) -> Option<maker::RecoveryAdmission> {
-    reconciliation
-        .cause
-        .recovery_trigger()
-        .meters_circuit()
-        .then(|| breaker.admit(now_secs))
-}
-
 pub(super) fn market_update_requires_replan(
     previous_mark: f64,
     mark: f64,

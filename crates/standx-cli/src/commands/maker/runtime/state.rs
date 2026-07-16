@@ -50,9 +50,7 @@ pub(super) struct RuntimeMarketState {
     pub(super) health_started: std::time::Instant,
     pub(super) health: maker::MarketDataHealth,
     pub(super) pending_degradation: Option<String>,
-    pub(super) breaker_metered: bool,
     pub(super) standby_started: Option<std::time::Instant>,
-    pub(super) transport_deadline: Option<std::time::Instant>,
     pub(super) next_heartbeat: Option<std::time::Instant>,
     pub(super) last_divergence_bps: Option<f64>,
     pub(super) maker_book_verified_empty: bool,
@@ -61,8 +59,6 @@ pub(super) struct RuntimeMarketState {
 }
 
 pub(super) struct RuntimeRecoveryState {
-    pub(super) clock_started: std::time::Instant,
-    pub(super) breaker: maker::RecoveryCircuitBreaker,
     pub(super) account_position_mismatch: Option<f64>,
     pub(super) pending_request_timeout: Option<TimedOutOrderRequest>,
     pub(super) account_order_reconciliation_required: bool,
@@ -133,11 +129,6 @@ impl MakerRuntime {
             AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
                 .with_account_floors(args.alert_equity_below, args.alert_margin_below);
         let market_health_started = std::time::Instant::now();
-        let recovery_clock_started = std::time::Instant::now();
-        let recovery_breaker = maker::RecoveryCircuitBreaker::new(
-            args.recovery_incidents_per_window,
-            args.recovery_window_secs,
-        );
         let mut runtime_state = MakerState::starting();
         runtime_state.handle(MakerEvent::StartupReady);
 
@@ -188,9 +179,7 @@ impl MakerRuntime {
                 health_started: market_health_started,
                 health: maker::MarketDataHealth::default(),
                 pending_degradation: None,
-                breaker_metered: false,
                 standby_started: None,
-                transport_deadline: None,
                 next_heartbeat: None,
                 last_divergence_bps: None,
                 maker_book_verified_empty: false,
@@ -198,8 +187,6 @@ impl MakerRuntime {
                 last_src: None,
             },
             recovery: RuntimeRecoveryState {
-                clock_started: recovery_clock_started,
-                breaker: recovery_breaker,
                 account_position_mismatch: None,
                 pending_request_timeout: None,
                 account_order_reconciliation_required: false,

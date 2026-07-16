@@ -35,15 +35,6 @@ impl PositionReconciliationCause {
             Self::CycleInvalidation => "cycle_invalidation",
         }
     }
-
-    pub(super) fn recovery_trigger(&self) -> standx_maker::RecoveryTrigger {
-        match self {
-            Self::CycleInvalidation => standx_maker::RecoveryTrigger::CycleInvalidation,
-            Self::PositionMismatch | Self::UnknownCurrentRunOrder => {
-                standx_maker::RecoveryTrigger::PositionMismatch
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -115,6 +106,61 @@ impl fmt::Display for ReconnectInterrupted {
 }
 
 impl std::error::Error for ReconnectInterrupted {}
+
+/// Marker error for a reconnect round that exhausted only retryable transport
+/// work. The runtime remains frozen and schedules another round.
+#[derive(Debug)]
+pub(super) struct TransportReconnectExhausted {
+    pub(super) reason: String,
+}
+
+impl fmt::Display for TransportReconnectExhausted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for TransportReconnectExhausted {}
+
+/// Marker error for a cleanup that already consumed its bounded retry budget.
+/// Without an authoritative empty maker book the runtime must still stop.
+#[derive(Debug)]
+pub(super) struct ReconnectCleanupFailed {
+    pub(super) reason: String,
+}
+
+impl fmt::Display for ReconnectCleanupFailed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for ReconnectCleanupFailed {}
+
+fn sdk_reconnect_error_is_terminal(error: &standx_sdk::Error) -> bool {
+    matches!(
+        error,
+        standx_sdk::Error::AuthRequired { .. }
+            | standx_sdk::Error::InvalidCredentials { .. }
+            | standx_sdk::Error::TokenExpired { .. }
+            | standx_sdk::Error::Config { .. }
+            | standx_sdk::Error::Validation { .. }
+            | standx_sdk::Error::Api {
+                code: 401 | 403,
+                ..
+            }
+            | standx_sdk::Error::Http {
+                code: 401 | 403,
+                ..
+            }
+    )
+}
+
+pub(super) fn reconnect_error_is_terminal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<standx_sdk::Error>()
+        .is_some_and(sdk_reconnect_error_is_terminal)
+}
 
 /// Resolves once the runtime's Ctrl+C latch has been set (see runtime.rs);
 /// pends forever if the listener is gone so callers' selects don't spin.
@@ -559,6 +605,7 @@ pub(super) type AccountStreamConnection = (
 pub(super) enum AccountStreamReconnect {
     Connected(AccountStreamConnection),
     Interrupted,
+    Terminal(String),
     Exhausted(String),
 }
 
@@ -601,6 +648,9 @@ pub(super) async fn reconnect_account_stream(
         };
         match connect_attempt {
             Ok(Ok(triple)) => return AccountStreamReconnect::Connected(triple),
+            Ok(Err(error)) if reconnect_error_is_terminal(&error) => {
+                return AccountStreamReconnect::Terminal(error.to_string());
+            }
             Ok(Err(error)) => last_connect_error = Some(format!("connect failed: {error}")),
             Err(_) => last_connect_error = Some("connect timed out after 15 seconds".to_string()),
         }
@@ -643,6 +693,7 @@ pub(super) async fn reconnect_order_response(
     request: ReconnectRequest<'_>,
     ledger: &mut MakerLedger,
     stats: &mut MakerStats,
+    recovered_fills: &mut Vec<MakerFill>,
 ) -> Result<ReconnectedOrderResponse> {
     let ReconnectRequest {
         cleanup_client,
@@ -659,7 +710,6 @@ pub(super) async fn reconnect_order_response(
     } = request;
     let mut ctrl_c = ctrl_c;
     let mut last_error = None;
-    let mut recovered_fills = Vec::new();
     // The runtime Cleanup effect has already emptied and verified the maker
     // book before it emits Recover. Only repeat cleanup between failed
     // reconnect attempts, when a late venue-side request may have surfaced.
@@ -679,8 +729,9 @@ pub(super) async fn reconnect_order_response(
             match cancel_maker_orders_with_retry(&cleanup_client, symbol, 3, output_format).await {
                 Ok(()) => true,
                 Err(error) => {
-                    last_error = Some(anyhow::anyhow!("retry cleanup failed: {error}"));
-                    false
+                    return Err(anyhow::Error::new(ReconnectCleanupFailed {
+                        reason: format!("retry cleanup failed: {error}"),
+                    }));
                 }
             }
         } else {
@@ -816,9 +867,12 @@ pub(super) async fn reconnect_order_response(
                             health,
                             handle,
                             position: snapshot.position,
-                            fills: recovered_fills,
+                            fills: std::mem::take(recovered_fills),
                         });
                     }
+                }
+                Ok(Err(error)) if sdk_reconnect_error_is_terminal(&error) => {
+                    return Err(anyhow::Error::new(error));
                 }
                 Ok(Err(error)) => {
                     last_error = Some(anyhow::anyhow!(
@@ -859,12 +913,14 @@ pub(super) async fn reconnect_order_response(
         }
     }
 
-    Err(anyhow::anyhow!(
-        "safe order-response reconnect exhausted: {}",
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "no attempts available".to_string())
-    ))
+    Err(anyhow::Error::new(TransportReconnectExhausted {
+        reason: format!(
+            "safe order-response reconnect exhausted: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no attempts available".to_string())
+        ),
+    }))
 }
 
 #[cfg(test)]
@@ -876,6 +932,20 @@ mod tests {
     const RUN_PREFIX: &str = "sxmk-reconnect-";
     const ORDER_ID: u64 = 11_575_317_826;
     const TRADE_ID: u64 = 900_001;
+
+    #[test]
+    fn reconnect_error_classification_keeps_auth_terminal_and_transport_retryable() {
+        let auth = anyhow::Error::new(standx_sdk::Error::AuthRequired {
+            message: "expired".to_string(),
+            resolution: "login".to_string(),
+        });
+        assert!(reconnect_error_is_terminal(&auth));
+
+        let transport = anyhow::Error::new(standx_sdk::Error::WebSocket {
+            message: "connection reset".to_string(),
+        });
+        assert!(!reconnect_error_is_terminal(&transport));
+    }
 
     fn filled_sell_order() -> Order {
         Order {

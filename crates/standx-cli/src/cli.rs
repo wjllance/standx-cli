@@ -570,8 +570,8 @@ pub enum MakerCommands {
         /// full loop, prints intended actions, no orders placed)
         #[arg(long)]
         live: bool,
-        /// Maximum authenticated order-response reconnect attempts for one
-        /// recovery incident. Each attempt first cleans maker orders and must
+        /// Maximum authenticated order-response reconnect attempts per round.
+        /// Each attempt first cleans maker orders and must
         /// reconcile an empty maker book before quoting resumes. 0 disables.
         #[arg(long)]
         order_response_reconnect_attempts: Option<u32>,
@@ -579,8 +579,8 @@ pub enum MakerCommands {
         /// Later attempts use bounded exponential backoff.
         #[arg(long)]
         order_response_reconnect_backoff: Option<u64>,
-        /// Maximum account-stream reconnect attempts for one unhealthy-stream
-        /// recovery incident. Each attempt reconnects the
+        /// Maximum account-stream reconnect attempts per recovery round.
+        /// Each attempt reconnects the
         /// authenticated account stream, replays buffered events, and backs
         /// fill gaps with REST trades before reconciling the venue position.
         /// 0 disables reconnect entirely (fail closed immediately).
@@ -590,12 +590,12 @@ pub enum MakerCommands {
         /// Later attempts use bounded exponential backoff.
         #[arg(long)]
         account_stream_reconnect_backoff: Option<u64>,
-        /// Maximum transport recovery incidents admitted inside one rolling
-        /// window, shared by account-stream and order-response recovery.
-        #[arg(long)]
+        /// Deprecated compatibility option. Transport faults now remain
+        /// frozen and retry instead of stopping on an incident count.
+        #[arg(long, hide = true)]
         recovery_incidents_per_window: Option<u32>,
-        /// Rolling transport recovery circuit-breaker window in seconds.
-        #[arg(long)]
+        /// Deprecated compatibility option; accepted but no longer used.
+        #[arg(long, hide = true)]
         recovery_window_secs: Option<u64>,
         /// Supervised fault injection: close the local order-response stream
         /// after this many seconds. Hidden because it is only for live-gate

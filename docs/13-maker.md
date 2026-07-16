@@ -87,12 +87,14 @@ standx maker run <SYMBOL> [OPTIONS]
 | `--alert-webhook-format` | `slack` | webhook 报文格式：`slack` / `feishu` / `telegram` / `raw` |
 | `--no-ws` | 关 | 禁用 WebSocket 行情，改为每轮 REST 轮询 |
 | `--live` | 关 | 下真实单（不带此标志即 paper 模式） |
-| `--order-response-reconnect-attempts` | `3` | 单次订单回报流事故内的安全重连次数；每次先清理、换 session 并对账，`0` 禁用 |
-| `--order-response-reconnect-backoff` | `2` | 安全重连基础退避秒数，后续失败按上限递增 |
-| `--account-stream-reconnect-attempts` | `3` | 单次账户流事故内的安全重连次数；重连后回放、REST 回补并对账，`0` 禁用 |
-| `--account-stream-reconnect-backoff` | `2` | 账户流重连基础退避秒数，后续失败按上限递增 |
-| `--recovery-incidents-per-window` | `3` | 账户流与订单回报流共用的滚动窗口事故熔断上限 |
-| `--recovery-window-secs` | `3600` | 运输层恢复事故熔断的滚动时间窗（秒） |
+| `--order-response-reconnect-attempts` | `3` | 单轮订单回报流安全重连次数；每次先清理、换 session 并对账，`0` 禁用并保持原 fail-closed 行为 |
+| `--order-response-reconnect-backoff` | `2` | 安全重连基础退避秒数；单轮耗尽后保持冻结并按最高 60 秒的退避继续下一轮 |
+| `--account-stream-reconnect-attempts` | `3` | 单轮账户流安全重连次数；重连后回放、REST 回补并对账，`0` 禁用并保持原 fail-closed 行为 |
+| `--account-stream-reconnect-backoff` | `2` | 账户流重连基础退避秒数；单轮耗尽后重新验证空簿并继续下一轮 |
+
+传输故障本身只影响可用性：重连期间 maker 保持冻结且不下新单。只有清理无法确认空簿、
+持仓回补后仍无法对账、硬鉴权错误或显式禁用重连时才 fail-safe 停机。旧版
+`--recovery-incidents-per-window` / `--recovery-window-secs` 仍兼容解析，但已弃用且不参与运行决策。
 
 启动时会做快速校验（fail fast）：交易对存在且在交易中、`spread-bps > 0`、`band-bps > spread-bps`、`size` 取整后 ≥ 最小下单量、`skew-bps ≥ 0`；主动退出必须同时设置百分比与数量。
 
@@ -328,9 +330,9 @@ live 模式的安全栏：
 - **订单回报安全重连**：WebSocket 断开或报错后立即停止新下单，记录 close code、
   close reason 或底层错误，清理并验证 maker 空簿；随后使用新 session 认证，并重新
   查询挂单、仓位、已成交订单及会话成交。只有全部对账通过才恢复报价。
-- **fail-safe 停机**：安全重连关闭、预算耗尽、清理/对账失败，或连续 3 次其他瞬时
-  cycle 错误时停机并再次清理。`--controlled-disconnect-after` 仍强制走停机演练，
-  不会因重连而变成持续实盘。
+- **fail-safe 停机**：安全重连关闭、清理/对账失败、终态鉴权错误，或连续 3 次其他瞬时
+  cycle 错误时停机并再次清理。单轮重连次数耗尽只会保持冻结、重新验证空簿并退避进入
+  下一轮。`--controlled-disconnect-after` 仍强制走停机演练，不会因重连而变成持续实盘。
 - **退出必清理**:所有退出路径都会 cancel-all(3 次重试 + 校验),有残留会大字告警并给出手动撤单命令。
 
 ---

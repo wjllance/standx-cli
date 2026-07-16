@@ -1,92 +1,23 @@
-//! Deterministic recovery admission policy for live recovery incidents
-//! (transport reconnects and position-mismatch freeze/recover alike).
+//! Deterministic retry policy for live transport recovery.
+//!
+//! Transport availability is not itself a trading-safety invariant. The CLI
+//! keeps the maker frozen while it retries; only cleanup, reconciliation, or
+//! other proof-of-safety failures are terminal.
 
-use std::collections::VecDeque;
+/// Keep repeated transport failures from producing a tight reconnect loop.
+pub const MAX_RECOVERY_RETRY_BACKOFF_SECS: u64 = 60;
 
-/// Why the live runtime entered a cleanup/recovery flow.
+/// Return the delay before the next bounded reconnect round.
 ///
-/// A cycle invalidated by an account event still requires compensating cleanup
-/// and authoritative reconciliation, but it is expected during normal fills.
-/// Counting it as an incident would eventually stop every healthy active maker.
-/// Market conditions that make quoting unsafe are likewise expected to clear
-/// without consuming the transport/reconciliation recovery budget.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryTrigger {
-    TransportFailure,
-    PositionMismatch,
-    CycleInvalidation,
-    MarketCondition,
-}
-
-impl RecoveryTrigger {
-    pub fn meters_circuit(self) -> bool {
-        !matches!(self, Self::CycleInvalidation | Self::MarketCondition)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecoveryAdmission {
-    Admitted {
-        incidents: u32,
-        limit: u32,
-        window_secs: u64,
-    },
-    CircuitOpen {
-        incidents: u32,
-        limit: u32,
-        window_secs: u64,
-    },
-}
-
-impl RecoveryAdmission {
-    pub fn is_admitted(self) -> bool {
-        matches!(self, Self::Admitted { .. })
-    }
-}
-
-#[derive(Debug)]
-pub struct RecoveryCircuitBreaker {
-    limit: u32,
-    window_secs: u64,
-    incidents: VecDeque<u64>,
-}
-
-impl RecoveryCircuitBreaker {
-    pub fn new(limit: u32, window_secs: u64) -> Self {
-        Self {
-            limit,
-            window_secs,
-            incidents: VecDeque::new(),
-        }
-    }
-
-    /// Admit one recovery incident at monotonic `now_secs`.
-    /// The individual recovery attempts inside an admitted incident (reconnect
-    /// retries, the position-mismatch backfill loop) are deliberately not
-    /// recorded here; the caller owns that bounded work for the admitted incident.
-    pub fn admit(&mut self, now_secs: u64) -> RecoveryAdmission {
-        while self
-            .incidents
-            .front()
-            .is_some_and(|started| now_secs.saturating_sub(*started) >= self.window_secs)
-        {
-            self.incidents.pop_front();
-        }
-        let incidents = self.incidents.len() as u32;
-        if incidents >= self.limit {
-            return RecoveryAdmission::CircuitOpen {
-                incidents,
-                limit: self.limit,
-                window_secs: self.window_secs,
-            };
-        }
-        self.incidents.push_back(now_secs);
-        RecoveryAdmission::Admitted {
-            incidents: incidents + 1,
-            limit: self.limit,
-            window_secs: self.window_secs,
-        }
-    }
+/// `failed_rounds` is one-based. The delay doubles for each failed round and
+/// caps at [`MAX_RECOVERY_RETRY_BACKOFF_SECS`]. A zero base remains zero so the
+/// pure policy is total; live CLI validation requires a positive base whenever
+/// reconnect is enabled.
+pub fn recovery_retry_delay_secs(base_secs: u64, failed_rounds: u32) -> u64 {
+    let exponent = failed_rounds.saturating_sub(1).min(5);
+    base_secs
+        .saturating_mul(1_u64 << exponent)
+        .min(MAX_RECOVERY_RETRY_BACKOFF_SECS)
 }
 
 #[cfg(test)]
@@ -94,44 +25,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn incidents_are_bounded_inside_one_window() {
-        let mut breaker = RecoveryCircuitBreaker::new(2, 60);
-        assert!(breaker.admit(10).is_admitted());
-        assert_eq!(breaker.incidents.len(), 1);
-        assert!(breaker.admit(20).is_admitted());
-        assert_eq!(breaker.incidents.len(), 2);
-        assert!(matches!(
-            breaker.admit(30),
-            RecoveryAdmission::CircuitOpen { incidents: 2, .. }
-        ));
+    fn retry_delay_is_bounded_exponential_backoff() {
+        let delays = (1..=8)
+            .map(|round| recovery_retry_delay_secs(2, round))
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![2, 4, 8, 16, 32, 60, 60, 60]);
     }
 
     #[test]
-    fn incidents_expire_at_the_rolling_window_boundary() {
-        let mut breaker = RecoveryCircuitBreaker::new(1, 60);
-        assert!(breaker.admit(10).is_admitted());
-        assert!(!breaker.admit(69).is_admitted());
-        assert!(breaker.admit(70).is_admitted());
+    fn retry_delay_saturates_large_inputs() {
+        assert_eq!(recovery_retry_delay_secs(u64::MAX, u32::MAX), 60);
     }
 
     #[test]
-    fn zero_limit_is_fail_closed() {
-        let mut breaker = RecoveryCircuitBreaker::new(0, 60);
-        assert!(matches!(
-            breaker.admit(0),
-            RecoveryAdmission::CircuitOpen {
-                incidents: 0,
-                limit: 0,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn expected_runtime_conditions_do_not_meter_the_incident_circuit() {
-        assert!(!RecoveryTrigger::CycleInvalidation.meters_circuit());
-        assert!(!RecoveryTrigger::MarketCondition.meters_circuit());
-        assert!(RecoveryTrigger::PositionMismatch.meters_circuit());
-        assert!(RecoveryTrigger::TransportFailure.meters_circuit());
+    fn zero_base_has_zero_delay() {
+        assert_eq!(recovery_retry_delay_secs(0, 1), 0);
     }
 }

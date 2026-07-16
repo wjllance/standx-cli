@@ -54,7 +54,7 @@ pub use performance::{
     PerformanceFill, PerformanceLedger, PerformanceSummary, QuoteQualityInterval, QuoteTimeSummary,
     MARKOUT_WINDOWS_MS,
 };
-pub use recovery::{RecoveryAdmission, RecoveryCircuitBreaker, RecoveryTrigger};
+pub use recovery::{recovery_retry_delay_secs, MAX_RECOVERY_RETRY_BACKOFF_SECS};
 pub use replay::{
     run_replay, ReplayCycle, ReplayCycleOutcome, ReplayError, ReplayEvent, ReplayResult,
     ReplaySettings,
