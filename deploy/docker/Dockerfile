@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+
+# ---- builder ------------------------------------------------------------
+# bookworm base so the produced glibc-linked binary matches the runtime.
+FROM rust:1.83-bookworm AS builder
+WORKDIR /build
+COPY . .
+# reqwest/tokio-tungstenite use rustls, so no OpenSSL dev headers are needed.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --bin standx && \
+    cp target/release/standx /build/standx
+
+# ---- runtime ------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+# bash        — the orchestrator and observed wrapper are bash scripts
+# python3     — manifest, config-diff, webhook, alert tooling
+# util-linux  — flock (guard/maker process locks)
+# coreutils   — sha256sum, date; perl provides shasum used by the wrapper
+# curl        — supervisor webhook POSTs from the observed wrapper
+# git         — the run manifest requires HEAD + a clean strategy worktree
+# ca-certificates — rustls native-roots for the venue TLS handshake
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash python3 util-linux coreutils perl curl git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/standx
+# Ships the repository (including .git; see .dockerignore) so the manifest's
+# git_sha_present / strategy_source_clean checks pass at runtime.
+COPY . /opt/standx
+COPY --from=builder /build/standx /opt/standx/bin/standx
+
+# git refuses to operate on a tree owned by another uid; the manifest tooling
+# runs git as the container user, so mark the deployment root as trusted.
+RUN git config --system --add safe.directory /opt/standx
+
+# Build-time gate mirroring scripts/maker_run_manifest.py: refuse to ship an
+# image whose committed strategy source is missing or dirty, because the A/B
+# orchestrator would invalidate every arm and critical-stop at runtime.
+RUN set -eu; \
+    test "$(git rev-parse HEAD | tr -d '\n' | wc -c)" -eq 40 \
+      || { echo 'ERROR: no committed HEAD; build from a clean release checkout' >&2; exit 1; }; \
+    dirty="$(git status --porcelain --untracked-files=all -- \
+        Cargo.toml Cargo.lock crates/standx-maker crates/standx-sdk \
+        crates/standx-cli examples/maker.toml)"; \
+    test -z "$dirty" \
+      || { echo 'ERROR: strategy source is dirty; build from a clean release commit:' >&2; \
+           echo "$dirty" >&2; exit 1; }
+
+# Credentials come from a read-only mount at $XDG_DATA_HOME/standx/credentials.enc.
+ENV XDG_DATA_HOME=/opt/standx/state
+RUN mkdir -p /opt/standx/state/standx /opt/standx/var/standx
+
+COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
