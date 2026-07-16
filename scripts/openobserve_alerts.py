@@ -180,11 +180,29 @@ class OpenObserve:
         self.json_request("POST", base, payload)
         return "created"
 
+    def _find_alert_id(self, base: str, name: str) -> str | None:
+        listing = self.json_request("GET", base)
+        items = listing.get("list", []) if isinstance(listing, dict) else []
+        if not isinstance(items, list):
+            return None
+        return next(
+            (
+                item.get("alert_id")
+                for item in items
+                if isinstance(item, dict) and item.get("name") == name
+            ),
+            None,
+        )
+
     def upsert_alert(self, alert: dict[str, Any]) -> str:
-        stream = parse.quote(self.stream, safe="")
-        base = f"/api/{self._org()}/{stream}/alerts"
-        if self._exists(base, ALERT_NAME):
-            self.json_request("PUT", f"{base}/{parse.quote(ALERT_NAME, safe='')}", alert)
+        # Alerts moved to the v2 API (OpenObserve >= ~0.14): org-scoped, keyed
+        # by alert_id rather than name, with stream_name as a body field
+        # instead of a path segment. The old stream-scoped v1 path
+        # (/api/{org}/{stream}/alerts) 404s on current OpenObserve builds.
+        base = f"/api/v2/{self._org()}/alerts"
+        alert_id = self._find_alert_id(base, ALERT_NAME)
+        if alert_id:
+            self.json_request("PUT", f"{base}/{parse.quote(alert_id, safe='')}", alert)
             return "updated"
         self.json_request("POST", base, alert)
         return "created"
