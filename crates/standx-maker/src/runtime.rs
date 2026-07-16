@@ -30,6 +30,7 @@ pub enum RecoveryTarget {
     AccountStream,
     OrderResponse,
     PositionReconciliation,
+    MarketData,
 }
 
 impl RecoveryTarget {
@@ -38,6 +39,7 @@ impl RecoveryTarget {
             Self::AccountStream => "account_stream",
             Self::OrderResponse => "order_response",
             Self::PositionReconciliation => "position_reconciliation",
+            Self::MarketData => "market_data",
         }
     }
 }
@@ -71,6 +73,7 @@ pub enum RuntimeStopReason {
     CtrlC,
     OrderResponse(String),
     PositionReconciliation(String),
+    MarketData(String),
     ConsecutiveCycleErrors(String),
     StopLoss(String),
     CleanupFailure {
@@ -85,6 +88,7 @@ impl RuntimeStopReason {
             Self::CtrlC => "Ctrl+C".to_string(),
             Self::OrderResponse(reason)
             | Self::PositionReconciliation(reason)
+            | Self::MarketData(reason)
             | Self::ConsecutiveCycleErrors(reason)
             | Self::StopLoss(reason) => reason.clone(),
             Self::CleanupFailure { reason, .. } => reason.clone(),
@@ -108,6 +112,7 @@ pub enum MakerEvent {
     AccountStreamDisconnected(String),
     OrderResponseDisconnected(String),
     PositionMismatch,
+    MarketDataDegraded(String),
     CleanupCompleted(WorkToken),
     CleanupFailed {
         token: WorkToken,
@@ -257,6 +262,9 @@ impl MakerState {
                 "position mismatch".to_string(),
                 RecoveryTarget::PositionReconciliation,
             ),
+            MakerEvent::MarketDataDegraded(reason) => {
+                self.freeze(reason, RecoveryTarget::MarketData)
+            }
             MakerEvent::CleanupCompleted(token) => {
                 if !self.matches_in_flight(token, WorkKind::Cleanup) {
                     return Vec::new();
@@ -303,6 +311,7 @@ impl MakerState {
                 self.in_flight = None;
                 let stop = match self.recovery_target {
                     Some(RecoveryTarget::OrderResponse) => RuntimeStopReason::OrderResponse(reason),
+                    Some(RecoveryTarget::MarketData) => RuntimeStopReason::MarketData(reason),
                     _ => RuntimeStopReason::PositionReconciliation(reason),
                 };
                 self.stop(stop)
@@ -489,6 +498,10 @@ mod tests {
             (
                 MakerEvent::PositionMismatch,
                 RecoveryTarget::PositionReconciliation,
+            ),
+            (
+                MakerEvent::MarketDataDegraded("feed idle".to_string()),
+                RecoveryTarget::MarketData,
             ),
         ] {
             let mut state = MakerState::starting();
@@ -700,6 +713,7 @@ mod tests {
             RuntimeStopReason::CtrlC,
             RuntimeStopReason::OrderResponse("boom".to_string()),
             RuntimeStopReason::PositionReconciliation("boom".to_string()),
+            RuntimeStopReason::MarketData("boom".to_string()),
             RuntimeStopReason::ConsecutiveCycleErrors("boom".to_string()),
             RuntimeStopReason::StopLoss("boom".to_string()),
             RuntimeStopReason::CleanupFailure {
@@ -861,6 +875,11 @@ mod tests {
                         "recovery failure must stop as PositionReconciliation for {event:?}"
                     )
                 }
+                RecoveryTarget::MarketData => assert_eq!(
+                    stop,
+                    RuntimeStopReason::MarketData("reconnect exhausted".to_string()),
+                    "market-data recovery failure must stop as MarketData for {event:?}"
+                ),
             }
         }
     }

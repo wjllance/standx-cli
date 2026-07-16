@@ -14,6 +14,7 @@ pub(super) struct FeedState {
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     book_meta: Option<FeedMeta>,
+    reconnect_issue: Option<WsSnapshotIssue>,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,12 @@ const WS_STALE_AFTER: Duration = Duration::from_secs(5);
 /// time is preferred; local receive-time skew is used only when either venue
 /// timestamp is unavailable.
 const WS_SNAPSHOT_MAX_SKEW: Duration = WS_STALE_AFTER;
+/// A socket can stay TCP-healthy while one subscribed channel stops yielding
+/// usable updates. Rebuild the whole public connection when either channel
+/// has been idle this long.
+const MARKET_FEED_IDLE_AFTER: Duration = Duration::from_secs(15);
+const MARKET_FEED_REBUILD_DELAY: Duration = Duration::from_secs(10);
+const MARKET_FEED_IDLE_REBUILD_DELAY: Duration = Duration::from_secs(1);
 
 /// Why the latest public WebSocket cache cannot safely be used for a maker
 /// cycle. These stable labels are emitted with `cycle_summary` so a REST
@@ -74,6 +81,10 @@ pub(super) enum WsSnapshotIssue {
     MarkStale,
     BookStale,
     MarkAndBookStale,
+    PriceIdle,
+    BookIdle,
+    PriceAndBookIdle,
+    StreamEnded,
     LocalSkew,
     ServerTimeSkew,
     InvalidSnapshot,
@@ -86,9 +97,65 @@ impl WsSnapshotIssue {
             Self::MarkStale => "ws_mark_stale",
             Self::BookStale => "ws_book_stale",
             Self::MarkAndBookStale => "ws_mark_and_book_stale",
+            Self::PriceIdle => "ws_price_idle",
+            Self::BookIdle => "ws_book_idle",
+            Self::PriceAndBookIdle => "ws_price_and_book_idle",
+            Self::StreamEnded => "ws_stream_ended",
             Self::LocalSkew => "ws_local_time_skew",
             Self::ServerTimeSkew => "ws_server_time_skew",
             Self::InvalidSnapshot => "ws_invalid_snapshot",
+        }
+    }
+
+    pub(super) const fn is_idle(self) -> bool {
+        matches!(
+            self,
+            Self::PriceIdle | Self::BookIdle | Self::PriceAndBookIdle
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FeedSnapshotVersion {
+    mark_received_at: Instant,
+    book_received_at: Instant,
+}
+
+impl FeedSnapshotVersion {
+    pub(super) fn both_advanced_from(self, previous: Option<Self>) -> bool {
+        previous.map_or(true, |previous| {
+            self.mark_received_at > previous.mark_received_at
+                && self.book_received_at > previous.book_received_at
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ChannelFreshness {
+    price: Instant,
+    book: Instant,
+}
+
+impl ChannelFreshness {
+    fn new(now: Instant) -> Self {
+        Self {
+            price: now,
+            book: now,
+        }
+    }
+
+    fn next_deadline(self) -> Instant {
+        self.price.min(self.book) + MARKET_FEED_IDLE_AFTER
+    }
+
+    fn idle_issue(self, now: Instant) -> Option<WsSnapshotIssue> {
+        let price_idle = now.saturating_duration_since(self.price) >= MARKET_FEED_IDLE_AFTER;
+        let book_idle = now.saturating_duration_since(self.book) >= MARKET_FEED_IDLE_AFTER;
+        match (price_idle, book_idle) {
+            (true, true) => Some(WsSnapshotIssue::PriceAndBookIdle),
+            (true, false) => Some(WsSnapshotIssue::PriceIdle),
+            (false, true) => Some(WsSnapshotIssue::BookIdle),
+            (false, false) => None,
         }
     }
 }
@@ -128,8 +195,19 @@ fn update_is_newer<T>(previous: Option<&FeedMeta>, update: &WsMarketUpdate<T>) -
             .as_deref()
             .and_then(parse_server_time_millis),
     ),
-        (Some(previous), Some(next)) if next < previous
+        (Some(previous), Some(next)) if next <= previous
     )
+}
+
+fn parse_optional_positive_price(value: Option<&str>) -> Option<Option<f64>> {
+    match value {
+        None => Some(None),
+        Some(value) => value
+            .parse::<f64>()
+            .ok()
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .map(Some),
+    }
 }
 
 fn update_meta<T>(update: &WsMarketUpdate<T>) -> FeedMeta {
@@ -231,15 +309,39 @@ fn coherent_ws_snapshot(
         .map_err(|_| WsSnapshotIssue::InvalidSnapshot)
 }
 
+pub(super) fn ws_snapshot_issue(state: &FeedState, now: Instant) -> Option<WsSnapshotIssue> {
+    coherent_ws_snapshot(state, now)
+        .err()
+        .map(|issue| state.reconnect_issue.unwrap_or(issue))
+}
+
+pub(super) fn fresh_ws_sample(
+    state: &FeedState,
+) -> Option<(f64, Option<f64>, Option<f64>, FeedSnapshotVersion)> {
+    let (mark, best_bid, best_ask) = coherent_ws_snapshot(state, Instant::now()).ok()?;
+    let version = FeedSnapshotVersion {
+        mark_received_at: state.mark_meta.as_ref()?.received_at,
+        book_received_at: state.book_meta.as_ref()?.received_at,
+    };
+    Some((mark, best_bid, best_ask, version))
+}
+
 pub(super) fn fresh_ws_snapshot(state: &FeedState) -> Option<(f64, Option<f64>, Option<f64>)> {
-    coherent_ws_snapshot(state, Instant::now()).ok()
+    fresh_ws_sample(state).map(|(mark, best_bid, best_ask, _)| (mark, best_bid, best_ask))
+}
+
+async fn reset_feed_state(state: &RwLock<FeedState>, issue: WsSnapshotIssue) {
+    *state.write().await = FeedState {
+        reconnect_issue: Some(issue),
+        ..FeedState::default()
+    };
 }
 
 /// Spawn the resident market-feed task: one public WS connection carrying
 /// `price` + `depth_book`, written into a shared cache. The outer loop wraps
 /// the SDK's internal 5-attempt reconnect — when the stream ends (attempts
 /// exhausted or clean close), it rebuilds the connection from scratch, since
-/// subscriptions only take effect when registered before `connect()`.
+/// subscriptions only take effect when registered before `connect_managed()`.
 pub(super) fn spawn_market_feed(
     symbol: String,
     verbose: bool,
@@ -259,61 +361,129 @@ pub(super) fn spawn_market_feed(
                 Ok(ws) => ws,
                 Err(e) => {
                     eprintln!("⚠️  market feed setup failed: {e}; retrying in 10s");
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(MARKET_FEED_REBUILD_DELAY).await;
                     continue;
                 }
             };
             let _ = ws.subscribe("price", Some(&symbol)).await;
             let _ = ws.subscribe("depth_book", Some(&symbol)).await;
-            let mut events = match ws.connect().await {
-                Ok(rx) => rx,
+            let (mut events, connection_handle) = match ws.connect_managed().await {
+                Ok(connection) => connection,
                 Err(e) => {
                     eprintln!("⚠️  market feed connect failed: {e}; retrying in 10s");
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    tokio::time::sleep(MARKET_FEED_REBUILD_DELAY).await;
                     continue;
                 }
             };
-            while let Some(msg) = events.recv().await {
-                let changed = match msg {
-                    WsMessage::Price(update)
-                        if update.data.symbol.eq_ignore_ascii_case(&symbol) =>
-                    {
-                        if let Ok(mark) = update.data.mark_price.parse::<f64>() {
-                            let mut s = state_task.write().await;
-                            if update_is_newer(s.mark_meta.as_ref(), &update) {
-                                s.mark = Some(mark);
-                                s.mark_meta = Some(update_meta(&update));
-                                true
-                            } else {
-                                false
+            let mut freshness = ChannelFreshness::new(Instant::now());
+            let rebuild_delay = loop {
+                let idle_deadline = tokio::time::Instant::from_std(freshness.next_deadline());
+                tokio::select! {
+                    message = events.recv() => {
+                        let Some(msg) = message else {
+                            connection_handle.abort();
+                            reset_feed_state(&state_task, WsSnapshotIssue::StreamEnded).await;
+                            seq = seq.saturating_add(1);
+                            let _ = tx.send(seq);
+                            eprintln!("⚠️  market feed stream ended; rebuilding connection in 10s");
+                            break MARKET_FEED_REBUILD_DELAY;
+                        };
+                        match &msg {
+                            WsMessage::Connected => {
+                                *state_task.write().await = FeedState::default();
+                                freshness = ChannelFreshness::new(Instant::now());
+                                seq = seq.saturating_add(1);
+                                let _ = tx.send(seq);
+                                continue;
                             }
-                        } else {
-                            false
+                            WsMessage::Disconnected => {
+                                reset_feed_state(&state_task, WsSnapshotIssue::StreamEnded).await;
+                                seq = seq.saturating_add(1);
+                                let _ = tx.send(seq);
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        let accepted = match msg {
+                            WsMessage::Price(update)
+                                if update.data.symbol.eq_ignore_ascii_case(&symbol) =>
+                            {
+                                let received_at = update.received_at;
+                                if let Ok(mark) = update.data.mark_price.parse::<f64>() {
+                                    if !mark.is_finite() || mark <= 0.0 {
+                                        None
+                                    } else {
+                                        let mut s = state_task.write().await;
+                                        if update_is_newer(s.mark_meta.as_ref(), &update) {
+                                            s.mark = Some(mark);
+                                            s.mark_meta = Some(update_meta(&update));
+                                            if s.book_meta.is_some() {
+                                                s.reconnect_issue = None;
+                                            }
+                                            Some((true, received_at))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            WsMessage::Depth(update)
+                                if update.data.symbol.eq_ignore_ascii_case(&symbol) =>
+                            {
+                                let received_at = update.received_at;
+                                let parsed = (
+                                    parse_optional_positive_price(update.data.best_bid()),
+                                    parse_optional_positive_price(update.data.best_ask()),
+                                );
+                                if let (Some(best_bid), Some(best_ask)) = parsed {
+                                    let mut s = state_task.write().await;
+                                    if update_is_newer(s.book_meta.as_ref(), &update) {
+                                        s.best_bid = best_bid;
+                                        s.best_ask = best_ask;
+                                        s.book_meta = Some(update_meta(&update));
+                                        if s.mark_meta.is_some() {
+                                            s.reconnect_issue = None;
+                                        }
+                                        Some((false, received_at))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        };
+                        if let Some((price, received_at)) = accepted {
+                            if price {
+                                freshness.price = received_at;
+                            } else {
+                                freshness.book = received_at;
+                            }
+                            seq = seq.saturating_add(1);
+                            let _ = tx.send(seq);
                         }
                     }
-                    WsMessage::Depth(update)
-                        if update.data.symbol.eq_ignore_ascii_case(&symbol) =>
-                    {
-                        let mut s = state_task.write().await;
-                        if update_is_newer(s.book_meta.as_ref(), &update) {
-                            s.best_bid = update.data.best_bid().and_then(|v| v.parse().ok());
-                            s.best_ask = update.data.best_ask().and_then(|v| v.parse().ok());
-                            s.book_meta = Some(update_meta(&update));
-                            true
-                        } else {
-                            false
-                        }
+                    _ = tokio::time::sleep_until(idle_deadline) => {
+                        let now = Instant::now();
+                        let Some(issue) = freshness.idle_issue(now) else {
+                            continue;
+                        };
+                        connection_handle.abort();
+                        reset_feed_state(&state_task, issue).await;
+                        seq = seq.saturating_add(1);
+                        let _ = tx.send(seq);
+                        eprintln!(
+                            "⚠️  market feed effective-update watchdog fired (reason={}); rebuilding connection in 1s",
+                            issue.as_str()
+                        );
+                        break MARKET_FEED_IDLE_REBUILD_DELAY;
                     }
-                    _ => false,
-                };
-                if changed {
-                    seq += 1;
-                    let _ = tx.send(seq);
                 }
-            }
-            // Stream ended: SDK reconnects exhausted or server closed.
-            eprintln!("⚠️  market feed stream ended; rebuilding connection in 10s");
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            };
+            tokio::time::sleep(rebuild_delay).await;
         }
     });
 
@@ -344,7 +514,9 @@ pub(super) async fn market_snapshot(
                     ws_snapshot,
                 });
             }
-            Err(issue) => ws_issue = Some(issue.as_str()),
+            Err(issue) => {
+                ws_issue = Some(s.reconnect_issue.unwrap_or(issue).as_str());
+            }
         }
     }
 
@@ -439,6 +611,27 @@ mod tests {
             received_at: now,
         };
         assert!(!update_is_newer(Some(&previous), &regressed_time));
+        let duplicate_time = WsMarketUpdate {
+            data: (),
+            seq: None,
+            server_time: Some("2026-07-14T00:00:10Z".to_string()),
+            envelope_time: Some("2026-07-14T00:00:10Z".to_string()),
+            payload_time: None,
+            received_at: now,
+        };
+        assert!(!update_is_newer(Some(&previous), &duplicate_time));
+    }
+
+    #[test]
+    fn effective_book_update_rejects_invalid_prices_but_accepts_empty_sides() {
+        assert_eq!(parse_optional_positive_price(None), Some(None));
+        assert_eq!(
+            parse_optional_positive_price(Some("100.25")),
+            Some(Some(100.25))
+        );
+        for value in ["0", "-1", "NaN", "not-a-price"] {
+            assert_eq!(parse_optional_positive_price(Some(value)), None);
+        }
     }
 
     #[test]
@@ -454,6 +647,7 @@ mod tests {
                 "2026-07-14T00:00:00Z",
                 now + Duration::from_secs(3),
             )),
+            reconnect_issue: None,
         };
         assert!(coherent_ws_snapshot(&state, now + Duration::from_secs(3)).is_ok());
     }
@@ -467,6 +661,7 @@ mod tests {
             best_bid: Some(99.9),
             best_ask: Some(100.1),
             book_meta: Some(meta(2, "2026-07-14T00:00:03Z", now)),
+            reconnect_issue: None,
         };
         assert!(coherent_ws_snapshot(&state, now).is_ok());
     }
@@ -480,6 +675,7 @@ mod tests {
             best_bid: Some(99.9),
             best_ask: Some(100.1),
             book_meta: Some(meta(2, "2026-07-14T00:00:06Z", now)),
+            reconnect_issue: None,
         };
         assert_eq!(
             coherent_ws_snapshot(&state, now),
@@ -502,6 +698,7 @@ mod tests {
                 payload_time: None,
                 received_at: now + Duration::from_secs(3),
             }),
+            reconnect_issue: None,
         };
         assert!(coherent_ws_snapshot(&state, now + Duration::from_secs(3)).is_ok());
     }
@@ -521,6 +718,7 @@ mod tests {
                 payload_time: None,
                 received_at: now + Duration::from_secs(6),
             }),
+            reconnect_issue: None,
         };
         assert_eq!(
             coherent_ws_snapshot(&state, now),
@@ -543,6 +741,7 @@ mod tests {
             best_bid: Some(99.9),
             best_ask: Some(100.1),
             book_meta: Some(book),
+            reconnect_issue: None,
         };
 
         let diagnostics = ws_snapshot_diagnostics(&state, now);
@@ -572,6 +771,7 @@ mod tests {
             best_bid: Some(99.9),
             best_ask: Some(100.1),
             book_meta: Some(meta(2, "2026-07-14T00:00:00Z", now - WS_STALE_AFTER)),
+            reconnect_issue: None,
         };
         assert_eq!(
             coherent_ws_snapshot(&state, now),
@@ -596,6 +796,65 @@ mod tests {
         assert_eq!(
             coherent_ws_snapshot(&state, now),
             Err(WsSnapshotIssue::MarkStale)
+        );
+    }
+
+    #[test]
+    fn idle_watchdog_tracks_price_and_book_independently() {
+        let now = Instant::now();
+        let mut freshness = ChannelFreshness::new(now);
+        assert_eq!(
+            freshness.idle_issue(now + MARKET_FEED_IDLE_AFTER - Duration::from_millis(1)),
+            None
+        );
+
+        freshness.price = now + Duration::from_secs(10);
+        assert_eq!(
+            freshness.idle_issue(now + MARKET_FEED_IDLE_AFTER),
+            Some(WsSnapshotIssue::BookIdle)
+        );
+
+        freshness.book = now + MARKET_FEED_IDLE_AFTER;
+        assert_eq!(
+            freshness.idle_issue(now + Duration::from_secs(25)),
+            Some(WsSnapshotIssue::PriceIdle)
+        );
+
+        let both_idle = ChannelFreshness::new(now);
+        assert_eq!(
+            both_idle.idle_issue(now + MARKET_FEED_IDLE_AFTER),
+            Some(WsSnapshotIssue::PriceAndBookIdle)
+        );
+    }
+
+    #[test]
+    fn recovery_version_requires_both_channels_to_advance() {
+        let now = Instant::now();
+        let previous = FeedSnapshotVersion {
+            mark_received_at: now,
+            book_received_at: now,
+        };
+        assert!(!FeedSnapshotVersion {
+            mark_received_at: now + Duration::from_secs(1),
+            book_received_at: now,
+        }
+        .both_advanced_from(Some(previous)));
+        assert!(FeedSnapshotVersion {
+            mark_received_at: now + Duration::from_secs(1),
+            book_received_at: now + Duration::from_secs(1),
+        }
+        .both_advanced_from(Some(previous)));
+    }
+
+    #[test]
+    fn reconnect_issue_explains_empty_cache_after_idle_reset() {
+        let state = FeedState {
+            reconnect_issue: Some(WsSnapshotIssue::PriceIdle),
+            ..FeedState::default()
+        };
+        assert_eq!(
+            ws_snapshot_issue(&state, Instant::now()),
+            Some(WsSnapshotIssue::PriceIdle)
         );
     }
 }

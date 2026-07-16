@@ -8,11 +8,20 @@ use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const DEFAULT_WS_URL: &str = "wss://perps.standx.com/ws-stream/v1";
 const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct AbortTaskOnDrop(JoinHandle<()>);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// WebSocket client state
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +207,13 @@ impl StandXWebSocket {
 
     /// Connect and start the WebSocket client
     pub async fn connect(&self) -> Result<mpsc::Receiver<WsMessage>> {
+        let (rx, _handle) = self.connect_managed().await?;
+        Ok(rx)
+    }
+
+    /// Connect and return ownership of the background task so a caller with
+    /// its own liveness policy can actively tear down a silent connection.
+    pub async fn connect_managed(&self) -> Result<(mpsc::Receiver<WsMessage>, JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel(100);
 
         let url = self.url.clone();
@@ -207,7 +223,7 @@ impl StandXWebSocket {
         let reconnect_attempts = self.reconnect_attempts.clone();
         let verbose = self.verbose;
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             loop {
                 *state.write().await = WsState::Connecting;
 
@@ -236,7 +252,7 @@ impl StandXWebSocket {
             }
         });
 
-        Ok(rx)
+        Ok((rx, handle))
     }
 
     /// Subscribe to a channel
@@ -397,7 +413,7 @@ async fn connect_and_run(
     let heartbeat_write = Arc::new(RwLock::new(write));
     let heartbeat_write_clone = heartbeat_write.clone();
 
-    tokio::spawn(async move {
+    let heartbeat_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         loop {
             interval.tick().await;
@@ -410,6 +426,10 @@ async fn connect_and_run(
             }
         }
     });
+    // Cancelling the owning connection task (for example, from a market-feed
+    // idle watchdog) must also stop the heartbeat writer that owns the other
+    // half of the socket.
+    let _heartbeat_guard = AbortTaskOnDrop(heartbeat_handle);
 
     // Main message loop
     while let Some(msg) = read.next().await {

@@ -22,6 +22,7 @@ mod config;
 mod cycle;
 mod feed;
 mod ledger;
+mod market_data;
 mod model;
 mod notify;
 mod output;
@@ -37,7 +38,11 @@ use startup::new_maker_rest_client;
 use startup::{run_startup, LiveSession, MakerStartup};
 
 use cycle::maker_cycle;
-use feed::{fresh_ws_snapshot, market_snapshot, spawn_market_feed};
+use feed::{fresh_ws_snapshot, market_snapshot, spawn_market_feed, ws_snapshot_issue};
+use market_data::{
+    degradation_detail, observe_acquired_market_health, recover_market_data, AcquiredMarketHealth,
+    MarketDataDegradedError, MarketDataRecovery, MARKET_DATA_RECOVERY_TIMEOUT,
+};
 use model::{is_maker_order, position_for_symbol, MakerExit};
 pub use model::{FailSafeShutdown, FAIL_SAFE_EXIT_CODE};
 #[cfg(test)]

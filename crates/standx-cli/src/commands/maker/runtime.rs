@@ -51,7 +51,7 @@ fn mark_request_timeout_stream_unhealthy(
     match timeout.phase.recovery_target() {
         RecoveryTarget::AccountStream => account_stream_health.mark_unhealthy(detail.to_string()),
         RecoveryTarget::OrderResponse => order_response_health.mark_unhealthy(detail.to_string()),
-        RecoveryTarget::PositionReconciliation => {
+        RecoveryTarget::PositionReconciliation | RecoveryTarget::MarketData => {
             unreachable!("request timeout phases never target position reconciliation")
         }
     }
@@ -139,6 +139,7 @@ enum EffectFailureStop {
     CleanupFailure,
     OrderResponse,
     PositionReconciliation,
+    MarketData,
 }
 
 fn effect_failure_stop(
@@ -152,6 +153,7 @@ fn effect_failure_stop(
         EffectFailureStop::PositionReconciliation => {
             RuntimeStopReason::PositionReconciliation(reason)
         }
+        EffectFailureStop::MarketData => RuntimeStopReason::MarketData(reason),
     }
 }
 
@@ -181,7 +183,7 @@ struct RecoveryIo<'a> {
     output_format: OutputFormat,
 }
 
-/// Everything that differs between the three incident flows' freeze/cleanup
+/// Everything that differs between the incident flows' freeze/cleanup
 /// preambles. The `notice` is built entirely by the caller so the risk
 /// payloads stay reviewable string-for-string at the call sites.
 enum FreezeNotice<'a> {
@@ -207,9 +209,12 @@ struct FreezeSpec<'a> {
     /// and reconciliation) or is being replaced (order-response), deciding
     /// whether pending request acks stay correlated across the cleanup.
     continuity: OrderResponseContinuity,
+    /// Live flows cancel and verify venue orders; paper recovery only clears
+    /// its simulated in-memory maker book.
+    cancel_venue_orders: bool,
 }
 
-/// Freeze/cleanup preamble shared by the three incident-recovery flows:
+/// Freeze/cleanup preamble shared by the incident-recovery flows:
 /// report the fault to the runtime, drain the cleanup effect, notify,
 /// cancel every maker order, reset the local book state, and drain the
 /// recovery effect. `Ok` carries the recovery token for the flow-specific
@@ -244,9 +249,12 @@ async fn freeze_and_cleanup_for_recovery(
         FreezeNotice::Risk(notice) => io.notifier.risk(notice, false).await,
         FreezeNotice::RequestTimeout(notice) => io.notifier.request_timeout(notice, false).await,
     }
-    if let Err(error) =
+    let cleanup = if spec.cancel_venue_orders {
         cancel_maker_orders_with_retry(io.client, io.symbol, 3, io.output_format).await
-    {
+    } else {
+        Ok(())
+    };
+    if let Err(error) = cleanup {
         io.runtime_state.handle(MakerEvent::CleanupFailed {
             token: cleanup_token,
             reason: format!(
@@ -278,7 +286,7 @@ async fn freeze_and_cleanup_for_recovery(
     }
 }
 
-/// Everything that differs between the three incident flows' resume tails.
+/// Everything that differs between the incident flows' resume tails.
 /// As with [`FreezeSpec`], the resolved `notice` is built entirely by the
 /// caller.
 struct ResumeSpec<'a> {
@@ -293,7 +301,7 @@ struct ResumeSpec<'a> {
     notice: RiskNotice<'a>,
 }
 
-/// Resume tail shared by the three incident-recovery flows: reset the
+/// Resume tail shared by the incident-recovery flows: reset the
 /// projection to an empty verified book, seed it with the reconciled venue
 /// position, report RecoverySucceeded, and send the resolved notice. The
 /// caller performs its flow-specific final book verification and session
@@ -1286,6 +1294,9 @@ pub(super) async fn run_maker(
         let (state, rx, handle) = spawn_market_feed(symbol.clone(), args.verbose);
         (Some(state), Some(rx), Some(handle))
     };
+    // A cloned watch cursor lets an in-flight cycle react to the feed's idle
+    // reset without consuming the normal cursor used for post-cycle replans.
+    let mut market_watchdog_updates = updates.as_ref().cloned();
 
     // ---- Loop state ----
     let mut cycle: u64 = 0;
@@ -1318,12 +1329,16 @@ pub(super) async fn run_maker(
             .with_account_floors(args.alert_equity_below, args.alert_margin_below);
     let mut last_mark: Option<f64> = None;
     let mut last_src: Option<&'static str> = None;
+    let market_data_health_started = std::time::Instant::now();
+    let mut market_data_health = maker::MarketDataHealth::default();
+    let mut pending_market_data_degradation: Option<String> = None;
     let recovery_clock_started = std::time::Instant::now();
     // One rolling budget shared across abnormal automatic recoveries —
-    // account-stream reconnect, order-response reconnect, and genuine
-    // position/projection mismatch. A normal account event that invalidates an
-    // in-flight cycle still performs cleanup and reconciliation, but is not an
-    // incident: otherwise ordinary fills eventually exhaust the live budget.
+    // market-data recovery, account-stream reconnect, order-response
+    // reconnect, and genuine position/projection mismatch. A normal account
+    // event that invalidates an in-flight cycle still performs cleanup and
+    // reconciliation, but is not an incident: otherwise ordinary fills
+    // eventually exhaust the live budget.
     let mut recovery_breaker = maker::RecoveryCircuitBreaker::new(
         args.recovery_incidents_per_window,
         args.recovery_window_secs,
@@ -1406,6 +1421,156 @@ pub(super) async fn run_maker(
                 }
             }
         }
+        if let Some(detail) = pending_market_data_degradation.take() {
+            let frozen_message = format!("{detail}; placements frozen and maker cleanup starting");
+            let recovery_token = match freeze_and_cleanup_for_recovery(
+                &mut RecoveryIo {
+                    runtime_state: &mut runtime_state,
+                    notifier: &notifier,
+                    client: &client,
+                    session: live_session.as_mut(),
+                    resting: &mut resting,
+                    inventory_exit_pending: &mut inventory_exit_pending,
+                    consecutive_errors: &mut consecutive_errors,
+                    next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                    symbol: &symbol,
+                    cycle,
+                    output_format,
+                },
+                FreezeSpec {
+                    target: RecoveryTarget::MarketData,
+                    // The event is normally already applied at the detection
+                    // site. Re-applying it is intentionally idempotent while
+                    // frozen and lets this preamble remain self-contained.
+                    trigger: MakerEvent::MarketDataDegraded(detail.clone()),
+                    cleanup_effect_stop: EffectFailureStop::CleanupFailure,
+                    recovery_effect_stop: EffectFailureStop::MarketData,
+                    cleanup_failure_prefix: "market data ".to_string(),
+                    cleanup_failed_exit: MakerExit::MarketData,
+                    notice: FreezeNotice::Risk(RiskNotice {
+                        kind: "market_data",
+                        severity: "warning",
+                        event: "degraded_frozen",
+                        message: &frozen_message,
+                        symbol: &symbol,
+                        cycle,
+                        position_before: None,
+                        position_after: Some(ledger.expected_position),
+                        expected: Some(ledger.expected_position),
+                        observed: None,
+                    }),
+                    frozen_note: None,
+                    abort_account_stream_handle: false,
+                    continuity: OrderResponseContinuity::Preserved,
+                    cancel_venue_orders: args.live,
+                },
+            )
+            .await
+            {
+                Ok(token) => token,
+                Err(exit) => break exit,
+            };
+            if args.live {
+                let admission = recovery_breaker.admit(recovery_clock_started.elapsed().as_secs());
+                if !admission.is_admitted() {
+                    break recovery_failed_exit(
+                        &mut runtime_state,
+                        recovery_token,
+                        format!(
+                            "{detail}; {}; refusing further live orders",
+                            recovery_circuit_detail(admission)
+                        ),
+                    );
+                }
+            }
+
+            eprintln!(
+                "⚠️  market data degraded; waiting for {} distinct coherent WS snapshots before re-quoting",
+                maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER
+            );
+            let recovery_result = tokio::select! {
+                _ = ctrl_c_latched(&mut ctrl_c_rx) => {
+                    break 'main stop_requested_exit(
+                        &mut runtime_state,
+                        RuntimeStopReason::CtrlC,
+                    );
+                }
+                result = tokio::time::timeout(
+                    MARKET_DATA_RECOVERY_TIMEOUT,
+                    recover_market_data(MarketDataRecovery {
+                        client: &client,
+                        symbol: &symbol,
+                        output_format,
+                        live: args.live,
+                        feed: feed.as_ref(),
+                        updates: updates.as_mut(),
+                        health: &mut market_data_health,
+                        health_started: market_data_health_started,
+                        max_divergence_bps: args.max_divergence_bps,
+                    }),
+                ) => result,
+            };
+            match recovery_result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    break recovery_failed_exit(
+                        &mut runtime_state,
+                        recovery_token,
+                        format!("market data recovery failed: {error}"),
+                    );
+                }
+                Err(_) => {
+                    break recovery_failed_exit(
+                        &mut runtime_state,
+                        recovery_token,
+                        format!(
+                            "market data did not produce {} coherent snapshots and a verified empty maker book within {}s",
+                            maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
+                            MARKET_DATA_RECOVERY_TIMEOUT.as_secs(),
+                        ),
+                    );
+                }
+            }
+
+            let observed = ledger.expected_position;
+            resume_quoting_after_recovery(
+                &mut RecoveryIo {
+                    runtime_state: &mut runtime_state,
+                    notifier: &notifier,
+                    client: &client,
+                    session: live_session.as_mut(),
+                    resting: &mut resting,
+                    inventory_exit_pending: &mut inventory_exit_pending,
+                    consecutive_errors: &mut consecutive_errors,
+                    next_cycle_is_recovery: &mut next_cycle_is_recovery,
+                    symbol: &symbol,
+                    cycle,
+                    output_format,
+                },
+                ResumeSpec {
+                    recovery_token,
+                    observed,
+                    continuity: OrderResponseContinuity::Preserved,
+                    clear_resting: true,
+                    recovered_note: None,
+                    notice: RiskNotice {
+                        kind: "market_data",
+                        severity: "resolved",
+                        event: "recovered",
+                        message: "market data recovered with consecutive coherent snapshots and a verified empty maker book; quoting may resume",
+                        symbol: &symbol,
+                        cycle,
+                        position_before: None,
+                        position_after: Some(observed),
+                        expected: Some(observed),
+                        observed: Some(observed),
+                    },
+                },
+            )
+            .await;
+            last_src = None;
+            continue 'main;
+        }
         if let Some(session) = live_session.as_mut() {
             if !session.account_stream_health.is_healthy() {
                 let detail = session
@@ -1478,6 +1643,7 @@ pub(super) async fn run_maker(
                         frozen_note: None,
                         abort_account_stream_handle: true,
                         continuity: OrderResponseContinuity::Preserved,
+                        cancel_venue_orders: true,
                     },
                 )
                 .await
@@ -1808,6 +1974,7 @@ pub(super) async fn run_maker(
                         frozen_note: None,
                         abort_account_stream_handle: false,
                         continuity: OrderResponseContinuity::Replaced,
+                        cancel_venue_orders: true,
                     },
                 )
                 .await
@@ -2243,6 +2410,23 @@ pub(super) async fn run_maker(
             let best_ask = market.best_ask;
             let src = market.source;
             let market_fallback_reason = market.fallback_reason;
+            if feed.is_some() {
+                let health_now_ms = duration_ms(market_data_health_started.elapsed());
+                if let Some(detail) = observe_acquired_market_health(
+                    &mut market_data_health,
+                    AcquiredMarketHealth {
+                        now_ms: health_now_ms,
+                        source: src,
+                        fallback_reason: market_fallback_reason,
+                        mark,
+                        best_bid,
+                        best_ask,
+                        max_divergence_bps: args.max_divergence_bps,
+                    },
+                ) {
+                    return Err(anyhow::Error::new(MarketDataDegradedError { detail }));
+                }
+            }
             let result = maker_cycle(
                 CycleRequest {
                     client: &client,
@@ -2309,6 +2493,7 @@ pub(super) async fn run_maker(
         let mut buffered_account: Vec<AccountEvent> = Vec::new();
         let mut buffered_orders: Vec<OrderResponse> = Vec::new();
         let mut cycle_invalidated_by_account = false;
+        let mut cycle_invalidated_by_market: Option<String> = None;
         // Scope the pinned work future so it (and its ledger/pending borrows)
         // is dropped once it resolves, before the buffered events are applied.
         let cycle_result = {
@@ -2323,6 +2508,12 @@ pub(super) async fn run_maker(
                 let order_during_work = async {
                     match cycle_order_responses.as_deref_mut() {
                         Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let market_during_work = async {
+                    match market_watchdog_updates.as_mut() {
+                        Some(receiver) => receiver.changed().await.is_ok(),
                         None => std::future::pending().await,
                     }
                 };
@@ -2363,9 +2554,38 @@ pub(super) async fn run_maker(
                         buffered_orders.push(response);
                     },
                     result = &mut work => break Some(result),
+                    changed = market_during_work => {
+                        if !changed {
+                            market_watchdog_updates = None;
+                            continue;
+                        }
+                        let idle_issue = match feed.as_ref() {
+                            Some(feed) => {
+                                let state = feed.read().await;
+                                ws_snapshot_issue(&state, std::time::Instant::now())
+                                    .filter(|issue| issue.is_idle())
+                            }
+                            None => None,
+                        };
+                        if let Some(issue) = idle_issue {
+                            cycle_invalidated_by_market = Some(format!(
+                                "market feed effective-update watchdog fired during maker cycle: {}",
+                                issue.as_str(),
+                            ));
+                            break None;
+                        }
+                    },
                 }
             }
         };
+        if let Some(detail) = cycle_invalidated_by_market {
+            let now_ms = duration_ms(market_data_health_started.elapsed());
+            let transition =
+                market_data_health.observe(now_ms, maker::MarketDataObservation::FeedIdle);
+            let detail = degradation_detail(transition, &detail).unwrap_or(detail);
+            runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
+            pending_market_data_degradation = Some(detail);
+        }
         // The buffers are only fed from live-session receivers, so both are
         // empty in paper mode.
         if let Some(session) = live_session.as_mut() {
@@ -2690,6 +2910,12 @@ pub(super) async fn run_maker(
                 }
             }
             Err(e) => {
+                if let Some(degraded) = e.downcast_ref::<MarketDataDegradedError>() {
+                    let detail = degraded.detail.clone();
+                    runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
+                    pending_market_data_degradation = Some(detail);
+                    continue 'main;
+                }
                 if e.downcast_ref::<ProjectionRegistryError>().is_some() {
                     let detail = format!("order-response correlation failed closed: {e}");
                     if let Some(session) = live_session.as_ref() {
@@ -2748,6 +2974,7 @@ pub(super) async fn run_maker(
                             }),
                             abort_account_stream_handle: false,
                             continuity: OrderResponseContinuity::Preserved,
+                            cancel_venue_orders: true,
                         },
                     )
                     .await
@@ -3126,34 +3353,94 @@ pub(super) async fn run_maker(
                 }
                 ok = update => {
                     if !ok {
-                        // Feed task gone: fall back to plain interval waits.
+                        let now_ms = duration_ms(market_data_health_started.elapsed());
+                        if let Some(detail) = degradation_detail(
+                            market_data_health.observe(
+                                now_ms,
+                                maker::MarketDataObservation::RestFallback,
+                            ),
+                            "market feed task ended",
+                        ) {
+                            runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
+                            pending_market_data_degradation = Some(detail);
+                            break;
+                        }
+                        // The next interval cycle records another REST
+                        // fallback observation and may cross the bounded grace.
                         updates = None;
                         continue;
                     }
-                    if tokio::time::Instant::now() < min_gap {
-                        continue;
-                    }
-                    let (Some(feed), Some(prev)) = (feed.as_ref(), last_mark) else {
+                    let Some(feed) = feed.as_ref() else {
                         continue;
                     };
                     let resting_for_replan = match live_session.as_ref() {
                         Some(session) => session.projection.resting_quotes(),
                         None => resting.clone(),
                     };
-                    let requires_replan = {
+                    let (observation, observation_detail, requires_replan) = {
                         let s = feed.read().await;
-                        fresh_ws_snapshot(&s).is_some_and(|(mark, best_bid, best_ask)| {
-                            market_update_requires_replan(
-                                prev,
-                                mark,
-                                best_bid,
-                                best_ask,
-                                &resting_for_replan,
-                                cfg.refresh_bps,
-                                args.max_divergence_bps,
-                            )
-                        })
+                        match fresh_ws_snapshot(&s) {
+                            Some((mark, best_bid, best_ask)) => {
+                                let observation = if matches!(
+                                    maker::touch_skip(
+                                        mark,
+                                        best_bid,
+                                        best_ask,
+                                        args.max_divergence_bps,
+                                    ),
+                                    Some(maker::CycleSkip::MarkMidDivergence { .. })
+                                ) {
+                                    maker::MarketDataObservation::MarkMidDivergence
+                                } else {
+                                    maker::MarketDataObservation::Coherent
+                                };
+                                let requires_replan = last_mark.is_some_and(|prev| {
+                                    market_update_requires_replan(
+                                        prev,
+                                        mark,
+                                        best_bid,
+                                        best_ask,
+                                        &resting_for_replan,
+                                        cfg.refresh_bps,
+                                        args.max_divergence_bps,
+                                    )
+                                });
+                                (
+                                    observation,
+                                    "websocket cache update".to_string(),
+                                    requires_replan,
+                                )
+                            }
+                            None => {
+                                let issue = ws_snapshot_issue(&s, std::time::Instant::now());
+                                let observation = if issue.is_some_and(|issue| issue.is_idle()) {
+                                    maker::MarketDataObservation::FeedIdle
+                                } else {
+                                    maker::MarketDataObservation::RestFallback
+                                };
+                                (
+                                    observation,
+                                    format!(
+                                        "websocket cache unavailable: {}",
+                                        issue.map_or("unknown", |issue| issue.as_str())
+                                    ),
+                                    false,
+                                )
+                            }
+                        }
                     };
+                    let now_ms = duration_ms(market_data_health_started.elapsed());
+                    if let Some(detail) = degradation_detail(
+                        market_data_health.observe(now_ms, observation),
+                        &observation_detail,
+                    ) {
+                        runtime_state.handle(MakerEvent::MarketDataDegraded(detail.clone()));
+                        pending_market_data_degradation = Some(detail);
+                        break;
+                    }
+                    if tokio::time::Instant::now() < min_gap {
+                        continue;
+                    }
                     if requires_replan {
                         runtime_state.handle(MakerEvent::MarketChanged);
                         break; // early re-quote cycle
@@ -3312,6 +3599,14 @@ mod tests {
                 "boom".to_string(),
             ),
             RuntimeStopReason::PositionReconciliation("boom".to_string())
+        );
+        assert_eq!(
+            effect_failure_stop(
+                EffectFailureStop::MarketData,
+                RecoveryTarget::MarketData,
+                "boom".to_string(),
+            ),
+            RuntimeStopReason::MarketData("boom".to_string())
         );
     }
 
@@ -4488,6 +4783,7 @@ mod tests {
             frozen_note: None,
             abort_account_stream_handle: false,
             continuity: OrderResponseContinuity::Replaced,
+            cancel_venue_orders: true,
         }
     }
 
