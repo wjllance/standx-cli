@@ -269,6 +269,7 @@ pub(super) struct AccountEventState<'a> {
 pub(super) struct AccountEventOutcome {
     pub(super) fills: u64,
     pub(super) latest_position: Option<f64>,
+    pub(super) position_observations: Vec<f64>,
     pub(super) exit_fill_observed: bool,
     pub(super) balance_changed: bool,
     pub(super) requires_order_reconciliation: bool,
@@ -278,16 +279,26 @@ pub(super) struct AccountEventOutcome {
 
 impl AccountEventOutcome {
     fn merge(&mut self, other: Self) {
-        self.fills += other.fills;
-        if other.latest_position.is_some() {
-            self.latest_position = other.latest_position;
+        let Self {
+            fills,
+            latest_position,
+            position_observations,
+            exit_fill_observed,
+            balance_changed,
+            requires_order_reconciliation,
+            effective_request_ids,
+            fill_order_ids,
+        } = other;
+        self.fills += fills;
+        if latest_position.is_some() {
+            self.latest_position = latest_position;
         }
-        self.exit_fill_observed |= other.exit_fill_observed;
-        self.balance_changed |= other.balance_changed;
-        self.requires_order_reconciliation |= other.requires_order_reconciliation;
-        self.effective_request_ids
-            .extend(other.effective_request_ids);
-        self.fill_order_ids.extend(other.fill_order_ids);
+        self.position_observations.extend(position_observations);
+        self.exit_fill_observed |= exit_fill_observed;
+        self.balance_changed |= balance_changed;
+        self.requires_order_reconciliation |= requires_order_reconciliation;
+        self.effective_request_ids.extend(effective_request_ids);
+        self.fill_order_ids.extend(fill_order_ids);
     }
 }
 
@@ -323,10 +334,11 @@ pub(super) struct OutcomeSink<'a> {
 }
 
 /// Fold one account-event outcome into the loop totals: accumulate fills, clear
-/// the pending inventory exit once its fill is observed, and emit a
-/// position-jump alert. Returns the latest observed position (if any) so the
-/// caller can apply its own mismatch bookkeeping — the one part that legitimately
-/// differs between the cycle, replan, and reconciliation paths.
+/// the pending inventory exit once its fill is observed, and feed every ordered
+/// position observation into risk detection. Returns the latest observed
+/// position (if any) so the caller can apply its own mismatch bookkeeping — the
+/// one part that legitimately differs between the cycle, replan, and
+/// reconciliation paths.
 pub(super) async fn absorb_account_outcome(
     outcome: AccountEventOutcome,
     mut sink: OutcomeSink<'_>,
@@ -352,12 +364,12 @@ pub(super) async fn absorb_account_outcome(
         *sink.inventory_exit_pending = false;
     }
     let position = outcome.latest_position;
-    if let Some(position) = position {
+    for observed in outcome.position_observations {
         sink.notifier
             .position_jump(
                 sink.position_alert_anchor,
                 PositionChange {
-                    observed: position,
+                    observed,
                     expected: sink.expected_position,
                     max_position: sink.max_position,
                     inventory_exit_pct: sink.inventory_exit_pct,
@@ -487,6 +499,7 @@ pub(super) fn apply_account_event(
             Ok(AccountEventOutcome {
                 fills: fills.len() as u64,
                 latest_position: None,
+                position_observations: Vec::new(),
                 exit_fill_observed,
                 balance_changed: false,
                 requires_order_reconciliation,
@@ -513,6 +526,7 @@ pub(super) fn apply_account_event(
             Ok(AccountEventOutcome {
                 fills: 0,
                 latest_position: Some(qty),
+                position_observations: vec![qty],
                 exit_fill_observed: false,
                 balance_changed: false,
                 requires_order_reconciliation: false,
@@ -546,6 +560,7 @@ pub(super) fn apply_account_event(
             Ok(AccountEventOutcome {
                 fills: fills.len() as u64,
                 latest_position: None,
+                position_observations: Vec::new(),
                 exit_fill_observed,
                 balance_changed: false,
                 requires_order_reconciliation: false,

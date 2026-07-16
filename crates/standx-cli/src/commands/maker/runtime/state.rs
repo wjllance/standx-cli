@@ -117,8 +117,11 @@ impl MakerRuntime {
         ledger.enable_performance(baseline_mark)?;
         let performance_started = std::time::Instant::now();
         let performance_epoch_ms = chrono::Utc::now().timestamp_millis();
-        let position_alert_anchor =
-            PositionAlertAnchor::new(starting_position, args.alert_position_change_pct);
+        let position_alert_anchor = PositionAlertAnchor::new(
+            starting_position,
+            args.alert_position_change_pct,
+            cfg.size / 2.0,
+        );
         let stats = if args.live {
             MakerStats::with_inventory_baseline(starting_position, baseline_mark)
         } else {
