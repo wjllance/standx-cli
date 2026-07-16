@@ -8,16 +8,19 @@ use std::collections::VecDeque;
 /// A cycle invalidated by an account event still requires compensating cleanup
 /// and authoritative reconciliation, but it is expected during normal fills.
 /// Counting it as an incident would eventually stop every healthy active maker.
+/// Market conditions that make quoting unsafe are likewise expected to clear
+/// without consuming the transport/reconciliation recovery budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryTrigger {
     TransportFailure,
     PositionMismatch,
     CycleInvalidation,
+    MarketCondition,
 }
 
 impl RecoveryTrigger {
     pub fn meters_circuit(self) -> bool {
-        !matches!(self, Self::CycleInvalidation)
+        !matches!(self, Self::CycleInvalidation | Self::MarketCondition)
     }
 }
 
@@ -125,8 +128,9 @@ mod tests {
     }
 
     #[test]
-    fn normal_cycle_invalidation_does_not_meter_the_incident_circuit() {
+    fn expected_runtime_conditions_do_not_meter_the_incident_circuit() {
         assert!(!RecoveryTrigger::CycleInvalidation.meters_circuit());
+        assert!(!RecoveryTrigger::MarketCondition.meters_circuit());
         assert!(RecoveryTrigger::PositionMismatch.meters_circuit());
         assert!(RecoveryTrigger::TransportFailure.meters_circuit());
     }

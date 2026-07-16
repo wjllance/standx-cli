@@ -366,6 +366,23 @@ pub(super) fn next_market_transport_deadline(
     }
 }
 
+pub(super) fn market_data_recovery_admission(
+    class: maker::MarketDataFaultClass,
+    breaker_metered: &mut bool,
+    breaker: &mut maker::RecoveryCircuitBreaker,
+    now_secs: u64,
+) -> Option<maker::RecoveryAdmission> {
+    let trigger = match class {
+        maker::MarketDataFaultClass::Transport => maker::RecoveryTrigger::TransportFailure,
+        maker::MarketDataFaultClass::MarketState => maker::RecoveryTrigger::MarketCondition,
+    };
+    if *breaker_metered || !trigger.meters_circuit() {
+        return None;
+    }
+    *breaker_metered = true;
+    Some(breaker.admit(now_secs))
+}
+
 fn sync_market_transport_deadline(market: &mut RuntimeMarketState, now: std::time::Instant) {
     market.transport_deadline = next_market_transport_deadline(
         market.health.degraded_class(),
@@ -462,6 +479,7 @@ impl MakerRuntime {
         let cycle = self.loop_state.counters.cycle;
         let recovery_clock_started = self.recovery.clock_started;
         let exit = 'phase: {
+            let pending_market_recovery;
             if let Some(detail) = self.market.pending_degradation.take() {
                 let frozen_message =
                     format!("{detail}; placements frozen and maker cleanup starting");
@@ -512,23 +530,47 @@ impl MakerRuntime {
                     Ok(token) => token,
                     Err(exit) => break 'phase exit,
                 };
-                if live {
-                    let admission = self
-                        .recovery
-                        .breaker
-                        .admit(recovery_clock_started.elapsed().as_secs());
+                pending_market_recovery = Some((recovery_token, detail));
+            } else {
+                pending_market_recovery = None;
+            }
+
+            if !self.market.health.is_degraded() {
+                return LoopDirective::Proceed;
+            }
+
+            if live {
+                let class = self
+                    .market
+                    .health
+                    .degraded_class()
+                    .expect("degraded market data must have a fault class");
+                if let Some(admission) = market_data_recovery_admission(
+                    class,
+                    &mut self.market.breaker_metered,
+                    &mut self.recovery.breaker,
+                    recovery_clock_started.elapsed().as_secs(),
+                ) {
                     if !admission.is_admitted() {
-                        break 'phase recovery_failed_exit(
+                        let circuit = recovery_circuit_detail(admission);
+                        if let Some((recovery_token, detail)) = pending_market_recovery.as_ref() {
+                            break 'phase recovery_failed_exit(
+                                &mut self.recovery.runtime_state,
+                                *recovery_token,
+                                format!("{detail}; {circuit}; refusing further live orders"),
+                            );
+                        }
+                        break 'phase stop_requested_exit(
                             &mut self.recovery.runtime_state,
-                            recovery_token,
-                            format!(
-                                "{detail}; {}; refusing further live orders",
-                                recovery_circuit_detail(admission)
-                            ),
+                            RuntimeStopReason::MarketData(format!(
+                                "market data standby escalated to transport failure; {circuit}; refusing further live orders"
+                            )),
                         );
                     }
                 }
+            }
 
+            if let Some((recovery_token, _)) = pending_market_recovery {
                 // Cleanup closes the reducer's frozen generation. Market data
                 // remains paused in the pure health gate, so normal account and
                 // order ingestion can resume without allowing new orders.
@@ -545,10 +587,6 @@ impl MakerRuntime {
                     maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER
                 );
                 return LoopDirective::Restart;
-            }
-
-            if !self.market.health.is_degraded() {
-                return LoopDirective::Proceed;
             }
 
             let now = std::time::Instant::now();
@@ -665,6 +703,7 @@ impl MakerRuntime {
                     maker::MarketDataTransition::Recovered
                 ) {
                     let observed = self.loop_state.ledger.expected_position;
+                    self.market.breaker_metered = false;
                     self.market.standby_started = None;
                     self.market.transport_deadline = None;
                     self.market.next_heartbeat = None;

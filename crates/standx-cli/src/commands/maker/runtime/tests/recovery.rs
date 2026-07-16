@@ -396,3 +396,83 @@ fn transport_deadline_starts_on_escalation_and_clears_on_market_state() {
         "market-state standby must remain non-terminal beyond sixty seconds"
     );
 }
+
+#[test]
+fn direct_transport_incident_meters_the_recovery_circuit_once() {
+    let mut breaker = maker::RecoveryCircuitBreaker::new(1, 3_600);
+    let mut breaker_metered = false;
+
+    assert!(market_data_recovery_admission(
+        maker::MarketDataFaultClass::Transport,
+        &mut breaker_metered,
+        &mut breaker,
+        10,
+    )
+    .expect("a transport incident must be metered")
+    .is_admitted());
+    assert!(breaker_metered);
+    assert!(market_data_recovery_admission(
+        maker::MarketDataFaultClass::Transport,
+        &mut breaker_metered,
+        &mut breaker,
+        20,
+    )
+    .is_none());
+}
+
+#[test]
+fn market_state_is_exempt_until_transport_upgrade_and_resets_per_incident() {
+    let mut breaker = maker::RecoveryCircuitBreaker::new(1, 3_600);
+    let mut breaker_metered = false;
+
+    for now_secs in [10, 20, 30] {
+        assert!(market_data_recovery_admission(
+            maker::MarketDataFaultClass::MarketState,
+            &mut breaker_metered,
+            &mut breaker,
+            now_secs,
+        )
+        .is_none());
+        assert!(!breaker_metered);
+    }
+
+    assert!(market_data_recovery_admission(
+        maker::MarketDataFaultClass::Transport,
+        &mut breaker_metered,
+        &mut breaker,
+        40,
+    )
+    .expect("a transport upgrade must be metered")
+    .is_admitted());
+    assert!(breaker_metered);
+    for class in [
+        maker::MarketDataFaultClass::Transport,
+        maker::MarketDataFaultClass::MarketState,
+        maker::MarketDataFaultClass::Transport,
+    ] {
+        assert!(
+            market_data_recovery_admission(class, &mut breaker_metered, &mut breaker, 50,)
+                .is_none()
+        );
+    }
+
+    // A successful recovery starts a new incident with a fresh meter flag.
+    breaker_metered = false;
+    assert!(market_data_recovery_admission(
+        maker::MarketDataFaultClass::MarketState,
+        &mut breaker_metered,
+        &mut breaker,
+        60,
+    )
+    .is_none());
+    assert!(!breaker_metered);
+    assert!(!market_data_recovery_admission(
+        maker::MarketDataFaultClass::Transport,
+        &mut breaker_metered,
+        &mut breaker,
+        70,
+    )
+    .expect("the next transport incident must be metered")
+    .is_admitted());
+    assert!(breaker_metered);
+}
