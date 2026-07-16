@@ -302,7 +302,7 @@ mod tests {
         assert!(anchor.evaluate(0.10, 0.8, 25.0, 0.0005).is_none());
         let alert = anchor.evaluate(0.161, 0.8, 25.0, 0.0005).unwrap();
         assert!((alert.before - 0.001).abs() < 1e-9);
-        assert!((alert.delta - 0.160).abs() < 1e-9);
+        assert!((alert.after - alert.before - 0.160).abs() < 1e-9);
         assert!(anchor.evaluate(0.161, 0.8, 25.0, 0.0005).is_none());
     }
 
