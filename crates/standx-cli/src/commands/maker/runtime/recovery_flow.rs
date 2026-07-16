@@ -490,7 +490,7 @@ impl MakerRuntime {
                 .await
                 {
                     Ok(token) => token,
-                    Err(exit) => break exit,
+                    Err(exit) => break 'phase exit,
                 };
                 if args.live {
                     let admission = self
@@ -498,7 +498,7 @@ impl MakerRuntime {
                         .breaker
                         .admit(recovery_clock_started.elapsed().as_secs());
                     if !admission.is_admitted() {
-                        break recovery_failed_exit(
+                        break 'phase recovery_failed_exit(
                             &mut self.recovery.runtime_state,
                             recovery_token,
                             format!(
@@ -538,14 +538,14 @@ impl MakerRuntime {
                 match recovery_result {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        break recovery_failed_exit(
+                        break 'phase recovery_failed_exit(
                             &mut self.recovery.runtime_state,
                             recovery_token,
                             format!("market data recovery failed: {error}"),
                         );
                     }
                     Err(_) => {
-                        break recovery_failed_exit(
+                        break 'phase recovery_failed_exit(
                             &mut self.recovery.runtime_state,
                             recovery_token,
                             format!(
@@ -698,11 +698,11 @@ impl MakerRuntime {
                     .await
                     {
                         Ok(token) => token,
-                        Err(exit) => break exit,
+                        Err(exit) => break 'phase exit,
                     };
 
                     if args.account_stream_reconnect_attempts == 0 {
-                        break recovery_failed_exit(
+                        break 'phase recovery_failed_exit(
                             &mut self.recovery.runtime_state,
                             recovery_token,
                             format!("account stream disconnected ({detail}); reconnect disabled"),
@@ -713,7 +713,7 @@ impl MakerRuntime {
                         .breaker
                         .admit(recovery_clock_started.elapsed().as_secs());
                     if !admission.is_admitted() {
-                        break recovery_failed_exit(
+                        break 'phase recovery_failed_exit(
                             &mut self.recovery.runtime_state,
                             recovery_token,
                             format!(
@@ -748,7 +748,7 @@ impl MakerRuntime {
                                     "account stream disconnected ({detail}); reconnect exhausted: {reason}"
                                 ),
                             });
-                            break take_stop_effect(
+                            break 'phase take_stop_effect(
                                 &mut self.recovery.runtime_state,
                                 MakerExit::PositionReconciliation,
                             );
@@ -779,7 +779,7 @@ impl MakerRuntime {
                         Ok(outcome) => outcome,
                         Err(error) => {
                             handle.abort();
-                            break recovery_failed_exit(
+                            break 'phase recovery_failed_exit(
                                 &mut self.recovery.runtime_state,
                                 recovery_token,
                                 format!(
@@ -795,7 +795,7 @@ impl MakerRuntime {
                         Ok(positions) => positions,
                         Err(error) => {
                             handle.abort();
-                            break recovery_failed_exit(
+                            break 'phase recovery_failed_exit(
                                 &mut self.recovery.runtime_state,
                                 recovery_token,
                                 format!("account stream reconnect snapshot failed: {error}"),
@@ -806,7 +806,7 @@ impl MakerRuntime {
                         Ok(position) => position,
                         Err(error) => {
                             handle.abort();
-                            break recovery_failed_exit(
+                            break 'phase recovery_failed_exit(
                                 &mut self.recovery.runtime_state,
                                 recovery_token,
                                 error.to_string(),
@@ -894,7 +894,7 @@ impl MakerRuntime {
                         }
                         if !gap_closed {
                             handle.abort();
-                            break recovery_failed_exit(
+                            break 'phase recovery_failed_exit(
                                 &mut self.recovery.runtime_state,
                                 recovery_token,
                                 format!(
@@ -913,7 +913,7 @@ impl MakerRuntime {
                         cancel_maker_orders_with_retry(client, symbol, 3, output_format).await
                     {
                         handle.abort();
-                        break recovery_failed_exit(
+                        break 'phase recovery_failed_exit(
                             &mut self.recovery.runtime_state,
                             recovery_token,
                             format!(
