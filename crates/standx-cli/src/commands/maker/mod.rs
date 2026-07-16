@@ -15,7 +15,6 @@ use standx_sdk::client::StandXClient;
 use standx_sdk::order_response::OrderResponseStream;
 use std::collections::HashSet;
 use std::time::Duration;
-use tokio::signal;
 
 mod canary;
 mod config;
