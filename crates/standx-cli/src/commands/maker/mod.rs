@@ -5,7 +5,7 @@ use standx_maker::{
     MakerEffect, MakerEvent, MakerFill, MakerLedger, MakerState, MakerStats,
     OrderResponseContinuity, PositionAlertAnchor, ProjectionPendingRequest,
     ProjectionRegistryError, RecoveryTarget, RestingQuote, RuntimeStopReason, VolBreaker,
-    WorkToken, MAKER_CL_ORD_ID_PREFIX,
+    WorkToken, MAKER_CL_ORD_ID_PREFIX, MAX_CONSECUTIVE_CYCLE_ERRORS,
 };
 use standx_sdk::account_stream::{
     AccountChannel, AccountEvent, AccountStream, AccountStreamHealth,

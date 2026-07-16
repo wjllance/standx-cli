@@ -548,7 +548,6 @@ impl MakerRuntime {
                     if !commit_cycle_effect(&mut self.recovery.runtime_state, cycle_work_token) {
                         return LoopDirective::Restart;
                     }
-                    self.loop_state.counters.consecutive_errors = 0;
                     self.loop_state.next_cycle_is_recovery = false;
                     self.loop_state.counters.total_places += places;
                     self.loop_state.counters.total_cancels += cancels;
@@ -761,7 +760,6 @@ impl MakerRuntime {
                                 session: self.live_session.as_mut(),
                                 resting: &mut self.loop_state.resting,
                                 inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                                consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                                 next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                                 symbol,
                                 cycle,
@@ -965,7 +963,6 @@ impl MakerRuntime {
                                     session: self.live_session.as_mut(),
                                     resting: &mut self.loop_state.resting,
                                     inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                                    consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                                     next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                                     symbol,
                                     cycle,
@@ -1062,10 +1059,11 @@ impl MakerRuntime {
                         token: cycle_work_token,
                         reason: e.to_string(),
                     });
-                    self.loop_state.counters.consecutive_errors += 1;
                     eprintln!(
-                        "⚠️  maker cycle failed ({}/3): {}",
-                        self.loop_state.counters.consecutive_errors, e
+                        "⚠️  maker cycle failed ({}/{}): {}",
+                        self.recovery.runtime_state.consecutive_cycle_errors(),
+                        MAX_CONSECUTIVE_CYCLE_ERRORS,
+                        e
                     );
                     if matches!(
                         self.recovery.runtime_state.pending_effect(),

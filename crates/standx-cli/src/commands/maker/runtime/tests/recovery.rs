@@ -136,7 +136,6 @@ async fn freeze_preamble_empties_the_maker_book_and_hands_back_recovery() {
     ));
     let mut resting = vec![resting_quote()];
     let mut inventory_exit_pending = true;
-    let mut consecutive_errors = 2;
     let mut next_cycle_is_recovery = false;
 
     let recovery_token = freeze_and_cleanup_for_recovery(
@@ -147,7 +146,6 @@ async fn freeze_preamble_empties_the_maker_book_and_hands_back_recovery() {
             session: None,
             resting: &mut resting,
             inventory_exit_pending: &mut inventory_exit_pending,
-            consecutive_errors: &mut consecutive_errors,
             next_cycle_is_recovery: &mut next_cycle_is_recovery,
             symbol: "BTC-USD",
             cycle: 7,
@@ -199,7 +197,6 @@ async fn freeze_preamble_cleanup_failure_stops_with_the_flow_exit() {
     let _ = runtime_state.next_effect();
     let mut resting = vec![resting_quote()];
     let mut inventory_exit_pending = false;
-    let mut consecutive_errors = 0;
     let mut next_cycle_is_recovery = false;
 
     let exit = freeze_and_cleanup_for_recovery(
@@ -210,7 +207,6 @@ async fn freeze_preamble_cleanup_failure_stops_with_the_flow_exit() {
             session: None,
             resting: &mut resting,
             inventory_exit_pending: &mut inventory_exit_pending,
-            consecutive_errors: &mut consecutive_errors,
             next_cycle_is_recovery: &mut next_cycle_is_recovery,
             symbol: "BTC-USD",
             cycle: 7,
@@ -252,7 +248,6 @@ async fn freeze_preamble_fails_closed_when_runtime_cannot_freeze() {
     while runtime_state.next_effect().is_some() {}
     let mut resting = vec![resting_quote()];
     let mut inventory_exit_pending = false;
-    let mut consecutive_errors = 0;
     let mut next_cycle_is_recovery = false;
 
     let exit = freeze_and_cleanup_for_recovery(
@@ -263,7 +258,6 @@ async fn freeze_preamble_fails_closed_when_runtime_cannot_freeze() {
             session: None,
             resting: &mut resting,
             inventory_exit_pending: &mut inventory_exit_pending,
-            consecutive_errors: &mut consecutive_errors,
             next_cycle_is_recovery: &mut next_cycle_is_recovery,
             symbol: "BTC-USD",
             cycle: 7,
@@ -302,7 +296,6 @@ async fn resume_tail_restores_quoting_state_and_schedules_a_cycle() {
     };
     let mut resting = vec![resting_quote()];
     let mut inventory_exit_pending = false;
-    let mut consecutive_errors = 2;
     let mut next_cycle_is_recovery = false;
 
     resume_quoting_after_recovery(
@@ -313,7 +306,6 @@ async fn resume_tail_restores_quoting_state_and_schedules_a_cycle() {
             session: None,
             resting: &mut resting,
             inventory_exit_pending: &mut inventory_exit_pending,
-            consecutive_errors: &mut consecutive_errors,
             next_cycle_is_recovery: &mut next_cycle_is_recovery,
             symbol: "BTC-USD",
             cycle: 7,
@@ -342,7 +334,6 @@ async fn resume_tail_restores_quoting_state_and_schedules_a_cycle() {
     .await;
 
     assert!(resting.is_empty());
-    assert_eq!(consecutive_errors, 0);
     assert!(next_cycle_is_recovery);
     assert!(
         matches!(runtime_state.next_effect(), Some(MakerEffect::RunCycle(_))),
