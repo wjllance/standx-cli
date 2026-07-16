@@ -2,7 +2,10 @@
 
 # ---- builder ------------------------------------------------------------
 # bookworm base so the produced glibc-linked binary matches the runtime.
-FROM rust:1.83-bookworm AS builder
+# Cargo.lock pulls transitive deps requiring the `edition2024` feature
+# (stabilized in Rust 1.85); 1.83 fails with "feature `edition2024` is
+# required". Pinned to the version verified locally (rustc --version).
+FROM rust:1.93.1-bookworm AS builder
 WORKDIR /build
 COPY . .
 # reqwest/tokio-tungstenite use rustls, so no OpenSSL dev headers are needed.
