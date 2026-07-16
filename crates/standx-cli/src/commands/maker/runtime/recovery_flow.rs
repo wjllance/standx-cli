@@ -326,7 +326,7 @@ pub(super) async fn accounting_invariant_exit(
     expected_position: f64,
     stats_position: f64,
     qty_tolerance: f64,
-) -> Option<MakerExit> {
+) -> Option<String> {
     if !accounting_position_mismatch(expected_position, stats_position, qty_tolerance) {
         return None;
     }
@@ -350,7 +350,7 @@ pub(super) async fn accounting_invariant_exit(
             true,
         )
         .await;
-    Some(MakerExit::AccountingInvariant(detail))
+    Some(detail)
 }
 
 pub(super) fn next_market_transport_deadline(
@@ -1541,7 +1541,7 @@ impl MakerRuntime {
                 self.recovery.account_position_mismatch = None;
             }
             if args.live {
-                if let Some(exit) = accounting_invariant_exit(
+                if let Some(detail) = accounting_invariant_exit(
                     notifier,
                     symbol,
                     cycle,
@@ -1551,7 +1551,10 @@ impl MakerRuntime {
                 )
                 .await
                 {
-                    break 'phase exit;
+                    break 'phase stop_requested_exit(
+                        &mut self.recovery.runtime_state,
+                        RuntimeStopReason::AccountingInvariant(detail),
+                    );
                 }
             }
             return LoopDirective::Proceed;

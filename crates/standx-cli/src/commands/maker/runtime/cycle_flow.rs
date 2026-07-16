@@ -465,7 +465,7 @@ impl MakerRuntime {
                 }
             }
             if args.live {
-                if let Some(exit) = accounting_invariant_exit(
+                if let Some(detail) = accounting_invariant_exit(
                     notifier,
                     symbol,
                     cycle,
@@ -475,7 +475,10 @@ impl MakerRuntime {
                 )
                 .await
                 {
-                    break 'execute exit;
+                    break 'execute stop_requested_exit(
+                        &mut self.recovery.runtime_state,
+                        RuntimeStopReason::AccountingInvariant(detail),
+                    );
                 }
             }
 
