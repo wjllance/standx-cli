@@ -131,4 +131,32 @@ mod tests {
         assert_eq!(config.max_position, Some(0.8));
         assert_eq!(config.alert_position_change_pct, Some(20.0));
     }
+
+    #[test]
+    fn conservative_bnb_example_preserves_xag_notional_scale() {
+        let config: MakerFileConfig = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-bnb-100u-conservative.toml"
+        )))
+        .unwrap();
+
+        assert_eq!(config.size, Some(0.02));
+        assert_eq!(config.max_position, Some(0.08));
+        assert_eq!(config.inventory_exit_pct, Some(50.0));
+        assert_eq!(config.inventory_exit_qty, Some(0.02));
+    }
+
+    #[test]
+    fn conservative_tsla_example_preserves_xag_notional_scale() {
+        let config: MakerFileConfig = toml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-tsla-100u-conservative.toml"
+        )))
+        .unwrap();
+
+        assert_eq!(config.size, Some(0.03));
+        assert_eq!(config.max_position, Some(0.12));
+        assert_eq!(config.inventory_exit_pct, Some(50.0));
+        assert_eq!(config.inventory_exit_qty, Some(0.03));
+    }
 }
