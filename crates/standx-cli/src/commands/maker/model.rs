@@ -2,10 +2,10 @@ use standx_sdk::account_stream::OrderUpdate;
 use standx_sdk::models::{Order, OrderSide, OrderStatus, Position};
 
 /// Process exit code emitted when the maker performs an *intentional*
-/// fail-safe shutdown: the order-response stream was lost, three maker
-/// cycles failed in a row, position reconciliation or an internal accounting
-/// invariant failed, or residual maker-owned orders could not be cancelled on
-/// the way out.
+/// fail-safe shutdown: order-response or market-data recovery failed, three
+/// maker cycles failed in a row, position reconciliation or an internal
+/// accounting invariant failed, or residual maker-owned orders could not be
+/// cancelled on the way out.
 ///
 /// Supervisors must treat this as "stop, do NOT auto-restart, notify a
 /// human" (systemd `RestartPreventExitStatus=`). It is deliberately
@@ -39,6 +39,7 @@ pub(super) enum MakerExit {
     OrderResponse(String),
     ConsecutiveErrors(String),
     PositionReconciliation(String),
+    MarketData(String),
     AccountingInvariant(String),
     StopLoss(String),
 }
@@ -55,6 +56,9 @@ impl MakerExit {
             }
             Self::PositionReconciliation(error) => {
                 format!("fail-safe: position reconciliation failed: {error}")
+            }
+            Self::MarketData(error) => {
+                format!("fail-safe: market data recovery failed: {error}")
             }
             Self::AccountingInvariant(detail) => {
                 format!("fail-safe: accounting invariant failed: {detail}")
@@ -77,6 +81,9 @@ impl MakerExit {
             Self::PositionReconciliation(error) => Some(format!(
                 "maker stopped immediately (fail-safe): position reconciliation failed: {error}"
             )),
+            Self::MarketData(error) => Some(format!(
+                "maker stopped immediately (fail-safe): market data recovery failed: {error}"
+            )),
             Self::AccountingInvariant(detail) => Some(format!(
                 "maker stopped immediately (fail-safe): accounting invariant failed: {detail}"
             )),
@@ -95,8 +102,10 @@ impl From<standx_maker::RuntimeStopReason> for MakerExit {
             standx_maker::RuntimeStopReason::PositionReconciliation(detail) => {
                 Self::PositionReconciliation(detail)
             }
+            standx_maker::RuntimeStopReason::MarketData(detail) => Self::MarketData(detail),
             standx_maker::RuntimeStopReason::CleanupFailure { target, reason } => match target {
                 standx_maker::RecoveryTarget::OrderResponse => Self::OrderResponse(reason),
+                standx_maker::RecoveryTarget::MarketData => Self::MarketData(reason),
                 standx_maker::RecoveryTarget::AccountStream
                 | standx_maker::RecoveryTarget::PositionReconciliation => {
                     Self::PositionReconciliation(reason)
@@ -265,6 +274,10 @@ mod exit_mapping_tests {
             MakerExit::PositionReconciliation(detail) if detail == "boom"
         ));
         assert!(matches!(
+            MakerExit::from(RuntimeStopReason::MarketData("boom".to_string())),
+            MakerExit::MarketData(detail) if detail == "boom"
+        ));
+        assert!(matches!(
             MakerExit::from(RuntimeStopReason::ConsecutiveCycleErrors("boom".to_string())),
             MakerExit::ConsecutiveErrors(detail) if detail == "boom"
         ));
@@ -291,6 +304,13 @@ mod exit_mapping_tests {
                 MakerExit::PositionReconciliation(detail) if detail == "boom"
             ));
         }
+        assert!(matches!(
+            MakerExit::from(RuntimeStopReason::CleanupFailure {
+                target: RecoveryTarget::MarketData,
+                reason: "boom".to_string(),
+            }),
+            MakerExit::MarketData(detail) if detail == "boom"
+        ));
     }
 
     /// Every fail-safe exit must surface a terminal error (only a clean
@@ -302,6 +322,7 @@ mod exit_mapping_tests {
             MakerExit::OrderResponse("boom".to_string()),
             MakerExit::ConsecutiveErrors("boom".to_string()),
             MakerExit::PositionReconciliation("boom".to_string()),
+            MakerExit::MarketData("boom".to_string()),
             MakerExit::AccountingInvariant("boom".to_string()),
             MakerExit::StopLoss("boom".to_string()),
         ] {
