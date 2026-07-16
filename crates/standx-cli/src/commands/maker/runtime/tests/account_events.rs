@@ -46,8 +46,8 @@ fn apply_account_events_records_position_mismatch_with_sign() {
 
 #[test]
 fn apply_account_events_applies_buffered_events_in_order() {
-    // The last position update in the buffer wins; benign Connected /
-    // Balance events are drained without contributing fills.
+    // The last position update remains available for reconciliation, while
+    // every ordered observation is retained for direction-risk state.
     let outcome = drain_positions(vec![
         AccountEvent::Connected { epoch: 1 },
         AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Buy), "0.2")),
@@ -64,6 +64,7 @@ fn apply_account_events_applies_buffered_events_in_order() {
         AccountEvent::Position(position_update("BTC-USD", Some(OrderSide::Sell), "0.9")),
     ]);
     assert_eq!(outcome.fills, 0);
+    assert_eq!(outcome.position_observations, vec![0.2, -0.9]);
     assert_eq!(
         outcome.latest_position,
         Some(-0.9),

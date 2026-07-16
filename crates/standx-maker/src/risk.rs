@@ -9,7 +9,7 @@ pub enum PositionRiskKind {
     InventoryExitCrossed,
 }
 
-/// A position change accepted by the alert anchor.
+/// A position change accepted by the position-risk detector.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PositionRiskEvent {
     pub kind: PositionRiskKind,
@@ -18,19 +18,31 @@ pub struct PositionRiskEvent {
     pub delta: f64,
 }
 
-/// Deduplicates position-risk alerts while allowing small changes to
-/// accumulate until they cross a configured threshold.
+/// Tracks consecutive position observations independently from the
+/// notification anchor, allowing small changes to accumulate without using a
+/// stale alert anchor for direction and threshold-crossing decisions.
 #[derive(Debug)]
 pub struct PositionAlertAnchor {
-    position: f64,
+    last_observed_position: f64,
+    notification_anchor: f64,
     change_pct: f64,
+    neutral_deadband: f64,
 }
 
 impl PositionAlertAnchor {
-    pub fn new(position: f64, change_pct: f64) -> Self {
+    pub fn new(position: f64, change_pct: f64, neutral_deadband: f64) -> Self {
         Self {
-            position,
+            last_observed_position: position,
+            notification_anchor: position,
             change_pct,
+            // An invalid deadband must not suppress genuine reversals. Runtime
+            // configuration supplies a finite non-negative size-derived value,
+            // while zero safely retains the strict sign-crossing fallback.
+            neutral_deadband: if neutral_deadband.is_finite() && neutral_deadband >= 0.0 {
+                neutral_deadband
+            } else {
+                0.0
+            },
         }
     }
 
@@ -42,40 +54,65 @@ impl PositionAlertAnchor {
         inventory_exit_pct: f64,
         qty_tolerance: f64,
     ) -> Option<PositionRiskEvent> {
-        let before = self.position;
-        let delta = observed - before;
-        if delta.abs() <= qty_tolerance {
-            return None;
-        }
+        let observed_before = self.last_observed_position;
+        self.last_observed_position = observed;
+        let notification_before = self.notification_anchor;
+        let notification_delta = observed - notification_before;
 
         let jump_threshold = max_position * self.change_pct / 100.0;
-        let jump = self.change_pct > 0.0 && delta.abs() + qty_tolerance >= jump_threshold;
-        let direction_flip = before * observed < 0.0;
-        let crossed_max = before.abs() + qty_tolerance < max_position
+        let jump = self.change_pct > 0.0
+            && notification_delta.abs() > qty_tolerance
+            && notification_delta.abs() + qty_tolerance >= jump_threshold;
+        let direction_flip = matches!(
+            (
+                position_direction(observed_before, self.neutral_deadband),
+                position_direction(observed, self.neutral_deadband),
+            ),
+            (PositionDirection::Short, PositionDirection::Long)
+                | (PositionDirection::Long, PositionDirection::Short)
+        );
+        let crossed_max = observed_before.abs() + qty_tolerance < max_position
             && observed.abs() + qty_tolerance >= max_position;
         let exit_threshold = max_position * inventory_exit_pct / 100.0;
         let crossed_exit = inventory_exit_pct > 0.0
-            && before.abs() + qty_tolerance < exit_threshold
+            && observed_before.abs() + qty_tolerance < exit_threshold
             && observed.abs() + qty_tolerance >= exit_threshold;
 
-        let kind = if direction_flip {
-            PositionRiskKind::DirectionFlip
+        let (kind, before) = if direction_flip {
+            (PositionRiskKind::DirectionFlip, observed_before)
         } else if crossed_max {
-            PositionRiskKind::MaxPositionCrossed
+            (PositionRiskKind::MaxPositionCrossed, observed_before)
         } else if crossed_exit {
-            PositionRiskKind::InventoryExitCrossed
+            (PositionRiskKind::InventoryExitCrossed, observed_before)
         } else if jump {
-            PositionRiskKind::Jump
+            (PositionRiskKind::Jump, notification_before)
         } else {
             return None;
         };
-        self.position = observed;
+        self.notification_anchor = observed;
         Some(PositionRiskEvent {
             kind,
             before,
             after: observed,
-            delta,
+            delta: observed - before,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PositionDirection {
+    Short,
+    Neutral,
+    Long,
+}
+
+fn position_direction(position: f64, neutral_deadband: f64) -> PositionDirection {
+    if position < -neutral_deadband {
+        PositionDirection::Short
+    } else if position > neutral_deadband {
+        PositionDirection::Long
+    } else {
+        PositionDirection::Neutral
     }
 }
 
@@ -85,7 +122,7 @@ mod tests {
 
     #[test]
     fn accumulates_changes_until_the_jump_threshold() {
-        let mut anchor = PositionAlertAnchor::new(0.001, 20.0);
+        let mut anchor = PositionAlertAnchor::new(0.001, 20.0, 0.1);
         assert!(anchor.evaluate(0.10, 0.8, 25.0, 0.0005).is_none());
         let event = anchor.evaluate(0.161, 0.8, 25.0, 0.0005).unwrap();
         assert_eq!(event.kind, PositionRiskKind::Jump);
@@ -94,14 +131,37 @@ mod tests {
     }
 
     #[test]
-    fn prioritizes_direction_and_threshold_crossings() {
-        let mut direction = PositionAlertAnchor::new(0.01, 0.0);
+    fn neutral_transitions_are_jumps_not_direction_flips() {
+        let mut anchor = PositionAlertAnchor::new(-0.074, 20.0, 0.1);
+        let neutral_to_long = anchor.evaluate(0.126, 0.8, 0.0, 0.0005).unwrap();
+        assert_eq!(neutral_to_long.kind, PositionRiskKind::Jump);
+        assert!((neutral_to_long.before - -0.074).abs() < 1e-9);
+
+        let long_to_neutral = anchor.evaluate(-0.074, 0.8, 0.0, 0.0005).unwrap();
+        assert_eq!(long_to_neutral.kind, PositionRiskKind::Jump);
+        assert!((long_to_neutral.before - 0.126).abs() < 1e-9);
+    }
+
+    #[test]
+    fn direction_flip_requires_consecutive_positions_beyond_the_deadband() {
+        let mut direct = PositionAlertAnchor::new(-0.126, 0.0, 0.1);
         assert_eq!(
-            direction.evaluate(-0.01, 0.8, 0.0, 0.0005).unwrap().kind,
+            direct.evaluate(0.126, 0.8, 0.0, 0.0005).unwrap().kind,
             PositionRiskKind::DirectionFlip
         );
 
-        let mut exit = PositionAlertAnchor::new(0.19, 0.0);
+        let mut through_neutral = PositionAlertAnchor::new(-0.126, 0.0, 0.1);
+        assert!(through_neutral.evaluate(-0.074, 0.8, 0.0, 0.0005).is_none());
+        assert!(through_neutral.evaluate(0.126, 0.8, 0.0, 0.0005).is_none());
+
+        let mut boundary = PositionAlertAnchor::new(-0.1, 0.0, 0.1);
+        assert!(boundary.evaluate(0.126, 0.8, 0.0, 0.0005).is_none());
+    }
+
+    #[test]
+    fn threshold_crossings_use_the_last_observation_not_the_notification_anchor() {
+        let mut exit = PositionAlertAnchor::new(0.3, 0.0, 0.1);
+        assert!(exit.evaluate(0.19, 0.8, 25.0, 0.0005).is_none());
         assert_eq!(
             exit.evaluate(0.20, 0.8, 25.0, 0.0005).unwrap().kind,
             PositionRiskKind::InventoryExitCrossed

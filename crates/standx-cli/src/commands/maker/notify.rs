@@ -65,8 +65,9 @@ async fn post_webhook(client: reqwest::Client, url: String, body: serde_json::Va
 /// Stable machine-readable name and delivery severity for a position-risk kind.
 ///
 /// `Jump` keeps its historical `position_jump` name for backward compatibility;
-/// the direction flip and max-position crossings escalate to `critical` so a
-/// reversal or breach is distinguishable from an ordinary threshold jump.
+/// genuine direction flips outside the neutral deadband and max-position
+/// crossings escalate to `critical` so they remain distinguishable from an
+/// ordinary threshold jump.
 fn risk_kind_descriptor(kind: PositionRiskKind) -> (&'static str, &'static str) {
     match kind {
         PositionRiskKind::Jump => ("position_jump", "warning"),

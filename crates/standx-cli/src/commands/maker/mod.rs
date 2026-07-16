@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn position_jump_alert_uses_anchor_and_half_tick_tolerance() {
-        let mut anchor = PositionAlertAnchor::new(0.001, 20.0);
+        let mut anchor = PositionAlertAnchor::new(0.001, 20.0, 0.1);
         assert!(anchor.evaluate(0.10, 0.8, 25.0, 0.0005).is_none());
         let alert = anchor.evaluate(0.161, 0.8, 25.0, 0.0005).unwrap();
         assert!((alert.before - 0.001).abs() < 1e-9);
@@ -307,11 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn position_jump_alert_fires_on_direction_flip_and_exit_crossing() {
-        let mut direction = PositionAlertAnchor::new(0.01, 0.0);
-        assert!(direction.evaluate(-0.01, 0.8, 0.0, 0.0005).is_some());
+    fn position_jump_alert_respects_neutral_deadband_and_exit_crossing() {
+        let mut direction = PositionAlertAnchor::new(-0.074, 20.0, 0.1);
+        assert_eq!(
+            direction.evaluate(0.126, 0.8, 0.0, 0.0005).unwrap().kind,
+            maker::PositionRiskKind::Jump
+        );
 
-        let mut exit = PositionAlertAnchor::new(0.19, 0.0);
+        let mut exit = PositionAlertAnchor::new(0.19, 0.0, 0.1);
         assert!(exit.evaluate(0.20, 0.8, 25.0, 0.0005).is_some());
     }
 
