@@ -103,6 +103,7 @@ class MakerRunManifestTests(unittest.TestCase):
             self.assertEqual(payload["log"]["cycle_summaries"], 1)
             self.assertEqual(payload["log"]["market_sources"], ["ws"])
             self.assertEqual(payload["log"]["regime"], "insufficient_window")
+            self.assertIsNone(payload["log"]["final_position"])
 
             with contextlib.redirect_stdout(io.StringIO()):
                 result = manifest.validate_manifest(
@@ -165,6 +166,50 @@ class MakerRunManifestTests(unittest.TestCase):
             self.assertEqual(payload["log"]["missing_cycles"], [1])
             self.assertEqual(payload["log"]["duplicate_cycles"], [2])
 
+    def test_invalidate_marks_finished_arm_ineligible_with_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "status": "finished",
+                        "validation": {"baseline_eligible": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.invalidate_manifest(
+                argparse.Namespace(manifest=path, reason="position remained nonzero")
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "invalid")
+            self.assertFalse(payload["validation"]["baseline_eligible"])
+            self.assertEqual(
+                payload["validation"]["invalid_reasons"],
+                ["position remained nonzero"],
+            )
+
+    def test_recorded_skip_keeps_cycle_sequence_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.ndjson"
+            log.write_text(
+                "\n".join(
+                    [
+                        '{"ts":1,"action":"cycle_summary","cycle":0}',
+                        '{"ts":2,"action":"skip","cycle":1,"reason":"mark_mid_divergence"}',
+                        '{"ts":3,"action":"cycle_summary","cycle":2}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            analyzed = manifest.analyze_log(log)
+            self.assertEqual(analyzed["cycle_summaries"], 2)
+            self.assertEqual(analyzed["cycle_min"], 0)
+            self.assertEqual(analyzed["cycle_max"], 2)
+            self.assertEqual(analyzed["missing_cycles"], [])
+            self.assertEqual(analyzed["duplicate_cycles"], [])
+
     def test_regime_report_distinguishes_calm_trend_and_stress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -185,12 +230,67 @@ class MakerRunManifestTests(unittest.TestCase):
                         "mark": mark,
                         "uptime_pct": 100.0,
                         "fills_total": 0,
+                        "position": 0.25 if index == len(marks) - 1 else 0.0,
                         "halted": expected == "fast_or_stressed" and index == 15,
                         "vol_bps": 200.0 if expected == "fast_or_stressed" and index == 15 else None,
                     }
                     events.append(json.dumps(event))
                 log.write_text("\n".join(events) + "\n", encoding="utf-8")
                 self.assertEqual(manifest.analyze_log(log)["regime"], expected)
+                self.assertEqual(manifest.analyze_log(log)["final_position"], 0.25)
+
+    def test_regime_prefers_rolling_volatility_and_falls_back_to_legacy_field(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for field in ("rolling_vol_bps", "vol_bps"):
+                log = root / f"{field}.ndjson"
+                events = []
+                for index in range(30):
+                    events.append(
+                        json.dumps(
+                            {
+                                "ts": index * 2,
+                                "symbol": "TEST-USD",
+                                "action": "cycle_summary",
+                                "cycle": index,
+                                "mark": 100.0,
+                                field: 60.0 if index == 10 else 0.0,
+                            }
+                        )
+                    )
+                log.write_text("\n".join(events) + "\n", encoding="utf-8")
+                self.assertEqual(manifest.analyze_log(log)["regime"], "fast_or_stressed")
+
+    def test_final_performance_position_overrides_last_cycle_position(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.ndjson"
+            log.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "ts": 1,
+                                "action": "cycle_summary",
+                                "cycle": 0,
+                                "symbol": "XAG-USD",
+                                "mark": 30.0,
+                                "position": 0.01,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "ts": 2,
+                                "action": "performance_summary",
+                                "symbol": "XAG-USD",
+                                "position": 0.0,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(manifest.analyze_log(log)["final_position"], 0.0)
 
 
 if __name__ == "__main__":

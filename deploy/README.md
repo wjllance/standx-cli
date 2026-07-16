@@ -116,3 +116,10 @@ All units default to **paper**. Live trading requires BOTH `--live` in
 `STANDX_MAKER_ARGS` (systemd) / the plist `ProgramArguments`, AND
 `STANDX_ENABLE_LIVE_MAKER=1`. Read `docs/14-maker-live-gate.md` first. Setting
 the env var alone changes nothing.
+
+Stage 2 uses the separate `standx-maker-stage2-ab.service` and a root-owned
+`0600` `/etc/standx/maker-stage2-ab.env`. The unit conflicts with the normal
+maker service, installs the deadman alert before start, and runs the guarded
+baseline/candidate orchestrator. See
+`docs/19-maker-stage2-live-ab-runbook.md`; do not start it without the exact
+authorization recorded there.

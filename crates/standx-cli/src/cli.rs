@@ -519,6 +519,11 @@ pub enum MakerCommands {
         /// Number of recent cycles the volatility breaker measures range over
         #[arg(long)]
         vol_window: Option<u32>,
+        /// Enable or disable the TOML-defined adaptive spread controller.
+        /// `--adaptive-spread=false` provides a baseline-arm override without
+        /// changing any tier geometry.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        adaptive_spread: Option<bool>,
         /// Financial brake: when session mark-to-market PnL drops to -this
         /// (quote units), run the fail-safe shutdown (freeze, cancel the maker
         /// book, await critical webhook, exit). 0 disables
@@ -737,5 +742,26 @@ mod tests {
         assert!(!should_load_maker_local_env(&args(&[
             "standx", "maker", "run", "XAG-USD",
         ])));
+    }
+
+    #[test]
+    fn adaptive_spread_flag_accepts_bare_true_and_explicit_false() {
+        for (argument, expected) in [
+            ("--adaptive-spread", true),
+            ("--adaptive-spread=false", false),
+        ] {
+            let cli = Cli::try_parse_from(["standx", "maker", "run", "XAG-USD", argument])
+                .expect("adaptive spread flag should parse");
+            let Commands::Maker { command } = cli.command else {
+                panic!("expected maker command");
+            };
+            let MakerCommands::Run {
+                adaptive_spread, ..
+            } = *command
+            else {
+                panic!("expected maker run command");
+            };
+            assert_eq!(adaptive_spread, Some(expected));
+        }
     }
 }

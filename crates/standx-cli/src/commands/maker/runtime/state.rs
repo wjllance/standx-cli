@@ -2,6 +2,7 @@ use super::super::feed::FeedState;
 use super::*;
 
 pub(super) struct RuntimeDeps {
+    pub(super) _live_process_lock: Option<super::super::process_lock::LiveProcessLock>,
     pub(super) args: MakerRunArgs,
     pub(super) output_format: OutputFormat,
     pub(super) client: StandXClient,
@@ -37,6 +38,7 @@ pub(super) struct RuntimeLoopState {
     pub(super) sim_position: f64,
     pub(super) stats: MakerStats,
     pub(super) breaker: VolBreaker,
+    pub(super) spread_controller: maker::SpreadController,
     pub(super) alerts: AlertMonitor,
     pub(super) account_balance_refresh_requested: bool,
     pub(super) balance_floor_parse_warned: bool,
@@ -93,6 +95,7 @@ impl MakerRuntime {
         startup: MakerStartup,
     ) -> Result<Self> {
         let MakerStartup {
+            live_process_lock,
             client,
             cfg,
             symbol,
@@ -127,7 +130,16 @@ impl MakerRuntime {
         } else {
             MakerStats::default()
         };
-        let breaker = VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps);
+        let breaker = match args.vol_window_secs {
+            Some(seconds) => VolBreaker::new_duration(
+                seconds
+                    .checked_mul(1_000)
+                    .ok_or_else(|| anyhow::anyhow!("vol_window_secs is too large"))?,
+                args.vol_pause_bps,
+            ),
+            None => VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps),
+        };
+        let spread_controller = maker::SpreadController::new(args.adaptive_spread.clone(), &cfg)?;
         let alerts =
             AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
                 .with_account_floors(args.alert_equity_below, args.alert_margin_below);
@@ -146,6 +158,7 @@ impl MakerRuntime {
 
         Ok(Self {
             deps: RuntimeDeps {
+                _live_process_lock: live_process_lock,
                 args,
                 output_format,
                 client,
@@ -170,6 +183,7 @@ impl MakerRuntime {
                 sim_position: 0.0,
                 stats,
                 breaker,
+                spread_controller,
                 alerts,
                 account_balance_refresh_requested: false,
                 balance_floor_parse_warned: false,

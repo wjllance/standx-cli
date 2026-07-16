@@ -47,6 +47,11 @@ maker by itself.
   explicit command-line options take precedence over both.
 - Stop immediately on residual maker orders, uncorrelated fills, stream disconnect, unexpected position change, failed cleanup, or breached risk limit.
 
+For the Stage 2 v0 renewed gate, the named operator, exact authorization,
+four-class webhook probe, controlled-disconnect recovery sequence and A/B
+handoff are specified in
+[19-maker-stage2-live-ab-runbook.md](19-maker-stage2-live-ab-runbook.md).
+
 ## Unlock decision
 
 Only a release owner may enable the environment variable after the preceding

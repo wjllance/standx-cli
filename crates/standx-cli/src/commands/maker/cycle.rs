@@ -227,6 +227,7 @@ pub(super) async fn maker_cycle(
         sim_position,
         stats,
         breaker,
+        spread_controller,
         mut order_request_deadlines,
         live_account_poll,
         mut order_latency,
@@ -263,7 +264,16 @@ pub(super) async fn maker_cycle(
             ledger.disable_performance();
         }
     }
-    let preflight = maker::preflight_cycle(breaker, market, max_divergence_bps, live);
+    let preflight = maker::preflight_cycle_at(
+        breaker,
+        performance_time_ms,
+        market,
+        max_divergence_bps,
+        live,
+    )?;
+    let spread_decision = spread_controller.observe(breaker.vol_bps(), cfg);
+    let effective_cfg = spread_controller.effective_config(cfg, &spread_decision);
+    let cfg = &effective_cfg;
     let halted = match preflight.skip {
         Some(skip) => {
             emit_cycle_skip(
@@ -905,6 +915,7 @@ pub(super) async fn maker_cycle(
         fills: &fills,
         stats,
         halt_vol_bps: halted.then(|| breaker.vol_bps()),
+        spread_decision: &spread_decision,
         cfg,
         performance: performance_summary.as_ref(),
     });

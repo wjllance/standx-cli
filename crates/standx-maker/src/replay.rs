@@ -6,21 +6,24 @@
 //! network.
 
 use crate::{
-    plan_cycle, preflight_cycle, CyclePlan, CyclePreflight, MakerConfig, MarketSnapshot,
-    PerformanceError, PerformanceFill, PerformanceLedger, PerformanceSummary, QuoteQualityInterval,
-    RestingQuote, VolBreaker,
+    plan_cycle, preflight_cycle_at, AdaptiveSpreadConfig, CyclePlan, CyclePreflight, MakerConfig,
+    MarketSnapshot, PerformanceError, PerformanceFill, PerformanceLedger, PerformanceSummary,
+    QuoteQualityInterval, RestingQuote, SpreadController, SpreadDecision, VolBreaker,
+    VolatilityError,
 };
 use standx_sdk::models::OrderSide;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ReplaySettings {
     pub starting_position: f64,
     pub starting_mark: f64,
     pub max_divergence_bps: f64,
     pub require_full_touch: bool,
     pub vol_window: usize,
+    pub vol_window_secs: Option<u64>,
     pub vol_pause_bps: f64,
+    pub adaptive_spread: AdaptiveSpreadConfig,
     pub active_exit_enabled: bool,
     pub inventory_exit_pct: f64,
     pub inventory_exit_qty: f64,
@@ -53,6 +56,7 @@ pub struct ReplayCycleOutcome {
     pub event_time_ms: i64,
     pub cycle: u64,
     pub preflight: CyclePreflight,
+    pub spread_decision: SpreadDecision,
     pub plan: Option<CyclePlan>,
 }
 
@@ -66,6 +70,8 @@ pub struct ReplayResult {
 pub enum ReplayError {
     InvalidSettings(&'static str),
     Performance(PerformanceError),
+    Volatility(VolatilityError),
+    AdaptiveSpread(String),
     MissingFinalMark,
 }
 
@@ -74,6 +80,10 @@ impl fmt::Display for ReplayError {
         match self {
             Self::InvalidSettings(reason) => write!(formatter, "invalid replay settings: {reason}"),
             Self::Performance(error) => write!(formatter, "replay performance error: {error}"),
+            Self::Volatility(error) => write!(formatter, "replay volatility error: {error}"),
+            Self::AdaptiveSpread(error) => {
+                write!(formatter, "invalid replay adaptive spread: {error}")
+            }
             Self::MissingFinalMark => formatter.write_str("replay has no final market mark"),
         }
     }
@@ -84,6 +94,12 @@ impl std::error::Error for ReplayError {}
 impl From<PerformanceError> for ReplayError {
     fn from(value: PerformanceError) -> Self {
         Self::Performance(value)
+    }
+}
+
+impl From<VolatilityError> for ReplayError {
+    fn from(value: VolatilityError) -> Self {
+        Self::Volatility(value)
     }
 }
 
@@ -98,10 +114,20 @@ pub fn run_replay(
     events: &[ReplayEvent],
     end_time_ms: i64,
 ) -> Result<ReplayResult, ReplayError> {
-    validate_settings(settings)?;
+    validate_settings(&settings)?;
     let mut performance =
         PerformanceLedger::new(settings.starting_position, settings.starting_mark)?;
-    let mut breaker = VolBreaker::new(settings.vol_window, settings.vol_pause_bps);
+    let mut breaker = match settings.vol_window_secs {
+        Some(seconds) => VolBreaker::new_duration(
+            seconds
+                .checked_mul(1_000)
+                .ok_or(ReplayError::InvalidSettings("vol_window_secs is too large"))?,
+            settings.vol_pause_bps,
+        ),
+        None => VolBreaker::new(settings.vol_window, settings.vol_pause_bps),
+    };
+    let mut spread_controller = SpreadController::new(settings.adaptive_spread.clone(), cfg)
+        .map_err(|error| ReplayError::AdaptiveSpread(error.to_string()))?;
     let mut outcomes = Vec::new();
     let mut final_mark = None;
 
@@ -115,15 +141,18 @@ pub fn run_replay(
                     eligible_ask_qty: cycle.eligible_ask_qty,
                 })?;
                 final_mark = Some(cycle.market.mark);
-                let preflight = preflight_cycle(
+                let preflight = preflight_cycle_at(
                     &mut breaker,
+                    cycle.event_time_ms,
                     cycle.market,
                     settings.max_divergence_bps,
                     settings.require_full_touch,
-                );
+                )?;
+                let spread_decision = spread_controller.observe(breaker.vol_bps(), cfg);
+                let effective_cfg = spread_controller.effective_config(cfg, &spread_decision);
                 let plan = preflight.skip.is_none().then(|| {
                     plan_cycle(
-                        cfg,
+                        &effective_cfg,
                         crate::CycleInput {
                             cycle: cycle.cycle,
                             market: cycle.market,
@@ -142,6 +171,7 @@ pub fn run_replay(
                     event_time_ms: cycle.event_time_ms,
                     cycle: cycle.cycle,
                     preflight,
+                    spread_decision,
                     plan,
                 });
             }
@@ -162,13 +192,18 @@ pub fn run_replay(
     })
 }
 
-fn validate_settings(settings: ReplaySettings) -> Result<(), ReplayError> {
+fn validate_settings(settings: &ReplaySettings) -> Result<(), ReplayError> {
     if !settings.max_divergence_bps.is_finite() || settings.max_divergence_bps < 0.0 {
         return Err(ReplayError::InvalidSettings(
             "max_divergence_bps must be finite and non-negative",
         ));
     }
-    if settings.vol_window == 0 {
+    if settings.vol_window_secs == Some(0) {
+        return Err(ReplayError::InvalidSettings(
+            "vol_window_secs must be positive",
+        ));
+    }
+    if settings.vol_window_secs.is_none() && settings.vol_window == 0 {
         return Err(ReplayError::InvalidSettings("vol_window must be positive"));
     }
     if !settings.vol_pause_bps.is_finite()
@@ -185,7 +220,7 @@ fn validate_settings(settings: ReplaySettings) -> Result<(), ReplayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExecutionCosts, FillRole, RestingQuote};
+    use crate::{ExecutionCosts, FillRole, RestingQuote, SpreadTier};
 
     fn config() -> MakerConfig {
         MakerConfig {
@@ -210,7 +245,9 @@ mod tests {
             max_divergence_bps: 25.0,
             require_full_touch: true,
             vol_window: 12,
+            vol_window_secs: None,
             vol_pause_bps: 0.0,
+            adaptive_spread: AdaptiveSpreadConfig::default(),
             active_exit_enabled: false,
             inventory_exit_pct: 0.0,
             inventory_exit_qty: 0.0,
@@ -293,5 +330,43 @@ mod tests {
         assert!(result.cycles[0].preflight.skip.is_some());
         assert!(result.cycles[0].plan.is_none());
         assert_eq!(result.performance.quote_time.observed_ms, 1_000);
+    }
+
+    #[test]
+    fn duration_window_adaptive_trace_is_deterministic_three_times() {
+        let mut cfg = config();
+        cfg.spread_bps = 8.0;
+        cfg.refresh_bps = 4.0;
+        cfg.band_bps = 30.0;
+        let mut settings = settings();
+        settings.vol_window_secs = Some(60);
+        settings.adaptive_spread = AdaptiveSpreadConfig {
+            enabled: true,
+            min_spread_bps: 8.0,
+            max_spread_bps: 18.0,
+            tiers: vec![
+                SpreadTier {
+                    enter_vol_bps: None,
+                    exit_vol_bps: None,
+                    spread_bps: 8.0,
+                    refresh_bps: 4.0,
+                },
+                SpreadTier {
+                    enter_vol_bps: Some(10.0),
+                    exit_vol_bps: Some(7.0),
+                    spread_bps: 12.0,
+                    refresh_bps: 5.0,
+                },
+            ],
+        };
+        let events = vec![cycle(0, 0, 100.0), cycle(1_000, 1, 100.11)];
+        let first = run_replay(&cfg, settings.clone(), &events, 1_000).unwrap();
+        let second = run_replay(&cfg, settings.clone(), &events, 1_000).unwrap();
+        let third = run_replay(&cfg, settings, &events, 1_000).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert_eq!(first.cycles[1].spread_decision.tier, 1);
+        assert_eq!(first.cycles[1].spread_decision.effective_spread_bps, 12.0);
     }
 }

@@ -21,8 +21,10 @@ pub async fn handle_account(command: AccountCommands, output_format: OutputForma
         AccountCommands::Positions { symbol } => {
             let mut positions = client.get_positions(symbol.as_deref()).await?;
 
-            // Filter out positions with qty = 0
-            positions.retain(|p| p.qty.parse::<f64>().unwrap_or(0.0) > 0.0);
+            // Only hide a quantity that is provably finite and exactly zero.
+            // Signed short quantities remain visible, while malformed/non-finite
+            // values fail closed as a non-empty result for operational checks.
+            positions.retain(|position| position_quantity_is_nonzero_or_invalid(&position.qty));
 
             match output_format {
                 OutputFormat::Table => println!("{}", output::format_table(positions)),
@@ -58,4 +60,26 @@ pub async fn handle_account(command: AccountCommands, output_format: OutputForma
         }
     }
     Ok(())
+}
+
+fn position_quantity_is_nonzero_or_invalid(value: &str) -> bool {
+    match value.parse::<f64>() {
+        Ok(quantity) if quantity.is_finite() => quantity != 0.0,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::position_quantity_is_nonzero_or_invalid;
+
+    #[test]
+    fn position_filter_only_hides_proven_finite_zero() {
+        assert!(!position_quantity_is_nonzero_or_invalid("0"));
+        assert!(!position_quantity_is_nonzero_or_invalid("-0.000"));
+        assert!(position_quantity_is_nonzero_or_invalid("0.001"));
+        assert!(position_quantity_is_nonzero_or_invalid("-0.001"));
+        assert!(position_quantity_is_nonzero_or_invalid("NaN"));
+        assert!(position_quantity_is_nonzero_or_invalid("not-a-number"));
+    }
 }

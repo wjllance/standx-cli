@@ -4,8 +4,9 @@ use crate::cli::OutputFormat;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use standx_maker::{
-    run_replay, Action, ExecutionCosts, FillRole, MakerConfig, MarketSnapshot, PerformanceFill,
-    ReplayCycle, ReplayEvent, ReplayResult, ReplaySettings, RestingQuote,
+    run_replay, Action, AdaptiveSpreadConfig, ExecutionCosts, FillRole, MakerConfig,
+    MarketSnapshot, PerformanceFill, ReplayCycle, ReplayEvent, ReplayResult, ReplaySettings,
+    RestingQuote, SpreadTier,
 };
 use standx_sdk::models::OrderSide;
 use std::io::{BufRead, BufReader, Read};
@@ -132,26 +133,78 @@ struct TraceReplaySettings {
     starting_mark: f64,
     max_divergence_bps: f64,
     require_full_touch: bool,
-    vol_window: usize,
+    vol_window: Option<usize>,
+    #[serde(default)]
+    vol_window_secs: Option<u64>,
     vol_pause_bps: f64,
+    #[serde(default)]
+    adaptive_spread: Option<TraceAdaptiveSpreadConfig>,
     active_exit_enabled: bool,
     inventory_exit_pct: f64,
     inventory_exit_qty: f64,
 }
 
-impl From<TraceReplaySettings> for ReplaySettings {
-    fn from(value: TraceReplaySettings) -> Self {
-        Self {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceAdaptiveSpreadConfig {
+    enabled: bool,
+    min_spread_bps: f64,
+    max_spread_bps: f64,
+    tiers: Vec<TraceSpreadTier>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceSpreadTier {
+    #[serde(default)]
+    enter_vol_bps: Option<f64>,
+    #[serde(default)]
+    exit_vol_bps: Option<f64>,
+    spread_bps: f64,
+    refresh_bps: f64,
+}
+
+impl TryFrom<TraceReplaySettings> for ReplaySettings {
+    type Error = anyhow::Error;
+
+    fn try_from(value: TraceReplaySettings) -> Result<Self> {
+        if value.vol_window.is_some() && value.vol_window_secs.is_some() {
+            anyhow::bail!("replay settings vol_window and vol_window_secs conflict");
+        }
+        let adaptive_spread = value
+            .adaptive_spread
+            .map(|config| AdaptiveSpreadConfig {
+                enabled: config.enabled,
+                min_spread_bps: config.min_spread_bps,
+                max_spread_bps: config.max_spread_bps,
+                tiers: config
+                    .tiers
+                    .into_iter()
+                    .map(|tier| SpreadTier {
+                        enter_vol_bps: tier.enter_vol_bps,
+                        exit_vol_bps: tier.exit_vol_bps,
+                        spread_bps: tier.spread_bps,
+                        refresh_bps: tier.refresh_bps,
+                    })
+                    .collect(),
+            })
+            .unwrap_or_default();
+        if adaptive_spread.enabled && value.vol_window_secs.is_none() {
+            anyhow::bail!("adaptive replay requires vol_window_secs");
+        }
+        Ok(Self {
             starting_position: value.starting_position,
             starting_mark: value.starting_mark,
             max_divergence_bps: value.max_divergence_bps,
             require_full_touch: value.require_full_touch,
-            vol_window: value.vol_window,
+            vol_window: value.vol_window.unwrap_or(1),
+            vol_window_secs: value.vol_window_secs,
             vol_pause_bps: value.vol_pause_bps,
+            adaptive_spread,
             active_exit_enabled: value.active_exit_enabled,
             inventory_exit_pct: value.inventory_exit_pct,
             inventory_exit_qty: value.inventory_exit_qty,
-        }
+        })
     }
 }
 
@@ -211,7 +264,7 @@ pub(super) fn run(path: &Path, output_format: OutputFormat) -> Result<()> {
     let trace = parse(BufReader::new(reader))?;
     let result = run_replay(
         &trace.config,
-        trace.settings,
+        trace.settings.clone(),
         &trace.events,
         trace.end_time_ms,
     )?;
@@ -265,7 +318,7 @@ fn parse(reader: impl BufRead) -> Result<ParsedTrace> {
                     config_hash,
                     seed,
                     config.into(),
-                    settings.into(),
+                    settings.try_into()?,
                 ));
             }
             TraceRecord::Cycle {
@@ -380,6 +433,11 @@ fn emit(trace: &ParsedTrace, result: &ReplayResult, output_format: OutputFormat)
                     "cycle": cycle.cycle,
                     "halted": cycle.preflight.halted,
                     "skip": cycle.preflight.skip.map(|skip| format!("{skip:?}")),
+                    "rolling_vol_bps": cycle.spread_decision.rolling_vol_bps,
+                    "adaptive_spread_enabled": cycle.spread_decision.enabled,
+                    "adaptive_spread_tier": cycle.spread_decision.tier,
+                    "effective_spread_bps": cycle.spread_decision.effective_spread_bps,
+                    "effective_refresh_bps": cycle.spread_decision.effective_refresh_bps,
                     "actions": actions,
                 })
             );
@@ -500,14 +558,14 @@ mod tests {
         let trace = parse(BufReader::new(TRACE.as_bytes())).unwrap();
         let first = run_replay(
             &trace.config,
-            trace.settings,
+            trace.settings.clone(),
             &trace.events,
             trace.end_time_ms,
         )
         .unwrap();
         let second = run_replay(
             &trace.config,
-            trace.settings,
+            trace.settings.clone(),
             &trace.events,
             trace.end_time_ms,
         )
@@ -524,5 +582,26 @@ mod tests {
         let trailing =
             format!("{TRACE}{{\"type\":\"funding\",\"event_time_ms\":2,\"cashflow_quote\":0.1}}\n");
         assert!(parse(BufReader::new(trailing.as_bytes())).is_err());
+    }
+
+    #[test]
+    fn schema_v1_accepts_optional_duration_window_and_adaptive_config() {
+        let adaptive = TRACE.replace(
+            "\"vol_window\":12,",
+            "\"vol_window_secs\":60,\"adaptive_spread\":{\"enabled\":true,\"min_spread_bps\":5.0,\"max_spread_bps\":10.0,\"tiers\":[{\"spread_bps\":5.0,\"refresh_bps\":3.0},{\"enter_vol_bps\":10.0,\"exit_vol_bps\":7.0,\"spread_bps\":10.0,\"refresh_bps\":4.0}]},",
+        );
+        let trace = parse(BufReader::new(adaptive.as_bytes())).unwrap();
+        assert_eq!(trace.settings.vol_window_secs, Some(60));
+        assert!(trace.settings.adaptive_spread.enabled);
+        assert_eq!(trace.settings.adaptive_spread.tiers.len(), 2);
+    }
+
+    #[test]
+    fn replay_rejects_sample_and_duration_windows_together() {
+        let conflict = TRACE.replace(
+            "\"vol_window\":12,",
+            "\"vol_window\":12,\"vol_window_secs\":60,",
+        );
+        assert!(parse(BufReader::new(conflict.as_bytes())).is_err());
     }
 }

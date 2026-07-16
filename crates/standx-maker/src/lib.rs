@@ -27,6 +27,7 @@ pub mod recovery;
 pub mod replay;
 pub mod risk;
 pub mod runtime;
+pub mod volatility;
 
 pub use account_projection::{
     AccountProjectionEvent, MakerAccountProjection, OrderObservation, OrderResponseContinuity,
@@ -63,6 +64,10 @@ pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
 pub use runtime::{
     order_cancel_rejection_reason, MakerEffect, MakerEvent, MakerState, RecoveryTarget,
     RequestTimeoutPhase, RuntimeStopReason, WorkToken, MAX_CONSECUTIVE_CYCLE_ERRORS,
+};
+pub use volatility::{
+    AdaptiveSpreadConfig, AdaptiveSpreadError, SpreadController, SpreadDecision, SpreadTier,
+    VolBreaker, VolatilityError, VolatilityWindow,
 };
 
 /// Static per-run configuration (CLI args + symbol metadata).
@@ -443,80 +448,6 @@ impl MakerStats {
     }
 }
 
-/// Volatility circuit breaker: halts quoting during fast mark moves so the
-/// maker isn't run over (adverse selection). Volatility is the peak-to-trough
-/// range of the last `window` marks, in bps; quoting halts when it reaches
-/// `pause_bps` and resumes once it falls back below `pause_bps/2` (hysteresis
-/// — the big move must roll out of the window first). Disabled when
-/// `pause_bps <= 0`.
-#[derive(Debug, Clone)]
-pub struct VolBreaker {
-    marks: std::collections::VecDeque<f64>,
-    window: usize,
-    pause_bps: f64,
-    rearm_bps: f64,
-    halted: bool,
-    last_vol_bps: f64,
-}
-
-impl VolBreaker {
-    pub fn new(window: usize, pause_bps: f64) -> Self {
-        Self {
-            marks: std::collections::VecDeque::with_capacity(window.max(1)),
-            window: window.max(1),
-            pause_bps,
-            rearm_bps: pause_bps * 0.5,
-            halted: false,
-            last_vol_bps: 0.0,
-        }
-    }
-
-    /// Whether the breaker is armed (a positive threshold was configured).
-    pub fn enabled(&self) -> bool {
-        self.pause_bps > 0.0
-    }
-
-    /// Feed the current mark and update state; returns whether quoting is
-    /// halted this cycle.
-    pub fn observe(&mut self, mark: f64) -> bool {
-        if !self.enabled() || mark <= 0.0 {
-            return false;
-        }
-        if self.marks.len() == self.window {
-            self.marks.pop_front();
-        }
-        self.marks.push_back(mark);
-
-        let (mut lo, mut hi) = (f64::MAX, f64::MIN);
-        for &m in &self.marks {
-            lo = lo.min(m);
-            hi = hi.max(m);
-        }
-        self.last_vol_bps = if lo > 0.0 && self.marks.len() >= 2 {
-            (hi - lo) / lo * 10_000.0
-        } else {
-            0.0
-        };
-
-        if self.halted {
-            if self.last_vol_bps < self.rearm_bps {
-                self.halted = false;
-            }
-        } else if self.last_vol_bps >= self.pause_bps {
-            self.halted = true;
-        }
-        self.halted
-    }
-
-    pub fn halted(&self) -> bool {
-        self.halted
-    }
-
-    pub fn vol_bps(&self) -> f64 {
-        self.last_vol_bps
-    }
-}
-
 /// Market data required to make one maker decision.
 ///
 /// This intentionally contains only plain values so it can be recorded and
@@ -601,6 +532,35 @@ pub fn preflight_cycle(
         };
     }
     CyclePreflight { halted, skip: None }
+}
+
+/// Timestamped variant used by duration-based volatility windows.
+pub fn preflight_cycle_at(
+    breaker: &mut VolBreaker,
+    event_time_ms: i64,
+    market: MarketSnapshot,
+    max_divergence_bps: f64,
+    require_full_touch: bool,
+) -> Result<CyclePreflight, VolatilityError> {
+    let halted = breaker.observe_at(event_time_ms, market.mark)?;
+    if let Some(skip) = touch_skip(
+        market.mark,
+        market.best_bid,
+        market.best_ask,
+        max_divergence_bps,
+    ) {
+        return Ok(CyclePreflight {
+            halted,
+            skip: Some(skip),
+        });
+    }
+    if require_full_touch && (market.best_bid.is_none() || market.best_ask.is_none()) {
+        return Ok(CyclePreflight {
+            halted,
+            skip: Some(CycleSkip::MissingTouch),
+        });
+    }
+    Ok(CyclePreflight { halted, skip: None })
 }
 
 /// Inputs owned by the strategy for one post-account-sync decision.

@@ -26,6 +26,7 @@ mod model;
 mod notify;
 mod output;
 mod pipeline;
+mod process_lock;
 mod recovery;
 mod replay;
 mod runtime;
@@ -139,6 +140,7 @@ pub async fn handle_maker(
             max_divergence_bps,
             vol_pause_bps,
             vol_window,
+            adaptive_spread,
             stop_loss,
             alert_loss,
             alert_inventory_pct,
@@ -159,6 +161,27 @@ pub async fn handle_maker(
             controlled_disconnect_after,
         } => {
             let file = config::load(maker_config.as_deref())?;
+            let selected_vol_window = vol_window.or(file.vol_window);
+            let selected_vol_window_secs = file.vol_window_secs;
+            if selected_vol_window.is_some() && selected_vol_window_secs.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--vol-window conflicts with vol_window_secs in TOML; choose samples or seconds"
+                ));
+            }
+            let adaptive_spread = match file.adaptive_spread {
+                Some(config) => config.into_domain(adaptive_spread),
+                None if adaptive_spread.unwrap_or(false) => {
+                    return Err(anyhow::anyhow!(
+                        "--adaptive-spread requires an [adaptive_spread] TOML section"
+                    ));
+                }
+                None => maker::AdaptiveSpreadConfig::default(),
+            };
+            if adaptive_spread.enabled && selected_vol_window_secs.is_none() {
+                return Err(anyhow::anyhow!(
+                    "adaptive spread requires vol_window_secs in TOML"
+                ));
+            }
             // Keep accepting the removed rolling-circuit knobs for one
             // compatibility window so existing production commands/configs do
             // not fail to parse. They deliberately do not enter MakerRunArgs.
@@ -182,7 +205,9 @@ pub async fn handle_maker(
                     inventory_exit_qty: choose(inventory_exit_qty, file.inventory_exit_qty, 0.0),
                     max_divergence_bps: choose(max_divergence_bps, file.max_divergence_bps, 25.0),
                     vol_pause_bps: choose(vol_pause_bps, file.vol_pause_bps, 0.0),
-                    vol_window: choose(vol_window, file.vol_window, 12),
+                    vol_window: selected_vol_window.unwrap_or(12),
+                    vol_window_secs: selected_vol_window_secs,
+                    adaptive_spread,
                     stop_loss: choose(stop_loss, file.stop_loss, 0.0),
                     alert_loss: choose(alert_loss, file.alert_loss, 0.0),
                     alert_inventory_pct: choose(alert_inventory_pct, file.alert_inventory_pct, 0.0),
@@ -267,6 +292,8 @@ struct MakerRunArgs {
     max_divergence_bps: f64,
     vol_pause_bps: f64,
     vol_window: u32,
+    vol_window_secs: Option<u64>,
+    adaptive_spread: maker::AdaptiveSpreadConfig,
     stop_loss: f64,
     alert_loss: f64,
     alert_inventory_pct: f64,

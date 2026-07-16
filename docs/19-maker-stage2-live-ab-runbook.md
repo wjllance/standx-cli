@@ -1,0 +1,131 @@
+# Maker Stage 2 v0 live canary and A/B runbook
+
+This runbook merges the renewed live gate with Stage 2 rollout. It does not
+record a pass by itself. The named online operator is **wujunlin**. Live work
+must not begin until the release record contains this exact authorization:
+
+> 授权执行 XAG-USD size=0.01 max_position=0.2 的阶段2 canary 与2小时A/B
+
+That text authorizes only XAG-USD, `size=0.01`, one level and
+`max_position=0.2`. It does not authorize another symbol, larger exposure,
+active inventory exit or automatic flatten.
+
+## Frozen artifacts and preflight
+
+- Install one release binary built from the recorded commit at
+  `/opt/standx/bin/standx` and record its SHA-256.
+- Install `maker-stage2-xag-baseline.toml` and
+  `maker-stage2-xag-candidate.toml`; verify the files differ only at
+  `adaptive_spread.enabled` and record both hashes.
+- Install `standx-maker-stage2-ab.service`, `run_maker_stage2_ab.sh`, the
+  observed-run/OpenObserve tools, and a root-owned `0600`
+  `/etc/standx/maker-stage2-ab.env`.
+- Keep both ordinary-maker and A/B environment files on the same
+  `/run/lock/standx-maker-live.lock` and
+  `/run/lock/standx-maker-stage2-ab.lock` paths. A manual live process that
+  cannot open those production locks must fail closed, not select another lock.
+- Read current XAG symbol info and fill the three
+  `STANDX_BASELINE_*` metadata values in that environment file. Blank or stale
+  metadata is a gate failure; the orchestrator refuses to switch arms when
+  manifest validation fails.
+- Record passing workspace tests, strict Clippy, fmt, replay output equality
+  across three runs, manifest/JSON/config tests, and a candidate paper run of
+  at least 30 minutes.
+- Keep both `standx-maker.service` and the A/B unit stopped during the canary.
+  The live-process locks must reject a concurrent manual or supervised maker.
+
+Configure OpenObserve live upload, catch-up and the external deadman alert.
+The catch-up unit optionally loads `/etc/standx/maker-stage2-ab.env` after the
+ordinary maker environment, so its log directory and OpenObserve credentials
+must match the frozen A/B deployment.
+Then send the four marked webhook probes and confirm all four messages in the
+same receiver:
+
+```bash
+cd /opt/standx
+python3 scripts/test_maker_stage2_webhooks.py
+```
+
+Record the common `test_id`, send timestamps and human receipt confirmation.
+A successful HTTP response without receiver confirmation is not a pass.
+
+## Emergency procedure
+
+At least wujunlin must have authenticated venue access throughout the first 30
+minutes. On any unknown fill, residual maker order, failed reconnect/reconcile,
+missing webhook or non-zero terminal position:
+
+1. Stop the maker or A/B unit; do not restart or switch arms.
+2. Cancel all XAG orders and independently query both resources:
+
+   ```bash
+   /opt/standx/bin/standx order cancel-all XAG-USD
+   /opt/standx/bin/standx --output json account orders --symbol XAG-USD
+   /opt/standx/bin/standx --output json account positions --symbol XAG-USD
+   ```
+
+3. If a residual position remains after stop-loss or cleanup, wujunlin reads
+   its exact side and quantity, submits one manually reviewed opposite-side
+   `--reduce-only` order, and rechecks orders and positions. Never infer the
+   quantity from configured `max_position`; never submit an automated flatten.
+   Choose exactly one command after the side and `<EXACT_QTY>` have been
+   independently reviewed:
+
+   ```bash
+   # Residual long only:
+   /opt/standx/bin/standx order new XAG-USD sell market --qty <EXACT_QTY> --reduce-only
+   # Residual short only:
+   /opt/standx/bin/standx order new XAG-USD buy market --qty <EXACT_QTY> --reduce-only
+   ```
+
+4. Preserve logs, request/order/trade IDs and webhook evidence. Mark the run
+   failed. A new exact authorization is required before retrying the canary.
+
+## Bounded canary
+
+After confirming `orders=[]` and `positions=[]`, execute the venue-minimum
+`ws-command-canary` and retain its full create/cancel correlation chain. Then
+start the final candidate config with a single controlled order-response
+disconnect at 15 seconds:
+
+```bash
+cd /opt/standx
+export STANDX_ENABLE_LIVE_MAKER=1
+bin/standx --output json maker ws-command-canary XAG-USD
+
+export STANDX_ENABLE_LIVE_MAKER=1
+export STANDX_RUN_ID="stage2-canary-$(date -u +%Y%m%dT%H%M%SZ)"
+scripts/run_maker_observed.sh bin/standx --output json maker run XAG-USD \
+  --maker-config examples/maker-stage2-xag-candidate.toml --live \
+  --controlled-disconnect-after 15
+```
+
+Verify the sequence `frozen → maker cleanup/empty book → reconnect → REST
+fills and position reconciliation → resumed quoting`. Let the recovered run
+remain stable for at least ten minutes, send SIGTERM, wait for normal cleanup,
+validate its manifest, and independently require `orders=[]` and
+`positions=[]`. Any failure condition invokes the emergency procedure.
+
+## Two-hour automatic A/B
+
+Only after the canary evidence is accepted:
+
+```bash
+sudo systemctl enable --now standx-openobserve-catchup.service
+sudo systemctl start standx-maker-stage2-ab.service
+journalctl -u standx-maker-stage2-ab.service -f
+```
+
+The orchestrator alternates baseline then candidate. Each arm has a unique
+`run_id/config_hash`, runs for two hours, and switches only from a flat
+position after normal maker cleanup, manifest validation, and independent
+empty-order/empty-position checks. A non-flat arm gets up to 30 extra minutes
+to return naturally to zero. If it does not, the arm is invalid, a critical
+webhook is sent, and the service exits 75 without flattening or restarting.
+Fail-safe exit, invalid manifest or failed post-check also blocks the next arm.
+
+Keep the Stage 2 state `live_ab` until valid, market-matched quote-hours include
+at least one calm and one trend window. Acceptance requires net PnL at least
+95% of baseline, no worse maximum drawdown, at least 10% improvement in
+negative 5-second markout, uptime loss no more than 3 percentage points, and
+no more than 20% cancel growth per quote-hour.

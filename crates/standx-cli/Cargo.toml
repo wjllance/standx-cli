@@ -52,6 +52,7 @@ dirs.workspace = true
 rpassword = "7.3"
 regex = "1.10"
 uuid.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tokio-test = "0.4"
