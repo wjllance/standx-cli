@@ -62,7 +62,7 @@ pub use replay::{
 pub use risk::{PositionAlertAnchor, PositionRiskEvent, PositionRiskKind};
 pub use runtime::{
     order_cancel_rejection_reason, MakerEffect, MakerEvent, MakerState, RecoveryTarget,
-    RequestTimeoutPhase, RuntimeStopReason, WorkToken,
+    RequestTimeoutPhase, RuntimeStopReason, WorkToken, MAX_CONSECUTIVE_CYCLE_ERRORS,
 };
 
 /// Static per-run configuration (CLI args + symbol metadata).

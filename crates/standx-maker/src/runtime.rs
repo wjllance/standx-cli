@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 
-const MAX_CONSECUTIVE_CYCLE_ERRORS: u32 = 3;
+pub const MAX_CONSECUTIVE_CYCLE_ERRORS: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RuntimePhase {
@@ -202,6 +202,10 @@ impl MakerState {
 
     pub fn pending_effect(&self) -> Option<&MakerEffect> {
         self.effects.front()
+    }
+
+    pub fn consecutive_cycle_errors(&self) -> u32 {
+        self.consecutive_cycle_errors
     }
 
     fn transition(&mut self, event: MakerEvent) -> Vec<MakerEffect> {

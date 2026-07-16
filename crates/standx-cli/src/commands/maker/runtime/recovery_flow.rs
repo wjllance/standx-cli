@@ -137,7 +137,6 @@ pub(super) struct RecoveryIo<'a> {
     pub(super) session: Option<&'a mut LiveSession>,
     pub(super) resting: &'a mut Vec<RestingQuote>,
     pub(super) inventory_exit_pending: &'a mut bool,
-    pub(super) consecutive_errors: &'a mut u32,
     pub(super) next_cycle_is_recovery: &'a mut bool,
     pub(super) symbol: &'a str,
     pub(super) cycle: u64,
@@ -282,7 +281,6 @@ pub(super) async fn resume_quoting_after_recovery(io: &mut RecoveryIo<'_>, spec:
             },
         );
     }
-    *io.consecutive_errors = 0;
     io.runtime_state
         .handle(MakerEvent::RecoverySucceeded(spec.recovery_token));
     *io.next_cycle_is_recovery = true;
@@ -473,7 +471,6 @@ impl MakerRuntime {
                         session: self.live_session.as_mut(),
                         resting: &mut self.loop_state.resting,
                         inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                        consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                         next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                         symbol,
                         cycle,
@@ -670,7 +667,6 @@ impl MakerRuntime {
                     self.market.next_heartbeat = None;
                     self.market.last_divergence_bps = None;
                     self.market.last_src = None;
-                    self.loop_state.counters.consecutive_errors = 0;
                     self.loop_state.next_cycle_is_recovery = true;
                     notifier
                         .risk(
@@ -769,7 +765,6 @@ impl MakerRuntime {
                             session: Some(&mut *session),
                             resting: &mut self.loop_state.resting,
                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                            consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                             next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                             symbol,
                             cycle,
@@ -1028,9 +1023,7 @@ impl MakerRuntime {
                             client,
                             session: Some(&mut *session),
                             resting: &mut self.loop_state.resting,
-                            inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                            consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
-                            next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
+                            inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,                            next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                             symbol,
                             cycle,
                             output_format,
@@ -1135,7 +1128,6 @@ impl MakerRuntime {
                             session: Some(&mut *session),
                             resting: &mut self.loop_state.resting,
                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                            consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                             next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                             symbol,
                             cycle,
@@ -1235,9 +1227,7 @@ impl MakerRuntime {
                                         client,
                                         session: Some(&mut *session),
                                         resting: &mut self.loop_state.resting,
-                                        inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                                        consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
-                                        next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
+                                        inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,                                        next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
                                         symbol,
                                         cycle,
                                         output_format,

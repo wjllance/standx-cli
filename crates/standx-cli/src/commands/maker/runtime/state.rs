@@ -18,7 +18,6 @@ pub(super) struct RuntimeDeps {
 #[derive(Default)]
 pub(super) struct RuntimeCounters {
     pub(super) cycle: u64,
-    pub(super) consecutive_errors: u32,
     pub(super) total_places: u64,
     pub(super) total_cancels: u64,
     pub(super) total_holds: u64,
