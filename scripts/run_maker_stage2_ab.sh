@@ -100,6 +100,25 @@ flock -n 9 || {
 export STANDX_STAGE2_AB_MEMBER=1
 export STANDX_STAGE2_AB_LOCK_PATH="$ab_lock"
 
+# PID of the maker arm currently running (via run_maker_observed.sh). Tracked so
+# a SIGTERM/SIGINT — e.g. `docker stop`, `systemctl stop` — is forwarded to the
+# live arm for its normal freeze/cancel-all cleanup instead of orphaning a live
+# maker. The observed wrapper already forwards the signal on to the binary.
+current_arm_pid=""
+graceful_shutdown() {
+  local signal="$1"
+  trap - TERM INT
+  notify "stage2 A/B received SIG$signal; forwarding to the active arm for cleanup" warning
+  if [[ -n "$current_arm_pid" ]] && kill -0 "$current_arm_pid" 2>/dev/null; then
+    kill -TERM "$current_arm_pid" 2>/dev/null || true
+    wait "$current_arm_pid" 2>/dev/null || true
+  fi
+  notify "stage2 A/B stopped on SIG$signal after arm cleanup; no automatic flatten was attempted"
+  exit 0
+}
+trap 'graceful_shutdown TERM' TERM
+trap 'graceful_shutdown INT' INT
+
 positions_json() {
   "$standx_bin" --output json account positions --symbol "$symbol"
 }
@@ -153,6 +172,7 @@ run_arm() {
   STANDX_RUN_ID="$run_id" "$root/scripts/run_maker_observed.sh" \
     "$standx_bin" --output json maker run "$symbol" --maker-config "$config" --live &
   pid=$!
+  current_arm_pid="$pid"
   deadline=$((SECONDS + arm_seconds))
   while ((SECONDS < deadline)); do
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -214,6 +234,7 @@ run_arm() {
     critical_stop "arm=$arm independent post-check found orders or position (run_id=$run_id)"
   }
   notify "stage2 A/B arm complete: arm=$arm run_id=$run_id config_hash=$config_hash orders=[] positions=[]"
+  current_arm_pid=""
 }
 
 while true; do

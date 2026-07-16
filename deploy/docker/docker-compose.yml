@@ -1,0 +1,58 @@
+# Stage 2 maker baseline/candidate A/B orchestrator, containerized.
+#
+# This is the docker-compose equivalent of deploy/systemd/standx-maker-stage2-ab.service.
+# Read docs/19-maker-stage2-live-ab-runbook.md first: this service trades live
+# and must not start until the canary evidence is recorded.
+#
+# It is gated behind the "ab" profile so a bare `docker compose up` cannot
+# launch live trading by accident. Start it deliberately:
+#   docker compose -f deploy/docker/docker-compose.yml --profile ab up -d --build
+#
+# OpenObserve is NOT part of this file — keep running deploy/openobserve/compose.yaml
+# separately. network_mode: host lets this container reach it on 127.0.0.1:5080,
+# share /run/lock with a host-run maker, and hit the venue exactly like the
+# systemd deployment.
+
+services:
+  stage2-ab:
+    profiles: ["ab"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: standx-stage2-ab:latest
+    container_name: standx-maker-stage2-ab
+
+    # SAFETY: never auto-restart. A critical stop exits 75 and requires human
+    # intervention (possible residual position). docker restart policies cannot
+    # exclude an exit code the way systemd RestartPreventExitStatus=75 does, so
+    # "no" is the only safe choice — a transient arm crash is itself surfaced as
+    # a critical stop that a human must clear before the next arm.
+    restart: "no"
+
+    # tini as PID 1 reaps zombies and forwards SIGTERM to the orchestrator,
+    # whose own trap then forwards it to the live arm for cancel-all cleanup.
+    init: true
+    stop_signal: SIGTERM
+    # >= systemd TimeoutStopSec=90, with margin for the arm's freeze/cancel-all.
+    stop_grace_period: 120s
+
+    # Host networking: OpenObserve on 127.0.0.1:5080, the venue, and the shared
+    # /run/lock mutual exclusion all behave as they do for the host-run maker.
+    network_mode: host
+
+    # Root-owned 0600 file, same contents as the systemd deployment. Provides
+    # STANDX_INSTALL_ROOT=/opt/standx, STANDX_BIN, lock paths, OpenObserve and
+    # supervisor webhook config, STANDX_ENABLE_LIVE_MAKER=1, and the three
+    # STANDX_BASELINE_* metadata values.
+    env_file:
+      - /etc/standx/maker-stage2-ab.env
+
+    volumes:
+      # Live credentials, read-only. Written on the host by `standx auth login`;
+      # refresh it there and the next arm's reconnect picks up the new token.
+      - ${STANDX_CREDENTIALS_FILE:-/opt/standx/state/standx/credentials.enc}:/opt/standx/state/standx/credentials.enc:ro
+      # Run evidence (NDJSON + manifests) must outlive the container.
+      - ${STANDX_LOG_DIR_HOST:-/opt/standx/var/standx}:/opt/standx/var/standx
+      # Shared lock dir so a host-run maker and this container are mutually
+      # exclusive on /run/lock/standx-maker-live.lock and the A/B guard lock.
+      - /run/lock:/run/lock

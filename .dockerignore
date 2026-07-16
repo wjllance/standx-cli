@@ -1,0 +1,14 @@
+# Keep .git: the run manifest requires `git rev-parse HEAD` and a clean
+# strategy worktree, so the image must ship the repo's git metadata.
+# Exclude only bulky or host-specific paths that must not enter the build.
+target/
+**/target/
+.claude/
+deploy/openobserve/data/
+var/standx/
+*.log
+*.tmp
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.DS_Store
