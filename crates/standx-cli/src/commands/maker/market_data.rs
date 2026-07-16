@@ -1,7 +1,6 @@
 use standx_maker as maker;
 use std::time::Duration;
 
-pub(super) const MARKET_DATA_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(60);
 pub(super) const MARKET_DATA_STANDBY_HEARTBEAT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]

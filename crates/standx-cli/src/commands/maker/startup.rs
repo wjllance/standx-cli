@@ -132,16 +132,6 @@ pub(super) async fn run_startup(
             "--account-stream-reconnect-backoff must be between 1 and 60 seconds when reconnect is enabled"
         ));
     }
-    if !(1..=100).contains(&args.recovery_incidents_per_window) {
-        return Err(anyhow::anyhow!(
-            "--recovery-incidents-per-window must be between 1 and 100"
-        ));
-    }
-    if !(60..=86_400).contains(&args.recovery_window_secs) {
-        return Err(anyhow::anyhow!(
-            "--recovery-window-secs must be between 60 and 86400"
-        ));
-    }
     // REST reads, audits, and fail-safe cleanup must stay outside the
     // order-response session. Attaching x-session-id to REST cancellation
     // would route its asynchronous response into the command response stream,

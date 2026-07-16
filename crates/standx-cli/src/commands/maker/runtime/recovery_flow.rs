@@ -301,22 +301,6 @@ pub(super) async fn resume_quoting_after_recovery(io: &mut RecoveryIo<'_>, spec:
     io.notifier.risk(spec.notice, false).await;
 }
 
-pub(super) fn recovery_circuit_detail(admission: maker::RecoveryAdmission) -> String {
-    let (incidents, limit, window_secs) = match admission {
-        maker::RecoveryAdmission::Admitted {
-            incidents,
-            limit,
-            window_secs,
-        }
-        | maker::RecoveryAdmission::CircuitOpen {
-            incidents,
-            limit,
-            window_secs,
-        } => (incidents, limit, window_secs),
-    };
-    format!("rolling recovery circuit {incidents}/{limit} incident(s) in {window_secs}s")
-}
-
 pub(super) async fn accounting_invariant_exit(
     notifier: &MakerNotifier,
     symbol: &str,
@@ -349,44 +333,6 @@ pub(super) async fn accounting_invariant_exit(
         )
         .await;
     Some(detail)
-}
-
-pub(super) fn next_market_transport_deadline(
-    class: Option<maker::MarketDataFaultClass>,
-    current: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> Option<std::time::Instant> {
-    match class {
-        Some(maker::MarketDataFaultClass::Transport) => {
-            current.or(Some(now + MARKET_DATA_TRANSPORT_TIMEOUT))
-        }
-        Some(maker::MarketDataFaultClass::MarketState) | None => None,
-    }
-}
-
-pub(super) fn market_data_recovery_admission(
-    class: maker::MarketDataFaultClass,
-    breaker_metered: &mut bool,
-    breaker: &mut maker::RecoveryCircuitBreaker,
-    now_secs: u64,
-) -> Option<maker::RecoveryAdmission> {
-    let trigger = match class {
-        maker::MarketDataFaultClass::Transport => maker::RecoveryTrigger::TransportFailure,
-        maker::MarketDataFaultClass::MarketState => maker::RecoveryTrigger::MarketCondition,
-    };
-    if *breaker_metered || !trigger.meters_circuit() {
-        return None;
-    }
-    *breaker_metered = true;
-    Some(breaker.admit(now_secs))
-}
-
-fn sync_market_transport_deadline(market: &mut RuntimeMarketState, now: std::time::Instant) {
-    market.transport_deadline = next_market_transport_deadline(
-        market.health.degraded_class(),
-        market.transport_deadline,
-        now,
-    );
 }
 
 impl MakerRuntime {
@@ -475,7 +421,6 @@ impl MakerRuntime {
         let symbol = &self.deps.symbol;
         let notifier = &self.deps.notifier;
         let cycle = self.loop_state.counters.cycle;
-        let recovery_clock_started = self.recovery.clock_started;
         let exit = 'phase: {
             let pending_market_recovery;
             if let Some(detail) = self.market.pending_degradation.take() {
@@ -536,37 +481,6 @@ impl MakerRuntime {
                 return LoopDirective::Proceed;
             }
 
-            if live {
-                let class = self
-                    .market
-                    .health
-                    .degraded_class()
-                    .expect("degraded market data must have a fault class");
-                if let Some(admission) = market_data_recovery_admission(
-                    class,
-                    &mut self.market.breaker_metered,
-                    &mut self.recovery.breaker,
-                    recovery_clock_started.elapsed().as_secs(),
-                ) {
-                    if !admission.is_admitted() {
-                        let circuit = recovery_circuit_detail(admission);
-                        if let Some((recovery_token, detail)) = pending_market_recovery.as_ref() {
-                            break 'phase recovery_failed_exit(
-                                &mut self.recovery.runtime_state,
-                                *recovery_token,
-                                format!("{detail}; {circuit}; refusing further live orders"),
-                            );
-                        }
-                        break 'phase stop_requested_exit(
-                            &mut self.recovery.runtime_state,
-                            RuntimeStopReason::MarketData(format!(
-                                "market data standby escalated to transport failure; {circuit}; refusing further live orders"
-                            )),
-                        );
-                    }
-                }
-            }
-
             if let Some((recovery_token, _)) = pending_market_recovery {
                 // Cleanup closes the reducer's frozen generation. Market data
                 // remains paused in the pure health gate, so normal account and
@@ -578,7 +492,6 @@ impl MakerRuntime {
                 self.market.standby_started = Some(now);
                 self.market.next_heartbeat = Some(now + MARKET_DATA_STANDBY_HEARTBEAT);
                 self.market.maker_book_verified_empty = true;
-                sync_market_transport_deadline(&mut self.market, now);
                 eprintln!(
                     "⚠️  market data paused; waiting for {} paired quoteable WS snapshots before re-quoting",
                     maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER
@@ -587,49 +500,54 @@ impl MakerRuntime {
             }
 
             let now = std::time::Instant::now();
-            sync_market_transport_deadline(&mut self.market, now);
             if self
                 .market
-                .transport_deadline
+                .next_heartbeat
                 .is_some_and(|deadline| now >= deadline)
-            {
-                break 'phase stop_requested_exit(
-                    &mut self.recovery.runtime_state,
-                    RuntimeStopReason::MarketData(format!(
-                        "market data transport did not produce {} structurally valid paired snapshots within {}s",
-                        maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
-                        MARKET_DATA_TRANSPORT_TIMEOUT.as_secs(),
-                    )),
-                );
-            }
-
-            if self.market.health.degraded_class() == Some(maker::MarketDataFaultClass::MarketState)
-                && self
-                    .market
-                    .next_heartbeat
-                    .is_some_and(|deadline| now >= deadline)
             {
                 let standby_secs = self.market.standby_started.map_or(0, |started| {
                     now.saturating_duration_since(started).as_secs()
                 });
-                let divergence = self
+                let class = self
                     .market
-                    .last_divergence_bps
-                    .map_or_else(|| "n/a".to_string(), |bps| format!("{bps:.2}bps"));
-                let message = format!(
-                    "market-state standby: divergence={divergence} threshold={:.2}bps paused={}s quoteable_streak={}/{} maker_book_empty={}",
-                    max_divergence_bps,
-                    standby_secs,
-                    self.market.health.quoteable_streak(),
-                    maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
-                    self.market.maker_book_verified_empty,
-                );
+                    .health
+                    .degraded_class()
+                    .expect("degraded market data must have a fault class");
+                let (event, message) = match class {
+                    maker::MarketDataFaultClass::MarketState => {
+                        let divergence = self.market.last_divergence_bps.map_or_else(
+                            || "n/a".to_string(),
+                            |bps| format!("{bps:.2}bps"),
+                        );
+                        (
+                            "divergence_standby",
+                            format!(
+                                "market-state standby: divergence={divergence} threshold={:.2}bps paused={}s quoteable_streak={}/{} maker_book_empty={}",
+                                max_divergence_bps,
+                                standby_secs,
+                                self.market.health.quoteable_streak(),
+                                maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
+                                self.market.maker_book_verified_empty,
+                            ),
+                        )
+                    }
+                    maker::MarketDataFaultClass::Transport => (
+                        "transport_standby",
+                        format!(
+                            "market-data transport standby: paused={}s quoteable_streak={}/{} maker_book_empty={}; retrying while placements remain frozen",
+                            standby_secs,
+                            self.market.health.quoteable_streak(),
+                            maker::MARKET_DATA_COHERENT_SNAPSHOTS_TO_RECOVER,
+                            self.market.maker_book_verified_empty,
+                        ),
+                    ),
+                };
                 notifier
                     .risk(
                         RiskNotice {
                             kind: "market_data",
                             severity: "warning",
-                            event: "divergence_standby",
+                            event,
                             message: &message,
                             symbol,
                             cycle,
@@ -683,7 +601,6 @@ impl MakerRuntime {
                         .health
                         .observe(now_ms, maker::MarketDataObservation::InvalidSnapshot);
                     self.market.maker_book_verified_empty = false;
-                    sync_market_transport_deadline(&mut self.market, std::time::Instant::now());
                     return LoopDirective::Restart;
                 };
                 self.market.last_divergence_bps = latest.divergence_bps;
@@ -691,7 +608,6 @@ impl MakerRuntime {
                     let now_ms = duration_ms(self.market.health_started.elapsed());
                     let _ = self.market.health.observe(now_ms, latest.observation);
                     self.market.maker_book_verified_empty = false;
-                    sync_market_transport_deadline(&mut self.market, std::time::Instant::now());
                     return LoopDirective::Restart;
                 }
 
@@ -700,9 +616,7 @@ impl MakerRuntime {
                     maker::MarketDataTransition::Recovered
                 ) {
                     let observed = self.loop_state.ledger.expected_position;
-                    self.market.breaker_metered = false;
                     self.market.standby_started = None;
-                    self.market.transport_deadline = None;
                     self.market.next_heartbeat = None;
                     self.market.last_divergence_bps = None;
                     self.market.last_src = None;
@@ -743,7 +657,6 @@ impl MakerRuntime {
         let baseline_mark = self.deps.baseline_mark;
         let session_started_at = self.deps.session_started_at;
         let cycle = self.loop_state.counters.cycle;
-        let recovery_clock_started = self.recovery.clock_started;
         let exit = 'phase: {
             if let Some(session) = self.live_session.as_mut() {
                 if !session.account_stream_health.is_healthy() {
@@ -838,50 +751,91 @@ impl MakerRuntime {
                             format!("account stream disconnected ({detail}); reconnect disabled"),
                         );
                     }
-                    let admission = self
-                        .recovery
-                        .breaker
-                        .admit(recovery_clock_started.elapsed().as_secs());
-                    if !admission.is_admitted() {
-                        break 'phase recovery_failed_exit(
-                            &mut self.recovery.runtime_state,
-                            recovery_token,
-                            format!(
-                                "account stream disconnected ({detail}); {}; refusing further live orders",
-                                recovery_circuit_detail(admission)
-                            ),
-                        );
-                    }
-
-                    let (mut events, health, handle) = match reconnect_account_stream(
-                        &mut session.account_stream_epoch,
-                        args.account_stream_reconnect_attempts,
-                        args.account_stream_reconnect_backoff,
-                        &mut self.ctrl_c_rx,
-                    )
-                    .await
-                    {
-                        AccountStreamReconnect::Connected(triple) => triple,
-                        AccountStreamReconnect::Interrupted => {
-                            self.recovery
-                                .runtime_state
-                                .handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
-                            break 'phase take_stop_effect(
-                                &mut self.recovery.runtime_state,
-                                MakerExit::PositionReconciliation,
-                            );
-                        }
-                        AccountStreamReconnect::Exhausted(reason) => {
-                            self.recovery.runtime_state.handle(MakerEvent::RecoveryFailed {
-                                token: recovery_token,
-                                reason: format!(
-                                    "account stream disconnected ({detail}); reconnect exhausted: {reason}"
-                                ),
-                            });
-                            break 'phase take_stop_effect(
-                                &mut self.recovery.runtime_state,
-                                MakerExit::PositionReconciliation,
-                            );
+                    let mut failed_rounds = 0_u32;
+                    let (mut events, health, handle) = loop {
+                        match reconnect_account_stream(
+                            &mut session.account_stream_epoch,
+                            args.account_stream_reconnect_attempts,
+                            args.account_stream_reconnect_backoff,
+                            &mut self.ctrl_c_rx,
+                        )
+                        .await
+                        {
+                            AccountStreamReconnect::Connected(triple) => break triple,
+                            AccountStreamReconnect::Interrupted => {
+                                self.recovery
+                                    .runtime_state
+                                    .handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
+                                break 'phase take_stop_effect(
+                                    &mut self.recovery.runtime_state,
+                                    MakerExit::PositionReconciliation,
+                                );
+                            }
+                            AccountStreamReconnect::Terminal(reason) => {
+                                break 'phase recovery_failed_exit(
+                                    &mut self.recovery.runtime_state,
+                                    recovery_token,
+                                    format!(
+                                        "account stream disconnected ({detail}); reconnect is not retryable: {reason}"
+                                    ),
+                                );
+                            }
+                            AccountStreamReconnect::Exhausted(reason) => {
+                                if let Err(error) =
+                                    cancel_maker_orders_with_retry(client, symbol, 3, output_format)
+                                        .await
+                                {
+                                    break 'phase stop_requested_exit(
+                                        &mut self.recovery.runtime_state,
+                                        RuntimeStopReason::CleanupFailure {
+                                            target: RecoveryTarget::AccountStream,
+                                            reason: format!(
+                                                "account-stream retry cleanup failed: {error}"
+                                            ),
+                                        },
+                                    );
+                                }
+                                failed_rounds = failed_rounds.saturating_add(1);
+                                let delay_secs = maker::recovery_retry_delay_secs(
+                                    args.account_stream_reconnect_backoff,
+                                    failed_rounds,
+                                );
+                                let retry_message = format!(
+                                    "account stream reconnect round {failed_rounds} exhausted ({reason}); maker book re-verified empty; placements remain frozen; retrying in {delay_secs}s"
+                                );
+                                notifier
+                                    .risk(
+                                        RiskNotice {
+                                            kind: "account_stream",
+                                            severity: "warning",
+                                            event: "reconnect_retrying",
+                                            message: &retry_message,
+                                            symbol,
+                                            cycle,
+                                            position_before: None,
+                                            position_after: None,
+                                            expected: Some(
+                                                self.loop_state.ledger.expected_position,
+                                            ),
+                                            observed: None,
+                                        },
+                                        false,
+                                    )
+                                    .await;
+                                tokio::select! {
+                                    biased;
+                                    _ = ctrl_c_latched(&mut self.ctrl_c_rx) => {
+                                        self.recovery.runtime_state.handle(
+                                            MakerEvent::StopRequested(RuntimeStopReason::CtrlC),
+                                        );
+                                        break 'phase take_stop_effect(
+                                            &mut self.recovery.runtime_state,
+                                            MakerExit::PositionReconciliation,
+                                        );
+                                    }
+                                    _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
+                                }
+                            }
                         }
                     };
 
@@ -1107,7 +1061,6 @@ impl MakerRuntime {
         let baseline_mark = self.deps.baseline_mark;
         let session_started_at = self.deps.session_started_at;
         let cycle = self.loop_state.counters.cycle;
-        let recovery_clock_started = self.recovery.clock_started;
         let exit = 'phase: {
             if let Some(session) = self.live_session.as_mut() {
                 if !session.order_response_health.is_healthy() {
@@ -1196,135 +1149,183 @@ impl MakerRuntime {
                     } else if args.order_response_reconnect_attempts == 0 {
                         Some("safe reconnect is disabled".to_string())
                     } else {
-                        let admission = self
-                            .recovery
-                            .breaker
-                            .admit(recovery_clock_started.elapsed().as_secs());
-                        (!admission.is_admitted()).then(|| {
-                            format!("{}; circuit is open", recovery_circuit_detail(admission))
-                        })
+                        None
                     };
                     if reconnect_unavailable.is_none() {
                         // Abort the stream task in place; the stale halves are
-                        // replaced together on success, and every failure path
-                        // below exits the loop.
+                        // replaced together on success. Retryable transport
+                        // exhaustion leaves the core recovery token in flight,
+                        // so the maker stays frozen until a later round succeeds.
                         session.order_response_handle.abort();
-                        match reconnect_order_response(
-                            ReconnectRequest {
-                                cleanup_client: client.clone(),
-                                symbol,
-                                session_started_at,
-                                run_order_prefix,
-                                qty_tolerance,
-                                mark: self.market.last_mark.unwrap_or(baseline_mark),
-                                output_format,
-                                max_attempts: args.order_response_reconnect_attempts,
-                                base_backoff: Duration::from_secs(
-                                    args.order_response_reconnect_backoff,
-                                ),
-                                original_failure: &detail,
-                                ctrl_c: self.ctrl_c_rx.clone(),
-                            },
-                            &mut self.loop_state.ledger,
-                            &mut self.loop_state.stats,
-                        )
-                        .await
-                        {
-                            Ok(reconnected) => {
-                                self.loop_state.counters.total_fills +=
-                                    reconnected.fills.len() as u64;
-                                for fill in &reconnected.fills {
-                                    emit_live_fill(fill, symbol, cycle, output_format);
-                                    if let Some(order_id) = fill.order_id {
-                                        let at_ms = u64::try_from(
-                                            session.latency_started.elapsed().as_millis(),
-                                        )
-                                        .unwrap_or(u64::MAX);
-                                        if let Err(error) = session
-                                            .order_latency
-                                            .record_fill_after_cancel_order(order_id, at_ms)
-                                        {
-                                            eprintln!(
-                                                "⚠️ fill-after-cancel observation unavailable: {error}"
-                                            );
-                                        }
-                                    }
-                                }
-                                self.loop_state.account_balance_refresh_requested |=
-                                    !reconnected.fills.is_empty();
-                                let reconciled_position = reconnected.position;
-                                session.order_commands = reconnected.commands;
-                                session.order_responses = reconnected.responses;
-                                session.order_response_health = reconnected.health;
-                                session.order_response_handle = reconnected.handle;
-                                // Cleanup verified an empty maker book. The next
-                                // cycle rebuilds exchange state before it may place.
-                                resume_quoting_after_recovery(
-                                    &mut RecoveryIo {
-                                        runtime_state: &mut self.recovery.runtime_state,
-                                        notifier,
-                                        client,
-                                        session: Some(&mut *session),
-                                        resting: &mut self.loop_state.resting,
-                                        inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,                                        next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                                        symbol,
-                                        cycle,
-                                        output_format,
-                                    },
-                                    ResumeSpec {
-                                        recovery_token,
-                                        observed: reconciled_position,
-                                        continuity: OrderResponseContinuity::Replaced,
-                                        clear_resting: true,
-                                        recovered_note: None,
-                                        notice: RiskNotice {
-                                            kind: "order_response",
-                                            severity: "resolved",
-                                            event: "reconnected",
-                                            message: "order-response stream reconnected; maker book verified empty before quoting resumes",
-                                            symbol,
-                                            cycle,
-                                            position_before: None,
-                                            position_after: None,
-                                            expected: Some(self.loop_state.ledger.expected_position),
-                                            observed: Some(reconciled_position),
-                                        },
-                                    },
-                                )
-                                .await;
-                                return LoopDirective::Restart;
-                            }
-                            Err(error) => {
-                                if error.downcast_ref::<ReconnectInterrupted>().is_some() {
-                                    self.recovery
-                                        .runtime_state
-                                        .handle(MakerEvent::StopRequested(
-                                            RuntimeStopReason::CtrlC,
-                                        ));
-                                    break 'phase take_stop_effect(
-                                        &mut self.recovery.runtime_state,
-                                        MakerExit::OrderResponse,
-                                    );
-                                }
-                                if let Some(reconciliation) =
-                                    error.downcast_ref::<PositionReconciliationError>()
-                                {
-                                    if output_format == OutputFormat::Json {
-                                        println!(
-                                            "{}",
-                                            serde_json::json!({
-                                                "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                                                "symbol": symbol,
-                                                "action": "position_reconciliation",
-                                                "event": "failed_during_reconnect",
-                                                "expected_position": reconciliation.expected,
-                                                "observed_position": reconciliation.observed,
-                                                "message": "post-reconnect venue position cannot be explained by current-run maker fills",
-                                            })
+                        let mut failed_rounds = 0_u32;
+                        let mut recovered_fills = Vec::new();
+                        let reconnected = loop {
+                            match reconnect_order_response(
+                                ReconnectRequest {
+                                    cleanup_client: client.clone(),
+                                    symbol,
+                                    session_started_at,
+                                    run_order_prefix,
+                                    qty_tolerance,
+                                    mark: self.market.last_mark.unwrap_or(baseline_mark),
+                                    output_format,
+                                    max_attempts: args.order_response_reconnect_attempts,
+                                    base_backoff: Duration::from_secs(
+                                        args.order_response_reconnect_backoff,
+                                    ),
+                                    original_failure: &detail,
+                                    ctrl_c: self.ctrl_c_rx.clone(),
+                                },
+                                &mut self.loop_state.ledger,
+                                &mut self.loop_state.stats,
+                                &mut recovered_fills,
+                            )
+                            .await
+                            {
+                                Ok(reconnected) => break reconnected,
+                                Err(error) => {
+                                    if error.downcast_ref::<ReconnectInterrupted>().is_some() {
+                                        self.recovery.runtime_state.handle(
+                                            MakerEvent::StopRequested(RuntimeStopReason::CtrlC),
+                                        );
+                                        break 'phase take_stop_effect(
+                                            &mut self.recovery.runtime_state,
+                                            MakerExit::OrderResponse,
                                         );
                                     }
-                                    let reconciliation_message = format!(
-                                        "order-response reconnect failed reconciliation: {error}"
+                                    if let Some(reconciliation) =
+                                        error.downcast_ref::<PositionReconciliationError>()
+                                    {
+                                        if output_format == OutputFormat::Json {
+                                            println!(
+                                                "{}",
+                                                serde_json::json!({
+                                                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                                                    "symbol": symbol,
+                                                    "action": "position_reconciliation",
+                                                    "event": "failed_during_reconnect",
+                                                    "expected_position": reconciliation.expected,
+                                                    "observed_position": reconciliation.observed,
+                                                    "message": "post-reconnect venue position cannot be explained by current-run maker fills",
+                                                })
+                                            );
+                                        }
+                                        let reconciliation_message = format!(
+                                            "order-response reconnect failed reconciliation: {error}"
+                                        );
+                                        notifier
+                                            .risk(
+                                                RiskNotice {
+                                                    kind: "order_response",
+                                                    severity: "critical",
+                                                    event: "reconnect_failed",
+                                                    message: &reconciliation_message,
+                                                    symbol,
+                                                    cycle,
+                                                    position_before: None,
+                                                    position_after: None,
+                                                    expected: Some(
+                                                        self.loop_state.ledger.expected_position,
+                                                    ),
+                                                    observed: None,
+                                                },
+                                                true,
+                                            )
+                                            .await;
+                                        self.recovery.runtime_state.handle(
+                                            MakerEvent::RecoveryFailed {
+                                                token: recovery_token,
+                                                reason: error.to_string(),
+                                            },
+                                        );
+                                        break 'phase take_stop_effect(
+                                            &mut self.recovery.runtime_state,
+                                            MakerExit::PositionReconciliation,
+                                        );
+                                    }
+                                    if let Some(cleanup) =
+                                        error.downcast_ref::<ReconnectCleanupFailed>()
+                                    {
+                                        break 'phase stop_requested_exit(
+                                            &mut self.recovery.runtime_state,
+                                            RuntimeStopReason::CleanupFailure {
+                                                target: RecoveryTarget::OrderResponse,
+                                                reason: cleanup.to_string(),
+                                            },
+                                        );
+                                    }
+                                    if error
+                                        .downcast_ref::<TransportReconnectExhausted>()
+                                        .is_some()
+                                    {
+                                        if let Err(cleanup_error) = cancel_maker_orders_with_retry(
+                                            client,
+                                            symbol,
+                                            3,
+                                            output_format,
+                                        )
+                                        .await
+                                        {
+                                            let reason = format!(
+                                                "order-response retry cleanup failed: {cleanup_error}"
+                                            );
+                                            break 'phase stop_requested_exit(
+                                                &mut self.recovery.runtime_state,
+                                                RuntimeStopReason::CleanupFailure {
+                                                    target: RecoveryTarget::OrderResponse,
+                                                    reason,
+                                                },
+                                            );
+                                        }
+                                        failed_rounds = failed_rounds.saturating_add(1);
+                                        let delay_secs = maker::recovery_retry_delay_secs(
+                                            args.order_response_reconnect_backoff,
+                                            failed_rounds,
+                                        );
+                                        let retry_message = format!(
+                                            concat!(
+                                                "order-response reconnect round {} exhausted ({}); ",
+                                                "maker book re-verified empty; placements remain frozen; ",
+                                                "retrying in {}s"
+                                            ),
+                                            failed_rounds, error, delay_secs,
+                                        );
+                                        notifier
+                                            .risk(
+                                                RiskNotice {
+                                                    kind: "order_response",
+                                                    severity: "warning",
+                                                    event: "reconnect_retrying",
+                                                    message: &retry_message,
+                                                    symbol,
+                                                    cycle,
+                                                    position_before: None,
+                                                    position_after: None,
+                                                    expected: Some(
+                                                        self.loop_state.ledger.expected_position,
+                                                    ),
+                                                    observed: None,
+                                                },
+                                                false,
+                                            )
+                                            .await;
+                                        tokio::select! {
+                                            biased;
+                                            _ = ctrl_c_latched(&mut self.ctrl_c_rx) => {
+                                                self.recovery.runtime_state.handle(
+                                                    MakerEvent::StopRequested(RuntimeStopReason::CtrlC),
+                                                );
+                                                break 'phase take_stop_effect(
+                                                    &mut self.recovery.runtime_state,
+                                                    MakerExit::OrderResponse,
+                                                );
+                                            }
+                                            _ = tokio::time::sleep(Duration::from_secs(delay_secs)) => {}
+                                        }
+                                        continue;
+                                    }
+                                    let reconnect_failed_message = format!(
+                                        "{detail}; safe reconnect is not retryable: {error}; refusing further live orders"
                                     );
                                     notifier
                                         .risk(
@@ -1332,7 +1333,7 @@ impl MakerRuntime {
                                                 kind: "order_response",
                                                 severity: "critical",
                                                 event: "reconnect_failed",
-                                                message: &reconciliation_message,
+                                                message: &reconnect_failed_message,
                                                 symbol,
                                                 cycle,
                                                 position_before: None,
@@ -1348,48 +1349,78 @@ impl MakerRuntime {
                                     self.recovery.runtime_state.handle(
                                         MakerEvent::RecoveryFailed {
                                             token: recovery_token,
-                                            reason: error.to_string(),
+                                            reason: reconnect_failed_message,
                                         },
                                     );
                                     break 'phase take_stop_effect(
                                         &mut self.recovery.runtime_state,
-                                        MakerExit::PositionReconciliation,
+                                        MakerExit::OrderResponse,
                                     );
                                 }
-                                let reconnect_failed_message = format!(
-                                    "{detail}; safe reconnect failed: {error}; refusing further live orders"
-                                );
-                                notifier
-                                    .risk(
-                                        RiskNotice {
-                                            kind: "order_response",
-                                            severity: "critical",
-                                            event: "reconnect_failed",
-                                            message: &reconnect_failed_message,
-                                            symbol,
-                                            cycle,
-                                            position_before: None,
-                                            position_after: None,
-                                            expected: Some(
-                                                self.loop_state.ledger.expected_position,
-                                            ),
-                                            observed: None,
-                                        },
-                                        true,
-                                    )
-                                    .await;
-                                self.recovery
-                                    .runtime_state
-                                    .handle(MakerEvent::RecoveryFailed {
-                                        token: recovery_token,
-                                        reason: reconnect_failed_message,
-                                    });
-                                break 'phase take_stop_effect(
-                                    &mut self.recovery.runtime_state,
-                                    MakerExit::OrderResponse,
-                                );
+                            }
+                        };
+
+                        self.loop_state.counters.total_fills += reconnected.fills.len() as u64;
+                        for fill in &reconnected.fills {
+                            emit_live_fill(fill, symbol, cycle, output_format);
+                            if let Some(order_id) = fill.order_id {
+                                let at_ms =
+                                    u64::try_from(session.latency_started.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX);
+                                if let Err(error) = session
+                                    .order_latency
+                                    .record_fill_after_cancel_order(order_id, at_ms)
+                                {
+                                    eprintln!(
+                                        "⚠️ fill-after-cancel observation unavailable: {error}"
+                                    );
+                                }
                             }
                         }
+                        self.loop_state.account_balance_refresh_requested |=
+                            !reconnected.fills.is_empty();
+                        let reconciled_position = reconnected.position;
+                        session.order_commands = reconnected.commands;
+                        session.order_responses = reconnected.responses;
+                        session.order_response_health = reconnected.health;
+                        session.order_response_handle = reconnected.handle;
+                        // Cleanup verified an empty maker book. The next cycle
+                        // rebuilds exchange state before it may place.
+                        resume_quoting_after_recovery(
+                            &mut RecoveryIo {
+                                runtime_state: &mut self.recovery.runtime_state,
+                                notifier,
+                                client,
+                                session: Some(&mut *session),
+                                resting: &mut self.loop_state.resting,
+                                inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
+                                next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
+                                symbol,
+                                cycle,
+                                output_format,
+                            },
+                            ResumeSpec {
+                                recovery_token,
+                                observed: reconciled_position,
+                                continuity: OrderResponseContinuity::Replaced,
+                                clear_resting: true,
+                                recovered_note: None,
+                                notice: RiskNotice {
+                                    kind: "order_response",
+                                    severity: "resolved",
+                                    event: "reconnected",
+                                    message: "order-response stream reconnected; maker book verified empty before quoting resumes",
+                                    symbol,
+                                    cycle,
+                                    position_before: None,
+                                    position_after: None,
+                                    expected: Some(self.loop_state.ledger.expected_position),
+                                    observed: Some(reconciled_position),
+                                },
+                            },
+                        )
+                        .await;
+                        return LoopDirective::Restart;
                     }
                     let reconnect_note = reconnect_unavailable
                         .expect("unavailable reconnect must carry a fail-safe reason");

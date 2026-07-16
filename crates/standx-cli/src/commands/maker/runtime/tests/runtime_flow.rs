@@ -271,24 +271,43 @@ fn account_cycle_invalidation_routes_through_cleanup_without_a_position_gap() {
 }
 
 #[test]
-fn normal_cycle_invalidations_do_not_consume_recovery_incident_budget() {
-    let invalidation = PositionReconciliationError::cycle_invalidation(0.0);
-    let mismatch = PositionReconciliationError::position_mismatch(0.0, 0.2);
-    let mut breaker = maker::RecoveryCircuitBreaker::new(1, 3_600);
+fn correlated_private_stream_failures_never_expose_the_intermediate_cycle() {
+    let mut runtime_state = MakerState::starting();
+    runtime_state.handle(MakerEvent::StartupReady);
+    let first_cycle = match runtime_state.next_effect() {
+        Some(MakerEffect::RunCycle(token)) => token,
+        effect => panic!("expected initial cycle, got {effect:?}"),
+    };
 
-    for now in [10, 20, 30, 40] {
-        assert!(reconciliation_recovery_admission(&invalidation, &mut breaker, now).is_none());
-    }
-    assert!(
-        reconciliation_recovery_admission(&mismatch, &mut breaker, 50)
-            .expect("a true mismatch must be metered")
-            .is_admitted()
-    );
-    assert!(
-        !reconciliation_recovery_admission(&mismatch, &mut breaker, 60)
-            .expect("a true mismatch must be metered")
-            .is_admitted()
-    );
+    runtime_state.handle(MakerEvent::AccountStreamDisconnected(
+        "connection reset".to_string(),
+    ));
+    let account_cleanup =
+        take_cleanup_effect(&mut runtime_state, RecoveryTarget::AccountStream).unwrap();
+    runtime_state.handle(MakerEvent::CycleCompleted(first_cycle));
+    runtime_state.handle(MakerEvent::CleanupCompleted(account_cleanup));
+    let account_recovery =
+        take_recovery_effect(&mut runtime_state, RecoveryTarget::AccountStream).unwrap();
+    runtime_state.handle(MakerEvent::RecoverySucceeded(account_recovery));
+
+    // The first recovery schedules a cycle, but the second private stream is
+    // checked before execution. Its freeze clears that queued cycle and starts
+    // another cleanup, so no placement can occur between correlated failures.
+    runtime_state.handle(MakerEvent::OrderResponseDisconnected(
+        "connection reset".to_string(),
+    ));
+    let order_cleanup =
+        take_cleanup_effect(&mut runtime_state, RecoveryTarget::OrderResponse).unwrap();
+    runtime_state.handle(MakerEvent::CleanupCompleted(order_cleanup));
+    let order_recovery =
+        take_recovery_effect(&mut runtime_state, RecoveryTarget::OrderResponse).unwrap();
+    runtime_state.handle(MakerEvent::RecoverySucceeded(order_recovery));
+
+    assert!(matches!(
+        runtime_state.next_effect(),
+        Some(MakerEffect::RunCycle(_))
+    ));
+    assert!(runtime_state.next_effect().is_none());
 }
 
 #[test]

@@ -246,8 +246,7 @@ impl MakerRuntime {
                     args.account_stream_reconnect_attempts, args.account_stream_reconnect_backoff
                 );
                 println!(
-                    "│ transport recovery circuit: {} incident(s) / {}s rolling window",
-                    args.recovery_incidents_per_window, args.recovery_window_secs
+                    "│ transport recovery: placements stay frozen while bounded reconnect rounds retry"
                 );
             }
             if args.no_ws {

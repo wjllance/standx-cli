@@ -36,6 +36,8 @@ pub(super) struct MakerFileConfig {
     pub order_response_reconnect_backoff: Option<u64>,
     pub account_stream_reconnect_attempts: Option<u32>,
     pub account_stream_reconnect_backoff: Option<u64>,
+    /// Deprecated compatibility fields. Existing production files continue to
+    /// parse, but transport recovery no longer uses an incident-count circuit.
     pub recovery_incidents_per_window: Option<u32>,
     pub recovery_window_secs: Option<u64>,
 }
@@ -105,8 +107,8 @@ mod tests {
         assert_eq!(config.order_response_reconnect_backoff, Some(2));
         assert_eq!(config.account_stream_reconnect_attempts, Some(3));
         assert_eq!(config.account_stream_reconnect_backoff, Some(2));
-        assert_eq!(config.recovery_incidents_per_window, Some(3));
-        assert_eq!(config.recovery_window_secs, Some(3600));
+        assert_eq!(config.recovery_incidents_per_window, None);
+        assert_eq!(config.recovery_window_secs, None);
     }
 
     #[test]

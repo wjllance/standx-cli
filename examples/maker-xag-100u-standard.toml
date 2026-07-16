@@ -63,8 +63,6 @@ account_stream_reconnect_attempts = 3
 account_stream_reconnect_backoff = 2
 order_response_reconnect_attempts = 3
 order_response_reconnect_backoff = 2
-recovery_incidents_per_window = 3
-recovery_window_secs = 3600
 
 # Use the WebSocket market feed, with REST fallback handled by the CLI.
 no_ws = false
