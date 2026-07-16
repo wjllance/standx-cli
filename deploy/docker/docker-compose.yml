@@ -9,9 +9,15 @@
 #   docker compose -f deploy/docker/docker-compose.yml --profile ab up -d --build
 #
 # OpenObserve is NOT part of this file — keep running deploy/openobserve/compose.yaml
-# separately. network_mode: host lets this container reach it on 127.0.0.1:5080,
-# share /run/lock with a host-run maker, and hit the venue exactly like the
-# systemd deployment.
+# separately. network_mode: host lets this container reach it on 127.0.0.1:5080
+# and hit the venue exactly like the systemd deployment.
+#
+# Locks are container-local (STANDX_MAKER_LOCK_PATH / STANDX_STAGE2_AB_LOCK_PATH
+# in /etc/standx/maker-stage2-ab.env should point under /opt/standx/var/lock),
+# not shared with the host's /run/lock. This assumes no host-run
+# standx-maker.service / standx-maker-stage2-ab.service runs at the same time
+# as this container — if you do run one, point both deployments at the same
+# bind-mounted lock directory instead of the container-local default.
 
 services:
   stage2-ab:
@@ -36,8 +42,8 @@ services:
     # >= systemd TimeoutStopSec=90, with margin for the arm's freeze/cancel-all.
     stop_grace_period: 120s
 
-    # Host networking: OpenObserve on 127.0.0.1:5080, the venue, and the shared
-    # /run/lock mutual exclusion all behave as they do for the host-run maker.
+    # Host networking: OpenObserve on 127.0.0.1:5080 and the venue behave as
+    # they do for the host-run maker.
     network_mode: host
 
     # Root-owned 0600 file, same contents as the systemd deployment. Provides
@@ -53,6 +59,3 @@ services:
       - ${STANDX_CREDENTIALS_FILE:-/opt/standx/state/standx/credentials.enc}:/opt/standx/state/standx/credentials.enc:ro
       # Run evidence (NDJSON + manifests) must outlive the container.
       - ${STANDX_LOG_DIR_HOST:-/opt/standx/var/standx}:/opt/standx/var/standx
-      # Shared lock dir so a host-run maker and this container are mutually
-      # exclusive on /run/lock/standx-maker-live.lock and the A/B guard lock.
-      - /run/lock:/run/lock
