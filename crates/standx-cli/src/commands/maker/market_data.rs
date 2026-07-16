@@ -216,7 +216,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn consecutive_rest_fallback_enters_degraded() {
+    fn sustained_rest_fallback_enters_degraded_after_grace() {
         let mut health = maker::MarketDataHealth::default();
         for now_ms in [0, 1_000] {
             assert!(observe_acquired_market_health(
@@ -236,7 +236,7 @@ mod tests {
         let detail = observe_acquired_market_health(
             &mut health,
             AcquiredMarketHealth {
-                now_ms: 2_000,
+                now_ms: maker::MARKET_DATA_BAD_GRACE_MS,
                 source: "rest",
                 fallback_reason: Some("ws_mark_and_book_stale"),
                 mark: 100.0,
@@ -245,7 +245,7 @@ mod tests {
                 max_divergence_bps: 10.0,
             },
         )
-        .expect("third consecutive REST fallback must degrade");
+        .expect("third sustained REST fallback after the grace must degrade");
         assert!(detail.contains("issue=rest_fallback"));
         assert!(detail.contains("consecutive=3"));
         assert!(health.is_degraded());

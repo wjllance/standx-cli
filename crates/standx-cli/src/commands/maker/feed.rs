@@ -326,10 +326,6 @@ pub(super) fn fresh_ws_sample(
     Some((mark, best_bid, best_ask, version))
 }
 
-pub(super) fn fresh_ws_snapshot(state: &FeedState) -> Option<(f64, Option<f64>, Option<f64>)> {
-    fresh_ws_sample(state).map(|(mark, best_bid, best_ask, _)| (mark, best_bid, best_ask))
-}
-
 async fn reset_feed_state(state: &RwLock<FeedState>, issue: WsSnapshotIssue) {
     *state.write().await = FeedState {
         reconnect_issue: Some(issue),
@@ -828,17 +824,19 @@ mod tests {
     }
 
     #[test]
-    fn recovery_version_requires_both_channels_to_advance() {
+    fn snapshot_version_requires_both_channels_to_advance() {
         let now = Instant::now();
         let previous = FeedSnapshotVersion {
             mark_received_at: now,
             book_received_at: now,
         };
-        assert!(!FeedSnapshotVersion {
-            mark_received_at: now + Duration::from_secs(1),
-            book_received_at: now,
+        for offset in 1..=3 {
+            assert!(!FeedSnapshotVersion {
+                mark_received_at: now,
+                book_received_at: now + Duration::from_millis(offset * 100),
+            }
+            .both_advanced_from(Some(previous)));
         }
-        .both_advanced_from(Some(previous)));
         assert!(FeedSnapshotVersion {
             mark_received_at: now + Duration::from_secs(1),
             book_received_at: now + Duration::from_secs(1),
