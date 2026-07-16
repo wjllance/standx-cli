@@ -327,7 +327,7 @@ impl MakerRuntime {
                     0
                 }
                 ),
-                &symbol,
+                symbol,
                 false,
             )
         .await;

@@ -93,7 +93,7 @@ impl MakerRuntime {
         let performance_epoch_ms = self.loop_state.performance_epoch_ms;
         let market_data_health_started = self.market.health_started;
         let feed = &self.market.feed;
-        let exit = 'execute: loop {
+        let exit = 'execute: {
             // Work phase raced against Ctrl+C so a slow API call can be
             // interrupted (mirrors run_watch_loop).
             let mismatch = self.recovery.account_position_mismatch.take();
@@ -105,7 +105,7 @@ impl MakerRuntime {
             let cycle_work_token = match take_cycle_work(&mut self.recovery.runtime_state) {
                 Ok(Some(token)) => token,
                 Ok(None) => return Err(LoopDirective::Restart),
-                Err(exit) => break exit,
+                Err(exit) => break 'execute exit,
             };
             // Split the live session into disjoint field borrows once per cycle:
             // the pinned `work` future holds the command/health/projection/poll
@@ -166,7 +166,7 @@ impl MakerRuntime {
                         ),
                     ));
                 }
-                let market = market_snapshot(&client, &symbol, feed.as_ref()).await?;
+                let market = market_snapshot(client, symbol, feed.as_ref()).await?;
                 let mark = market.mark;
                 let best_bid = market.best_bid;
                 let best_ask = market.best_ask;
@@ -191,9 +191,9 @@ impl MakerRuntime {
                 }
                 let result = maker_cycle(
                     CycleRequest {
-                        client: &client,
-                        symbol: &symbol,
-                        cfg: &cfg,
+                        client,
+                        symbol,
+                        cfg,
                         live: args.live,
                         cycle,
                         mark,
@@ -207,7 +207,7 @@ impl MakerRuntime {
                         inventory_exit_pct: args.inventory_exit_pct,
                         inventory_exit_qty: args.inventory_exit_qty,
                         session_started_at,
-                        run_order_prefix: &run_order_prefix,
+                        run_order_prefix,
                         starting_position,
                         output_format,
                         order_commands: cycle_order_commands,
@@ -374,7 +374,7 @@ impl MakerRuntime {
                         response,
                         &mut session.projection,
                         output_format,
-                        &symbol,
+                        symbol,
                         cycle,
                         cfg.price_decimals,
                     );
@@ -395,8 +395,8 @@ impl MakerRuntime {
                             projection: &mut session.projection,
                         },
                         &AccountEventContext {
-                            symbol: &symbol,
-                            run_order_prefix: &run_order_prefix,
+                            symbol,
+                            run_order_prefix,
                             mark: self.market.last_mark.unwrap_or(baseline_mark),
                             cycle,
                             output_format,
@@ -416,7 +416,7 @@ impl MakerRuntime {
                                     inventory_exit_pending: &mut self
                                         .loop_state
                                         .inventory_exit_pending,
-                                    notifier: &notifier,
+                                    notifier,
                                     position_alert_anchor: &mut self
                                         .loop_state
                                         .position_alert_anchor,
@@ -424,7 +424,7 @@ impl MakerRuntime {
                                     max_position: cfg.max_position,
                                     inventory_exit_pct: args.inventory_exit_pct,
                                     qty_tolerance,
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     order_latency: Some(&mut session.order_latency),
                                     latency_started: Some(session.latency_started),
@@ -454,8 +454,8 @@ impl MakerRuntime {
             }
             if args.live {
                 if let Some(exit) = accounting_invariant_exit(
-                    &notifier,
-                    &symbol,
+                    notifier,
+                    symbol,
                     cycle,
                     self.loop_state.ledger.expected_position,
                     self.loop_state.stats.position(),
@@ -519,7 +519,7 @@ impl MakerRuntime {
             breaker_halted_before,
             result: cycle_result,
         } = attempt;
-        let exit = 'phase: loop {
+        let exit = 'phase: {
             match cycle_result {
                 Ok(CycleSuccess {
                     places,
@@ -565,7 +565,7 @@ impl MakerRuntime {
                                     severity,
                                     event,
                                     message,
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: Some(self.loop_state.ledger.expected_position),
@@ -584,7 +584,7 @@ impl MakerRuntime {
                                     severity: "warning",
                                     event: "submitted",
                                     message: "reduce-only inventory exit submitted",
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: Some(self.loop_state.ledger.expected_position),
@@ -602,7 +602,7 @@ impl MakerRuntime {
                                     severity: "resolved",
                                     event: "confirmed",
                                     message: "reduce-only inventory exit is no longer pending after ledger reconciliation",
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: Some(self.loop_state.ledger.expected_position),
@@ -642,7 +642,7 @@ impl MakerRuntime {
                             // Await firing alerts so a breach raised on the final
                             // cycle before shutdown is not dropped with its task.
                             let await_delivery = alert.firing;
-                            notifier.alert(&alert, &symbol, await_delivery).await;
+                            notifier.alert(&alert, symbol, await_delivery).await;
                         }
                     }
                     // Account equity / available-margin floors. The snapshot is
@@ -657,7 +657,7 @@ impl MakerRuntime {
                                     self.loop_state.alerts.evaluate_account(equity, available);
                                 for alert in fired {
                                     let await_delivery = alert.firing;
-                                    notifier.alert(&alert, &symbol, await_delivery).await;
+                                    notifier.alert(&alert, symbol, await_delivery).await;
                                 }
                             } else if !self.loop_state.balance_floor_parse_warned {
                                 // An armed --alert-equity-below / --alert-margin-below
@@ -679,7 +679,7 @@ impl MakerRuntime {
                         if pnl <= -args.stop_loss {
                             emit_stop_loss_triggered(
                                 output_format,
-                                &symbol,
+                                symbol,
                                 cycle,
                                 pnl,
                                 args.stop_loss,
@@ -694,7 +694,7 @@ impl MakerRuntime {
                                             "session PnL {pnl:+.2} breached stop-loss -{:.2}; shutting down",
                                             args.stop_loss
                                         ),
-                                        symbol: &symbol,
+                                        symbol,
                                         cycle,
                                         position_before: None,
                                         position_after: Some(self.loop_state.ledger.expected_position),
@@ -744,14 +744,14 @@ impl MakerRuntime {
                         let recovery_token = match freeze_and_cleanup_for_recovery(
                             &mut RecoveryIo {
                                 runtime_state: &mut self.recovery.runtime_state,
-                                notifier: &notifier,
-                                client: &client,
+                                notifier,
+                                client,
                                 session: self.live_session.as_mut(),
                                 resting: &mut self.loop_state.resting,
                                 inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                                 consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                                 next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                                symbol: &symbol,
+                                symbol,
                                 cycle,
                                 output_format,
                             },
@@ -771,7 +771,7 @@ impl MakerRuntime {
                                         PositionReconciliationCause::UnknownCurrentRunOrder => "unknown current-run order detected; placements frozen and maker cleanup starting",
                                         PositionReconciliationCause::PositionMismatch => "position mismatch detected; placements frozen and maker cleanup starting",
                                     },
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: None,
@@ -837,8 +837,8 @@ impl MakerRuntime {
                                         projection: &mut session.projection,
                                     },
                                     &AccountEventContext {
-                                        symbol: &symbol,
-                                        run_order_prefix: &run_order_prefix,
+                                        symbol,
+                                        run_order_prefix,
                                         mark: self.market.last_mark.unwrap_or(baseline_mark),
                                         cycle,
                                         output_format,
@@ -858,7 +858,7 @@ impl MakerRuntime {
                                                 inventory_exit_pending: &mut self
                                                     .loop_state
                                                     .inventory_exit_pending,
-                                                notifier: &notifier,
+                                                notifier,
                                                 position_alert_anchor: &mut self
                                                     .loop_state
                                                     .position_alert_anchor,
@@ -869,7 +869,7 @@ impl MakerRuntime {
                                                 max_position: cfg.max_position,
                                                 inventory_exit_pct: args.inventory_exit_pct,
                                                 qty_tolerance,
-                                                symbol: &symbol,
+                                                symbol,
                                                 cycle,
                                                 order_latency: Some(&mut session.order_latency),
                                                 latency_started: Some(session.latency_started),
@@ -895,11 +895,11 @@ impl MakerRuntime {
                                 }
                             }
                             match probe_position_convergence(
-                                &client,
+                                client,
                                 ReconcileRequest {
-                                    symbol: &symbol,
+                                    symbol,
                                     session_started_at,
-                                    run_order_prefix: &run_order_prefix,
+                                    run_order_prefix,
                                     qty_tolerance,
                                     mark: self.market.last_mark.unwrap_or(baseline_mark),
                                 },
@@ -920,7 +920,7 @@ impl MakerRuntime {
                                 ConvergenceProbe::SnapshotFailed(error) => {
                                     emit_reconciliation_snapshot_error(
                                         output_format,
-                                        &symbol,
+                                        symbol,
                                         cycle,
                                         &error.to_string(),
                                     )
@@ -933,7 +933,7 @@ impl MakerRuntime {
                             // maker book again at the end of the bounded recovery
                             // window before unfreezing placements.
                             if let Err(error) =
-                                cancel_maker_orders_with_retry(&client, &symbol, 3, output_format)
+                                cancel_maker_orders_with_retry(client, symbol, 3, output_format)
                                     .await
                             {
                                 break 'phase recovery_failed_exit(
@@ -948,14 +948,14 @@ impl MakerRuntime {
                             resume_quoting_after_recovery(
                                 &mut RecoveryIo {
                                     runtime_state: &mut self.recovery.runtime_state,
-                                    notifier: &notifier,
-                                    client: &client,
+                                    notifier,
+                                    client,
                                     session: self.live_session.as_mut(),
                                     resting: &mut self.loop_state.resting,
                                     inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
                                     consecutive_errors: &mut self.loop_state.counters.consecutive_errors,
                                     next_cycle_is_recovery: &mut self.loop_state.next_cycle_is_recovery,
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     output_format,
                                 },
@@ -974,7 +974,7 @@ impl MakerRuntime {
                                         severity: "resolved",
                                         event: "recovered",
                                         message: "position ledger recovered within the 3-second freeze window; quoting may resume from an empty maker book",
-                                        symbol: &symbol,
+                                        symbol,
                                         cycle,
                                         position_before: None,
                                         position_after: None,
@@ -988,7 +988,7 @@ impl MakerRuntime {
                         }
                         emit_reconciliation_state(
                             output_format,
-                            &symbol,
+                            symbol,
                             cycle,
                             "failed",
                             reconciliation_cause,
@@ -1002,7 +1002,7 @@ impl MakerRuntime {
                                     severity: "critical",
                                     event: "failed",
                                     message: "position ledger remained inconsistent after the 3-second freeze window",
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: None,
@@ -1035,7 +1035,7 @@ impl MakerRuntime {
                                     severity: "warning",
                                     event: "failed",
                                     message: &message,
-                                    symbol: &symbol,
+                                    symbol,
                                     cycle,
                                     position_before: None,
                                     position_after: Some(self.loop_state.ledger.expected_position),
@@ -1059,7 +1059,7 @@ impl MakerRuntime {
                         self.recovery.runtime_state.pending_effect(),
                         Some(MakerEffect::Stop(_))
                     ) {
-                        break take_stop_effect(
+                        break 'phase take_stop_effect(
                             &mut self.recovery.runtime_state,
                             MakerExit::ConsecutiveErrors,
                         );
@@ -1082,7 +1082,7 @@ impl MakerRuntime {
         let baseline_mark = self.deps.baseline_mark;
         let market_data_health_started = self.market.health_started;
         let feed = &self.market.feed;
-        let exit = 'phase: loop {
+        let exit = 'phase: {
             self.loop_state.counters.cycle += 1;
 
             if matches!(
@@ -1153,8 +1153,8 @@ impl MakerRuntime {
                                     projection: &mut session.projection,
                                 },
                                 &AccountEventContext {
-                                    symbol: &symbol,
-                                    run_order_prefix: &run_order_prefix,
+                                    symbol,
+                                    run_order_prefix,
                                     mark: self.market.last_mark.unwrap_or(baseline_mark),
                                     cycle: self.loop_state.counters.cycle,
                                     output_format,
@@ -1169,13 +1169,13 @@ impl MakerRuntime {
                                             total_fills: &mut self.loop_state.counters.total_fills,
                                             balance_refresh_requested: &mut self.loop_state.account_balance_refresh_requested,
                                             inventory_exit_pending: &mut self.loop_state.inventory_exit_pending,
-                                            notifier: &notifier,
+                                            notifier,
                                             position_alert_anchor: &mut self.loop_state.position_alert_anchor,
                                             expected_position: self.loop_state.ledger.expected_position,
                                             max_position: cfg.max_position,
                                             inventory_exit_pct: args.inventory_exit_pct,
                                             qty_tolerance,
-                                            symbol: &symbol,
+                                            symbol,
                                             cycle: self.loop_state.counters.cycle,
                                             order_latency: Some(&mut session.order_latency),
                                             latency_started: Some(session.latency_started),
