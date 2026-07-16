@@ -11,6 +11,14 @@ set -euo pipefail
 root="${STANDX_INSTALL_ROOT:-/opt/standx}"
 cred_file="${XDG_DATA_HOME:-$root/state}/standx/credentials.enc"
 
+# Validate-only is a pure offline config/preflight check (symbol, config
+# byte-equality, hashes) — no credentials, no OpenObserve, no live orders. Skip
+# the live-only preconditions and hand straight to the orchestrator, which
+# validates and exits 0.
+if [[ "${STANDX_STAGE2_VALIDATE_ONLY:-0}" == "1" ]]; then
+  exec "$root/scripts/run_maker_stage2_ab.sh"
+fi
+
 # Credentials arrive either as env (STANDX_JWT) or the read-only mounted file.
 if [[ -z "${STANDX_JWT:-}" && ! -f "$cred_file" ]]; then
   printf 'entrypoint: no credentials: set STANDX_JWT or mount %s (read-only)\n' \
