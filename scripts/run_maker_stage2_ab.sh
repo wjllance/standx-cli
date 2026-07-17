@@ -6,7 +6,7 @@ standx_bin="${STANDX_BIN:-$root/bin/standx}"
 baseline_config="${STANDX_STAGE2_BASELINE_CONFIG:-$root/examples/maker-stage2-xag-baseline.toml}"
 candidate_config="${STANDX_STAGE2_CANDIDATE_CONFIG:-$root/examples/maker-stage2-xag-candidate.toml}"
 symbol="${STANDX_SYMBOL:-XAG-USD}"
-arm_seconds=7200
+arm_seconds="${STANDX_STAGE2_ARM_SECONDS:-7200}"
 # Minimum arm length is arm_seconds. At that mark the orchestrator signals the
 # arm with SIGUSR1, latching maker wind-down: the maker stops quoting for good
 # and flattens any residual position via reduce-only market exits (bounded,
@@ -69,7 +69,7 @@ critical_stop() {
   exit 75
 }
 
-for value in "$poll_seconds" "$arm_max_seconds"; do
+for value in "$poll_seconds" "$arm_seconds" "$arm_max_seconds"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     printf 'stage2 A/B durations must be positive integers\n' >&2
     exit 64
