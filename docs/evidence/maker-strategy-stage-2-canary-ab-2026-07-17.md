@@ -328,3 +328,54 @@ closure. Replaces extend-to-flat quoting with a latched **wind-down**:
   binary kills it.
 - Status: implemented and verified offline; NOT yet committed (awaiting
   operator approval), not yet deployed.
+
+### Wind-down deployed; HYPE A/B #1 incident and cycle_summary fix — 2026-07-17T10:4x–15:1xZ
+
+Committed as ba60b6a + 08c08ed (PR #316, exp -> main). Docker image rebuilt
+from 08c08ed (build-time strategy_source_clean gate passed).
+
+- 10:44Z XAG A/B restarted (pre-checks: venue flat, token TTL 166h — the
+  09:04Z failure was server-side session invalidation, not JWT expiry).
+  Arm 1 healthy; operator then redirected to HYPE; XAG container stopped
+  cleanly 10:4xZ (Exited 0, venue flat).
+- HYPE bring-up: `/etc/standx/maker-stage2-hype-ab.env` installed (venue
+  metadata re-verified live: price_tick=3, qty_tick=2, min_order=0.1).
+  ws-command-canary PASS (full create/cancel chain, order 11639733982);
+  controlled-disconnect drill PASS (frozen -> cleanup empty -> fail-safe
+  exit 75); canary manifest validated (log sha256 1177c1f3... matches).
+- 10:52Z HYPE A/B #1 started. Baseline arm ran the full 2h (34+ fills,
+  PnL -0.25). 12:52Z SIGUSR1 wind-down: quotes pulled, residual +0.2
+  flattened via reduce-only market exit @59.735, position -> 0.0, maker
+  exit 0. **Wind-down's first live exercise: flatten worked exactly as
+  designed.**
+- BUT the orchestrator then critical-stopped (exit 75): the exit order
+  spent one cycle awaiting venue confirmation, that cycle aborted via the
+  duplicate-exit guard BEFORE emitting cycle_summary, and the manifest
+  gate (correctly, fail-closed) failed `cycle_sequence_complete`
+  (`missing_cycles=[2663]`, 2668/2669 present, otherwise fully eligible).
+  Arm 1 data void; arm 2 never ran. Venue verified flat.
+- Root cause: `cycle.rs` treated "exit still awaiting confirmation" as a
+  hard cycle error, skipping the summary emission. Fix (2db6106): the
+  cycle now completes with zero order work (identical execution
+  semantics — no duplicate exit, no quote churn) and emits its summary;
+  the historical `inventory_exit/failed` notification is preserved
+  byte-identical on the success path. Also afbb695 makes arm_seconds
+  env-configurable (`STANDX_STAGE2_ARM_SECONDS`, default 7200 unchanged).
+  Offline gates green; validate-only + negative-path checks pass.
+- 13:53Z HYPE A/B #2 (30-min arms, operator-directed validation rerun)
+  on image afbb695. Arm 1 baseline: wind-down at 14:23Z with residual
+  +0.2 — flatten @60.392, the awaiting-confirmation cycle (967) emitted
+  its summary, manifest `baseline_eligible=True`, `missing_cycles=[]`
+  (949 cycles / 1821s). Arm 2 candidate: wind-down at 14:53Z already
+  flat, clean stop, manifest `eligible=True`, `missing_cycles=[]`
+  (750 cycles / 1820s). Both switch styles (flatten / already-flat) PASS.
+- Operator stopped the run 15:08Z (SIGTERM, Exited 0). Arm 3 (baseline
+  #2, 371 cycles, void) had residual +0.3 HYPE long; orders=[] but
+  position non-flat. Per operator authorization, flattened via host CLI
+  reduce-only market sell 0.3 (order f8be1140-5830-42d1-a29c-4d0c69806a32);
+  post-check orders=[] positions=[]. Monitoring cron 23033b6b deleted.
+- Net: wind-down arm switching is now proven live on HYPE for both the
+  flatten and already-flat switch paths, with both arm manifests fully
+  baseline-eligible. Remaining follow-ups: restore
+  `STANDX_STAGE2_ARM_SECONDS=7200` for the standard 2h A/B; PR #316
+  awaits merge; formal 2h baseline/candidate comparison still to be run.
