@@ -80,10 +80,13 @@ done
     "$arm_max_seconds" "$arm_seconds" >&2
   exit 64
 }
-[[ "$symbol" == "XAG-USD" ]] || {
-  printf 'stage2 A/B is frozen to XAG-USD\n' >&2
-  exit 64
-}
+case "$symbol" in
+  XAG-USD|HYPE-USD) ;;
+  *)
+    printf 'stage2 A/B is frozen to XAG-USD and HYPE-USD\n' >&2
+    exit 64
+    ;;
+esac
 [[ -x "$standx_bin" && -f "$baseline_config" && -f "$candidate_config" ]] || {
   printf 'stage2 A/B binary or frozen configs are missing\n' >&2
   exit 64

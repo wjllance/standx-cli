@@ -59,3 +59,27 @@ services:
       - ${STANDX_CREDENTIALS_FILE:-/opt/standx/state/standx/credentials.enc}:/opt/standx/state/standx/credentials.enc:ro
       # Run evidence (NDJSON + manifests) must outlive the container.
       - ${STANDX_LOG_DIR_HOST:-/opt/standx/var/standx}:/opt/standx/var/standx
+
+  # HYPE-USD variant of the stage2 A/B above. Same image, same safety model,
+  # separate container name, env file, and lock paths (see
+  # deploy/systemd/maker-stage2-hype-ab.env.example). NEVER run this profile
+  # at the same time as "ab": maker locks are container-local, so two A/B
+  # containers would not exclude each other on the shared account. Stop the
+  # XAG service, verify orders=[] positions=[], then start this one.
+  stage2-ab-hype:
+    profiles: ["ab-hype"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: standx-stage2-ab:latest
+    container_name: standx-maker-stage2-ab-hype
+    restart: "no"
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 120s
+    network_mode: host
+    env_file:
+      - /etc/standx/maker-stage2-hype-ab.env
+    volumes:
+      - ${STANDX_CREDENTIALS_FILE:-/opt/standx/state/standx/credentials.enc}:/opt/standx/state/standx/credentials.enc:ro
+      - ${STANDX_LOG_DIR_HOST:-/opt/standx/var/standx}:/opt/standx/var/standx
