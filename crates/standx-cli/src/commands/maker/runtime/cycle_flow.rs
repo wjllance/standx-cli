@@ -641,6 +641,30 @@ impl MakerRuntime {
                                 false,
                             )
                         .await;
+                    } else if exit_pending_before && exit_pending_after {
+                        // The in-flight exit is still awaiting venue
+                        // confirmation. The cycle itself now completes
+                        // normally (cycle_summary stays gap-free for
+                        // run-manifest validation); keep the historical
+                        // notification wording so downstream consumers see
+                        // the same contract as the pre-fix refused cycle.
+                        notifier
+                            .risk(
+                                RiskNotice {
+                                    kind: "inventory_exit",
+                                    severity: "warning",
+                                    event: "failed",
+                                    message: "inventory exit cycle failed: inventory exit is still awaiting venue confirmation; refusing to submit another",
+                                    symbol,
+                                    cycle,
+                                    position_before: None,
+                                    position_after: Some(self.loop_state.ledger.expected_position),
+                                    expected: Some(self.loop_state.ledger.expected_position),
+                                    observed: None,
+                                },
+                                false,
+                            )
+                        .await;
                     }
                     if !args.no_ws && self.market.last_src != Some(src) {
                         match src {

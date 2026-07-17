@@ -545,15 +545,16 @@ pub(super) async fn maker_cycle(
     if raw_inventory_exit.is_none() {
         *inventory_exit_pending = false;
     }
-    if raw_inventory_exit.is_some() && *inventory_exit_pending {
-        return Err(anyhow::anyhow!(
-            "inventory exit is still awaiting venue confirmation; refusing to submit another"
-        ));
-    }
+    // A still-unconfirmed exit must never be duplicated, but waiting for its
+    // venue confirmation is a normal cycle outcome rather than a failure:
+    // suppress all new order work for this cycle and let the cycle complete
+    // so the cycle_summary sequence stays gap-free for run-manifest
+    // validation.
+    let exit_awaiting_confirmation = raw_inventory_exit.is_some() && *inventory_exit_pending;
 
     let create_orders_allowed = market_data_mode == maker::MarketDataMode::Active
         && order_creation_allowed(live, rest_position_recheck_pending);
-    let inventory_exit = if create_orders_allowed {
+    let inventory_exit = if create_orders_allowed && !exit_awaiting_confirmation {
         plan.inventory_exit
     } else {
         None
@@ -566,6 +567,9 @@ pub(super) async fn maker_cycle(
         .actions
         .into_iter()
         .filter(|action| match action {
+            // While awaiting exit confirmation this cycle performs no order
+            // work at all: no duplicate exit, no quote churn.
+            _ if exit_awaiting_confirmation => false,
             Action::Place(_) if !create_orders_allowed => false,
             Action::Place(q)
                 if live
