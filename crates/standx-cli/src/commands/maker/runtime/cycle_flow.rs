@@ -103,6 +103,19 @@ impl MakerRuntime {
             let breaker_halted_before = self.loop_state.breaker.halted();
             let recovery_cycle = self.loop_state.next_cycle_is_recovery;
             let market_paused_before_cycle = self.market.health.is_degraded();
+            // Latch a supervisor wind-down request (SIGUSR1). Once set, the
+            // planner stops quoting and flattens via reduce-only exits.
+            if !self.loop_state.wind_down && *self.wind_down_rx.borrow_and_update() {
+                self.loop_state.wind_down = true;
+                notifier
+                    .lifecycle(
+                        "wind_down",
+                        "wind-down requested: quoting stopped, flattening via reduce-only exits",
+                        symbol,
+                        false,
+                    )
+                    .await;
+            }
             let cycle_work_token = match take_cycle_work(&mut self.recovery.runtime_state) {
                 Ok(Some(token)) => token,
                 Ok(None) => return Err(LoopDirective::Restart),
@@ -215,6 +228,8 @@ impl MakerRuntime {
                         max_divergence_bps: args.max_divergence_bps,
                         inventory_exit_pct: args.inventory_exit_pct,
                         inventory_exit_qty: args.inventory_exit_qty,
+                        wind_down: self.loop_state.wind_down,
+                        qty_tolerance,
                         session_started_at,
                         run_order_prefix,
                         starting_position,

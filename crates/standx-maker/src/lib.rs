@@ -176,6 +176,29 @@ pub(crate) fn inventory_exit_plan(
     })
 }
 
+/// Wind-down exit: flatten any position larger than the quantity tolerance in
+/// one reduce-only request, ignoring the configured trigger thresholds. The
+/// whole residual is taken at once because session position caps are small by
+/// design. Like [`inventory_exit_plan`] this is only a plan — the caller
+/// cancels stale quotes and submits the reduce-only order separately.
+pub(crate) fn wind_down_exit_plan(position: f64, qty_tolerance: f64) -> Option<InventoryExit> {
+    if !position.is_finite() || !qty_tolerance.is_finite() || qty_tolerance < 0.0 {
+        return None;
+    }
+    let abs_position = position.abs();
+    if abs_position <= qty_tolerance {
+        return None;
+    }
+    Some(InventoryExit {
+        side: if position > 0.0 {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        },
+        qty: abs_position,
+    })
+}
+
 /// A quote currently resting (a real order in live mode, simulated in paper
 /// mode).
 #[derive(Debug, Clone, PartialEq)]
@@ -576,6 +599,13 @@ pub struct CycleInput<'a> {
     pub active_exit_enabled: bool,
     pub inventory_exit_pct: f64,
     pub inventory_exit_qty: f64,
+    /// Supervisor-requested wind-down (e.g. an A/B arm past its scheduled
+    /// window): never place new quotes again and flatten any residual
+    /// position through the reduce-only exit path, ignoring the configured
+    /// exit thresholds. Converges to flat instead of re-accumulating.
+    pub wind_down: bool,
+    /// Positions at or below this magnitude count as flat during wind-down.
+    pub qty_tolerance: f64,
 }
 
 /// A deterministic plan for the executor to apply after a successful preflight.
@@ -598,16 +628,27 @@ pub struct CyclePlan {
 /// The caller owns transport state (pending HTTP submissions and exit
 /// acknowledgements) and must run [`preflight_cycle`] first. This function
 /// deliberately cannot perform I/O.
+///
+/// With `input.wind_down` set (a supervisor requesting session end, e.g. an
+/// A/B arm past its scheduled window) the plan converges to flat: no new
+/// quotes are ever desired — even once the position reaches zero — and any
+/// residual position above `input.qty_tolerance` yields a reduce-only exit
+/// plan regardless of the configured exit thresholds.
 pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> CyclePlan {
     let market_active = input.market_data_mode == MarketDataMode::Active;
-    let requested_inventory_exit = (market_active && input.active_exit_enabled)
+    let requested_inventory_exit = (market_active
+        && (input.active_exit_enabled || input.wind_down))
         .then(|| {
-            inventory_exit_plan(
-                input.position,
-                cfg.max_position,
-                input.inventory_exit_pct,
-                input.inventory_exit_qty,
-            )
+            if input.wind_down {
+                wind_down_exit_plan(input.position, input.qty_tolerance)
+            } else {
+                inventory_exit_plan(
+                    input.position,
+                    cfg.max_position,
+                    input.inventory_exit_pct,
+                    input.inventory_exit_qty,
+                )
+            }
         })
         .flatten();
 
@@ -616,7 +657,9 @@ pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> Cyc
     let inventory_exit = (!halted && market_active)
         .then_some(requested_inventory_exit.clone())
         .flatten();
-    let desired = if halted || !market_active || inventory_exit.is_some() {
+    // Wind-down never places new quotes, even once flat: the session must
+    // converge to flat instead of re-accumulating inventory.
+    let desired = if halted || !market_active || inventory_exit.is_some() || input.wind_down {
         Vec::new()
     } else {
         let raw = compute_desired_quotes(
@@ -1918,6 +1961,8 @@ mod tests {
             active_exit_enabled: true,
             inventory_exit_pct: 80.0,
             inventory_exit_qty: 0.01,
+            wind_down: false,
+            qty_tolerance: 0.0005,
         };
 
         let exit_plan = plan_cycle(&c, input, false);
@@ -1970,6 +2015,8 @@ mod tests {
                 active_exit_enabled: false,
                 inventory_exit_pct: 0.0,
                 inventory_exit_qty: 0.0,
+                wind_down: false,
+                qty_tolerance: 0.0005,
             },
             false,
         );
@@ -2008,6 +2055,8 @@ mod tests {
                 active_exit_enabled: true,
                 inventory_exit_pct: 80.0,
                 inventory_exit_qty: 0.01,
+                wind_down: false,
+                qty_tolerance: 0.0005,
             },
             false,
         );
@@ -2126,5 +2175,134 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].kind, "margin");
         assert!(a[0].firing);
+    }
+
+    // 35. Wind-down: any residual position yields a full reduce-only exit
+    // plan and no new quotes, even with configured exits fully disabled
+    // (the frozen live configs). A vol halt suppresses the taker exit but
+    // never the quote suppression.
+    #[test]
+    fn wind_down_flattens_residual_and_stops_quoting() {
+        let c = cfg();
+        let resting = vec![
+            resting(OrderSide::Buy, 0, 99.9, 100.0),
+            resting(OrderSide::Sell, 0, 100.1, 100.0),
+        ];
+        let input = CycleInput {
+            cycle: 7,
+            market: MarketSnapshot {
+                mark: 100.0,
+                best_bid: Some(99.9),
+                best_ask: Some(100.1),
+            },
+            position: -0.02,
+            resting: &resting,
+            pending_slots: &[],
+            market_data_mode: MarketDataMode::Active,
+            active_exit_enabled: true,
+            inventory_exit_pct: 0.0,
+            inventory_exit_qty: 0.0,
+            wind_down: true,
+            qty_tolerance: 0.0005,
+        };
+        let plan = plan_cycle(&c, input, false);
+        assert_eq!(
+            plan.requested_inventory_exit,
+            Some(InventoryExit {
+                side: OrderSide::Buy,
+                qty: 0.02,
+            })
+        );
+        assert_eq!(plan.inventory_exit, plan.requested_inventory_exit);
+        assert!(plan
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Cancel { .. })));
+        assert!(!plan
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(_))));
+
+        let halted = plan_cycle(&c, input, true);
+        assert_eq!(halted.inventory_exit, None);
+        assert!(!halted
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(_))));
+    }
+
+    // 36. Wind-down keeps quotes off even when already flat, so inventory
+    // cannot re-accumulate while the supervisor waits to switch.
+    #[test]
+    fn wind_down_flat_still_suppresses_quotes() {
+        let c = cfg();
+        let plan = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 8,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.9),
+                    best_ask: Some(100.1),
+                },
+                position: 0.0,
+                resting: &[],
+                pending_slots: &[],
+                market_data_mode: MarketDataMode::Active,
+                active_exit_enabled: true,
+                inventory_exit_pct: 0.0,
+                inventory_exit_qty: 0.0,
+                wind_down: true,
+                qty_tolerance: 0.0005,
+            },
+            false,
+        );
+        assert_eq!(plan.requested_inventory_exit, None);
+        assert_eq!(plan.inventory_exit, None);
+        assert!(plan.actions.is_empty());
+    }
+
+    // 37. Wind-down overrides the configured exit threshold (a residual
+    // below the enabled trigger still exits, both sides) and treats
+    // positions at or below the quantity tolerance as flat.
+    #[test]
+    fn wind_down_overrides_threshold_and_honors_tolerance() {
+        let c = cfg();
+        let mk = |position: f64| CycleInput {
+            cycle: 9,
+            market: MarketSnapshot {
+                mark: 100.0,
+                best_bid: Some(99.9),
+                best_ask: Some(100.1),
+            },
+            position,
+            resting: &[],
+            pending_slots: &[],
+            market_data_mode: MarketDataMode::Active,
+            active_exit_enabled: true,
+            inventory_exit_pct: 80.0,
+            inventory_exit_qty: 0.01,
+            wind_down: true,
+            qty_tolerance: 0.0005,
+        };
+        // 0.02 is below the configured 80%-of-max trigger (0.04): the
+        // configured path stays inactive, wind-down exits everything.
+        let long = plan_cycle(&c, mk(0.02), false);
+        assert_eq!(
+            long.inventory_exit,
+            Some(InventoryExit {
+                side: OrderSide::Sell,
+                qty: 0.02,
+            })
+        );
+        assert_eq!(plan_cycle(&c, mk(0.0005), false).inventory_exit, None);
+        assert_eq!(plan_cycle(&c, mk(-0.0005), false).inventory_exit, None);
+        assert_eq!(
+            plan_cycle(&c, mk(-0.0006), false).inventory_exit,
+            Some(InventoryExit {
+                side: OrderSide::Buy,
+                qty: 0.0006,
+            })
+        );
     }
 }

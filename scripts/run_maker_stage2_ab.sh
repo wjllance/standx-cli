@@ -7,13 +7,15 @@ baseline_config="${STANDX_STAGE2_BASELINE_CONFIG:-$root/examples/maker-stage2-xa
 candidate_config="${STANDX_STAGE2_CANDIDATE_CONFIG:-$root/examples/maker-stage2-xag-candidate.toml}"
 symbol="${STANDX_SYMBOL:-XAG-USD}"
 arm_seconds=7200
-# Minimum arm length is arm_seconds. A non-flat position at that mark is a
-# normal trending-market outcome, not a safety failure, so the arm is extended
-# and switches at the next natural flat instead of critical-stopping. Only an
-# arm that stays non-flat past arm_max_seconds (the hard cap, counted from arm
-# start and inclusive of arm_seconds) escalates to critical_stop. While
-# extending, a warning fires every flat_grace_seconds so a long-running arm is
-# visible.
+# Minimum arm length is arm_seconds. At that mark the orchestrator signals the
+# arm with SIGUSR1, latching maker wind-down: the maker stops quoting for good
+# and flattens any residual position via reduce-only market exits (bounded,
+# deterministic cost) instead of waiting for flow-dependent natural flat. The
+# poll below then simply confirms the venue is flat; a maker that stays
+# non-flat past arm_max_seconds (the hard cap, counted from arm start and
+# inclusive of arm_seconds) still escalates to critical_stop. A warning fires
+# every flat_grace_seconds while the arm is not yet flat so a stalled
+# wind-down stays visible.
 arm_max_seconds="${STANDX_STAGE2_ARM_MAX_SECONDS:-21600}"
 flat_grace_seconds=1800
 poll_seconds="${STANDX_STAGE2_POLL_SECONDS:-15}"
@@ -199,12 +201,13 @@ run_arm() {
     sleep "$poll_seconds"
   done
 
-  # Past the arm_seconds minimum: switch at the next natural flat. Staying
-  # non-flat is a normal trending-market outcome, so the healthy maker keeps
-  # running and quoting (inventory bounded by max_position, downside by
-  # stop_loss) until it flattens — not a critical_stop. Escalate only on a
+  # Past the arm_seconds minimum: latch maker wind-down with SIGUSR1. The
+  # maker stops quoting for good and flattens any residual position via
+  # reduce-only market exits, so the arm should reach flat within a few
+  # cycles; the poll below confirms it on the venue. Escalate only on a
   # genuinely unsafe state (position query fails, maker dies) or when the arm
-  # stays non-flat past the arm_max_seconds hard cap.
+  # stays non-flat past the arm_max_seconds hard cap (wind-down stalled).
+  kill -USR1 "$pid" 2>/dev/null || true
   hard_deadline=$((arm_start + arm_max_seconds))
   next_extension_notice=$SECONDS
   extending=0
@@ -223,8 +226,8 @@ run_arm() {
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid"
       status=$?
-      invalidate_arm "arm exited while awaiting natural flat"
-      critical_stop "arm=$arm exited while waiting for natural flat (status=$status run_id=$run_id)"
+      invalidate_arm "arm exited while awaiting wind-down flat"
+      critical_stop "arm=$arm exited while waiting for wind-down flat (status=$status run_id=$run_id)"
     fi
     if ((SECONDS >= hard_deadline)); then
       kill -TERM "$pid" 2>/dev/null || true
@@ -234,13 +237,16 @@ run_arm() {
     fi
     if ((SECONDS >= next_extension_notice)); then
       extending=1
-      notify "stage2 A/B arm=$arm past its ${arm_seconds}s window but not flat; extending and will switch at the next natural flat (hard cap ${arm_max_seconds}s, run_id=$run_id)" warning
+      # Re-signal with each warning: wind-down is latched, so repeats are
+      # harmless and cover a signal lost to a mid-arm maker restart.
+      kill -USR1 "$pid" 2>/dev/null || true
+      notify "stage2 A/B arm=$arm past its ${arm_seconds}s window, wind-down signaled but not yet flat (hard cap ${arm_max_seconds}s, run_id=$run_id)" warning
       next_extension_notice=$((SECONDS + flat_grace_seconds))
     fi
     sleep "$poll_seconds"
   done
   if ((extending == 1)); then
-    notify "stage2 A/B arm=$arm reached natural flat after extension; proceeding to switch (run_id=$run_id)"
+    notify "stage2 A/B arm=$arm flat after wind-down; proceeding to switch (run_id=$run_id)"
   fi
 
   kill -TERM "$pid" 2>/dev/null || true
