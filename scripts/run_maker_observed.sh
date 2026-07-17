@@ -85,6 +85,7 @@ notify() {
 trap cleanup EXIT
 trap 'forward_signal INT' INT
 trap 'forward_signal TERM' TERM
+trap 'forward_signal USR1' USR1
 
 : >"$stdout_log"
 : >"$stderr_log"

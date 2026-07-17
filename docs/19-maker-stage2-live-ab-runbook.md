@@ -137,17 +137,25 @@ journalctl -u standx-maker-stage2-ab.service -f
 The orchestrator alternates baseline then candidate. Each arm has a unique
 `run_id/config_hash`, runs for a two-hour **minimum**, and switches only from a
 flat position after normal maker cleanup, manifest validation, and independent
-empty-order/empty-position checks. A non-flat position at the two-hour mark is a
-normal trending-market outcome, not a safety failure: the healthy maker keeps
-running and quoting (inventory bounded by `max_position`, downside by
-`stop_loss`) and the arm switches at the next natural flat. A warning webhook
-fires every 30 minutes while an arm is extended past two hours. Only an arm that
-stays non-flat past the hard cap (`STANDX_STAGE2_ARM_MAX_SECONDS`, default six
-hours from arm start) is invalidated with a critical webhook and exit 75 —
-never with an automatic flatten. Fail-safe exit, invalid manifest, failed
-post-check, a failed venue position query, or a maker that dies mid-wait also
-block the next arm. Because arms can run longer than two hours, acceptance
-balances **quote-hours** per regime rather than assuming equal wall-clock.
+empty-order/empty-position checks. At the two-hour mark the orchestrator
+signals the arm with `SIGUSR1`, latching maker **wind-down**: the maker stops
+quoting for good and flattens any residual position via reduce-only market
+exits (bounded, deterministic cost — spread plus taker fee on the residual),
+so the arm should reach flat within a few cycles. A warning webhook fires
+every 30 minutes while an arm is not yet flat past two hours, and the signal
+is re-sent with each warning. Only an arm that stays non-flat past the hard
+cap (`STANDX_STAGE2_ARM_MAX_SECONDS`, default six hours from arm start — i.e.
+a stalled wind-down) is invalidated with a critical webhook and exit 75 —
+never with an automatic flatten beyond the reduce-only exits. Fail-safe exit,
+invalid manifest, failed post-check, a failed venue position query, or a maker
+that dies mid-wait also block the next arm. Arms now run close to two hours
+plus a short wind-down, but acceptance still balances **quote-hours** per
+regime rather than assuming equal wall-clock.
+
+Deployment constraint: the orchestrator, the observed wrapper, and the maker
+binary must ship in the **same image**. `SIGUSR1` sent to a binary built
+before wind-down support terminates it (default disposition), so never pair a
+new orchestrator with an older maker image.
 
 Keep the Stage 2 state `live_ab` until valid, market-matched quote-hours include
 at least one calm and one trend window. Acceptance requires net PnL at least

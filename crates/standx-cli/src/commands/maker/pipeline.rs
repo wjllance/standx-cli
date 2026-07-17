@@ -131,6 +131,11 @@ pub(super) struct CycleRequest<'a> {
     pub(super) max_divergence_bps: f64,
     pub(super) inventory_exit_pct: f64,
     pub(super) inventory_exit_qty: f64,
+    /// Latched supervisor wind-down request (SIGUSR1 from the A/B
+    /// orchestrator): stop quoting and flatten via reduce-only exits.
+    pub(super) wind_down: bool,
+    /// Venue-quantity tolerance; positions at or below it count as flat.
+    pub(super) qty_tolerance: f64,
     pub(super) session_started_at: i64,
     pub(super) run_order_prefix: &'a str,
     pub(super) starting_position: f64,

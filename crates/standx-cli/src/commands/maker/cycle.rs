@@ -210,6 +210,8 @@ pub(super) async fn maker_cycle(
         max_divergence_bps,
         inventory_exit_pct,
         inventory_exit_qty,
+        wind_down,
+        qty_tolerance,
         session_started_at,
         run_order_prefix,
         starting_position,
@@ -531,6 +533,8 @@ pub(super) async fn maker_cycle(
             active_exit_enabled: live,
             inventory_exit_pct,
             inventory_exit_qty,
+            wind_down,
+            qty_tolerance,
         },
         halted,
     );

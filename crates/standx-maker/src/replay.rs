@@ -163,6 +163,8 @@ pub fn run_replay(
                             active_exit_enabled: settings.active_exit_enabled,
                             inventory_exit_pct: settings.inventory_exit_pct,
                             inventory_exit_qty: settings.inventory_exit_qty,
+                            wind_down: false,
+                            qty_tolerance: 0.0005,
                         },
                         preflight.halted,
                     )

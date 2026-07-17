@@ -29,6 +29,9 @@ pub(super) struct RuntimeCounters {
 pub(super) struct RuntimeLoopState {
     pub(super) resting: Vec<RestingQuote>,
     pub(super) inventory_exit_pending: bool,
+    /// Latched supervisor wind-down request (SIGUSR1): stop quoting and
+    /// flatten via reduce-only exits. Sticky once set.
+    pub(super) wind_down: bool,
     pub(super) ledger: MakerLedger,
     pub(super) performance_started: std::time::Instant,
     pub(super) performance_epoch_ms: i64,
@@ -80,6 +83,7 @@ pub(super) struct MakerRuntime {
     pub(super) lifecycle: RuntimeLifecycleState,
     pub(super) live_session: Option<LiveSession>,
     pub(super) ctrl_c_rx: tokio::sync::watch::Receiver<bool>,
+    pub(super) wind_down_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 pub(super) enum LoopDirective {
@@ -155,6 +159,7 @@ impl MakerRuntime {
         // default disposition with no maker cleanup, leaving resting orders
         // on the venue (observed on the 2026-07-17 stage-2 arm boundary).
         let (ctrl_c_tx, ctrl_c_rx) = tokio::sync::watch::channel(false);
+        let (wind_down_tx, wind_down_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -164,12 +169,25 @@ impl MakerRuntime {
                 let mut sigterm =
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                         .expect("failed to install SIGTERM handler");
+                // SIGUSR1 (from the A/B orchestrator at the arm deadline)
+                // requests wind-down: stop quoting and flatten. It must be
+                // registered unconditionally — an unhandled SIGUSR1 kills the
+                // process by default.
+                let mut sigusr1 =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                        .expect("failed to install SIGUSR1 handler");
                 loop {
                     tokio::select! {
-                        _ = sigint.recv() => {}
-                        _ = sigterm.recv() => {}
+                        _ = sigint.recv() => {
+                            let _ = ctrl_c_tx.send(true);
+                        }
+                        _ = sigterm.recv() => {
+                            let _ = ctrl_c_tx.send(true);
+                        }
+                        _ = sigusr1.recv() => {
+                            let _ = wind_down_tx.send(true);
+                        }
                     }
-                    let _ = ctrl_c_tx.send(true);
                 }
             }
             #[cfg(not(unix))]
@@ -198,6 +216,7 @@ impl MakerRuntime {
             loop_state: RuntimeLoopState {
                 resting: Vec::new(),
                 inventory_exit_pending: false,
+                wind_down: false,
                 ledger,
                 performance_started,
                 performance_epoch_ms,
@@ -239,6 +258,7 @@ impl MakerRuntime {
             },
             live_session,
             ctrl_c_rx,
+            wind_down_rx,
         })
     }
 }
