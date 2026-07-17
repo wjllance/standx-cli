@@ -7,6 +7,14 @@ baseline_config="${STANDX_STAGE2_BASELINE_CONFIG:-$root/examples/maker-stage2-xa
 candidate_config="${STANDX_STAGE2_CANDIDATE_CONFIG:-$root/examples/maker-stage2-xag-candidate.toml}"
 symbol="${STANDX_SYMBOL:-XAG-USD}"
 arm_seconds=7200
+# Minimum arm length is arm_seconds. A non-flat position at that mark is a
+# normal trending-market outcome, not a safety failure, so the arm is extended
+# and switches at the next natural flat instead of critical-stopping. Only an
+# arm that stays non-flat past arm_max_seconds (the hard cap, counted from arm
+# start and inclusive of arm_seconds) escalates to critical_stop. While
+# extending, a warning fires every flat_grace_seconds so a long-running arm is
+# visible.
+arm_max_seconds="${STANDX_STAGE2_ARM_MAX_SECONDS:-21600}"
 flat_grace_seconds=1800
 poll_seconds="${STANDX_STAGE2_POLL_SECONDS:-15}"
 log_dir="${STANDX_LOG_DIR:-$root/var/standx}"
@@ -59,12 +67,17 @@ critical_stop() {
   exit 75
 }
 
-for value in "$poll_seconds"; do
+for value in "$poll_seconds" "$arm_max_seconds"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     printf 'stage2 A/B durations must be positive integers\n' >&2
     exit 64
   }
 done
+((arm_max_seconds > arm_seconds)) || {
+  printf 'stage2 A/B arm_max_seconds (%s) must exceed arm_seconds (%s)\n' \
+    "$arm_max_seconds" "$arm_seconds" >&2
+  exit 64
+}
 [[ "$symbol" == "XAG-USD" ]] || {
   printf 'stage2 A/B is frozen to XAG-USD\n' >&2
   exit 64
@@ -159,7 +172,8 @@ notify "stage2 A/B preflight verified: orders=[] positions=[]"
 run_arm() {
   local arm="$1"
   local config="$2"
-  local config_hash run_id manifest pid status deadline grace_deadline position_status
+  local config_hash run_id manifest pid status arm_start deadline position_status
+  local hard_deadline next_extension_notice extending
   config_hash="$(sha256sum "$config" | awk '{print $1}')"
   run_id="stage2-${arm}-$(date -u +%Y%m%dT%H%M%SZ)-${config_hash:0:12}"
   manifest="$log_dir/$run_id.manifest.json"
@@ -173,7 +187,8 @@ run_arm() {
     "$standx_bin" --output json maker run "$symbol" --maker-config "$config" --live &
   pid=$!
   current_arm_pid="$pid"
-  deadline=$((SECONDS + arm_seconds))
+  arm_start=$SECONDS
+  deadline=$((arm_start + arm_seconds))
   while ((SECONDS < deadline)); do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid"
@@ -184,7 +199,15 @@ run_arm() {
     sleep "$poll_seconds"
   done
 
-  grace_deadline=$((SECONDS + flat_grace_seconds))
+  # Past the arm_seconds minimum: switch at the next natural flat. Staying
+  # non-flat is a normal trending-market outcome, so the healthy maker keeps
+  # running and quoting (inventory bounded by max_position, downside by
+  # stop_loss) until it flattens — not a critical_stop. Escalate only on a
+  # genuinely unsafe state (position query fails, maker dies) or when the arm
+  # stays non-flat past the arm_max_seconds hard cap.
+  hard_deadline=$((arm_start + arm_max_seconds))
+  next_extension_notice=$SECONDS
+  extending=0
   while true; do
     position_state
     position_status=$?
@@ -203,14 +226,22 @@ run_arm() {
       invalidate_arm "arm exited while awaiting natural flat"
       critical_stop "arm=$arm exited while waiting for natural flat (status=$status run_id=$run_id)"
     fi
-    if ((SECONDS >= grace_deadline)); then
+    if ((SECONDS >= hard_deadline)); then
       kill -TERM "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
-      invalidate_arm "position remained nonzero beyond flat grace"
-      critical_stop "arm=$arm remained non-flat for ${flat_grace_seconds}s (run_id=$run_id invalid)"
+      invalidate_arm "position stayed nonzero past the hard arm cap"
+      critical_stop "arm=$arm stayed non-flat past ${arm_max_seconds}s hard cap (run_id=$run_id invalid)"
+    fi
+    if ((SECONDS >= next_extension_notice)); then
+      extending=1
+      notify "stage2 A/B arm=$arm past its ${arm_seconds}s window but not flat; extending and will switch at the next natural flat (hard cap ${arm_max_seconds}s, run_id=$run_id)" warning
+      next_extension_notice=$((SECONDS + flat_grace_seconds))
     fi
     sleep "$poll_seconds"
   done
+  if ((extending == 1)); then
+    notify "stage2 A/B arm=$arm reached natural flat after extension; proceeding to switch (run_id=$run_id)"
+  fi
 
   kill -TERM "$pid" 2>/dev/null || true
   wait "$pid"

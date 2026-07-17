@@ -135,12 +135,19 @@ journalctl -u standx-maker-stage2-ab.service -f
 ```
 
 The orchestrator alternates baseline then candidate. Each arm has a unique
-`run_id/config_hash`, runs for two hours, and switches only from a flat
-position after normal maker cleanup, manifest validation, and independent
-empty-order/empty-position checks. A non-flat arm gets up to 30 extra minutes
-to return naturally to zero. If it does not, the arm is invalid, a critical
-webhook is sent, and the service exits 75 without flattening or restarting.
-Fail-safe exit, invalid manifest or failed post-check also blocks the next arm.
+`run_id/config_hash`, runs for a two-hour **minimum**, and switches only from a
+flat position after normal maker cleanup, manifest validation, and independent
+empty-order/empty-position checks. A non-flat position at the two-hour mark is a
+normal trending-market outcome, not a safety failure: the healthy maker keeps
+running and quoting (inventory bounded by `max_position`, downside by
+`stop_loss`) and the arm switches at the next natural flat. A warning webhook
+fires every 30 minutes while an arm is extended past two hours. Only an arm that
+stays non-flat past the hard cap (`STANDX_STAGE2_ARM_MAX_SECONDS`, default six
+hours from arm start) is invalidated with a critical webhook and exit 75 —
+never with an automatic flatten. Fail-safe exit, invalid manifest, failed
+post-check, a failed venue position query, or a maker that dies mid-wait also
+block the next arm. Because arms can run longer than two hours, acceptance
+balances **quote-hours** per regime rather than assuming equal wall-clock.
 
 Keep the Stage 2 state `live_ab` until valid, market-matched quote-hours include
 at least one calm and one trend window. Acceptance requires net PnL at least
