@@ -149,10 +149,34 @@ impl MakerRuntime {
 
         // Tokio installs a process-wide SIGINT handler on the first call. Keep
         // one long-lived task and latch presses so no phase can lose Ctrl+C.
+        // Supervisors (systemd, docker stop, the A/B orchestrator via the
+        // observed wrapper) stop the maker with SIGTERM, which must take the
+        // same graceful path: without a handler the process dies by the
+        // default disposition with no maker cleanup, leaving resting orders
+        // on the venue (observed on the 2026-07-17 stage-2 arm boundary).
         let (ctrl_c_tx, ctrl_c_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            while tokio::signal::ctrl_c().await.is_ok() {
-                let _ = ctrl_c_tx.send(true);
+            #[cfg(unix)]
+            {
+                let mut sigint =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .expect("failed to install SIGINT handler");
+                let mut sigterm =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to install SIGTERM handler");
+                loop {
+                    tokio::select! {
+                        _ = sigint.recv() => {}
+                        _ = sigterm.recv() => {}
+                    }
+                    let _ = ctrl_c_tx.send(true);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                while tokio::signal::ctrl_c().await.is_ok() {
+                    let _ = ctrl_c_tx.send(true);
+                }
             }
         });
 
