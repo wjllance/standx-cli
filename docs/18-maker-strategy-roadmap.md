@@ -220,11 +220,22 @@ python3 -m py_compile scripts/openobserve_dashboard.py
 
 ## 阶段 2：波动驱动的自适应 Spread 与 Refresh（v0 单因子）
 
-当前状态：`implemented_pending_evidence`。代码、冻结配置与自动 A/B 运维件已进入离线验收；
-30 分钟 candidate paper 已通过；在 renewed canary 和覆盖平静/趋势市场的有效 live A/B 证据完成前，
-不得标记 `accepted`。执行手册见
+当前状态：`ab_completed_not_accepted`（2026-07-18 判定）。代码、冻结配置与自动 A/B 运维件已通过离线验收；
+canary 重验通过；2026-07-17T15:23Z → 07-18T16:1xZ 在 HYPE-USD 完成 3 对 4 小时臂的实盘时间片 A/B
+（docker,24h+ 连续，6 次 wind-down 换臂全部干净），candidate 未达到下方经济晋级门槛，按规约不晋级。
+执行手册见
 [19-maker-stage2-live-ab-runbook.md](19-maker-stage2-live-ab-runbook.md)，实现证据见
-[maker-strategy-stage-2-v0-implementation-2026-07-16.md](evidence/maker-strategy-stage-2-v0-implementation-2026-07-16.md)。
+[maker-strategy-stage-2-v0-implementation-2026-07-16.md](evidence/maker-strategy-stage-2-v0-implementation-2026-07-16.md)，
+A/B 全程记录与 markout 分析见
+[maker-strategy-stage-2-canary-ab-2026-07-17.md](evidence/maker-strategy-stage-2-canary-ab-2026-07-17.md)
+（分析脚本 `scripts/maker_markout_ab.py`）。
+
+A/B 要点（3 对，baseline n=222 / candidate n=112 笔被动成交）：单笔毒性、capture、净边际两臂在噪声内
+一致（mo5 -5.51 vs -5.35 bps,mo30 -8.71 vs -9.13 bps）；自适应加宽的唯一实测效果是高波动时段少成交
+（tier 激活 14–23% 时间），未转化为 PnL 或 markout 改善。运维门槛（uptime、撤单率）达标，经济门槛未达。
+附带策略级发现：当前 8bps / ~2.45s 报价循环在 HYPE 上为结构性负边际（每笔 30s 净边际约 -4~-5bps,
+90%+ 成交 5s 内被反向穿越），亏损主因是逆选择与库存盯市而非费率——这是后续迭代（非对称报价 /
+requote 提速 / 漂移侧收手）应优先攻击的问题，而非继续调 tier 宽度。
 
 运维件现有两条部署路径：systemd（`deploy/systemd/standx-maker-stage2-ab.service`）与容器化
 （`deploy/docker/`，docker-compose，同一 runbook 授权门槛）。容器化路径已在 2026-07-16 完成首次
@@ -269,13 +280,20 @@ peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 l
 - [x] planner 回归覆盖不会生成穿 touch、出 band、低于最小数量或突破敞口预算的报价。
 - [x] 波动单调恶化时 spread 不收窄；恢复时通过 hysteresis 回落；档位切换在阈值附近无振荡。
 
-实盘时间片 A/B（按统一验收口径）：
+实盘时间片 A/B（按统一验收口径；2026-07-17/18 HYPE 3 对 4h 臂实测）：
 
-- [ ] 代码合并后完成一次 canary 重验，A/B 在风险预算边界内运行。
+- [x] 代码合并后完成一次 canary 重验，A/B 在风险预算边界内运行。
 - [ ] 比较窗口（含平静与趋势时段）合计 net PnL 不低于静态基线的 95%。
+  **未达**:Σ baseline -0.173 vs Σ candidate -0.740 USD（先后时段、行情混淆，但门槛未过）。
 - [ ] 最大回撤绝对值不得大于基线；5s 负向 markout 绝对值至少改善 10%，否则不晋级。
-- [ ] 时间加权双边 uptime 相对基线下降不超过 3 个百分点。
-- [ ] 每 quote-hour 撤单数相对基线增加不超过 20%。
+  **未达**:mo5 -5.35 vs -5.51 bps(≈3%,噪声内）,mo30 反而略差；candidate 最差臂 PnL -0.280
+  大于 baseline 最差 -0.166。
+- [x] 时间加权双边 uptime 相对基线下降不超过 3 个百分点。
+  （baseline 均值 98.5% / candidate 99.2%,candidate 反而略高。）
+- [x] 每 quote-hour 撤单数相对基线增加不超过 20%。
+  （baseline 均值约 118 / candidate 约 98，无增加。）
+
+判定：运维门槛通过，经济门槛未过，candidate 不晋级；阶段 2 v0 维持 baseline 配置为生产基线。
 
 ## 阶段 3：非线性库存控制
 
