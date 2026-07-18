@@ -379,3 +379,67 @@ from 08c08ed (build-time strategy_source_clean gate passed).
   baseline-eligible. Remaining follow-ups: restore
   `STANDX_STAGE2_ARM_SECONDS=7200` for the standard 2h A/B; PR #316
   awaits merge; formal 2h baseline/candidate comparison still to be run.
+
+### Overnight 4h-arm A/B (3 pairs) and experiment conclusion — 2026-07-17T15:23Z → 2026-07-18T16:1xZ
+
+PR #316 merged to main (`a37bf4f`). `STANDX_STAGE2_ARM_SECONDS=14400`
+(4h arms) installed in `/etc/standx/maker-stage2-hype-ab.env`, image
+rebuilt from main `a37bf4f`, venue verified flat, run started 15:23Z
+under a 30-min monitoring cron (auto-report only; no auto-restart,
+no auto-flatten policy). Stopped by operator 16:1xZ the next day.
+
+Operations: 24h+ continuous, 7 arms, 6 switches — all clean, zero
+manual intervention. Four switches carried inventory into wind-down
+(+0.2, +0.4, +0.3, +0.4) and each flattened via reduce-only exit in
+~1s; two switched already-flat. Every completed arm manifest:
+`baseline_eligible=True`, `missing_cycles=[]`. One pre-switch cancel
+race (07:21Z) left a residual order that cleanup retry cleared in 2s
+(designed path). Stop: SIGUSR1 wind-down of arm 7 (+0.3 flattened
+@59.209), then `docker stop` (Exited 0); venue read-only check
+orders=[] positions=[]. Monitoring cron deleted.
+
+Completed arms (all HYPE-USD, spread 8bps, size 0.1):
+
+| arm | window (UTC) | fills | cap bps | mo5 bps | mo30 bps | PnL | mark range |
+|-----|--------------|-------|---------|---------|----------|-----|------------|
+| B1 baseline | 15:23–19:23 07-17 | 163 | +4.49 | -5.65 | -9.10 | -0.076 | 59.80–60.80 |
+| C1 candidate | 19:23–23:24 07-17 | 27 | +4.87 | -6.52 | -8.63 | -0.196 | 59.55–60.34 |
+| B2 baseline | 23:24–03:24 | 28 | +4.99 | -5.78 | -8.26 | +0.068 | 59.41–60.09 |
+| C2 candidate | 03:24–07:25 07-18 | 31 | +3.85 | -4.55 | -11.05 | -0.264 | 58.67–59.71 |
+| B3 baseline | 07:25–11:25 07-18 | 31 | +4.64 | -4.50 | -7.11 | -0.166 | 58.76–59.50 |
+| C3 candidate | 11:25–15:26 07-18 | 54 | +4.35 | -5.23 | -8.27 | -0.280 | 58.39–59.68 |
+
+Pooled (baseline n=222 fills, candidate n=112): capture +4.58 vs +4.34
+bps; markout-5s -5.51 vs -5.35 bps (90–91% of fills adverse within 5s
+in both); markout-30s -8.71 vs -9.13 bps; net per-fill edge
+(cap+mo30) ≈ -4.1 vs -4.8 bps. Candidate tier-0-only fills vs all
+baseline fills: mo5 -5.01 vs -5.51, mo30 -9.14 vs -8.71 — identical
+within noise. Candidate tier-stratified: tier0 cap+3.8/mo5-5.0,
+tier1 cap+5.9/mo5-6.5 (n=21), tier2 cap+8.5/mo5-7.4 (n=3) — the wider
+tier spread's extra capture is offset by equally higher toxicity.
+Analysis: `scripts/maker_markout_ab.py` (markout from cycle marks;
+runner-side aggregates cross-checked, differ by ≈capture as expected
+since they measure from fill price).
+
+Conclusions (consistent across all 3 pairs):
+
+1. **A/B verdict: candidate shows no measurable edge.** Fill-level
+   toxicity, capture, and net edge are identical within noise; the
+   adaptive spread's only real effect is fewer fills during high-vol
+   windows (tier-active 14–23% of time), and skipping those (already
+   negative-edge) fills did not improve PnL.
+2. **B1's 40 fills/h was an outlier active window.** In quiet regimes
+   both arms trade ~7–13 fills/h; the preliminary "candidate trades
+   6x less" read was regime confounding, not treatment.
+3. **Strategy-level finding: the 8bps / ~2.45s-cycle quote loop is
+   structurally negative-edge on HYPE.** ~90%+ of fills are adversely
+   selected within 5s; net ≈ -4 to -5 bps per fill at 30s. Losses are
+   adverse selection + inventory MTM, not fees. This is the problem
+   the next strategy iteration must attack (asymmetric quoting /
+   faster requote / drift-side pullback), not tier tuning.
+4. **Wind-down arm switching is operationally proven**: 6/6 clean
+   switches, 4 with inventory, all flattening in ~1s, all manifests
+   eligible. The A/B harness itself is ready for reuse.
+
+Experiment stopped by operator 16:1xZ 07-18 after 3 pairs; further
+pairs were judged low marginal value given the per-pair consistency.
