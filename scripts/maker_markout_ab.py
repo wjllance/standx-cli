@@ -66,6 +66,8 @@ from datetime import datetime, timezone
 from statistics import mean, median
 
 HORIZONS = [1.0, 5.0, 30.0]
+# attribution_rows computes the full curve; legacy pooled tables keep HORIZONS.
+MO_CURVE_HORIZONS = [1.0, 5.0, 30.0, 60.0, 120.0, 300.0]
 DRIFT_WINDOWS = [5.0, 15.0, 30.0]
 AGE_BUCKETS = [(0, 5), (5, 15), (15, 30), (30, 60), (60, 120), (120, None)]
 # refresh_bps per adaptive-spread tier, frozen stage2 config
@@ -221,7 +223,7 @@ def attribution_rows(cycles, timeline):
                 j = bisect.bisect_right(ts_list, t - w) - 1
                 drift[w] = (maf - cycles[j][1]) * sign / maf * 1e4 if j >= 0 and maf else None
             mo = {}
-            for h in HORIZONS:
+            for h in MO_CURVE_HORIZONS:
                 j = bisect.bisect_left(ts_list, t + h)
                 mo[h] = (cycles[j][1] - mark0) * sign / mark0 * 1e4 if j < len(cycles) else None
             thr = REFRESH_BY_TIER.get(tier, REFRESH_BY_TIER[0])
@@ -291,6 +293,23 @@ def attribution_rows(cycles, timeline):
                              stale_bps=stale_bps, stale_age=stale_age,
                              drift_place=drift_place, exc=exc))
     return rows, matched, unmatched
+
+
+def print_markout_curve(rows):
+    print("\n=== markout curve after fill (pooled passive fills; n shrinks via arm-end censoring) ===")
+    print("signed mark move after fill, bps; still falling at longer horizon = continued bleeding,")
+    print("recovering toward zero = mean reversion (holding is free, exiting realizes the loss)")
+    for h in MO_CURVE_HORIZONS:
+        xs = [r["mo"][h] for r in rows if r["mo"].get(h) is not None]
+        if not xs:
+            continue
+        buys = [r["mo"][h] for r in rows if r["side"] == "buy" and r["mo"].get(h) is not None]
+        sells = [r["mo"][h] for r in rows if r["side"] == "sell" and r["mo"].get(h) is not None]
+        neg = sum(1 for x in xs if x < 0) / len(xs) * 100
+        bs = f"buy {mean(buys):+6.2f}(n{len(buys):3d})" if buys else "buy n/a"
+        ss = f"sell {mean(sells):+6.2f}(n{len(sells):3d})" if sells else "sell n/a"
+        print(f" mo{h:>4.0f}s: n{len(xs):3d} mean{mean(xs):+6.2f} med{median(xs):+6.2f} "
+              f"neg%{neg:3.0f} | {bs} {ss}")
 
 
 def pearson(xs, ys):
@@ -632,6 +651,7 @@ def main(paths):
         print_drift_attribution(attr_rows)
         print_age_attribution(attr_rows, attr_matched, attr_unmatched, rest_age_s)
         print_staleness_attribution(attr_rows)
+        print_markout_curve(attr_rows)
         print("\n=== attribution robustness: by treatment ===")
         for t in ("baseline", "candidate"):
             xs = [r for r in attr_rows if r["treatment"] == t and r["drift"][15.0] is not None]

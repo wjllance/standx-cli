@@ -92,14 +92,88 @@ esac
   exit 64
 }
 
-# Both configs must be byte-identical after normalizing the single enable line.
+# The two arm configs must be byte-identical after normalizing either
+#   (a) the single adaptive_spread enable line (adaptive A/B), or
+#   (b) the top-level spread_bps assignment AND the base-tier (first
+#       [[adaptive_spread.tiers]]) spread_bps, with adaptive_spread disabled
+#       in both (constant-width widening A/B). The maker requires base tier
+#       == top-level spread_bps/refresh_bps even when adaptive is disabled,
+#       so (b) also rejects either config when those pairs disagree — that
+#       mismatch must fail here, not at arm start.
 python3 - "$baseline_config" "$candidate_config" <<'PY' || exit 64
 from pathlib import Path
+import re
 import sys
 baseline = Path(sys.argv[1]).read_text(encoding="utf-8")
 candidate = Path(sys.argv[2]).read_text(encoding="utf-8")
-if baseline.replace("enabled = false", "enabled = true") != candidate:
-    raise SystemExit("stage2 arm configs differ outside adaptive_spread.enabled")
+
+TOP = "top"
+TIER0 = "tier0"
+OTHER = "other"
+
+
+def spread_sections(text):
+    """Split lines into top-level / first-tier / other; return (rewritten, fields).
+
+    rewritten blanks every spread_bps in the top section and in the first
+    [[adaptive_spread.tiers]] block. fields holds the literal spread_bps /
+    refresh_bps values found in those two sections for the coherence check.
+    """
+    lines = text.splitlines(keepends=True)
+    section = TOP
+    first_tier_seen = False
+    fields = {"top_spread": None, "top_refresh": None,
+              "tier0_spread": None, "tier0_refresh": None}
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            if stripped.startswith("[[adaptive_spread.tiers]]") and not first_tier_seen:
+                section = TIER0
+                first_tier_seen = True
+            elif section != TOP:
+                section = OTHER
+            continue
+        if section == TOP:
+            if re.fullmatch(r"\s*spread_bps\s*=\s*([0-9.]+)\s*\n?", line):
+                fields["top_spread"] = re.fullmatch(
+                    r"\s*spread_bps\s*=\s*([0-9.]+)\s*\n?", line).group(1)
+                lines[i] = "spread_bps = <normalized>\n"
+            elif re.fullmatch(r"\s*refresh_bps\s*=\s*([0-9.]+)\s*\n?", line):
+                fields["top_refresh"] = re.fullmatch(
+                    r"\s*refresh_bps\s*=\s*([0-9.]+)\s*\n?", line).group(1)
+        elif section == TIER0:
+            if re.fullmatch(r"\s*spread_bps\s*=\s*([0-9.]+)\s*\n?", line):
+                fields["tier0_spread"] = re.fullmatch(
+                    r"\s*spread_bps\s*=\s*([0-9.]+)\s*\n?", line).group(1)
+                lines[i] = "spread_bps = <normalized>\n"
+            elif re.fullmatch(r"\s*refresh_bps\s*=\s*([0-9.]+)\s*\n?", line):
+                fields["tier0_refresh"] = re.fullmatch(
+                    r"\s*refresh_bps\s*=\s*([0-9.]+)\s*\n?", line).group(1)
+    return "".join(lines), fields
+
+
+adaptive_toggle_only = baseline.replace("enabled = false", "enabled = true") == candidate
+if adaptive_toggle_only:
+    pass
+elif "enabled = false" in baseline and "enabled = false" in candidate:
+    baseline_norm, baseline_fields = spread_sections(baseline)
+    candidate_norm, candidate_fields = spread_sections(candidate)
+    for name, fields in (("baseline", baseline_fields), ("candidate", candidate_fields)):
+        if (fields["top_spread"] != fields["tier0_spread"]
+                or fields["top_refresh"] != fields["tier0_refresh"]):
+            raise SystemExit(
+                f"stage2 {name} config incoherent: base tier spread/refresh "
+                f"({fields['tier0_spread']}/{fields['tier0_refresh']}) != top-level "
+                f"({fields['top_spread']}/{fields['top_refresh']})"
+            )
+    if baseline_norm != candidate_norm:
+        raise SystemExit(
+            "stage2 arm configs differ outside adaptive_spread.enabled / spread_bps"
+        )
+else:
+    raise SystemExit(
+        "stage2 arm configs differ outside adaptive_spread.enabled / spread_bps"
+    )
 PY
 
 if [[ "${STANDX_STAGE2_VALIDATE_ONLY:-0}" == "1" ]]; then
@@ -277,7 +351,22 @@ run_arm() {
   current_arm_pid=""
 }
 
+# Arm the loop starts with. Default baseline; set to "candidate" only when
+# resuming an interrupted A/B whose first baseline arm already completed
+# (operator-directed). Any other value fails closed.
+first_arm="${STANDX_STAGE2_FIRST_ARM:-baseline}"
+case "$first_arm" in
+  baseline|candidate) ;;
+  *)
+    printf 'stage2 A/B STANDX_STAGE2_FIRST_ARM must be baseline or candidate\n' >&2
+    exit 64
+    ;;
+esac
+
 while true; do
-  run_arm baseline "$baseline_config"
+  if [[ "$first_arm" == "baseline" ]]; then
+    run_arm baseline "$baseline_config"
+  fi
+  first_arm=baseline
   run_arm candidate "$candidate_config"
 done
