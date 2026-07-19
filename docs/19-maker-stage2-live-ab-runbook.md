@@ -16,7 +16,14 @@ active inventory exit or automatic flatten.
   `/opt/standx/bin/standx` and record its SHA-256.
 - Install `maker-stage2-xag-baseline.toml` and
   `maker-stage2-xag-candidate.toml`; verify the files differ only at
-  `adaptive_spread.enabled` and record both hashes.
+  `adaptive_spread.enabled` and record both hashes. (Widening-control
+  exercises instead use a pair differing only at top-level + base-tier
+  `spread_bps` with `adaptive_spread` disabled in both — the maker requires
+  base tier == top level even when disabled, and the orchestrator preflight
+  rejects incoherent pairs. The orchestrator check accepts exactly these two
+  shapes. Resume after a completed baseline arm uses
+  `STANDX_STAGE2_FIRST_ARM=candidate`. See
+  `docs/evidence/maker-stage4-wide12-ab-2026-07-18.md`.)
 - Install `standx-maker-stage2-ab.service`, `run_maker_stage2_ab.sh`, the
   observed-run/OpenObserve tools, and a root-owned `0600`
   `/etc/standx/maker-stage2-ab.env`. A containerized alternative to this unit
