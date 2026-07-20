@@ -251,6 +251,7 @@ impl MakerRuntime {
                         stats: &mut self.loop_state.stats,
                         breaker: &mut self.loop_state.breaker,
                         spread_controller: &mut self.loop_state.spread_controller,
+                        size_skew_controller: &mut self.loop_state.size_skew_controller,
                         order_request_deadlines: cycle_order_request_deadlines.as_deref_mut(),
                         live_account_poll: cycle_account_poll.as_deref_mut(),
                         order_latency: cycle_order_latency.as_deref_mut(),

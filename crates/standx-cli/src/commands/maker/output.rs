@@ -228,6 +228,7 @@ pub(super) struct CycleOutput<'a> {
     pub(super) stats: &'a MakerStats,
     pub(super) halt_vol_bps: Option<f64>,
     pub(super) spread_decision: &'a maker::SpreadDecision,
+    pub(super) size_skew_decision: &'a maker::SizeSkewDecision,
     pub(super) cfg: &'a MakerConfig,
     pub(super) performance: Option<&'a maker::PerformanceSummary>,
 }
@@ -252,6 +253,7 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
         stats,
         halt_vol_bps,
         spread_decision,
+        size_skew_decision,
         cfg,
         performance,
     } = output;
@@ -337,29 +339,32 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
             }
             println!(
                 "{}",
-                with_spread_fields(
-                    serde_json::json!({
-                        "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
-                        "action": "cycle_summary",
-                        "mark": format_decimals(mark, cfg.price_decimals),
-                        "best_bid": best_bid, "best_ask": best_ask,
-                        "market_source": market_source,
-                        "market_fallback_reason": market_fallback_reason,
-                        "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
-                        "position": position,
-                        "starting_position": starting_position,
-                        "account": account.map(account_json),
-                        "holds": holds, "places": places, "cancels": cancels,
-                        "fills": fills.len(),
-                        "pnl": (pnl * 1e6).round() / 1e6,
-                        "fills_total": stats.fills(),
-                        "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
-                        "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
-                        "performance": performance.map(performance_json),
-                        "halted": halt_vol_bps.is_some(),
-                        "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
-                    }),
-                    spread_decision
+                with_size_skew_fields(
+                    with_spread_fields(
+                        serde_json::json!({
+                            "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                            "action": "cycle_summary",
+                            "mark": format_decimals(mark, cfg.price_decimals),
+                            "best_bid": best_bid, "best_ask": best_ask,
+                            "market_source": market_source,
+                            "market_fallback_reason": market_fallback_reason,
+                            "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
+                            "position": position,
+                            "starting_position": starting_position,
+                            "account": account.map(account_json),
+                            "holds": holds, "places": places, "cancels": cancels,
+                            "fills": fills.len(),
+                            "pnl": (pnl * 1e6).round() / 1e6,
+                            "fills_total": stats.fills(),
+                            "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
+                            "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
+                            "performance": performance.map(performance_json),
+                            "halted": halt_vol_bps.is_some(),
+                            "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
+                        }),
+                        spread_decision,
+                    ),
+                    size_skew_decision,
                 )
             );
         }
@@ -511,6 +516,36 @@ fn with_spread_fields(
     object.insert(
         "effective_refresh_bps".to_string(),
         serde_json::json!(decision.effective_refresh_bps),
+    );
+    summary
+}
+
+fn with_size_skew_fields(
+    mut summary: serde_json::Value,
+    decision: &maker::SizeSkewDecision,
+) -> serde_json::Value {
+    let object = summary
+        .as_object_mut()
+        .expect("cycle summary JSON must be an object");
+    object.insert(
+        "size_skew_enabled".to_string(),
+        serde_json::json!(decision.enabled),
+    );
+    object.insert(
+        "size_skew_active".to_string(),
+        serde_json::json!(decision.active),
+    );
+    object.insert(
+        "size_skew_add_side".to_string(),
+        serde_json::json!(decision.add_side),
+    );
+    object.insert(
+        "size_skew_inventory_ratio".to_string(),
+        serde_json::json!(decision.inventory_ratio),
+    );
+    object.insert(
+        "size_skew_add_qty".to_string(),
+        serde_json::json!(decision.add_qty),
     );
     summary
 }
@@ -1067,5 +1102,28 @@ mod tests {
         assert_eq!(json["adaptive_spread_tier"], 2);
         assert_eq!(json["effective_spread_bps"], 18.0);
         assert_eq!(json["effective_refresh_bps"], 6.0);
+    }
+
+    #[test]
+    fn cycle_summary_size_skew_fields_are_additive_and_top_level() {
+        let decision = maker::SizeSkewDecision {
+            enabled: true,
+            active: true,
+            add_side: Some(OrderSide::Buy),
+            inventory_ratio: 0.3,
+            add_qty: Some(0.05),
+        };
+        let json = with_size_skew_fields(
+            serde_json::json!({"action": "cycle_summary", "vol_bps": null}),
+            &decision,
+        );
+
+        assert_eq!(json["action"], "cycle_summary");
+        assert!(json["vol_bps"].is_null());
+        assert_eq!(json["size_skew_enabled"], true);
+        assert_eq!(json["size_skew_active"], true);
+        assert_eq!(json["size_skew_add_side"], "buy");
+        assert_eq!(json["size_skew_inventory_ratio"], 0.3);
+        assert_eq!(json["size_skew_add_qty"], 0.05);
     }
 }

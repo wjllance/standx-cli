@@ -228,6 +228,8 @@ pub(super) async fn run_startup(
     }
     maker::SpreadController::new(args.adaptive_spread.clone(), &cfg)
         .map_err(|error| anyhow::anyhow!("invalid adaptive spread config: {error}"))?;
+    let size_skew_controller = maker::SizeSkewController::new(args.size_skew, &cfg)
+        .map_err(|error| anyhow::anyhow!("invalid size skew config: {error}"))?;
     let rounded_size = maker::round_to_decimals(cfg.size, cfg.qty_decimals);
     if rounded_size < cfg.min_order_qty || rounded_size <= 0.0 {
         return Err(anyhow::anyhow!(
@@ -238,6 +240,9 @@ pub(super) async fn run_startup(
             cfg.min_order_qty,
             symbol
         ));
+    }
+    if size_skew_controller.is_degenerate(&cfg) {
+        eprintln!("⚠️  size skew 缩量低于最小下单量，退化为二值加仓侧压制");
     }
     if cfg.refresh_bps >= cfg.spread_bps {
         eprintln!(

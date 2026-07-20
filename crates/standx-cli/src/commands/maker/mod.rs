@@ -141,6 +141,7 @@ pub async fn handle_maker(
             vol_pause_bps,
             vol_window,
             adaptive_spread,
+            size_skew,
             stop_loss,
             alert_loss,
             alert_inventory_pct,
@@ -182,6 +183,15 @@ pub async fn handle_maker(
                     "adaptive spread requires vol_window_secs in TOML"
                 ));
             }
+            let size_skew = match file.size_skew {
+                Some(config) => config.into_domain(size_skew),
+                None if size_skew.is_some() => {
+                    return Err(anyhow::anyhow!(
+                        "--size-skew requires a [size_skew] TOML section"
+                    ));
+                }
+                None => maker::SizeSkewConfig::default(),
+            };
             // Keep accepting the removed rolling-circuit knobs for one
             // compatibility window so existing production commands/configs do
             // not fail to parse. They deliberately do not enter MakerRunArgs.
@@ -208,6 +218,7 @@ pub async fn handle_maker(
                     vol_window: selected_vol_window.unwrap_or(12),
                     vol_window_secs: selected_vol_window_secs,
                     adaptive_spread,
+                    size_skew,
                     stop_loss: choose(stop_loss, file.stop_loss, 0.0),
                     alert_loss: choose(alert_loss, file.alert_loss, 0.0),
                     alert_inventory_pct: choose(alert_inventory_pct, file.alert_inventory_pct, 0.0),
@@ -294,6 +305,7 @@ struct MakerRunArgs {
     vol_window: u32,
     vol_window_secs: Option<u64>,
     adaptive_spread: maker::AdaptiveSpreadConfig,
+    size_skew: maker::SizeSkewConfig,
     stop_loss: f64,
     alert_loss: f64,
     alert_inventory_pct: f64,

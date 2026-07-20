@@ -6,7 +6,7 @@ use serde::Deserialize;
 use standx_maker::{
     run_replay, Action, AdaptiveSpreadConfig, ExecutionCosts, FillRole, MakerConfig,
     MarketSnapshot, PerformanceFill, ReplayCycle, ReplayEvent, ReplayResult, ReplaySettings,
-    RestingQuote, SpreadTier,
+    RestingQuote, SizeSkewConfig, SpreadTier,
 };
 use standx_sdk::models::OrderSide;
 use std::io::{BufRead, BufReader, Read};
@@ -24,7 +24,7 @@ enum TraceRecord {
         config_hash: String,
         seed: u64,
         config: TraceMakerConfig,
-        settings: TraceReplaySettings,
+        settings: Box<TraceReplaySettings>,
     },
     Cycle {
         event_time_ms: i64,
@@ -139,6 +139,8 @@ struct TraceReplaySettings {
     vol_pause_bps: f64,
     #[serde(default)]
     adaptive_spread: Option<TraceAdaptiveSpreadConfig>,
+    #[serde(default)]
+    size_skew: Option<TraceSizeSkewConfig>,
     active_exit_enabled: bool,
     inventory_exit_pct: f64,
     inventory_exit_qty: f64,
@@ -162,6 +164,15 @@ struct TraceSpreadTier {
     exit_vol_bps: Option<f64>,
     spread_bps: f64,
     refresh_bps: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceSizeSkewConfig {
+    enabled: bool,
+    activate_pct: f64,
+    release_pct: f64,
+    add_side_factor: f64,
 }
 
 impl TryFrom<TraceReplaySettings> for ReplaySettings {
@@ -192,6 +203,15 @@ impl TryFrom<TraceReplaySettings> for ReplaySettings {
         if adaptive_spread.enabled && value.vol_window_secs.is_none() {
             anyhow::bail!("adaptive replay requires vol_window_secs");
         }
+        let size_skew = value
+            .size_skew
+            .map(|config| SizeSkewConfig {
+                enabled: config.enabled,
+                activate_pct: config.activate_pct,
+                release_pct: config.release_pct,
+                add_side_factor: config.add_side_factor,
+            })
+            .unwrap_or_default();
         Ok(Self {
             starting_position: value.starting_position,
             starting_mark: value.starting_mark,
@@ -201,7 +221,7 @@ impl TryFrom<TraceReplaySettings> for ReplaySettings {
             vol_window_secs: value.vol_window_secs,
             vol_pause_bps: value.vol_pause_bps,
             adaptive_spread,
-            size_skew: Default::default(),
+            size_skew,
             active_exit_enabled: value.active_exit_enabled,
             inventory_exit_pct: value.inventory_exit_pct,
             inventory_exit_qty: value.inventory_exit_qty,
@@ -319,7 +339,7 @@ fn parse(reader: impl BufRead) -> Result<ParsedTrace> {
                     config_hash,
                     seed,
                     config.into(),
-                    settings.try_into()?,
+                    (*settings).try_into()?,
                 ));
             }
             TraceRecord::Cycle {
@@ -439,6 +459,11 @@ fn emit(trace: &ParsedTrace, result: &ReplayResult, output_format: OutputFormat)
                     "adaptive_spread_tier": cycle.spread_decision.tier,
                     "effective_spread_bps": cycle.spread_decision.effective_spread_bps,
                     "effective_refresh_bps": cycle.spread_decision.effective_refresh_bps,
+                    "size_skew_enabled": cycle.size_skew_decision.enabled,
+                    "size_skew_active": cycle.size_skew_decision.active,
+                    "size_skew_add_side": cycle.size_skew_decision.add_side,
+                    "size_skew_inventory_ratio": cycle.size_skew_decision.inventory_ratio,
+                    "size_skew_add_qty": cycle.size_skew_decision.add_qty,
                     "actions": actions,
                 })
             );
@@ -577,6 +602,12 @@ mod tests {
     }
 
     #[test]
+    fn schema_v1_without_size_skew_still_parses_as_disabled() {
+        let trace = parse(BufReader::new(TRACE.as_bytes())).unwrap();
+        assert_eq!(trace.settings.size_skew, SizeSkewConfig::default());
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_records_after_finish() {
         let unknown = TRACE.replace("\"seed\":7", "\"seed\":7,\"surprise\":true");
         assert!(parse(BufReader::new(unknown.as_bytes())).is_err());
@@ -595,6 +626,19 @@ mod tests {
         assert_eq!(trace.settings.vol_window_secs, Some(60));
         assert!(trace.settings.adaptive_spread.enabled);
         assert_eq!(trace.settings.adaptive_spread.tiers.len(), 2);
+    }
+
+    #[test]
+    fn schema_v1_accepts_size_skew_config() {
+        let configured = TRACE.replace(
+            "\"vol_pause_bps\":0.0,",
+            "\"vol_pause_bps\":0.0,\"size_skew\":{\"enabled\":true,\"activate_pct\":30.0,\"release_pct\":20.0,\"add_side_factor\":0.5},",
+        );
+        let trace = parse(BufReader::new(configured.as_bytes())).unwrap();
+        assert!(trace.settings.size_skew.enabled);
+        assert_eq!(trace.settings.size_skew.activate_pct, 30.0);
+        assert_eq!(trace.settings.size_skew.release_pct, 20.0);
+        assert_eq!(trace.settings.size_skew.add_side_factor, 0.5);
     }
 
     #[test]

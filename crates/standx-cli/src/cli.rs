@@ -544,6 +544,11 @@ pub enum MakerCommands {
         /// changing any tier geometry.
         #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
         adaptive_spread: Option<bool>,
+        /// Enable or disable the TOML-defined size skew controller.
+        /// `--size-skew=false` provides a baseline-arm override without
+        /// changing any size skew geometry.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+        size_skew: Option<bool>,
         /// Financial brake: when session mark-to-market PnL drops to -this
         /// (quote units), run the fail-safe shutdown (freeze, cancel the maker
         /// book, await critical webhook, exit). 0 disables
@@ -782,6 +787,21 @@ mod tests {
                 panic!("expected maker run command");
             };
             assert_eq!(adaptive_spread, Some(expected));
+        }
+    }
+
+    #[test]
+    fn size_skew_flag_accepts_bare_true_and_explicit_false() {
+        for (argument, expected) in [("--size-skew", true), ("--size-skew=false", false)] {
+            let cli = Cli::try_parse_from(["standx", "maker", "run", "XAG-USD", argument])
+                .expect("size skew flag should parse");
+            let Commands::Maker { command } = cli.command else {
+                panic!("expected maker command");
+            };
+            let MakerCommands::Run { size_skew, .. } = *command else {
+                panic!("expected maker run command");
+            };
+            assert_eq!(size_skew, Some(expected));
         }
     }
 }

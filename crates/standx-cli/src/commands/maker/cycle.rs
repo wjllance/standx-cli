@@ -230,6 +230,7 @@ pub(super) async fn maker_cycle(
         stats,
         breaker,
         spread_controller,
+        size_skew_controller,
         mut order_request_deadlines,
         live_account_poll,
         mut order_latency,
@@ -509,6 +510,7 @@ pub(super) async fn maker_cycle(
     }
 
     // 3. Build the pure quote/exit plan from the synchronized state.
+    let size_skew_decision = size_skew_controller.observe(position, cfg);
     let active_resting = if live {
         projected_resting.as_slice()
     } else {
@@ -533,7 +535,7 @@ pub(super) async fn maker_cycle(
             active_exit_enabled: live,
             inventory_exit_pct,
             inventory_exit_qty,
-            size_skew: Default::default(),
+            size_skew: size_skew_decision,
             wind_down,
             qty_tolerance,
         },
@@ -925,6 +927,7 @@ pub(super) async fn maker_cycle(
         stats,
         halt_vol_bps: halted.then(|| breaker.vol_bps()),
         spread_decision: &spread_decision,
+        size_skew_decision: &size_skew_decision,
         cfg,
         performance: performance_summary.as_ref(),
     });
