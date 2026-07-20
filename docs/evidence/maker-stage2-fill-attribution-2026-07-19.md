@@ -64,8 +64,11 @@ distance continuously ≤2bps for ≥3s before the hit.
 
 ## Provenance
 
-One-off scripts (not committed): `/tmp/mo_curve_tail.py` (markout curve ×
-drift buckets × worst-decile split, reusing `maker_markout_ab.py`
-loaders), `/tmp/creep_analysis.py` (book-distance replay + markout by
-warning class). Inputs: `/opt/standx/var/standx/stage2-*.ndjson` arms
-listed by config hash above; outputs reproduced in this document.
+Scripts: `scripts/maker_mo_curve_tail.py` (markout curve × drift buckets ×
+worst-decile split, reusing `maker_markout_ab.py` loaders),
+`scripts/maker_creep_replay.py` (book-distance replay + markout by warning
+class). Stage-3 arbitration (position-at-tail / halt overlap / exit pricing)
+lives in `scripts/maker_tail_arbitration.py` with results in
+`maker-stage3-arbitration-2026-07-20.md`. Inputs:
+`/opt/standx/var/standx/stage2-*.ndjson` arms listed by config hash above;
+outputs reproduced in this document.
