@@ -87,10 +87,14 @@ case "$symbol" in
     exit 64
     ;;
 esac
-[[ -x "$standx_bin" && -f "$baseline_config" && -f "$candidate_config" ]] || {
-  printf 'stage2 A/B binary or frozen configs are missing\n' >&2
+[[ -f "$baseline_config" && -f "$candidate_config" ]] || {
+  printf 'stage2 A/B frozen configs are missing\n' >&2
   exit 64
 }
+if [[ "${STANDX_STAGE2_VALIDATE_ONLY:-0}" != "1" && ! -x "$standx_bin" ]]; then
+  printf 'stage2 A/B binary is missing\n' >&2
+  exit 64
+fi
 
 # The two arm configs must be byte-identical after normalizing either
 #   (a) the single adaptive_spread enable line (adaptive A/B), or
@@ -99,7 +103,9 @@ esac
 #       in both (constant-width widening A/B). The maker requires base tier
 #       == top-level spread_bps/refresh_bps even when adaptive is disabled,
 #       so (b) also rejects either config when those pairs disagree — that
-#       mismatch must fail here, not at arm start.
+#       mismatch must fail here, not at arm start; or
+#   (c) the enabled assignment inside [size_skew], with baseline false,
+#       candidate true, and adaptive_spread disabled in both arms.
 python3 - "$baseline_config" "$candidate_config" <<'PY' || exit 64
 from pathlib import Path
 import re
@@ -152,6 +158,36 @@ def spread_sections(text):
     return "".join(lines), fields
 
 
+def size_skew_sections(text):
+    """Blank only [size_skew].enabled and return both controller switches."""
+    lines = text.splitlines(keepends=True)
+    section = None
+    enabled = {"adaptive_spread": None, "size_skew": None}
+    for i, line in enumerate(lines):
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+        header = re.fullmatch(r"\s*\[([^][]+)]\s*(?:#.*)?", body)
+        if header:
+            section = header.group(1).strip()
+            continue
+        if body.lstrip().startswith("["):
+            section = None
+            continue
+        if section not in enabled:
+            continue
+        match = re.fullmatch(
+            r"(\s*enabled\s*=\s*)(true|false)(\s*(?:#.*)?)", body
+        )
+        if match is None:
+            continue
+        if enabled[section] is not None:
+            raise SystemExit(f"stage2 config repeats [{section}].enabled")
+        enabled[section] = match.group(2) == "true"
+        if section == "size_skew":
+            lines[i] = f"{match.group(1)}<normalized>{match.group(3)}{ending}"
+    return "".join(lines), enabled
+
+
 adaptive_toggle_only = baseline.replace("enabled = false", "enabled = true") == candidate
 if adaptive_toggle_only:
     pass
@@ -166,13 +202,27 @@ elif "enabled = false" in baseline and "enabled = false" in candidate:
                 f"({fields['tier0_spread']}/{fields['tier0_refresh']}) != top-level "
                 f"({fields['top_spread']}/{fields['top_refresh']})"
             )
-    if baseline_norm != candidate_norm:
-        raise SystemExit(
-            "stage2 arm configs differ outside adaptive_spread.enabled / spread_bps"
+    if baseline_norm == candidate_norm:
+        pass
+    else:
+        baseline_size_norm, baseline_enabled = size_skew_sections(baseline)
+        candidate_size_norm, candidate_enabled = size_skew_sections(candidate)
+        size_skew_toggle_only = (
+            baseline_size_norm == candidate_size_norm
+            and baseline_enabled["size_skew"] is False
+            and candidate_enabled["size_skew"] is True
+            and baseline_enabled["adaptive_spread"] is False
+            and candidate_enabled["adaptive_spread"] is False
         )
+        if not size_skew_toggle_only:
+            raise SystemExit(
+                "stage2 arm configs differ outside adaptive_spread.enabled / "
+                "spread_bps / size_skew.enabled"
+            )
 else:
     raise SystemExit(
-        "stage2 arm configs differ outside adaptive_spread.enabled / spread_bps"
+        "stage2 arm configs differ outside adaptive_spread.enabled / "
+        "spread_bps / size_skew.enabled"
     )
 PY
 

@@ -303,4 +303,36 @@ add_side_factor = 0.5
         assert!(!baseline.adaptive_spread.unwrap().enabled.unwrap());
         assert!(candidate.adaptive_spread.unwrap().enabled.unwrap());
     }
+
+    #[test]
+    fn stage3_live_arms_only_differ_by_size_skew_enable_switch() {
+        let baseline = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-stage3-hype-baseline.toml"
+        ));
+        let candidate = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-stage3-hype-candidate.toml"
+        ));
+        assert_eq!(baseline.lines().count(), candidate.lines().count());
+        let differing_lines: Vec<_> = baseline
+            .lines()
+            .zip(candidate.lines())
+            .filter(|(baseline_line, candidate_line)| baseline_line != candidate_line)
+            .collect();
+        assert_eq!(differing_lines, vec![("enabled = false", "enabled = true")]);
+
+        let baseline: MakerFileConfig = toml::from_str(baseline).unwrap();
+        let candidate: MakerFileConfig = toml::from_str(candidate).unwrap();
+        assert!(!baseline.adaptive_spread.unwrap().enabled.unwrap());
+        assert!(!candidate.adaptive_spread.unwrap().enabled.unwrap());
+
+        let baseline = baseline.size_skew.unwrap().into_domain(None);
+        let candidate = candidate.size_skew.unwrap().into_domain(None);
+        assert!(!baseline.enabled);
+        assert!(candidate.enabled);
+        assert_eq!(baseline.activate_pct, 30.0);
+        assert_eq!(baseline.release_pct, 20.0);
+        assert_eq!(baseline.add_side_factor, 0.5);
+    }
 }
