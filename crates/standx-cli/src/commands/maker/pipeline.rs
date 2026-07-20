@@ -4,7 +4,8 @@ use crate::cli::OutputFormat;
 use anyhow::Result;
 use standx_maker::{
     MakerAccountProjection, MakerConfig, MakerLedger, MakerStats, MarketDataMode,
-    OrderLatencyTracker, RequestTimeoutPhase, RestingQuote, SpreadController, VolBreaker,
+    OrderLatencyTracker, RequestTimeoutPhase, RestingQuote, SizeSkewController, SpreadController,
+    VolBreaker,
 };
 use standx_sdk::account_stream::AccountStreamHealth;
 use standx_sdk::client::StandXClient;
@@ -157,6 +158,7 @@ pub(super) struct CycleState<'a> {
     pub(super) stats: &'a mut MakerStats,
     pub(super) breaker: &'a mut VolBreaker,
     pub(super) spread_controller: &'a mut SpreadController,
+    pub(super) size_skew_controller: &'a mut SizeSkewController,
     pub(super) order_request_deadlines: Option<&'a mut OrderRequestDeadlines>,
     /// Live-only REST polling state. It is deliberately a CLI concern: it
     /// controls I/O cadence and cached account presentation, not strategy.

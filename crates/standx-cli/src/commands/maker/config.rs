@@ -46,6 +46,29 @@ impl AdaptiveSpreadFileConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SizeSkewFileConfig {
+    pub enabled: Option<bool>,
+    pub activate_pct: f64,
+    pub release_pct: f64,
+    pub add_side_factor: f64,
+}
+
+impl SizeSkewFileConfig {
+    pub(super) fn into_domain(
+        self,
+        enabled_override: Option<bool>,
+    ) -> standx_maker::SizeSkewConfig {
+        standx_maker::SizeSkewConfig {
+            enabled: enabled_override.or(self.enabled).unwrap_or(false),
+            activate_pct: self.activate_pct,
+            release_pct: self.release_pct,
+            add_side_factor: self.add_side_factor,
+        }
+    }
+}
+
 /// Values are optional so an explicit CLI flag can override one field without
 /// requiring every strategy default to be repeated in TOML.
 #[derive(Debug, Default, Deserialize)]
@@ -67,6 +90,7 @@ pub(super) struct MakerFileConfig {
     pub vol_window: Option<u32>,
     pub vol_window_secs: Option<u64>,
     pub adaptive_spread: Option<AdaptiveSpreadFileConfig>,
+    pub size_skew: Option<SizeSkewFileConfig>,
     pub stop_loss: Option<f64>,
     pub alert_loss: Option<f64>,
     pub alert_inventory_pct: Option<f64>,
@@ -162,6 +186,29 @@ refresh_bps = 5
         assert!(!adaptive.enabled);
         assert_eq!(adaptive.tiers.len(), 2);
         assert_eq!(adaptive.tiers[1].enter_vol_bps, Some(10.0));
+    }
+
+    #[test]
+    fn parses_size_skew_and_cli_override_wins() {
+        let config: MakerFileConfig = toml::from_str(
+            r#"
+[size_skew]
+enabled = true
+activate_pct = 30
+release_pct = 20
+add_side_factor = 0.5
+"#,
+        )
+        .unwrap();
+        let file_config = config.size_skew.unwrap();
+        let configured = file_config.clone().into_domain(None);
+        let overridden = file_config.into_domain(Some(false));
+
+        assert!(configured.enabled);
+        assert!(!overridden.enabled);
+        assert_eq!(overridden.activate_pct, 30.0);
+        assert_eq!(overridden.release_pct, 20.0);
+        assert_eq!(overridden.add_side_factor, 0.5);
     }
 
     #[test]

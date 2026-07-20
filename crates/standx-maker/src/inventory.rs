@@ -103,6 +103,15 @@ impl SizeSkewController {
         })
     }
 
+    pub fn is_degenerate(&self, cfg: &MakerConfig) -> bool {
+        if !self.config.enabled {
+            return false;
+        }
+        let base = round_to_decimals(cfg.size, cfg.qty_decimals);
+        let reduced = floor_to_decimals(base * self.config.add_side_factor, cfg.qty_decimals);
+        reduced < cfg.min_order_qty || reduced <= 0.0
+    }
+
     pub fn observe(&mut self, position: f64, cfg: &MakerConfig) -> SizeSkewDecision {
         if !self.config.enabled {
             self.active = false;
@@ -297,5 +306,20 @@ mod tests {
         let decision = enabled.observe(2.0, &base);
         assert!(decision.active);
         assert_eq!(decision.inventory_ratio, 1.0);
+    }
+
+    #[test]
+    fn degenerate_detection_requires_enabled_and_below_minimum_quantity() {
+        let mut base = base_config();
+        base.size = 0.019;
+        base.min_order_qty = 0.01;
+        let enabled = SizeSkewController::new(enabled_config(), &base).unwrap();
+        let disabled = SizeSkewController::new(SizeSkewConfig::default(), &base).unwrap();
+        assert!(enabled.is_degenerate(&base));
+        assert!(!disabled.is_degenerate(&base));
+
+        base.size = 0.021;
+        let enabled = SizeSkewController::new(enabled_config(), &base).unwrap();
+        assert!(!enabled.is_degenerate(&base));
     }
 }

@@ -42,6 +42,7 @@ pub(super) struct RuntimeLoopState {
     pub(super) stats: MakerStats,
     pub(super) breaker: VolBreaker,
     pub(super) spread_controller: maker::SpreadController,
+    pub(super) size_skew_controller: maker::SizeSkewController,
     pub(super) alerts: AlertMonitor,
     pub(super) account_balance_refresh_requested: bool,
     pub(super) balance_floor_parse_warned: bool,
@@ -144,6 +145,7 @@ impl MakerRuntime {
             None => VolBreaker::new(args.vol_window.max(1) as usize, args.vol_pause_bps),
         };
         let spread_controller = maker::SpreadController::new(args.adaptive_spread.clone(), &cfg)?;
+        let size_skew_controller = maker::SizeSkewController::new(args.size_skew, &cfg)?;
         let alerts =
             AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
                 .with_account_floors(args.alert_equity_below, args.alert_margin_below);
@@ -227,6 +229,7 @@ impl MakerRuntime {
                 stats,
                 breaker,
                 spread_controller,
+                size_skew_controller,
                 alerts,
                 account_balance_refresh_requested: false,
                 balance_floor_parse_warned: false,
