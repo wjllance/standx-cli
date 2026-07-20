@@ -109,10 +109,55 @@ semantics, larger exposure, or another symbol. Execution environment: docker
   Remaining schedule: candidate → baseline → candidate → baseline →
   candidate (5 × 4h = 20h, ETA end ~2026-07-20T02:51Z + wind-down slack),
   giving 3 baseline + 3 candidate arms in total.
-- Wind-down / final venue check / NDJSON sha256: TBD.
+- 2026-07-20T02:53:35Z: candidate arm 6 complete — venue orders/positions
+  empty, manifest valid. All 6 planned arms (3 pairs) done.
+- 2026-07-20T03:14Z: harness loop had auto-started an UNPLANNED arm 7
+  (baseline `stage2-baseline-20260720T025335Z`, 427 cycles); container
+  stopped via `docker compose stop` (SIGTERM, graceful, exit 0). Arm 7
+  caught one passive buy fill (0.1 @ 60.484, 03:06:29Z) before the stop,
+  leaving a residual +0.1 HYPE long on the venue (orders=[] verified;
+  position flagged to operator for flatten authorization). Arm-7 file
+  EXCLUDED from analysis.
+- Monitoring cron `492aa559` deleted at wrap-up.
+- Arm NDJSON SHA-256 (analysis inputs, all 4.0h):
+  - `stage2-baseline-20260719T013410Z-bbd769c50318` `721698def4e1…`
+  - `stage2-candidate-20260719T065113Z-658eb167dbe9` `7c879d613187…`
+  - `stage2-baseline-20260719T105142Z-bbd769c50318` `c7dc79a84dcb…`
+  - `stage2-candidate-20260719T145210Z-658eb167dbe9` `c74f0372aef2…`
+  - `stage2-baseline-20260719T185239Z-bbd769c50318` `a0cfdce035f6…`
+  - `stage2-candidate-20260719T225307Z-658eb167dbe9` `a6f53043def0…`
 
 ## Results
 
-(to be filled after completion: per-arm fill/capture/markout table, pooled
-comparison vs baseline, and the resulting go/no-go decision for the drift
-controller)
+Per-arm (`maker_markout_ab.py`, fills = passive maker fills; cap/mo in bps,
+net = cap + mo30 per fill):
+
+| arm | fills (/h) | cap | mo5 | mo30 | net/fill | pnl | gross |
+|---|---|---|---|---|---|---|---|
+| baseline #1 013410Z | 36 (9.0) | +4.51 | -4.30 | -6.43 | -1.92 | -0.001 | +0.128 |
+| candidate #2 065113Z | 11 (2.7) | +7.97 | -7.24 | -11.86 | -3.89 | -0.098 | +0.076 |
+| baseline #3 105142Z | 44 (11.0) | +4.02 | -4.61 | -5.96 | -1.94 | -0.237 | +0.149 |
+| candidate #4 145210Z | 18 (4.5) | +7.56 | -8.05 | -10.43 | -2.87 | -0.079 | +0.111 |
+| baseline #5 185239Z | 37 (9.2) | +4.96 | -5.53 | -6.65 | -1.69 | -0.033 | +0.126 |
+| candidate #6 225307Z | 23 (5.7) | +7.74 | -9.57 | -15.03 | -7.29 | -0.073 | +0.140 |
+
+Pooled: baseline n=117 cap +4.46 / mo30 -6.32 (net -1.86), sum pnl -0.271,
+gross +0.403; candidate n=52 cap +7.73 / mo30 -12.77 (net -5.04), sum pnl
+-0.249, gross +0.327.
+
+Consistency: fill rate 9.0-11.0/h (baseline) vs 2.7-5.7/h (candidate) and
+mo30 -6.0..-6.7 vs -10.4..-15.0 are NON-OVERLAPPING across all three pairs.
+
+**Verdict (pre-registered decision rule): live constant widening 8→12bps is
+NEGATIVE, not ≈0 and not positive.** The +3.3bps extra capture per fill is
+more than eaten by ~2x worse mo30 (toxicity selection), fill rate drops
+~2.3x, and gross per 4h FALLS (+0.403 vs +0.327 pooled). Widening is not
+adopted into the baseline. Consequently the offline front-run credit for
+drift-conditioned quoting collapses (its unconditional control already
+scored as well as every conditioned combo, and the live measurement of
+pure widening shows the counterfactual accounting over-credits by more
+than 100%); the stage-4 v0 drift controller (impl + replay equivalence +
+canary re-lock + three-arm A/B) is CANCELLED and stage 4 returns to design
+reserve. See `docs/evidence/maker-stage2-fill-attribution-2026-07-19.md`
+for the supporting cross-experiment analyses (markout curve to 900s,
+creep/predictive-cancel go/no-go).
