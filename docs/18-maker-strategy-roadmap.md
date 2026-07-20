@@ -311,7 +311,7 @@ peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 l
 
 ## 阶段 3：非线性库存控制
 
-当前状态：`planned`（2026-07-20 立项，release owner 批准；实现暂缓待单独启动）。
+当前状态：`implemented_pending_ab`（2026-07-20 实现已落地，待实盘时间片 A/B）。
 立项依据是三项仲裁分析（610 笔 fill / 81 个库存事件 / 16 笔实测退出成本），记录见
 [maker-stage3-arbitration-2026-07-20.md](evidence/maker-stage3-arbitration-2026-07-20.md)，
 分析脚本 `scripts/maker_tail_arbitration.py`。
