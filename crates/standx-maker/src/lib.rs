@@ -18,6 +18,7 @@
 use standx_sdk::models::OrderSide;
 
 pub mod account_projection;
+pub mod inventory;
 pub mod latency;
 pub mod ledger;
 pub mod market_data;
@@ -35,6 +36,7 @@ pub use account_projection::{
     ProjectionPendingRequest, ProjectionRegistryError, ProjectionRequestResolution,
     MAX_PENDING_ORDER_REQUESTS,
 };
+pub use inventory::{SizeSkewConfig, SizeSkewController, SizeSkewDecision, SizeSkewError};
 pub use latency::{
     LatencyError, LatencyMetricSummary, LatencyRequest, LatencyRequestContext, LatencyRequestKind,
     LatencyRequestOutcome, LatencySummary, OrderLatencyTracker,
@@ -599,6 +601,7 @@ pub struct CycleInput<'a> {
     pub active_exit_enabled: bool,
     pub inventory_exit_pct: f64,
     pub inventory_exit_qty: f64,
+    pub size_skew: SizeSkewDecision,
     /// Supervisor-requested wind-down (e.g. an A/B arm past its scheduled
     /// window): never place new quotes again and flatten any residual
     /// position through the reduce-only exit path, ignoring the configured
@@ -668,6 +671,7 @@ pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> Cyc
             input.market.best_bid,
             input.market.best_ask,
             input.position,
+            input.size_skew,
         );
         cap_desired_exposure(cfg, input.position, &raw, input.pending_slots)
     };
@@ -910,6 +914,7 @@ pub(crate) fn compute_desired_quotes(
     best_bid: Option<f64>,
     best_ask: Option<f64>,
     position: f64,
+    size_skew: SizeSkewDecision,
 ) -> Vec<DesiredQuote> {
     let mut out = Vec::new();
     if !mark.is_finite()
@@ -941,6 +946,14 @@ pub(crate) fn compute_desired_quotes(
         if (side == OrderSide::Buy && suppress_buy) || (side == OrderSide::Sell && suppress_sell) {
             continue;
         }
+        let side_qty = if size_skew.active && size_skew.add_side == Some(side) {
+            let Some(add_qty) = size_skew.add_qty else {
+                continue;
+            };
+            add_qty
+        } else {
+            qty
+        };
         let mut last_price: Option<f64> = None;
         for level in 0..cfg.levels {
             let offset_bps = cfg.spread_bps + level as f64 * cfg.level_step_bps;
@@ -1009,7 +1022,7 @@ pub(crate) fn compute_desired_quotes(
                 side,
                 level,
                 price,
-                qty,
+                qty: side_qty,
             });
         }
     }
@@ -1191,6 +1204,23 @@ mod tests {
         }
     }
 
+    fn desired(
+        cfg: &MakerConfig,
+        mark: f64,
+        best_bid: Option<f64>,
+        best_ask: Option<f64>,
+        position: f64,
+    ) -> Vec<DesiredQuote> {
+        compute_desired_quotes(
+            cfg,
+            mark,
+            best_bid,
+            best_ask,
+            position,
+            SizeSkewDecision::INACTIVE,
+        )
+    }
+
     fn resting(side: OrderSide, level: u32, price: f64, ref_center: f64) -> RestingQuote {
         RestingQuote {
             order_id: Some("1".into()),
@@ -1234,7 +1264,7 @@ mod tests {
     #[test]
     fn requotes_on_touch_move_without_creating_crossed_quote() {
         // Cycle 0: quote a calm book and let the places rest.
-        let desired = compute_desired_quotes(&cfg(), 100.0, Some(99.99), Some(100.01), 0.0);
+        let desired = desired(&cfg(), 100.0, Some(99.99), Some(100.01), 0.0);
         let actions = reconcile(
             &cfg(),
             100.0,
@@ -1267,7 +1297,7 @@ mod tests {
         // Cycle 1: the touch drops below the resting sell; the stale quote is
         // cancelled as WouldCross and no replacement crosses the new touch.
         let (bid, ask) = (99.88, 99.90);
-        let desired = compute_desired_quotes(&cfg(), 100.0, Some(bid), Some(ask), 0.0);
+        let desired = self::desired(&cfg(), 100.0, Some(bid), Some(ask), 0.0);
         let actions = reconcile(
             &cfg(),
             100.0,
@@ -1298,7 +1328,7 @@ mod tests {
     // 1. Basic two-sided quoting.
     #[test]
     fn basic_two_sided() {
-        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(99.99), Some(100.01), 0.0);
+        let quotes = desired(&cfg(), 100.0, Some(99.99), Some(100.01), 0.0);
         assert_eq!(quotes.len(), 2);
         assert_eq!(find(&quotes, OrderSide::Buy, 0).price, 99.90);
         assert_eq!(find(&quotes, OrderSide::Sell, 0).price, 100.10);
@@ -1310,7 +1340,7 @@ mod tests {
     fn band_clamp() {
         let mut c = cfg();
         c.spread_bps = 30.0; // > band 20
-        let quotes = compute_desired_quotes(&c, 100.0, Some(99.5), Some(100.5), 0.0);
+        let quotes = desired(&c, 100.0, Some(99.5), Some(100.5), 0.0);
         assert_eq!(find(&quotes, OrderSide::Buy, 0).price, 99.80);
         assert_eq!(find(&quotes, OrderSide::Sell, 0).price, 100.20);
     }
@@ -1323,7 +1353,7 @@ mod tests {
         c.spread_bps = 5.0;
         // mark=100.03: raw buy = 99.979985 -> floor(1dp) 99.9
         //              raw sell = 100.080015 -> ceil(1dp) 100.1
-        let quotes = compute_desired_quotes(&c, 100.03, None, None, 0.0);
+        let quotes = desired(&c, 100.03, None, None, 0.0);
         assert_eq!(find(&quotes, OrderSide::Buy, 0).price, 99.9);
         assert_eq!(find(&quotes, OrderSide::Sell, 0).price, 100.1);
         assert_eq!(format_decimals(99.9, 1), "99.9");
@@ -1338,7 +1368,7 @@ mod tests {
         c.band_bps = 20.0;
         // raw buy = 99.8, floor(0dp) = 99 < band_lo 99.8 -> nudge +1 tick = 100
         // (floor(99.8+1) = 100)... still >= band_lo, inside band.
-        let quotes = compute_desired_quotes(&c, 100.0, None, None, 0.0);
+        let quotes = desired(&c, 100.0, None, None, 0.0);
         let buy = find(&quotes, OrderSide::Buy, 0);
         assert!(buy.price >= 99.8, "price {} left the band", buy.price);
         assert_eq!(buy.price, 100.0);
@@ -1349,7 +1379,7 @@ mod tests {
     fn no_cross_clamp() {
         // Best ask (99.85) sits BELOW our raw buy (99.90): buy must clamp
         // down to ask - tick.
-        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(99.83), Some(99.85), 0.0);
+        let quotes = desired(&cfg(), 100.0, Some(99.83), Some(99.85), 0.0);
         assert_eq!(quotes.len(), 2, "{quotes:?}");
         let buy = find(&quotes, OrderSide::Buy, 0);
         let sell = find(&quotes, OrderSide::Sell, 0);
@@ -1359,25 +1389,25 @@ mod tests {
         assert_eq!(sell.price, 100.10);
 
         // Symmetric: bid above our raw sell forces sell up to bid + tick.
-        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(100.15), Some(100.20), 0.0);
+        let quotes = desired(&cfg(), 100.0, Some(100.15), Some(100.20), 0.0);
         let sell = find(&quotes, OrderSide::Sell, 0);
         assert_eq!(sell.price, 100.16);
     }
 
     #[test]
     fn drops_side_when_band_and_no_cross_have_no_feasible_tick() {
-        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(99.78), Some(99.79), 0.0);
+        let quotes = desired(&cfg(), 100.0, Some(99.78), Some(99.79), 0.0);
         assert!(quotes.iter().all(|quote| quote.side == OrderSide::Sell));
 
-        let quotes = compute_desired_quotes(&cfg(), 100.0, Some(100.21), Some(100.22), 0.0);
+        let quotes = desired(&cfg(), 100.0, Some(100.21), Some(100.22), 0.0);
         assert!(quotes.iter().all(|quote| quote.side == OrderSide::Buy));
     }
 
     #[test]
     fn invalid_market_values_produce_no_quotes() {
-        assert!(compute_desired_quotes(&cfg(), f64::NAN, None, None, 0.0).is_empty());
-        assert!(compute_desired_quotes(&cfg(), 100.0, Some(f64::INFINITY), None, 0.0).is_empty());
-        assert!(compute_desired_quotes(&cfg(), 100.0, None, Some(0.0), 0.0).is_empty());
+        assert!(desired(&cfg(), f64::NAN, None, None, 0.0).is_empty());
+        assert!(desired(&cfg(), 100.0, Some(f64::INFINITY), None, 0.0).is_empty());
+        assert!(desired(&cfg(), 100.0, None, Some(0.0), 0.0).is_empty());
     }
 
     // 6. Size below min_order_qty -> no quotes at all.
@@ -1385,21 +1415,21 @@ mod tests {
     fn min_qty_rejection() {
         let mut c = cfg();
         c.size = 0.00001; // rounds to 0.0000 at 4dp -> below min 0.001
-        let quotes = compute_desired_quotes(&c, 100.0, None, None, 0.0);
+        let quotes = desired(&c, 100.0, None, None, 0.0);
         assert!(quotes.is_empty());
     }
 
     // 7. Max-position suppression, both directions.
     #[test]
     fn max_position_suppresses_buy() {
-        let quotes = compute_desired_quotes(&cfg(), 100.0, None, None, 0.05);
+        let quotes = desired(&cfg(), 100.0, None, None, 0.05);
         assert!(quotes.iter().all(|q| q.side == OrderSide::Sell));
         assert_eq!(quotes.len(), 1);
     }
 
     #[test]
     fn max_position_suppresses_sell() {
-        let quotes = compute_desired_quotes(&cfg(), 100.0, None, None, -0.05);
+        let quotes = desired(&cfg(), 100.0, None, None, -0.05);
         assert!(quotes.iter().all(|q| q.side == OrderSide::Buy));
         assert_eq!(quotes.len(), 1);
     }
@@ -1409,7 +1439,7 @@ mod tests {
     fn reconcile_hold_within_refresh() {
         let c = cfg();
         let mark = 100.02; // 2 bps from ref 100.0, refresh = 3
-        let desired = compute_desired_quotes(&c, mark, None, None, 0.0);
+        let desired = desired(&c, mark, None, None, 0.0);
         let rest = vec![
             resting(OrderSide::Buy, 0, 99.90, 100.0),
             resting(OrderSide::Sell, 0, 100.10, 100.0),
@@ -1430,7 +1460,7 @@ mod tests {
     fn reconcile_requote_beyond_refresh() {
         let c = cfg();
         let mark = 100.05; // 5 bps > refresh 3
-        let desired = compute_desired_quotes(&c, mark, None, None, 0.0);
+        let desired = desired(&c, mark, None, None, 0.0);
         let rest = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
         let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
         // Expect: cancel(buy, mark_moved), then places for buy+sell.
@@ -1456,7 +1486,7 @@ mod tests {
         // Mark gapped 30 bps: resting buy at 99.90 with ref 100.0 is now
         // outside band [100.10, 100.50] around mark 100.30.
         let mark = 100.30;
-        let desired = compute_desired_quotes(&c, mark, None, None, 0.0);
+        let desired = desired(&c, mark, None, None, 0.0);
         let rest = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
         let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
         assert!(
@@ -1476,7 +1506,7 @@ mod tests {
     fn reconcile_cancel_would_cross() {
         let c = cfg();
         let mark = 100.01; // tiny drift, within refresh
-        let desired = compute_desired_quotes(&c, mark, Some(100.12), Some(100.14), 0.0);
+        let desired = desired(&c, mark, Some(100.12), Some(100.14), 0.0);
         // Resting sell at 100.10 now BELOW best bid 100.12 -> crossed.
         let rest = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
         let actions = reconcile(
@@ -1521,7 +1551,7 @@ mod tests {
     fn reconcile_stale_level() {
         let c = cfg(); // levels = 1 -> only level 0 desired
         let mark = 100.0;
-        let desired = compute_desired_quotes(&c, mark, None, None, 0.0);
+        let desired = desired(&c, mark, None, None, 0.0);
         let rest = vec![
             resting(OrderSide::Buy, 0, 99.90, 100.0),
             resting(OrderSide::Buy, 1, 99.88, 100.0), // stale level
@@ -1548,7 +1578,7 @@ mod tests {
     fn multi_level_ladder() {
         let mut c = cfg();
         c.levels = 3;
-        let quotes = compute_desired_quotes(&c, 100.0, None, None, 0.0);
+        let quotes = desired(&c, 100.0, None, None, 0.0);
         // Buys descending: 99.90, 99.88, 99.86; sells ascending mirrored.
         assert_eq!(find(&quotes, OrderSide::Buy, 0).price, 99.90);
         assert_eq!(find(&quotes, OrderSide::Buy, 1).price, 99.88);
@@ -1561,7 +1591,7 @@ mod tests {
         let mut c2 = cfg();
         c2.levels = 3;
         c2.spread_bps = 18.0;
-        let quotes = compute_desired_quotes(&c2, 100.0, None, None, 0.0);
+        let quotes = desired(&c2, 100.0, None, None, 0.0);
         let buys: Vec<_> = quotes.iter().filter(|q| q.side == OrderSide::Buy).collect();
         assert_eq!(buys.len(), 2, "{buys:?}"); // 99.82, then 99.80 (L1) and L2 dup dropped
         assert_eq!(buys[1].price, 99.80);
@@ -1717,7 +1747,7 @@ mod tests {
         let mut c = cfg();
         c.skew_bps = 10.0;
         // half-max long -> center 99.95; buy = 99.85, sell = 100.05
-        let q = compute_desired_quotes(&c, 100.0, None, None, 0.025);
+        let q = desired(&c, 100.0, None, None, 0.025);
         assert_eq!(find(&q, OrderSide::Buy, 0).price, 99.85);
         assert_eq!(find(&q, OrderSide::Sell, 0).price, 100.05);
         // both below the no-skew baseline (99.90 / 100.10)
@@ -1731,7 +1761,7 @@ mod tests {
         let mut c = cfg();
         c.skew_bps = 10.0;
         // half-max short -> center 100.05; buy = 99.94, sell = 100.16
-        let q = compute_desired_quotes(&c, 100.0, None, None, -0.025);
+        let q = desired(&c, 100.0, None, None, -0.025);
         assert_eq!(find(&q, OrderSide::Buy, 0).price, 99.94);
         assert_eq!(find(&q, OrderSide::Sell, 0).price, 100.16);
         // buy moved nearer mark than the no-skew baseline 99.90
@@ -1742,8 +1772,8 @@ mod tests {
     #[test]
     fn skew_zero_is_noop() {
         let c = cfg(); // skew_bps = 0
-        let base = compute_desired_quotes(&c, 100.0, None, None, 0.0);
-        let with_pos = compute_desired_quotes(&c, 100.0, None, None, 0.025);
+        let base = desired(&c, 100.0, None, None, 0.0);
+        let with_pos = desired(&c, 100.0, None, None, 0.025);
         assert_eq!(base, with_pos);
     }
 
@@ -1753,7 +1783,7 @@ mod tests {
         c.levels = 3;
         c.size = 0.02;
         c.max_position = 0.05;
-        let raw = compute_desired_quotes(&c, 100.0, None, None, 0.03);
+        let raw = desired(&c, 100.0, None, None, 0.03);
         let capped = cap_desired_exposure(&c, 0.03, &raw, &[]);
 
         // At +0.03, only one additional 0.02 buy can be exposed. All three
@@ -1786,7 +1816,7 @@ mod tests {
         c.levels = 3;
         c.size = 0.02;
         c.max_position = 0.05;
-        let raw = compute_desired_quotes(&c, 100.0, None, None, 0.03);
+        let raw = desired(&c, 100.0, None, None, 0.03);
         let capped = cap_desired_exposure(&c, 0.03, &raw, &[(OrderSide::Buy, 2)]);
 
         // The in-flight outer bid gets the only 0.02 buy budget. A later
@@ -1808,7 +1838,7 @@ mod tests {
         // 2x max short: growing side (sell) suppressed, only buy remains;
         // ratio clamps to -1 -> center 100.10 -> buy 99.99 (NOT the ratio=-2
         // value 100.09).
-        let q = compute_desired_quotes(&c, 100.0, None, None, -0.10);
+        let q = desired(&c, 100.0, None, None, -0.10);
         assert!(q.iter().all(|d| d.side == OrderSide::Buy));
         assert_eq!(find(&q, OrderSide::Buy, 0).price, 99.99);
     }
@@ -1821,7 +1851,7 @@ mod tests {
         let (bid, ask) = (99.90, 100.00);
         // full long: buy suppressed; sell pulled down hard but held above the
         // band floor and one tick above the bid.
-        let q = compute_desired_quotes(&c, 100.0, Some(bid), Some(ask), 0.05);
+        let q = desired(&c, 100.0, Some(bid), Some(ask), 0.05);
         assert_eq!(q.len(), 1, "{q:?}");
         let sell = find(&q, OrderSide::Sell, 0).price;
         assert!(sell >= 99.80 - 1e-9, "sell {sell} below band floor");
@@ -1838,7 +1868,7 @@ mod tests {
         // Resting sell placed when flat (ref_center = 100.0).
         // Long 0.025 -> center 99.95, drift 5bps > refresh 3 -> re-quote.
         let pos = 0.025;
-        let desired = compute_desired_quotes(&c, mark, None, None, pos);
+        let desired = desired(&c, mark, None, None, pos);
         let rest = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
         let actions = reconcile(&c, mark, pos, None, None, &desired, &rest, 1);
         assert!(actions.iter().any(|a| matches!(
@@ -1851,7 +1881,7 @@ mod tests {
 
         // Smaller long 0.01 -> center 99.98, drift 2bps < refresh -> hold.
         let pos2 = 0.01;
-        let desired2 = compute_desired_quotes(&c, mark, None, None, pos2);
+        let desired2 = self::desired(&c, mark, None, None, pos2);
         let rest2 = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
         let actions2 = reconcile(&c, mark, pos2, None, None, &desired2, &rest2, 1);
         assert!(actions2.iter().any(|a| matches!(a, Action::Hold { .. })));
@@ -1961,6 +1991,7 @@ mod tests {
             active_exit_enabled: true,
             inventory_exit_pct: 80.0,
             inventory_exit_qty: 0.01,
+            size_skew: Default::default(),
             wind_down: false,
             qty_tolerance: 0.0005,
         };
@@ -2015,6 +2046,7 @@ mod tests {
                 active_exit_enabled: false,
                 inventory_exit_pct: 0.0,
                 inventory_exit_qty: 0.0,
+                size_skew: Default::default(),
                 wind_down: false,
                 qty_tolerance: 0.0005,
             },
@@ -2055,6 +2087,7 @@ mod tests {
                 active_exit_enabled: true,
                 inventory_exit_pct: 80.0,
                 inventory_exit_qty: 0.01,
+                size_skew: Default::default(),
                 wind_down: false,
                 qty_tolerance: 0.0005,
             },
@@ -2074,6 +2107,63 @@ mod tests {
             .actions
             .iter()
             .any(|action| matches!(action, Action::Place(_))));
+    }
+
+    #[test]
+    fn inactive_size_skew_is_exactly_plan_equivalent_across_state_grid() {
+        let mut c = cfg();
+        c.levels = 2;
+        c.max_position = 0.05;
+        let resting_sets = [
+            Vec::new(),
+            vec![
+                resting(OrderSide::Buy, 0, 99.9, 100.0),
+                resting(OrderSide::Sell, 0, 100.1, 100.0),
+            ],
+        ];
+        let pending_sets = [Vec::new(), vec![(OrderSide::Buy, 0), (OrderSide::Sell, 1)]];
+        let inactive = SizeSkewDecision {
+            enabled: true,
+            active: false,
+            add_side: Some(OrderSide::Buy),
+            inventory_ratio: 0.99,
+            add_qty: Some(c.min_order_qty),
+        };
+
+        for position in [-0.025, 0.0, 0.025] {
+            for resting in &resting_sets {
+                for pending_slots in &pending_sets {
+                    let input = CycleInput {
+                        cycle: 6,
+                        market: MarketSnapshot {
+                            mark: 100.0,
+                            best_bid: Some(99.99),
+                            best_ask: Some(100.01),
+                        },
+                        position,
+                        resting,
+                        pending_slots,
+                        market_data_mode: MarketDataMode::Active,
+                        active_exit_enabled: false,
+                        inventory_exit_pct: 0.0,
+                        inventory_exit_qty: 0.0,
+                        size_skew: SizeSkewDecision::default(),
+                        wind_down: false,
+                        qty_tolerance: 0.0005,
+                    };
+                    let default_plan = plan_cycle(&c, input, false);
+                    let inactive_plan = plan_cycle(
+                        &c,
+                        CycleInput {
+                            size_skew: inactive,
+                            ..input
+                        },
+                        false,
+                    );
+                    assert_eq!(inactive_plan, default_plan);
+                }
+            }
+        }
     }
 
     // 28. Alert monitor: disabled emits nothing.
@@ -2202,6 +2292,7 @@ mod tests {
             active_exit_enabled: true,
             inventory_exit_pct: 0.0,
             inventory_exit_qty: 0.0,
+            size_skew: Default::default(),
             wind_down: true,
             qty_tolerance: 0.0005,
         };
@@ -2252,6 +2343,7 @@ mod tests {
                 active_exit_enabled: true,
                 inventory_exit_pct: 0.0,
                 inventory_exit_qty: 0.0,
+                size_skew: Default::default(),
                 wind_down: true,
                 qty_tolerance: 0.0005,
             },
@@ -2282,6 +2374,7 @@ mod tests {
             active_exit_enabled: true,
             inventory_exit_pct: 80.0,
             inventory_exit_qty: 0.01,
+            size_skew: Default::default(),
             wind_down: true,
             qty_tolerance: 0.0005,
         };

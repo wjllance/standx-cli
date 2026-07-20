@@ -533,6 +533,7 @@ pub(super) async fn maker_cycle(
             active_exit_enabled: live,
             inventory_exit_pct,
             inventory_exit_qty,
+            size_skew: Default::default(),
             wind_down,
             qty_tolerance,
         },
