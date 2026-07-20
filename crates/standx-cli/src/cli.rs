@@ -198,6 +198,26 @@ pub enum Commands {
         #[command(subcommand)]
         command: Box<MakerCommands>,
     },
+    /// Record StandX vs Hyperliquid mark prices to NDJSON to measure StandX's
+    /// price lag (read-only diagnostic; no auth, no orders).
+    LagRecorder {
+        /// StandX symbol to record (e.g. HYPE-USD).
+        #[arg(long, default_value = "HYPE-USD")]
+        symbol: String,
+        /// Hyperliquid coin symbol. Defaults to the StandX symbol with its
+        /// `-USD`/`-USDT` quote suffix stripped (HYPE-USD -> HYPE).
+        #[arg(long)]
+        hl_coin: Option<String>,
+        /// NDJSON output file (created if absent, appended otherwise).
+        #[arg(long)]
+        out: String,
+        /// Seconds between output-file flushes.
+        #[arg(long, default_value_t = 5)]
+        flush_secs: u64,
+        /// Seconds between stderr status heartbeats.
+        #[arg(long, default_value_t = 30)]
+        status_secs: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

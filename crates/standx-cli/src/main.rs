@@ -165,6 +165,7 @@ fn command_name(command: &Commands) -> &'static str {
         Commands::Portfolio { .. } => "portfolio",
         Commands::Block { .. } => "block",
         Commands::Maker { .. } => "maker",
+        Commands::LagRecorder { .. } => "lag-recorder",
     }
 }
 
@@ -290,6 +291,16 @@ async fn execute_command(
                 });
             }
         }
+        Commands::LagRecorder {
+            symbol,
+            hl_coin,
+            out,
+            flush_secs,
+            status_secs,
+        } => {
+            commands::handle_lag_recorder(symbol, hl_coin, out, flush_secs, status_secs, verbose)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -312,6 +323,9 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Maker { .. } => {
             "⚠️  WOULD RUN MAKER BOT - PLACES/CANCELS ORDERS WITH --live (paper mode without)"
         }
+        Commands::LagRecorder { .. } => {
+            "Would record StandX/Hyperliquid prices to NDJSON (read-only, safe to execute)"
+        }
     };
 
     let command_label = match command {
@@ -328,6 +342,7 @@ async fn handle_dry_run(command: &Commands, output: OutputFormat) -> Result<(), 
         Commands::Portfolio { .. } => "portfolio",
         Commands::Block { .. } => "block",
         Commands::Maker { .. } => "maker",
+        Commands::LagRecorder { .. } => "lag-recorder",
     };
     let dry_run_info = serde_json::json!({
         "dry_run": true,
