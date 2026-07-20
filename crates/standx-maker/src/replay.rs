@@ -8,8 +8,8 @@
 use crate::{
     plan_cycle, preflight_cycle_at, AdaptiveSpreadConfig, CyclePlan, CyclePreflight, MakerConfig,
     MarketSnapshot, PerformanceError, PerformanceFill, PerformanceLedger, PerformanceSummary,
-    QuoteQualityInterval, RestingQuote, SpreadController, SpreadDecision, VolBreaker,
-    VolatilityError,
+    QuoteQualityInterval, RestingQuote, SizeSkewConfig, SizeSkewController, SizeSkewDecision,
+    SpreadController, SpreadDecision, VolBreaker, VolatilityError,
 };
 use standx_sdk::models::OrderSide;
 use std::fmt;
@@ -24,6 +24,7 @@ pub struct ReplaySettings {
     pub vol_window_secs: Option<u64>,
     pub vol_pause_bps: f64,
     pub adaptive_spread: AdaptiveSpreadConfig,
+    pub size_skew: SizeSkewConfig,
     pub active_exit_enabled: bool,
     pub inventory_exit_pct: f64,
     pub inventory_exit_qty: f64,
@@ -57,6 +58,7 @@ pub struct ReplayCycleOutcome {
     pub cycle: u64,
     pub preflight: CyclePreflight,
     pub spread_decision: SpreadDecision,
+    pub size_skew_decision: SizeSkewDecision,
     pub plan: Option<CyclePlan>,
 }
 
@@ -72,6 +74,7 @@ pub enum ReplayError {
     Performance(PerformanceError),
     Volatility(VolatilityError),
     AdaptiveSpread(String),
+    SizeSkew(String),
     MissingFinalMark,
 }
 
@@ -84,6 +87,7 @@ impl fmt::Display for ReplayError {
             Self::AdaptiveSpread(error) => {
                 write!(formatter, "invalid replay adaptive spread: {error}")
             }
+            Self::SizeSkew(error) => write!(formatter, "invalid replay size skew: {error}"),
             Self::MissingFinalMark => formatter.write_str("replay has no final market mark"),
         }
     }
@@ -128,6 +132,8 @@ pub fn run_replay(
     };
     let mut spread_controller = SpreadController::new(settings.adaptive_spread.clone(), cfg)
         .map_err(|error| ReplayError::AdaptiveSpread(error.to_string()))?;
+    let mut size_skew_controller = SizeSkewController::new(settings.size_skew, cfg)
+        .map_err(|error| ReplayError::SizeSkew(error.to_string()))?;
     let mut outcomes = Vec::new();
     let mut final_mark = None;
 
@@ -150,6 +156,8 @@ pub fn run_replay(
                 )?;
                 let spread_decision = spread_controller.observe(breaker.vol_bps(), cfg);
                 let effective_cfg = spread_controller.effective_config(cfg, &spread_decision);
+                let size_skew_decision =
+                    size_skew_controller.observe(cycle.position, &effective_cfg);
                 let plan = preflight.skip.is_none().then(|| {
                     plan_cycle(
                         &effective_cfg,
@@ -163,6 +171,7 @@ pub fn run_replay(
                             active_exit_enabled: settings.active_exit_enabled,
                             inventory_exit_pct: settings.inventory_exit_pct,
                             inventory_exit_qty: settings.inventory_exit_qty,
+                            size_skew: size_skew_decision,
                             wind_down: false,
                             qty_tolerance: 0.0005,
                         },
@@ -174,6 +183,7 @@ pub fn run_replay(
                     cycle: cycle.cycle,
                     preflight,
                     spread_decision,
+                    size_skew_decision,
                     plan,
                 });
             }
@@ -250,6 +260,7 @@ mod tests {
             vol_window_secs: None,
             vol_pause_bps: 0.0,
             adaptive_spread: AdaptiveSpreadConfig::default(),
+            size_skew: SizeSkewConfig::default(),
             active_exit_enabled: false,
             inventory_exit_pct: 0.0,
             inventory_exit_qty: 0.0,
@@ -257,6 +268,15 @@ mod tests {
     }
 
     fn cycle(event_time_ms: i64, cycle: u64, mark: f64) -> ReplayEvent {
+        cycle_with_position(event_time_ms, cycle, mark, 0.0)
+    }
+
+    fn cycle_with_position(
+        event_time_ms: i64,
+        cycle: u64,
+        mark: f64,
+        position: f64,
+    ) -> ReplayEvent {
         ReplayEvent::Cycle(ReplayCycle {
             event_time_ms,
             cycle,
@@ -265,7 +285,7 @@ mod tests {
                 best_bid: Some(mark - 0.01),
                 best_ask: Some(mark + 0.01),
             },
-            position: 0.0,
+            position,
             resting: Vec::new(),
             pending_slots: Vec::new(),
             eligible_bid_qty: 1.0,
@@ -276,7 +296,7 @@ mod tests {
     #[test]
     fn same_trace_replays_to_identical_plans_and_summary_three_times() {
         let events = vec![
-            cycle(0, 0, 100.0),
+            cycle_with_position(0, 0, 100.0, 4.0),
             ReplayEvent::Fill(PerformanceFill {
                 trade_id: 1,
                 order_id: 10,
@@ -288,13 +308,18 @@ mod tests {
                 event_time_ms: 0,
                 costs: Some(ExecutionCosts::default()),
             }),
-            cycle(1_000, 1, 100.1),
-            cycle(5_000, 2, 100.2),
-            cycle(30_000, 3, 100.3),
+            cycle_with_position(1_000, 1, 100.1, 4.0),
+            cycle_with_position(5_000, 2, 100.2, 4.0),
+            cycle_with_position(30_000, 3, 100.3, 4.0),
         ];
-        let first = run_replay(&config(), settings(), &events, 30_000).unwrap();
-        let second = run_replay(&config(), settings(), &events, 30_000).unwrap();
-        let third = run_replay(&config(), settings(), &events, 30_000).unwrap();
+        let mut replay_settings = settings();
+        replay_settings.size_skew = SizeSkewConfig {
+            enabled: true,
+            ..SizeSkewConfig::default()
+        };
+        let first = run_replay(&config(), replay_settings.clone(), &events, 30_000).unwrap();
+        let second = run_replay(&config(), replay_settings.clone(), &events, 30_000).unwrap();
+        let third = run_replay(&config(), replay_settings, &events, 30_000).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(second, third);
@@ -302,6 +327,21 @@ mod tests {
         assert_eq!(first.performance.markouts[0].samples, 1);
         assert_eq!(first.performance.markouts[1].samples, 1);
         assert_eq!(first.performance.markouts[2].samples, 1);
+        assert!(first
+            .cycles
+            .iter()
+            .all(|cycle| cycle.size_skew_decision.active));
+        assert!(first.cycles.iter().all(|cycle| {
+            cycle.size_skew_decision.add_side == Some(OrderSide::Buy)
+                && cycle.size_skew_decision.inventory_ratio == 0.4
+                && cycle.size_skew_decision.add_qty == Some(0.5)
+        }));
+        // Fill events feed performance only. Position ownership/filtering is
+        // resolved before replay produces the next normalized Cycle input.
+        assert_eq!(
+            first.cycles[0].size_skew_decision,
+            first.cycles[1].size_skew_decision
+        );
     }
 
     #[test]

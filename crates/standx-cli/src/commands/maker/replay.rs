@@ -201,6 +201,7 @@ impl TryFrom<TraceReplaySettings> for ReplaySettings {
             vol_window_secs: value.vol_window_secs,
             vol_pause_bps: value.vol_pause_bps,
             adaptive_spread,
+            size_skew: Default::default(),
             active_exit_enabled: value.active_exit_enabled,
             inventory_exit_pct: value.inventory_exit_pct,
             inventory_exit_qty: value.inventory_exit_qty,
