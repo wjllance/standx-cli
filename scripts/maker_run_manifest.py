@@ -250,6 +250,8 @@ def classify_regime(metrics: dict[str, Any], cycles: int, duration_seconds: floa
 def analyze_log(path: Path) -> dict[str, Any]:
     cycles: set[int] = set()
     cycle_counts: dict[int, int] = {}
+    cycle_summary_line_numbers: dict[int, list[int]] = {}
+    freeze_event_lines: list[int] = []
     observed_cycles: set[int] = set()
     lifecycle_events: list[str] = []
     symbols: set[str] = set()
@@ -273,7 +275,7 @@ def analyze_log(path: Path) -> dict[str, Any]:
     invalid_lines = 0
 
     with path.open(encoding="utf-8") as handle:
-        for line in handle:
+        for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
             try:
@@ -313,6 +315,7 @@ def analyze_log(path: Path) -> dict[str, Any]:
                 cycle = event["cycle"]
                 cycles.add(cycle)
                 cycle_counts[cycle] = cycle_counts.get(cycle, 0) + 1
+                cycle_summary_line_numbers.setdefault(cycle, []).append(line_number)
                 mark = finite_float(event.get("mark"))
                 if mark is not None and mark > 0:
                     marks.append(mark)
@@ -340,6 +343,16 @@ def analyze_log(path: Path) -> dict[str, Any]:
                     final_position = position
             if event.get("action") == "lifecycle" and isinstance(event.get("event"), str):
                 lifecycle_events.append(event["event"])
+            # Freeze notifications mark a cycle invalidation: the runtime
+            # freezes placements, cleans the maker book, and retries the
+            # active cycle after recovery, which re-emits that cycle's
+            # cycle_summary. Line positions let validation tell such
+            # freeze-retried duplicates from genuine sequence corruption.
+            if event.get("action") == "risk_notification" and event.get("event") in {
+                "frozen",
+                "disconnected_frozen",
+            }:
+                freeze_event_lines.append(line_number)
             if event.get("action") == "performance_summary":
                 position = finite_float(event.get("position"))
                 if position is not None:
@@ -353,6 +366,14 @@ def analyze_log(path: Path) -> dict[str, Any]:
         else []
     )
     duplicate_cycles = sorted(cycle for cycle, count in cycle_counts.items() if count > 1)
+    freeze_retried_cycles = sorted(
+        cycle
+        for cycle in duplicate_cycles
+        if any(
+            min(cycle_summary_line_numbers[cycle]) < freeze < max(cycle_summary_line_numbers[cycle])
+            for freeze in freeze_event_lines
+        )
+    )
     duration_seconds = (
         last_timestamp_epoch - first_timestamp_epoch
         if last_timestamp_epoch is not None and first_timestamp_epoch is not None
@@ -411,6 +432,7 @@ def analyze_log(path: Path) -> dict[str, Any]:
         "cycle_max": cycle_max,
         "missing_cycles": missing_cycles,
         "duplicate_cycles": duplicate_cycles,
+        "freeze_retried_cycles": freeze_retried_cycles,
         "lifecycle_events": lifecycle_events,
         "regime": regime,
         "regime_metrics": regime_metrics,
@@ -484,7 +506,7 @@ def finalize_manifest(args: argparse.Namespace) -> int:
         "json_only": log["invalid_lines"] == 0,
         "cycle_sequence_complete": bool(log["cycle_summaries"])
         and not log["missing_cycles"]
-        and not log["duplicate_cycles"],
+        and not sorted(set(log["duplicate_cycles"]) - set(log["freeze_retried_cycles"])),
         "lifecycle_started": "started" in log["lifecycle_events"],
         "lifecycle_stopped": "stopped" in log["lifecycle_events"],
     }
