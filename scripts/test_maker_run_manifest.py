@@ -210,6 +210,83 @@ class MakerRunManifestTests(unittest.TestCase):
             self.assertEqual(analyzed["missing_cycles"], [])
             self.assertEqual(analyzed["duplicate_cycles"], [])
 
+    def test_freeze_retried_duplicate_keeps_cycle_sequence_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.ndjson"
+            log.write_text(
+                "\n".join(
+                    [
+                        '{"ts":1,"action":"cycle_summary","cycle":0}',
+                        '{"ts":2,"action":"cycle_summary","cycle":1}',
+                        '{"ts":3,"action":"risk_notification","event":"frozen","kind":"position_reconciliation"}',
+                        '{"ts":4,"action":"cycle_summary","cycle":1}',
+                        '{"ts":5,"action":"cycle_summary","cycle":2}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            analyzed = manifest.analyze_log(log)
+            self.assertEqual(analyzed["duplicate_cycles"], [1])
+            self.assertEqual(analyzed["freeze_retried_cycles"], [1])
+
+            root = Path(directory)
+            output = root / "run.manifest.json"
+            output.write_text(
+                json.dumps(
+                    {
+                        "git_sha": "a" * 40,
+                        "git_dirty": False,
+                        "strategy_dirty_paths": [],
+                        "symbol": "BTC-USD",
+                        "program": {"sha256": "c" * 64},
+                        "collector": {
+                            "manifest_tool": {"sha256": "d" * 64},
+                            "wrapper": {"sha256": "e" * 64},
+                        },
+                        "config": {"sha256": "b" * 64},
+                        "symbol_metadata": {
+                            "price_tick_decimals": 1,
+                            "qty_tick_decimals": 1,
+                            "min_order_qty": "0.1",
+                        },
+                        "log": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write('{"ts":6,"action":"lifecycle","event":"started"}\n')
+                handle.write('{"ts":7,"action":"lifecycle","event":"stopped"}\n')
+            manifest.finalize_manifest(
+                argparse.Namespace(manifest=output, log=log, exit_status=0)
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(payload["validation"]["checks"]["cycle_sequence_complete"])
+            self.assertTrue(payload["validation"]["baseline_eligible"])
+
+    def test_duplicate_without_freeze_breaks_cycle_sequence_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.ndjson"
+            log.write_text(
+                "\n".join(
+                    [
+                        '{"ts":1,"action":"cycle_summary","cycle":0}',
+                        '{"ts":2,"action":"cycle_summary","cycle":1}',
+                        '{"ts":3,"action":"risk_notification","event":"frozen","kind":"position_reconciliation"}',
+                        '{"ts":4,"action":"cycle_summary","cycle":2}',
+                        '{"ts":5,"action":"cycle_summary","cycle":2}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            analyzed = manifest.analyze_log(log)
+            # The freeze precedes both copies of cycle 2, so the duplicate is
+            # not a freeze retry and must stay disqualifying.
+            self.assertEqual(analyzed["duplicate_cycles"], [2])
+            self.assertEqual(analyzed["freeze_retried_cycles"], [])
+
     def test_regime_report_distinguishes_calm_trend_and_stress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
