@@ -2,7 +2,8 @@
 """Measure how far StandX's mark price lags Hyperliquid. Read-only, stdlib only.
 
 Usage:
-    python3 scripts/lag_analysis.py LAG.ndjson [--field mark|mid|index]
+    python3 scripts/lag_analysis.py LAG.ndjson [--standx-field mark|mid|index]
+                                    [--leader-field mark|mid|index]
                                     [--grid-ms 250] [--max-lag-ms 4000]
                                     [--event-bps 8] [--event-window-ms 2000]
                                     [--cover-frac 0.5]
@@ -11,7 +12,12 @@ Input is the NDJSON produced by `standx lag-recorder`: one price observation per
 line, each tagged `source` ("standx" | "hyperliquid") with a common-clock
 `local_recv_ms` and price fields (mark/mid/index/last/best_bid/best_ask).
 
-Two independent lag estimates are printed:
+Each source uses its own field: the leader (Hyperliquid) defaults to `mid`
+(midPx, the fastest-moving public price on that feed), StandX to `mark` (the
+price the maker quotes against). The earlier single `--field` option was
+replaced by `--standx-field` / `--leader-field`.
+
+Three statistics are printed:
 
 1. Cross-correlation of resampled price increments across candidate lags. The
    lag maximizing correlation is the typical co-movement offset (positive =
@@ -19,7 +25,16 @@ Two independent lag estimates are printed:
 2. Event response: when Hyperliquid jumps sharply, how long until StandX covers
    a fraction of that move. More robust than (1) because it isolates the moments
    that actually matter (the jumps that snipe stale quotes), and it is directly
-   causal (measured from realized price paths).
+   causal (measured from realized price paths). Coverage outcomes (already
+   ahead / never followed / measurable follow) are stratified by jump size in
+   tiers of [1x, 2x, 4x, 8x) * --event-bps, so the exploitability of the window
+   can be read per regime.
+3. StandX own-feed jump response: for jumps detected on StandX's OWN series,
+   how fast StandX's mark itself traverses 50% / 90% of the move. This prices
+   an "own-feed fast cancel": how much of the move is still ahead of you once
+   your own feed starts moving. StandX's mark updates at a slower cadence than
+   the leader feed, so its jump scan uses a wider window (--own-window-ms,
+   default 3x --event-window-ms).
 
 HONEST CAVEATS (also printed at the end):
 - The common local clock carries a FIXED differential-network-latency offset:
@@ -38,8 +53,10 @@ import json
 from statistics import mean, median
 
 
-def load(path, field):
-    """Return (standx, hyper): each a sorted list of (t_ms, price)."""
+def load(path, standx_field, leader_field):
+    """Return (standx, hyper): each a sorted list of (t_ms, price). Each source
+    reads its own price field; lines where that field is null are skipped."""
+    fields = {"standx": standx_field, "hyperliquid": leader_field}
     series = {"standx": [], "hyperliquid": []}
     with open(path) as handle:
         for line in handle:
@@ -53,7 +70,7 @@ def load(path, field):
             source = rec.get("source")
             if source not in series:
                 continue
-            price = rec.get(field)
+            price = rec.get(fields[source])
             if price is None:
                 continue
             t = rec.get("local_recv_ms")
@@ -130,9 +147,31 @@ def cross_correlation(standx, hyper, grid_ms, max_lag_ms):
     return best, curve
 
 
+def detect_jumps(series, event_bps, window_ms):
+    """Yield (t0, p0, p1, move_bps) for the first later sample within
+    `window_ms` that moves >= event_bps from each anchor sample. Detection
+    semantics are shared by the leader and the own-feed scan so jump sets are
+    comparable."""
+    n = len(series)
+    jumps = []
+    for i in range(n):
+        t0, p0 = series[i]
+        k = i + 1
+        while k < n and series[k][0] - t0 <= window_ms:
+            t1, p1 = series[k]
+            move_bps = (p1 / p0 - 1.0) * 1e4
+            if abs(move_bps) >= event_bps:
+                jumps.append((t0, p0, p1, move_bps))
+                break
+            k += 1
+    return jumps
+
+
 def event_response(standx, hyper, event_bps, window_ms, cover_frac):
     """For each sharp Hyperliquid jump, measure ms until StandX covers
-    `cover_frac` of the move in the same direction."""
+    `cover_frac` of the move in the same direction. Returns a list of
+    (abs_move_bps, outcome, follow_ms) with outcome in
+    "already" | "never" | "follow" (follow_ms set only for "follow")."""
     st_times = [row[0] for row in standx]
     st_px = [row[1] for row in standx]
 
@@ -140,44 +179,55 @@ def event_response(standx, hyper, event_bps, window_ms, cover_frac):
         i = bisect.bisect_right(st_times, t) - 1
         return st_px[i] if i >= 0 else None
 
-    responses = []
-    already = 0  # StandX had already moved by event time
-    never = 0    # StandX never covered within a generous follow window
-    follow_ms = max(window_ms * 4, 8000)
+    events = []
+    follow_ms_limit = max(window_ms * 4, 8000)
 
-    n = len(hyper)
-    j = 0
-    for i in range(n):
-        t0, p0 = hyper[i]
-        # find the first later sample within window that constitutes a jump
-        k = i + 1
-        while k < n and hyper[k][0] - t0 <= window_ms:
-            t1, p1 = hyper[k]
-            move_bps = (p1 / p0 - 1.0) * 1e4
-            if abs(move_bps) >= event_bps:
-                direction = 1.0 if p1 > p0 else -1.0
-                target = p0 + cover_frac * (p1 - p0)
-                s0 = standx_at(t0)
-                if s0 is not None and direction * (s0 - target) >= 0:
-                    already += 1
-                else:
-                    # find first StandX sample at/after t0 that reaches target
-                    idx = bisect.bisect_left(st_times, t0)
-                    hit = None
-                    while idx < len(standx) and st_times[idx] - t0 <= follow_ms:
-                        if direction * (st_px[idx] - target) >= 0:
-                            hit = st_times[idx] - t0
-                            break
-                        idx += 1
-                    if hit is None:
-                        never += 1
-                    else:
-                        responses.append(hit)
+    for t0, p0, p1, move_bps in detect_jumps(hyper, event_bps, window_ms):
+        direction = 1.0 if p1 > p0 else -1.0
+        target = p0 + cover_frac * (p1 - p0)
+        s0 = standx_at(t0)
+        if s0 is not None and direction * (s0 - target) >= 0:
+            events.append((abs(move_bps), "already", None))
+            continue
+        # find first StandX sample at/after t0 that reaches target
+        idx = bisect.bisect_left(st_times, t0)
+        hit = None
+        while idx < len(standx) and st_times[idx] - t0 <= follow_ms_limit:
+            if direction * (st_px[idx] - target) >= 0:
+                hit = st_times[idx] - t0
                 break
-            k += 1
-        j = i
-    _ = j
-    return responses, already, never
+            idx += 1
+        if hit is None:
+            events.append((abs(move_bps), "never", None))
+        else:
+            events.append((abs(move_bps), "follow", hit))
+    return events
+
+
+def own_jump_response(series, event_bps, window_ms, fracs=(0.5, 0.9)):
+    """Detect jumps on a single (StandX own) series and measure, per jump, the
+    ms from the jump's first sample until the series itself covers each
+    fraction of the move. Prices an own-feed fast cancel: how much traverse
+    time your own feed gives you once it starts moving.
+    Returns (jump_sizes, {frac: [ms, ...]})."""
+    times = [row[0] for row in series]
+    px = [row[1] for row in series]
+    n = len(series)
+    by_frac = {f: [] for f in fracs}
+    sizes = []
+    for t0, p0, p1, move_bps in detect_jumps(series, event_bps, window_ms):
+        direction = 1.0 if p1 > p0 else -1.0
+        sizes.append(abs(move_bps))
+        i0 = bisect.bisect_left(times, t0)
+        for f in fracs:
+            target = p0 + f * (p1 - p0)
+            idx = i0
+            while idx < n:
+                if direction * (px[idx] - target) >= 0:
+                    by_frac[f].append(times[idx] - t0)
+                    break
+                idx += 1
+    return sizes, by_frac
 
 
 def quantile(xs, q):
@@ -190,20 +240,36 @@ def quantile(xs, q):
     return s[lo] + (s[hi] - s[lo]) * (pos - lo)
 
 
+def fmt_stats(xs):
+    return (f"median={median(xs):.0f}ms  "
+            f"p25={quantile(xs, 0.25):.0f}ms  "
+            f"p75={quantile(xs, 0.75):.0f}ms  "
+            f"mean={mean(xs):.0f}ms")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Measure StandX price lag vs Hyperliquid.")
     ap.add_argument("path")
-    ap.add_argument("--field", default="mark", choices=["mark", "mid", "index"])
+    ap.add_argument("--standx-field", default="mark",
+                    choices=["mark", "mid", "index"],
+                    help="StandX price field (the price we quote against)")
+    ap.add_argument("--leader-field", default="mid",
+                    choices=["mark", "mid", "index"],
+                    help="Hyperliquid leader field (midPx is the fastest public price)")
     ap.add_argument("--grid-ms", type=int, default=250)
     ap.add_argument("--max-lag-ms", type=int, default=4000)
     ap.add_argument("--event-bps", type=float, default=8.0)
     ap.add_argument("--event-window-ms", type=int, default=2000)
     ap.add_argument("--cover-frac", type=float, default=0.5)
+    ap.add_argument("--own-window-ms", type=int, default=None,
+                    help="jump-scan window for the StandX own-feed statistic; "
+                         "defaults to 3x --event-window-ms because StandX's mark "
+                         "cadence is slower than the leader feed's")
     args = ap.parse_args()
 
-    standx, hyper = load(args.path, args.field)
-    print(f"loaded: standx={len(standx)} hyperliquid={len(hyper)} samples "
-          f"(field={args.field})")
+    standx, hyper = load(args.path, args.standx_field, args.leader_field)
+    print(f"loaded: standx={len(standx)} (field={args.standx_field}) "
+          f"hyperliquid={len(hyper)} (field={args.leader_field}) samples")
     if len(standx) < 5 or len(hyper) < 5:
         print("not enough samples on both sources; record a longer window.")
         return
@@ -228,9 +294,12 @@ def main():
                   " treat as 'no resolvable lead'.")
 
     print("\n== 2. Event response (Hyperliquid jumps -> StandX follow time) ==")
-    responses, already, never = event_response(
+    events = event_response(
         standx, hyper, args.event_bps, args.event_window_ms, args.cover_frac)
-    total = len(responses) + already + never
+    total = len(events)
+    already = sum(1 for _, o, _ in events if o == "already")
+    never = sum(1 for _, o, _ in events if o == "never")
+    responses = [ms for _, o, ms in events if o == "follow"]
     print(f"  jumps >= {args.event_bps:g}bps within {args.event_window_ms}ms: {total}")
     if total:
         print(f"    StandX already ahead at jump: {already}")
@@ -238,12 +307,44 @@ def main():
     if responses:
         print(f"    follow-time to cover {args.cover_frac:.0%} of the move "
               f"(n={len(responses)}):")
-        print(f"      median={median(responses):.0f}ms  "
-              f"p25={quantile(responses,0.25):.0f}ms  "
-              f"p75={quantile(responses,0.75):.0f}ms  "
-              f"mean={mean(responses):.0f}ms")
+        print(f"      {fmt_stats(responses)}")
     else:
         print("    no measurable follow events (need a longer / more volatile window).")
+
+    # coverage stratified by jump size, in tiers of [1x, 2x, 4x, 8x) * event-bps
+    if total:
+        print("  coverage by jump size:")
+        print("    tier(bps)   jumps  already  never  follow  follow-median")
+        edges = [args.event_bps * m for m in (1, 2, 4, 8)]
+        for t_i in range(len(edges)):
+            lo = edges[t_i]
+            hi = edges[t_i + 1] if t_i + 1 < len(edges) else None
+            tier = [e for e in events
+                    if e[0] >= lo and (hi is None or e[0] < hi)]
+            if not tier:
+                continue
+            t_jumps = len(tier)
+            t_already = sum(1 for _, o, _ in tier if o == "already")
+            t_never = sum(1 for _, o, _ in tier if o == "never")
+            t_follow = [ms for _, o, ms in tier if o == "follow"]
+            label = f"{lo:g}-{hi:g}" if hi is not None else f">={lo:g}"
+            med = f"{median(t_follow):.0f}ms" if t_follow else "-"
+            print(f"    {label:<10} {t_jumps:>6} {t_already:>8} {t_never:>6}"
+                  f" {len(t_follow):>7}  {med:>13}")
+
+    print("\n== 3. StandX own-feed jump response (fast-cancel pricing) ==")
+    own_window_ms = args.own_window_ms or args.event_window_ms * 3
+    sizes, by_frac = own_jump_response(
+        standx, args.event_bps, own_window_ms)
+    print(f"  StandX own jumps >= {args.event_bps:g}bps within "
+          f"{own_window_ms}ms: {len(sizes)}")
+    for f in sorted(by_frac):
+        xs = by_frac[f]
+        if xs:
+            print(f"    time for own mark to cover {f:.0%} of its move (n={len(xs)}):")
+            print(f"      {fmt_stats(xs)}")
+    if not sizes:
+        print("    no own-feed jumps (need a longer / more volatile window).")
 
     print("\n== Caveats ==")
     print("  - Absolute lag carries a fixed differential-network-latency bias "
