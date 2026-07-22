@@ -66,5 +66,6 @@ unlock decision.
 
 ## Execution records
 
+- [2026-07-21 Stage 3 v0 renewed gate: canary and A/B start](evidence/maker-stage3-canary-2026-07-21.md)
 - [2026-07-14 WS order-command controlled canary](evidence/maker-ws-order-command-canary-2026-07-14.md)
 - [2026-07-10 maker paper long run, controlled disconnect, and supervised production canary](evidence/maker-live-gate-2026-07-10.md)
