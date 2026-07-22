@@ -43,6 +43,21 @@ pub(super) struct RuntimeLoopState {
     pub(super) breaker: VolBreaker,
     pub(super) spread_controller: maker::SpreadController,
     pub(super) size_skew_controller: maker::SizeSkewController,
+    pub(super) nonlinear_skew: maker::NonlinearSkewConfig,
+    pub(super) guard_controller: maker::GuardController,
+    /// Latest leader (Hyperliquid) sample for the external guard; `None` when
+    /// the guard is disabled and no feed task runs.
+    pub(super) external_feed: Option<
+        std::sync::Arc<
+            tokio::sync::RwLock<crate::commands::maker::external_feed::ExternalFeedState>,
+        >,
+    >,
+    pub(super) external_updates: Option<tokio::sync::watch::Receiver<u64>>,
+    /// Slow EMA over the raw leader-vs-mark divergence; the guard triggers on
+    /// the excess over it, never on the persistent venue basis.
+    pub(super) external_basis: crate::commands::maker::external_feed::DivergenceBaseline,
+    #[allow(dead_code)]
+    pub(super) external_feed_handle: Option<tokio::task::JoinHandle<()>>,
     pub(super) alerts: AlertMonitor,
     pub(super) account_balance_refresh_requested: bool,
     pub(super) balance_floor_parse_warned: bool,
@@ -146,6 +161,27 @@ impl MakerRuntime {
         };
         let spread_controller = maker::SpreadController::new(args.adaptive_spread.clone(), &cfg)?;
         let size_skew_controller = maker::SizeSkewController::new(args.size_skew, &cfg)?;
+        // Stage 3 v1 combined candidate: validate both switches up front so a
+        // bad file never rides along silently (band red line included).
+        let nonlinear_skew = args.nonlinear_skew;
+        nonlinear_skew.validate(&cfg)?;
+        let guard_basis_half_life_secs = args.external_guard_basis_half_life_secs;
+        let guard_controller = maker::GuardController::new(args.external_guard)?;
+        let (external_feed, external_updates, external_feed_handle) = if args.external_guard.enabled
+        {
+            let coin = crate::commands::maker::external_feed::leader_coin(&symbol);
+            eprintln!(
+                "🛡️ external guard enabled: leader=hyperliquid:{coin} enter={} exit={} max_age_ms={}",
+                args.external_guard.enter_bps,
+                args.external_guard.exit_bps,
+                args.external_guard.max_age_ms,
+            );
+            let (state, updates, handle) =
+                crate::commands::maker::external_feed::spawn_external_feed(coin);
+            (Some(state), Some(updates), Some(handle))
+        } else {
+            (None, None, None)
+        };
         let alerts =
             AlertMonitor::new(args.alert_loss, args.alert_inventory_pct, args.alert_uptime)
                 .with_account_floors(args.alert_equity_below, args.alert_margin_below);
@@ -230,6 +266,14 @@ impl MakerRuntime {
                 breaker,
                 spread_controller,
                 size_skew_controller,
+                nonlinear_skew,
+                guard_controller,
+                external_feed,
+                external_updates,
+                external_basis: crate::commands::maker::external_feed::DivergenceBaseline::new(
+                    guard_basis_half_life_secs,
+                ),
+                external_feed_handle,
                 alerts,
                 account_balance_refresh_requested: false,
                 balance_floor_parse_warned: false,

@@ -159,10 +159,17 @@ def spread_sections(text):
 
 
 def size_skew_sections(text):
-    """Blank only [size_skew].enabled and return both controller switches."""
+    """Blank the controller enable lines ([size_skew], [nonlinear_skew],
+    [external_guard]) and return every controller switch."""
     lines = text.splitlines(keepends=True)
     section = None
-    enabled = {"adaptive_spread": None, "size_skew": None}
+    enabled = {
+        "adaptive_spread": None,
+        "size_skew": None,
+        "nonlinear_skew": None,
+        "external_guard": None,
+    }
+    NORMALIZED = {"size_skew", "nonlinear_skew", "external_guard"}
     for i, line in enumerate(lines):
         body = line.rstrip("\r\n")
         ending = line[len(body):]
@@ -183,7 +190,7 @@ def size_skew_sections(text):
         if enabled[section] is not None:
             raise SystemExit(f"stage2 config repeats [{section}].enabled")
         enabled[section] = match.group(2) == "true"
-        if section == "size_skew":
+        if section in NORMALIZED:
             lines[i] = f"{match.group(1)}<normalized>{match.group(3)}{ending}"
     return "".join(lines), enabled
 
@@ -207,17 +214,38 @@ elif "enabled = false" in baseline and "enabled = false" in candidate:
     else:
         baseline_size_norm, baseline_enabled = size_skew_sections(baseline)
         candidate_size_norm, candidate_enabled = size_skew_sections(candidate)
-        size_skew_toggle_only = (
-            baseline_size_norm == candidate_size_norm
-            and baseline_enabled["size_skew"] is False
-            and candidate_enabled["size_skew"] is True
-            and baseline_enabled["adaptive_spread"] is False
+        adaptive_off_both = (
+            baseline_enabled["adaptive_spread"] is False
             and candidate_enabled["adaptive_spread"] is False
         )
-        if not size_skew_toggle_only:
+        # (c) stage-3 v0 pair: only [size_skew].enabled flips.
+        size_skew_toggle_only = (
+            baseline_size_norm == candidate_size_norm
+            and adaptive_off_both
+            and baseline_enabled["size_skew"] is False
+            and candidate_enabled["size_skew"] is True
+            and baseline_enabled["nonlinear_skew"] == candidate_enabled["nonlinear_skew"]
+            and baseline_enabled["external_guard"] == candidate_enabled["external_guard"]
+            and candidate_enabled["nonlinear_skew"] is not True
+            and candidate_enabled["external_guard"] is not True
+        )
+        # (d) stage-3 v1 combined pair: [nonlinear_skew].enabled AND
+        #     [external_guard].enabled both flip false -> true together.
+        combined_toggle_only = (
+            baseline_size_norm == candidate_size_norm
+            and adaptive_off_both
+            and baseline_enabled["size_skew"] is False
+            and candidate_enabled["size_skew"] is False
+            and baseline_enabled["nonlinear_skew"] is False
+            and candidate_enabled["nonlinear_skew"] is True
+            and baseline_enabled["external_guard"] is False
+            and candidate_enabled["external_guard"] is True
+        )
+        if not (size_skew_toggle_only or combined_toggle_only):
             raise SystemExit(
                 "stage2 arm configs differ outside adaptive_spread.enabled / "
-                "spread_bps / size_skew.enabled"
+                "spread_bps / size_skew.enabled / "
+                "nonlinear_skew.enabled+external_guard.enabled"
             )
 else:
     raise SystemExit(

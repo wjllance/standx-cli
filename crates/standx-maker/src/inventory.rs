@@ -3,6 +3,64 @@ use standx_sdk::models::OrderSide;
 use std::error::Error;
 use std::fmt;
 
+/// Stage 3 v1: non-linear price-skew strength (`[nonlinear_skew]`).
+///
+/// Replaces v0's binary add-side suppression with a steeper — but never
+/// stopping — center shift: `shift_bps = min(skew_bps × boost × |ratio|,
+/// cap_bps)` where `ratio = position / max_position`. Stateless by design (no
+/// hysteresis): v0's release-threshold latch pinned suppression for hours, so
+/// v1 strength is a pure continuous function of the current position. With
+/// `boost = 1` and `cap_bps ≥ skew_bps` the curve equals today's linear skew.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NonlinearSkewConfig {
+    pub enabled: bool,
+    /// Slope multiplier over the linear skew (≥ 1).
+    pub boost: f64,
+    /// Hard ceiling on the center shift in bps. Red line: the far-side quote
+    /// sits at `spread_bps + shift` from mark, so `spread_bps + cap_bps` must
+    /// stay inside `band_bps` (validated in [`Self::validate`]).
+    pub cap_bps: f64,
+}
+
+impl Default for NonlinearSkewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            boost: 3.0,
+            cap_bps: 12.0,
+        }
+    }
+}
+
+impl NonlinearSkewConfig {
+    /// Validate against the base strategy config. Invalid values are rejected
+    /// even when disabled so a bad file never rides along silently.
+    pub fn validate(&self, base: &MakerConfig) -> Result<(), SizeSkewError> {
+        if !self.boost.is_finite() || !self.cap_bps.is_finite() {
+            return Err(SizeSkewError::new("nonlinear skew values must be finite"));
+        }
+        if self.boost < 1.0 {
+            return Err(SizeSkewError::new("nonlinear skew boost must be >= 1"));
+        }
+        if self.cap_bps <= 0.0 {
+            return Err(SizeSkewError::new("nonlinear skew cap_bps must be > 0"));
+        }
+        if self.enabled {
+            if !base.max_position.is_finite() || base.max_position <= 0.0 {
+                return Err(SizeSkewError::new(
+                    "enabled nonlinear skew requires positive finite max_position",
+                ));
+            }
+            if base.spread_bps + self.cap_bps > base.band_bps {
+                return Err(SizeSkewError::new(
+                    "nonlinear skew violates band red line: spread_bps + cap_bps must be <= band_bps",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SizeSkewConfig {
     pub enabled: bool,
@@ -306,6 +364,55 @@ mod tests {
         let decision = enabled.observe(2.0, &base);
         assert!(decision.active);
         assert_eq!(decision.inventory_ratio, 1.0);
+    }
+
+    #[test]
+    fn nonlinear_skew_validation_rejects_bad_values_and_band_violation() {
+        let base = base_config(); // spread 8, band 30
+        for config in [
+            NonlinearSkewConfig {
+                boost: f64::NAN,
+                ..NonlinearSkewConfig::default()
+            },
+            NonlinearSkewConfig {
+                cap_bps: f64::INFINITY,
+                ..NonlinearSkewConfig::default()
+            },
+            NonlinearSkewConfig {
+                boost: 0.9,
+                ..NonlinearSkewConfig::default()
+            },
+            NonlinearSkewConfig {
+                cap_bps: 0.0,
+                ..NonlinearSkewConfig::default()
+            },
+        ] {
+            assert!(config.validate(&base).is_err(), "{config:?}");
+        }
+
+        // Band red line: spread(8) + cap must stay <= band(30).
+        let too_wide = NonlinearSkewConfig {
+            enabled: true,
+            boost: 3.0,
+            cap_bps: 22.1,
+        };
+        assert!(too_wide.validate(&base).is_err());
+        // Same cap is fine while disabled (values still sanity-checked).
+        let disabled_wide = NonlinearSkewConfig {
+            enabled: false,
+            ..too_wide
+        };
+        assert!(disabled_wide.validate(&base).is_ok());
+
+        // Enabled requires a positive max_position.
+        let mut no_max = base_config();
+        no_max.max_position = 0.0;
+        let enabled = NonlinearSkewConfig {
+            enabled: true,
+            ..NonlinearSkewConfig::default()
+        };
+        assert!(enabled.validate(&no_max).is_err());
+        assert!(enabled.validate(&base).is_ok());
     }
 
     #[test]

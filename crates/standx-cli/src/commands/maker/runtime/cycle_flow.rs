@@ -210,6 +210,21 @@ impl MakerRuntime {
                 } else {
                     maker::MarketDataMode::Active
                 };
+                // Normalize the leader feed against THIS cycle's mark. A
+                // missing/stale sample yields None and the guard fails open.
+                let cycle_external_divergence = match self.loop_state.external_feed.as_ref() {
+                    Some(feed) => {
+                        let state = *feed.read().await;
+                        super::super::external_feed::divergence_input(
+                            state,
+                            mark,
+                            std::time::Instant::now(),
+                            &mut self.loop_state.external_basis,
+                        )
+                    }
+                    None => None,
+                };
+                let cycle_external_basis_bps = self.loop_state.external_basis.basis_bps();
                 let result = maker_cycle(
                     CycleRequest {
                         client,
@@ -252,6 +267,10 @@ impl MakerRuntime {
                         breaker: &mut self.loop_state.breaker,
                         spread_controller: &mut self.loop_state.spread_controller,
                         size_skew_controller: &mut self.loop_state.size_skew_controller,
+                        nonlinear_skew: self.loop_state.nonlinear_skew,
+                        guard_controller: &mut self.loop_state.guard_controller,
+                        external_divergence: cycle_external_divergence,
+                        external_basis_bps: cycle_external_basis_bps,
                         order_request_deadlines: cycle_order_request_deadlines.as_deref_mut(),
                         live_account_poll: cycle_account_poll.as_deref_mut(),
                         order_latency: cycle_order_latency.as_deref_mut(),
@@ -1189,6 +1208,12 @@ impl MakerRuntime {
                         None => std::future::pending().await,
                     }
                 };
+                let external_update = async {
+                    match self.loop_state.external_updates.as_mut() {
+                        Some(rx) => rx.changed().await.is_ok(),
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
                     _ = ctrl_c_latched(&mut self.ctrl_c_rx) => {
                         self.recovery.runtime_state.handle(MakerEvent::StopRequested(RuntimeStopReason::CtrlC));
@@ -1197,6 +1222,60 @@ impl MakerRuntime {
                     _ = tokio::time::sleep_until(deadline) => break,
                     _ = request_timeout => break,
                     _ = market_wakeup => break,
+                    ok = external_update => {
+                        // Leader-feed early wake: replan only when the fresh
+                        // divergence would change the guard's decision, and
+                        // never faster than the bounded-replan floor. A dead
+                        // feed channel is a fail-open non-event.
+                        if !ok {
+                            self.loop_state.external_updates = None;
+                            continue;
+                        }
+                        if tokio::time::Instant::now() < min_gap {
+                            continue;
+                        }
+                        let Some(feed) = self.loop_state.external_feed.as_ref() else {
+                            continue;
+                        };
+                        let Some(mark) = self.market.last_mark else {
+                            continue;
+                        };
+                        let state = *feed.read().await;
+                        let Some((raw_bps, age_ms)) =
+                            super::super::external_feed::raw_divergence(
+                                state,
+                                mark,
+                                std::time::Instant::now(),
+                            )
+                        else {
+                            continue;
+                        };
+                        let config = self.loop_state.guard_controller.config();
+                        if age_ms > config.max_age_ms {
+                            continue;
+                        }
+                        // Excess over the slow basis, read-only: the cycle is
+                        // the single writer of the baseline.
+                        let excess = self.loop_state.external_basis.peek(raw_bps);
+                        let magnitude = excess.abs();
+                        let toward = if excess > 0.0 {
+                            standx_sdk::models::OrderSide::Sell
+                        } else {
+                            standx_sdk::models::OrderSide::Buy
+                        };
+                        let would_change = match self.loop_state.guard_controller.endangered() {
+                            // Release, or a sign flip past the enter threshold
+                            // (side switch), both warrant an early replan.
+                            Some(side) => {
+                                magnitude < config.exit_bps
+                                    || (magnitude >= config.enter_bps && toward != side)
+                            }
+                            None => magnitude >= config.enter_bps,
+                        };
+                        if would_change {
+                            break;
+                        }
+                    },
                     event = account_update => {
                         // The branch futures are dropped before select! handlers
                         // run, so the session can be re-borrowed here. An event

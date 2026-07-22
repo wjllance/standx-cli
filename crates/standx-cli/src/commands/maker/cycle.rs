@@ -3,7 +3,8 @@ use super::ledger::{adopt_order, apply_rest_trade};
 use super::ledger::{apply_account_trade, apply_order_update, maker_trade_fill};
 use super::model::{position_for_symbol, rest_order_observation};
 use super::output::{
-    emit_cycle_skip, emit_maker_cycle, log_maker_event, CycleOutput, MakerLogEvent,
+    emit_cycle_skip, emit_guard_transition, emit_maker_cycle, log_maker_event, CycleOutput,
+    MakerLogEvent,
 };
 use super::pipeline::{
     fetch_account_audit, CycleRequest, CycleResult, CycleState, OrderRequestKind,
@@ -231,6 +232,10 @@ pub(super) async fn maker_cycle(
         breaker,
         spread_controller,
         size_skew_controller,
+        nonlinear_skew,
+        guard_controller,
+        external_divergence,
+        external_basis_bps,
         mut order_request_deadlines,
         live_account_poll,
         mut order_latency,
@@ -511,6 +516,11 @@ pub(super) async fn maker_cycle(
 
     // 3. Build the pure quote/exit plan from the synchronized state.
     let size_skew_decision = size_skew_controller.observe(position, cfg);
+    let previous_guard_side = guard_controller.endangered();
+    let guard_decision = guard_controller.observe(external_divergence);
+    if guard_decision.endangered != previous_guard_side {
+        emit_guard_transition(output_format, symbol, cycle, &guard_decision);
+    }
     let active_resting = if live {
         projected_resting.as_slice()
     } else {
@@ -536,6 +546,8 @@ pub(super) async fn maker_cycle(
             inventory_exit_pct,
             inventory_exit_qty,
             size_skew: size_skew_decision,
+            nonlinear_skew,
+            guard: guard_decision,
             wind_down,
             qty_tolerance,
         },
@@ -928,6 +940,13 @@ pub(super) async fn maker_cycle(
         halt_vol_bps: halted.then(|| breaker.vol_bps()),
         spread_decision: &spread_decision,
         size_skew_decision: &size_skew_decision,
+        guard_decision: &guard_decision,
+        external_basis_bps,
+        skew_shift_bps: if mark > 0.0 {
+            (mark - ref_center) / mark * 1e4
+        } else {
+            0.0
+        },
         cfg,
         performance: performance_summary.as_ref(),
     });
