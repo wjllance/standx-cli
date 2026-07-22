@@ -229,6 +229,12 @@ pub(super) struct CycleOutput<'a> {
     pub(super) halt_vol_bps: Option<f64>,
     pub(super) spread_decision: &'a maker::SpreadDecision,
     pub(super) size_skew_decision: &'a maker::SizeSkewDecision,
+    pub(super) guard_decision: &'a maker::GuardDecision,
+    /// Divergence-basis EMA the guard's excess is measured against.
+    pub(super) external_basis_bps: Option<f64>,
+    /// Realized quote-center shift in bps (mark vs plan ref_center); covers
+    /// linear and nonlinear skew alike. Telemetry only.
+    pub(super) skew_shift_bps: f64,
     pub(super) cfg: &'a MakerConfig,
     pub(super) performance: Option<&'a maker::PerformanceSummary>,
 }
@@ -254,6 +260,9 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
         halt_vol_bps,
         spread_decision,
         size_skew_decision,
+        guard_decision,
+        external_basis_bps,
+        skew_shift_bps,
         cfg,
         performance,
     } = output;
@@ -339,32 +348,37 @@ pub(super) fn emit_maker_cycle(output: CycleOutput<'_>) {
             }
             println!(
                 "{}",
-                with_size_skew_fields(
-                    with_spread_fields(
-                        serde_json::json!({
-                            "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
-                            "action": "cycle_summary",
-                            "mark": format_decimals(mark, cfg.price_decimals),
-                            "best_bid": best_bid, "best_ask": best_ask,
-                            "market_source": market_source,
-                            "market_fallback_reason": market_fallback_reason,
-                            "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
-                            "position": position,
-                            "starting_position": starting_position,
-                            "account": account.map(account_json),
-                            "holds": holds, "places": places, "cancels": cancels,
-                            "fills": fills.len(),
-                            "pnl": (pnl * 1e6).round() / 1e6,
-                            "fills_total": stats.fills(),
-                            "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
-                            "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
-                            "performance": performance.map(performance_json),
-                            "halted": halt_vol_bps.is_some(),
-                            "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
-                        }),
-                        spread_decision,
+                with_guard_fields(
+                    with_size_skew_fields(
+                        with_spread_fields(
+                            serde_json::json!({
+                                "ts": ts, "cycle": cycle, "mode": mode, "symbol": symbol,
+                                "action": "cycle_summary",
+                                "mark": format_decimals(mark, cfg.price_decimals),
+                                "best_bid": best_bid, "best_ask": best_ask,
+                                "market_source": market_source,
+                                "market_fallback_reason": market_fallback_reason,
+                                "ws_snapshot": ws_snapshot.map(ws_snapshot_json),
+                                "position": position,
+                                "starting_position": starting_position,
+                                "account": account.map(account_json),
+                                "holds": holds, "places": places, "cancels": cancels,
+                                "fills": fills.len(),
+                                "pnl": (pnl * 1e6).round() / 1e6,
+                                "fills_total": stats.fills(),
+                                "uptime_pct": (stats.uptime_pct() * 10.0).round() / 10.0,
+                                "avg_capture_bps": (stats.avg_spread_capture_bps() * 100.0).round() / 100.0,
+                                "performance": performance.map(performance_json),
+                                "halted": halt_vol_bps.is_some(),
+                                "vol_bps": halt_vol_bps.map(|v| (v * 100.0).round() / 100.0),
+                            }),
+                            spread_decision,
+                        ),
+                        size_skew_decision,
                     ),
-                    size_skew_decision,
+                    guard_decision,
+                    external_basis_bps,
+                    skew_shift_bps,
                 )
             );
         }
@@ -520,6 +534,44 @@ fn with_spread_fields(
     summary
 }
 
+/// Additive stage-3 v1 fields: external-guard state and the realized skew
+/// shift. Optional top-level keys only — old consumers keep working.
+fn with_guard_fields(
+    mut summary: serde_json::Value,
+    decision: &maker::GuardDecision,
+    external_basis_bps: Option<f64>,
+    skew_shift_bps: f64,
+) -> serde_json::Value {
+    let object = summary
+        .as_object_mut()
+        .expect("cycle summary JSON must be an object");
+    object.insert(
+        "guard_enabled".to_string(),
+        serde_json::json!(decision.enabled),
+    );
+    object.insert(
+        "guard_active".to_string(),
+        serde_json::json!(decision.active),
+    );
+    object.insert(
+        "guard_side".to_string(),
+        serde_json::json!(decision.endangered),
+    );
+    object.insert(
+        "external_divergence_bps".to_string(),
+        serde_json::json!(decision.divergence_bps.map(|d| (d * 100.0).round() / 100.0)),
+    );
+    object.insert(
+        "external_basis_bps".to_string(),
+        serde_json::json!(external_basis_bps.map(|d| (d * 100.0).round() / 100.0)),
+    );
+    object.insert(
+        "skew_shift_bps".to_string(),
+        serde_json::json!((skew_shift_bps * 100.0).round() / 100.0),
+    );
+    summary
+}
+
 fn with_size_skew_fields(
     mut summary: serde_json::Value,
     decision: &maker::SizeSkewDecision,
@@ -640,6 +692,45 @@ fn side_str(side: OrderSide) -> &'static str {
 
 /// Emit a one-off maker event (order rejection, no-op cancel) inline,
 /// respecting the output format. Only reached in live mode.
+/// One line per external-guard activation/release/side-switch (a new additive
+/// `action`; existing consumers ignore unknown actions). Event-level
+/// attribution joins these against fills avoided inside guard windows.
+pub(super) fn emit_guard_transition(
+    output_format: OutputFormat,
+    symbol: &str,
+    cycle: u64,
+    decision: &maker::GuardDecision,
+) {
+    match output_format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "cycle": cycle, "symbol": symbol,
+                    "action": "external_guard",
+                    "active": decision.active,
+                    "side": decision.endangered,
+                    "divergence_bps": decision.divergence_bps
+                        .map(|d| (d * 100.0).round() / 100.0),
+                })
+            );
+        }
+        OutputFormat::Quiet => {}
+        _ => {
+            if let Some(side) = decision.endangered {
+                eprintln!(
+                    "    🛡️ external guard: suppressing {} (divergence {:+.2}bps)",
+                    side_str(side),
+                    decision.divergence_bps.unwrap_or(f64::NAN),
+                );
+            } else {
+                eprintln!("    🛡️ external guard: released");
+            }
+        }
+    }
+}
+
 pub(super) struct MakerLogEvent<'a> {
     pub(super) output_format: OutputFormat,
     pub(super) symbol: &'a str,
@@ -1125,5 +1216,44 @@ mod tests {
         assert_eq!(json["size_skew_add_side"], "buy");
         assert_eq!(json["size_skew_inventory_ratio"], 0.3);
         assert_eq!(json["size_skew_add_qty"], 0.05);
+    }
+
+    #[test]
+    fn cycle_summary_guard_fields_are_additive_and_top_level() {
+        let decision = maker::GuardDecision {
+            enabled: true,
+            active: true,
+            endangered: Some(OrderSide::Sell),
+            divergence_bps: Some(7.816),
+        };
+        let json = with_guard_fields(
+            serde_json::json!({"action": "cycle_summary", "vol_bps": null}),
+            &decision,
+            Some(-14.2),
+            4.804,
+        );
+
+        assert_eq!(json["action"], "cycle_summary");
+        assert!(json["vol_bps"].is_null());
+        assert_eq!(json["guard_enabled"], true);
+        assert_eq!(json["guard_active"], true);
+        assert_eq!(json["guard_side"], "sell");
+        assert_eq!(json["external_divergence_bps"], 7.82);
+        assert_eq!(json["external_basis_bps"], -14.2);
+        assert_eq!(json["skew_shift_bps"], 4.8);
+
+        // Inactive guard serializes nulls, never drops the keys.
+        let idle = with_guard_fields(
+            serde_json::json!({"action": "cycle_summary"}),
+            &maker::GuardDecision::INACTIVE,
+            None,
+            0.0,
+        );
+        assert_eq!(idle["guard_enabled"], false);
+        assert_eq!(idle["guard_active"], false);
+        assert!(idle["guard_side"].is_null());
+        assert!(idle["external_divergence_bps"].is_null());
+        assert!(idle["external_basis_bps"].is_null());
+        assert_eq!(idle["skew_shift_bps"], 0.0);
     }
 }

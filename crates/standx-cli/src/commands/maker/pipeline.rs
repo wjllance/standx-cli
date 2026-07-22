@@ -159,6 +159,14 @@ pub(super) struct CycleState<'a> {
     pub(super) breaker: &'a mut VolBreaker,
     pub(super) spread_controller: &'a mut SpreadController,
     pub(super) size_skew_controller: &'a mut SizeSkewController,
+    /// Stage 3 v1 nonlinear price-skew strength (disabled ≡ legacy linear).
+    pub(super) nonlinear_skew: standx_maker::NonlinearSkewConfig,
+    pub(super) guard_controller: &'a mut standx_maker::GuardController,
+    /// Caller-normalized external leader observation for this cycle; `None`
+    /// when the guard is disabled or the feed has no usable sample.
+    pub(super) external_divergence: Option<standx_maker::ExternalDivergence>,
+    /// Current divergence-basis EMA (telemetry only).
+    pub(super) external_basis_bps: Option<f64>,
     pub(super) order_request_deadlines: Option<&'a mut OrderRequestDeadlines>,
     /// Live-only REST polling state. It is deliberately a CLI concern: it
     /// controls I/O cadence and cached account presentation, not strategy.

@@ -18,6 +18,7 @@
 use standx_sdk::models::OrderSide;
 
 pub mod account_projection;
+pub mod external_guard;
 pub mod inventory;
 pub mod latency;
 pub mod ledger;
@@ -36,7 +37,12 @@ pub use account_projection::{
     ProjectionPendingRequest, ProjectionRegistryError, ProjectionRequestResolution,
     MAX_PENDING_ORDER_REQUESTS,
 };
-pub use inventory::{SizeSkewConfig, SizeSkewController, SizeSkewDecision, SizeSkewError};
+pub use external_guard::{
+    ExternalDivergence, GuardConfig, GuardController, GuardDecision, GuardError,
+};
+pub use inventory::{
+    NonlinearSkewConfig, SizeSkewConfig, SizeSkewController, SizeSkewDecision, SizeSkewError,
+};
 pub use latency::{
     LatencyError, LatencyMetricSummary, LatencyRequest, LatencyRequestContext, LatencyRequestKind,
     LatencyRequestOutcome, LatencySummary, OrderLatencyTracker,
@@ -330,6 +336,29 @@ pub(crate) fn skew_center(cfg: &MakerConfig, mark: f64, position: f64) -> f64 {
     mark * (1.0 - cfg.skew_bps * inv_ratio / 1e4)
 }
 
+/// Nonlinear-aware quote center (stage 3 v1). With the feature disabled this
+/// is byte-for-byte the legacy [`skew_center`] path; enabled, the shift grows
+/// `boost`× steeper than linear and saturates at `cap_bps`:
+/// `shift = sign(ratio) × min(skew_bps × boost × |ratio|, cap_bps)`.
+/// Stateless on purpose — no hysteresis, so strength tracks the live position
+/// with no latch (the failure mode that rejected v0).
+pub(crate) fn skew_center_with(
+    cfg: &MakerConfig,
+    nonlinear: NonlinearSkewConfig,
+    mark: f64,
+    position: f64,
+) -> f64 {
+    if !nonlinear.enabled {
+        return skew_center(cfg, mark, position);
+    }
+    if cfg.max_position <= 0.0 {
+        return mark;
+    }
+    let inv_ratio = (position / cfg.max_position).clamp(-1.0, 1.0);
+    let shift_bps = (cfg.skew_bps * nonlinear.boost * inv_ratio.abs()).min(nonlinear.cap_bps);
+    mark * (1.0 - shift_bps * inv_ratio.signum() / 1e4)
+}
+
 /// Paper-mode fill model: whether a resting quote would be filled by the
 /// current touch. A resting bid fills when offers reach down to it
 /// (`best_ask <= price`); a resting ask fills when bids reach up to it
@@ -602,6 +631,10 @@ pub struct CycleInput<'a> {
     pub inventory_exit_pct: f64,
     pub inventory_exit_qty: f64,
     pub size_skew: SizeSkewDecision,
+    /// Stage 3 v1 nonlinear price-skew strength; disabled ≡ legacy linear skew.
+    pub nonlinear_skew: NonlinearSkewConfig,
+    /// External-price guard outcome for this cycle; inactive ≡ no suppression.
+    pub guard: GuardDecision,
     /// Supervisor-requested wind-down (e.g. an A/B arm past its scheduled
     /// window): never place new quotes again and flatten any residual
     /// position through the reduce-only exit path, ignoring the configured
@@ -672,6 +705,8 @@ pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> Cyc
             input.market.best_ask,
             input.position,
             input.size_skew,
+            input.nonlinear_skew,
+            input.guard,
         );
         cap_desired_exposure(cfg, input.position, &raw, input.pending_slots)
     };
@@ -688,8 +723,9 @@ pub fn plan_cycle(cfg: &MakerConfig, input: CycleInput<'_>, halted: bool) -> Cyc
             &desired,
             input.resting,
             input.cycle,
+            input.nonlinear_skew,
         ),
-        ref_center: skew_center(cfg, input.market.mark, input.position),
+        ref_center: skew_center_with(cfg, input.nonlinear_skew, input.market.mark, input.position),
     }
 }
 
@@ -908,6 +944,7 @@ impl AlertMonitor {
 /// min-qty filter, and max-position side suppression. Quotes that fail a guard
 /// are dropped; duplicate prices after clamping/rounding are collapsed (outer
 /// level wins nothing — the inner level is kept).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_desired_quotes(
     cfg: &MakerConfig,
     mark: f64,
@@ -915,6 +952,8 @@ pub(crate) fn compute_desired_quotes(
     best_ask: Option<f64>,
     position: f64,
     size_skew: SizeSkewDecision,
+    nonlinear_skew: NonlinearSkewConfig,
+    guard: GuardDecision,
 ) -> Vec<DesiredQuote> {
     let mut out = Vec::new();
     if !mark.is_finite()
@@ -937,13 +976,20 @@ pub(crate) fn compute_desired_quotes(
 
     // Ladder is centered on the inventory-skewed price; the band/no-cross
     // guards below still reference the true mark and touch.
-    let center = skew_center(cfg, mark, position);
+    let center = skew_center_with(cfg, nonlinear_skew, mark, position);
 
     let suppress_buy = position >= cfg.max_position;
     let suppress_sell = position <= -cfg.max_position;
 
     for side in [OrderSide::Buy, OrderSide::Sell] {
         if (side == OrderSide::Buy && suppress_buy) || (side == OrderSide::Sell && suppress_sell) {
+            continue;
+        }
+        // External-price guard: the endangered side's quotes are stale against
+        // a leading market that has already moved — do not quote it this
+        // cycle. Resting quotes on that side cancel via the SideSuppressed
+        // path; the guard releases once StandX's mark catches up.
+        if guard.active && guard.endangered == Some(side) {
             continue;
         }
         let side_qty = if size_skew.active && size_skew.add_side == Some(side) {
@@ -1115,12 +1161,13 @@ pub(crate) fn reconcile(
     desired: &[DesiredQuote],
     resting: &[RestingQuote],
     cycle: u64,
+    nonlinear_skew: NonlinearSkewConfig,
 ) -> Vec<Action> {
     // Band/no-cross reference the true mark and touch; the anti-flicker anchor
     // uses the inventory-skewed center.
     let band_lo = mark * (1.0 - cfg.band_bps / 1e4);
     let band_hi = mark * (1.0 + cfg.band_bps / 1e4);
-    let center = skew_center(cfg, mark, position);
+    let center = skew_center_with(cfg, nonlinear_skew, mark, position);
 
     let desired_has = |side: OrderSide, level: u32| -> bool {
         desired.iter().any(|d| d.side == side && d.level == level)
@@ -1218,6 +1265,8 @@ mod tests {
             best_ask,
             position,
             SizeSkewDecision::INACTIVE,
+            NonlinearSkewConfig::default(),
+            GuardDecision::INACTIVE,
         )
     }
 
@@ -1274,6 +1323,7 @@ mod tests {
             &desired,
             &[],
             0,
+            Default::default(),
         );
         assert!(actions
             .iter()
@@ -1307,6 +1357,7 @@ mod tests {
             &desired,
             &resting,
             1,
+            Default::default(),
         );
         assert!(actions.iter().any(|action| matches!(
             action,
@@ -1444,7 +1495,17 @@ mod tests {
             resting(OrderSide::Buy, 0, 99.90, 100.0),
             resting(OrderSide::Sell, 0, 100.10, 100.0),
         ];
-        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 7);
+        let actions = reconcile(
+            &c,
+            mark,
+            0.0,
+            None,
+            None,
+            &desired,
+            &rest,
+            7,
+            Default::default(),
+        );
         assert!(
             actions.iter().all(|a| matches!(a, Action::Hold { .. })),
             "{actions:?}"
@@ -1462,7 +1523,17 @@ mod tests {
         let mark = 100.05; // 5 bps > refresh 3
         let desired = desired(&c, mark, None, None, 0.0);
         let rest = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
-        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
+        let actions = reconcile(
+            &c,
+            mark,
+            0.0,
+            None,
+            None,
+            &desired,
+            &rest,
+            1,
+            Default::default(),
+        );
         // Expect: cancel(buy, mark_moved), then places for buy+sell.
         assert!(matches!(
             actions[0],
@@ -1488,7 +1559,17 @@ mod tests {
         let mark = 100.30;
         let desired = desired(&c, mark, None, None, 0.0);
         let rest = vec![resting(OrderSide::Buy, 0, 99.90, 100.0)];
-        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
+        let actions = reconcile(
+            &c,
+            mark,
+            0.0,
+            None,
+            None,
+            &desired,
+            &rest,
+            1,
+            Default::default(),
+        );
         assert!(
             matches!(
                 actions[0],
@@ -1518,6 +1599,7 @@ mod tests {
             &desired,
             &rest,
             1,
+            Default::default(),
         );
         assert!(
             matches!(
@@ -1556,7 +1638,17 @@ mod tests {
             resting(OrderSide::Buy, 0, 99.90, 100.0),
             resting(OrderSide::Buy, 1, 99.88, 100.0), // stale level
         ];
-        let actions = reconcile(&c, mark, 0.0, None, None, &desired, &rest, 1);
+        let actions = reconcile(
+            &c,
+            mark,
+            0.0,
+            None,
+            None,
+            &desired,
+            &rest,
+            1,
+            Default::default(),
+        );
         let stale: Vec<_> = actions
             .iter()
             .filter(|a| {
@@ -1870,7 +1962,17 @@ mod tests {
         let pos = 0.025;
         let desired = desired(&c, mark, None, None, pos);
         let rest = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
-        let actions = reconcile(&c, mark, pos, None, None, &desired, &rest, 1);
+        let actions = reconcile(
+            &c,
+            mark,
+            pos,
+            None,
+            None,
+            &desired,
+            &rest,
+            1,
+            Default::default(),
+        );
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::Cancel {
@@ -1883,7 +1985,17 @@ mod tests {
         let pos2 = 0.01;
         let desired2 = self::desired(&c, mark, None, None, pos2);
         let rest2 = vec![resting(OrderSide::Sell, 0, 100.10, 100.0)];
-        let actions2 = reconcile(&c, mark, pos2, None, None, &desired2, &rest2, 1);
+        let actions2 = reconcile(
+            &c,
+            mark,
+            pos2,
+            None,
+            None,
+            &desired2,
+            &rest2,
+            1,
+            Default::default(),
+        );
         assert!(actions2.iter().any(|a| matches!(a, Action::Hold { .. })));
         assert!(!actions2.iter().any(|a| matches!(a, Action::Cancel { .. })));
     }
@@ -1992,6 +2104,8 @@ mod tests {
             inventory_exit_pct: 80.0,
             inventory_exit_qty: 0.01,
             size_skew: Default::default(),
+            nonlinear_skew: Default::default(),
+            guard: Default::default(),
             wind_down: false,
             qty_tolerance: 0.0005,
         };
@@ -2047,6 +2161,8 @@ mod tests {
                 inventory_exit_pct: 0.0,
                 inventory_exit_qty: 0.0,
                 size_skew: Default::default(),
+                nonlinear_skew: Default::default(),
+                guard: Default::default(),
                 wind_down: false,
                 qty_tolerance: 0.0005,
             },
@@ -2088,6 +2204,8 @@ mod tests {
                 inventory_exit_pct: 80.0,
                 inventory_exit_qty: 0.01,
                 size_skew: Default::default(),
+                nonlinear_skew: Default::default(),
+                guard: Default::default(),
                 wind_down: false,
                 qty_tolerance: 0.0005,
             },
@@ -2148,6 +2266,8 @@ mod tests {
                         inventory_exit_pct: 0.0,
                         inventory_exit_qty: 0.0,
                         size_skew: SizeSkewDecision::default(),
+                        nonlinear_skew: Default::default(),
+                        guard: Default::default(),
                         wind_down: false,
                         qty_tolerance: 0.0005,
                     };
@@ -2156,6 +2276,8 @@ mod tests {
                         &c,
                         CycleInput {
                             size_skew: inactive,
+                            nonlinear_skew: Default::default(),
+                            guard: Default::default(),
                             ..input
                         },
                         false,
@@ -2164,6 +2286,277 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn disabled_nonlinear_and_inactive_guard_are_plan_equivalent_across_state_grid() {
+        let mut c = cfg();
+        c.levels = 2;
+        c.max_position = 0.05;
+        c.skew_bps = 10.0;
+        let resting_sets = [
+            Vec::new(),
+            vec![
+                resting(OrderSide::Buy, 0, 99.9, 100.0),
+                resting(OrderSide::Sell, 0, 100.1, 100.0),
+            ],
+        ];
+        // Disabled nonlinear config with aggressive non-default parameters, and
+        // an enabled-but-inactive guard: neither may perturb a single action.
+        let disabled_nonlinear = NonlinearSkewConfig {
+            enabled: false,
+            boost: 7.0,
+            cap_bps: 9.0,
+        };
+        let inactive_guard = GuardDecision {
+            enabled: true,
+            active: false,
+            endangered: None,
+            divergence_bps: Some(2.0),
+        };
+
+        for position in [-0.04, -0.025, 0.0, 0.025, 0.04] {
+            for resting in &resting_sets {
+                let input = CycleInput {
+                    cycle: 6,
+                    market: MarketSnapshot {
+                        mark: 100.0,
+                        best_bid: Some(99.99),
+                        best_ask: Some(100.01),
+                    },
+                    position,
+                    resting,
+                    pending_slots: &[],
+                    market_data_mode: MarketDataMode::Active,
+                    active_exit_enabled: false,
+                    inventory_exit_pct: 0.0,
+                    inventory_exit_qty: 0.0,
+                    size_skew: SizeSkewDecision::default(),
+                    nonlinear_skew: Default::default(),
+                    guard: Default::default(),
+                    wind_down: false,
+                    qty_tolerance: 0.0005,
+                };
+                let default_plan = plan_cycle(&c, input, false);
+                let candidate_plan = plan_cycle(
+                    &c,
+                    CycleInput {
+                        nonlinear_skew: disabled_nonlinear,
+                        guard: inactive_guard,
+                        ..input
+                    },
+                    false,
+                );
+                assert_eq!(candidate_plan, default_plan);
+            }
+        }
+    }
+
+    #[test]
+    fn nonlinear_skew_boost_one_with_high_cap_equals_linear() {
+        let mut c = cfg();
+        c.skew_bps = 8.0;
+        c.max_position = 1.0;
+        let nl = NonlinearSkewConfig {
+            enabled: true,
+            boost: 1.0,
+            cap_bps: 8.0,
+        };
+        for position in [-1.0, -0.6, -0.2, 0.0, 0.2, 0.6, 1.0] {
+            assert_eq!(
+                skew_center_with(&c, nl, 100.0, position),
+                skew_center(&c, 100.0, position),
+                "position {position}"
+            );
+        }
+    }
+
+    #[test]
+    fn nonlinear_skew_steepens_saturates_and_mirrors() {
+        let mut c = cfg();
+        c.skew_bps = 8.0;
+        c.max_position = 1.0;
+        let nl = NonlinearSkewConfig {
+            enabled: true,
+            boost: 3.0,
+            cap_bps: 12.0,
+        };
+        // ratio 0.2 -> 8*3*0.2 = 4.8bps below mark (long favors selling).
+        let long = skew_center_with(&c, nl, 100.0, 0.2);
+        assert!((long - (100.0 * (1.0 - 4.8 / 1e4))).abs() < 1e-9);
+        // Steeper than linear (linear at 0.2 is 1.6bps).
+        assert!(long < skew_center(&c, 100.0, 0.2));
+        // ratio 0.5 -> 12bps raw but capped at 12 -> exactly the cap; deeper
+        // inventory saturates at the same shift.
+        let at_half = skew_center_with(&c, nl, 100.0, 0.5);
+        let at_full = skew_center_with(&c, nl, 100.0, 1.0);
+        assert!((at_half - (100.0 * (1.0 - 12.0 / 1e4))).abs() < 1e-9);
+        assert_eq!(at_half, at_full);
+        // Long/short mirror around the mark.
+        let short = skew_center_with(&c, nl, 100.0, -0.2);
+        assert!((short + long - 200.0).abs() < 1e-9);
+        // Zero position never shifts.
+        assert_eq!(skew_center_with(&c, nl, 100.0, 0.0), 100.0);
+    }
+
+    #[test]
+    fn guard_suppresses_endangered_side_and_cancels_its_resting_quotes() {
+        let c = cfg();
+        let resting = vec![
+            resting(OrderSide::Buy, 0, 99.9, 100.0),
+            resting(OrderSide::Sell, 0, 100.1, 100.0),
+        ];
+        let plan = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 3,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.99),
+                    best_ask: Some(100.01),
+                },
+                position: 0.0,
+                resting: &resting,
+                pending_slots: &[],
+                market_data_mode: MarketDataMode::Active,
+                active_exit_enabled: false,
+                inventory_exit_pct: 0.0,
+                inventory_exit_qty: 0.0,
+                size_skew: Default::default(),
+                nonlinear_skew: Default::default(),
+                guard: GuardDecision {
+                    enabled: true,
+                    active: true,
+                    endangered: Some(OrderSide::Sell),
+                    divergence_bps: Some(9.0),
+                },
+                wind_down: false,
+                qty_tolerance: 0.0005,
+            },
+            false,
+        );
+
+        // The endangered sell side: no new quotes, resting cancelled as
+        // side-suppressed.
+        assert!(!plan
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(q) if q.side == OrderSide::Sell)));
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            Action::Cancel {
+                side: OrderSide::Sell,
+                reason: CancelReason::SideSuppressed,
+                ..
+            }
+        )));
+        // The safe buy side keeps quoting (hold of the fresh resting quote).
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            Action::Hold {
+                side: OrderSide::Buy,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn combined_high_inventory_and_guard_keeps_all_invariants() {
+        let mut c = cfg();
+        c.skew_bps = 8.0;
+        c.band_bps = 30.0;
+        c.max_position = 0.05;
+        let nl = NonlinearSkewConfig {
+            enabled: true,
+            boost: 3.0,
+            cap_bps: 12.0,
+        };
+        // Long 80% of max while the external leader jumps DOWN: guard protects
+        // the buy side (stale-rich bids), nonlinear skew is already pushing the
+        // center down. Both act in the same defensive direction by design.
+        let position = 0.04;
+        let plan = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 9,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.99),
+                    best_ask: Some(100.01),
+                },
+                position,
+                resting: &[],
+                pending_slots: &[],
+                market_data_mode: MarketDataMode::Active,
+                active_exit_enabled: false,
+                inventory_exit_pct: 0.0,
+                inventory_exit_qty: 0.0,
+                size_skew: Default::default(),
+                nonlinear_skew: nl,
+                guard: GuardDecision {
+                    enabled: true,
+                    active: true,
+                    endangered: Some(OrderSide::Buy),
+                    divergence_bps: Some(-8.0),
+                },
+                wind_down: false,
+                qty_tolerance: 0.0005,
+            },
+            false,
+        );
+
+        let band_lo = 100.0 * (1.0 - c.band_bps / 1e4);
+        let band_hi = 100.0 * (1.0 + c.band_bps / 1e4);
+        let mut worst_case_long = position;
+        for action in &plan.actions {
+            if let Action::Place(q) = action {
+                // Guard: no buy quotes at all.
+                assert_ne!(q.side, OrderSide::Buy);
+                // Band and no-cross hold under the combined shift.
+                assert!(q.price >= band_lo && q.price <= band_hi);
+                assert!(q.price >= 99.99 + c.price_tick() - 1e-9);
+                if q.side == OrderSide::Buy {
+                    worst_case_long += q.qty;
+                }
+            }
+        }
+        assert!(worst_case_long <= c.max_position + 1e-9);
+
+        // Release: guard inactive next cycle restores the buy ladder under the
+        // same (still skewed) center.
+        let released = plan_cycle(
+            &c,
+            CycleInput {
+                cycle: 10,
+                market: MarketSnapshot {
+                    mark: 100.0,
+                    best_bid: Some(99.99),
+                    best_ask: Some(100.01),
+                },
+                position,
+                resting: &[],
+                pending_slots: &[],
+                market_data_mode: MarketDataMode::Active,
+                active_exit_enabled: false,
+                inventory_exit_pct: 0.0,
+                inventory_exit_qty: 0.0,
+                size_skew: Default::default(),
+                nonlinear_skew: nl,
+                guard: GuardDecision {
+                    enabled: true,
+                    active: false,
+                    endangered: None,
+                    divergence_bps: Some(1.0),
+                },
+                wind_down: false,
+                qty_tolerance: 0.0005,
+            },
+            false,
+        );
+        assert!(released
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Place(q) if q.side == OrderSide::Buy)));
     }
 
     // 28. Alert monitor: disabled emits nothing.
@@ -2293,6 +2686,8 @@ mod tests {
             inventory_exit_pct: 0.0,
             inventory_exit_qty: 0.0,
             size_skew: Default::default(),
+            nonlinear_skew: Default::default(),
+            guard: Default::default(),
             wind_down: true,
             qty_tolerance: 0.0005,
         };
@@ -2344,6 +2739,8 @@ mod tests {
                 inventory_exit_pct: 0.0,
                 inventory_exit_qty: 0.0,
                 size_skew: Default::default(),
+                nonlinear_skew: Default::default(),
+                guard: Default::default(),
                 wind_down: true,
                 qty_tolerance: 0.0005,
             },
@@ -2375,6 +2772,8 @@ mod tests {
             inventory_exit_pct: 80.0,
             inventory_exit_qty: 0.01,
             size_skew: Default::default(),
+            nonlinear_skew: Default::default(),
+            guard: Default::default(),
             wind_down: true,
             qty_tolerance: 0.0005,
         };

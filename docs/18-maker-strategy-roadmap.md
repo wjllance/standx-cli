@@ -311,12 +311,20 @@ peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 l
 
 ## 阶段 3：非线性库存控制
 
-当前状态：`rejected_uptime_cost`（2026-07-22 判定）。v0 的 6 臂实盘 A/B 完成：
-尾部治理达标（p95 |position| 降 40–62%、≥70% 仓时间清零、退出成本未恶化），但二值加仓侧
-压制使双边 uptime 降 43–80pp（判据 ≤3pp），按预注册判据不晋级；baseline 维持 HYPE 静态
-配置。判定报告见
+当前状态：`v1_combined_implementing`（2026-07-22 立项）。v0 判定 `rejected_uptime_cost`
+（2026-07-22）：6 臂实盘 A/B 完成，尾部治理达标（p95 |position| 降 40–62%、≥70% 仓时间
+清零、退出成本未恶化），但二值加仓侧压制使双边 uptime 降 43–80pp，按预注册判据不晋级；
+baseline 维持 HYPE 静态配置。判定报告见
 [maker-stage3-ab-judgment-2026-07-22.md](evidence/maker-stage3-ab-judgment-2026-07-22.md)。
-按 20 号文档分支，下一增量候选为 v1 非线性 price skew（"更陡但不停"），重走同一验收。
+
+**v1 组合候选（release owner 2026-07-22 裁决）**：非线性 price skew（"更陡但不停"）与
+外部价防御门（HL midPx 领先信号压制危险侧，lag 证据见
+[lag-recorder-hype-result-2026-07-22.md](evidence/lag-recorder-hype-result-2026-07-22.md)）
+**合并为一个 release、各带独立 enable 开关**，一次 canary 重锁，A/B 两臂
+（baseline vs 双开组合）+ 遥测事件级归因；组合被拒时拆单机制以纯配置 A/B 重跑（不重锁）。
+**uptime 判据修订为绝对值 ≥80%**（替代原 ≤3pp 相对判据，release owner 2026-07-22）。
+设计、红线（SIP-5A 带内 cap、无迟滞、guard fail-open）与预注册判据全文见
+[22-maker-stage3v1-guard-design.md](22-maker-stage3v1-guard-design.md)。
 立项依据是三项仲裁分析（610 笔 fill / 81 个库存事件 / 16 笔实测退出成本），记录见
 [maker-stage3-arbitration-2026-07-20.md](evidence/maker-stage3-arbitration-2026-07-20.md)，
 分析脚本 `scripts/maker_tail_arbitration.py`。

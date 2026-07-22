@@ -69,6 +69,57 @@ impl SizeSkewFileConfig {
     }
 }
 
+/// Stage 3 v1 nonlinear price skew (`[nonlinear_skew]`). Field defaults match
+/// [`standx_maker::NonlinearSkewConfig`] so partial files stay valid.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct NonlinearSkewFileConfig {
+    pub enabled: Option<bool>,
+    pub boost: Option<f64>,
+    pub cap_bps: Option<f64>,
+}
+
+impl NonlinearSkewFileConfig {
+    pub(super) fn into_domain(self) -> standx_maker::NonlinearSkewConfig {
+        let defaults = standx_maker::NonlinearSkewConfig::default();
+        standx_maker::NonlinearSkewConfig {
+            enabled: self.enabled.unwrap_or(false),
+            boost: self.boost.unwrap_or(defaults.boost),
+            cap_bps: self.cap_bps.unwrap_or(defaults.cap_bps),
+        }
+    }
+}
+
+/// External-price defensive guard (`[external_guard]`). Field defaults match
+/// [`standx_maker::GuardConfig`] so partial files stay valid.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExternalGuardFileConfig {
+    pub enabled: Option<bool>,
+    pub enter_bps: Option<f64>,
+    pub exit_bps: Option<f64>,
+    pub max_age_ms: Option<u64>,
+    /// CLI-side basis EMA half-life (seconds): the guard triggers on the
+    /// excess divergence over this slow baseline, so the persistent
+    /// leader-vs-mark basis never latches the guard.
+    pub basis_half_life_secs: Option<u64>,
+}
+
+/// Default half-life for the divergence-basis EMA (seconds).
+pub(super) const DEFAULT_GUARD_BASIS_HALF_LIFE_SECS: u64 = 300;
+
+impl ExternalGuardFileConfig {
+    pub(super) fn into_domain(self) -> standx_maker::GuardConfig {
+        let defaults = standx_maker::GuardConfig::default();
+        standx_maker::GuardConfig {
+            enabled: self.enabled.unwrap_or(false),
+            enter_bps: self.enter_bps.unwrap_or(defaults.enter_bps),
+            exit_bps: self.exit_bps.unwrap_or(defaults.exit_bps),
+            max_age_ms: self.max_age_ms.unwrap_or(defaults.max_age_ms),
+        }
+    }
+}
+
 /// Values are optional so an explicit CLI flag can override one field without
 /// requiring every strategy default to be repeated in TOML.
 #[derive(Debug, Default, Deserialize)]
@@ -91,6 +142,8 @@ pub(super) struct MakerFileConfig {
     pub vol_window_secs: Option<u64>,
     pub adaptive_spread: Option<AdaptiveSpreadFileConfig>,
     pub size_skew: Option<SizeSkewFileConfig>,
+    pub nonlinear_skew: Option<NonlinearSkewFileConfig>,
+    pub external_guard: Option<ExternalGuardFileConfig>,
     pub stop_loss: Option<f64>,
     pub alert_loss: Option<f64>,
     pub alert_inventory_pct: Option<f64>,
@@ -334,5 +387,98 @@ add_side_factor = 0.5
         assert_eq!(baseline.activate_pct, 30.0);
         assert_eq!(baseline.release_pct, 20.0);
         assert_eq!(baseline.add_side_factor, 0.5);
+    }
+
+    #[test]
+    fn parses_nonlinear_skew_and_external_guard_sections() {
+        let config: MakerFileConfig = toml::from_str(
+            "[nonlinear_skew]\nenabled = true\nboost = 3.0\ncap_bps = 12.0\n\n[external_guard]\nenabled = true\nenter_bps = 6.0\nexit_bps = 3.0\nmax_age_ms = 5000\n",
+        )
+        .unwrap();
+        let nonlinear = config.nonlinear_skew.unwrap().into_domain();
+        assert!(nonlinear.enabled);
+        assert_eq!(nonlinear.boost, 3.0);
+        assert_eq!(nonlinear.cap_bps, 12.0);
+        let guard = config.external_guard.unwrap().into_domain();
+        assert!(guard.enabled);
+        assert_eq!(guard.enter_bps, 6.0);
+        assert_eq!(guard.exit_bps, 3.0);
+        assert_eq!(guard.max_age_ms, 5000);
+
+        // Partial sections fall back to domain defaults, disabled by default.
+        let partial: MakerFileConfig =
+            toml::from_str("[nonlinear_skew]\nboost = 2.0\n\n[external_guard]\nenter_bps = 8.0\n")
+                .unwrap();
+        let nonlinear = partial.nonlinear_skew.unwrap().into_domain();
+        assert!(!nonlinear.enabled);
+        assert_eq!(nonlinear.boost, 2.0);
+        assert_eq!(nonlinear.cap_bps, 12.0);
+        let guard = partial.external_guard.unwrap().into_domain();
+        assert!(!guard.enabled);
+        assert_eq!(guard.enter_bps, 8.0);
+        assert_eq!(guard.exit_bps, 3.0);
+    }
+
+    #[test]
+    fn stage3v1_live_arms_only_differ_by_combined_enable_switches() {
+        let baseline = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-stage3v1-hype-baseline.toml"
+        ));
+        let candidate = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/maker-stage3v1-hype-candidate.toml"
+        ));
+        assert_eq!(baseline.lines().count(), candidate.lines().count());
+        let differing_lines: Vec<_> = baseline
+            .lines()
+            .zip(candidate.lines())
+            .filter(|(baseline_line, candidate_line)| baseline_line != candidate_line)
+            .collect();
+        assert_eq!(
+            differing_lines,
+            vec![
+                ("enabled = false", "enabled = true"),
+                ("enabled = false", "enabled = true"),
+            ]
+        );
+
+        let baseline: MakerFileConfig = toml::from_str(baseline).unwrap();
+        let candidate: MakerFileConfig = toml::from_str(candidate).unwrap();
+        // Every other controller stays off in both arms.
+        assert!(!baseline.adaptive_spread.as_ref().unwrap().enabled.unwrap());
+        assert!(!candidate.adaptive_spread.as_ref().unwrap().enabled.unwrap());
+        assert!(!baseline
+            .size_skew
+            .as_ref()
+            .unwrap()
+            .enabled
+            .unwrap_or(false));
+        assert!(!candidate
+            .size_skew
+            .as_ref()
+            .unwrap()
+            .enabled
+            .unwrap_or(false));
+
+        let baseline_nl = baseline.nonlinear_skew.unwrap().into_domain();
+        let candidate_nl = candidate.nonlinear_skew.unwrap().into_domain();
+        assert!(!baseline_nl.enabled);
+        assert!(candidate_nl.enabled);
+        assert_eq!(candidate_nl.boost, 3.0);
+        assert_eq!(candidate_nl.cap_bps, 12.0);
+
+        let baseline_guard = baseline.external_guard.unwrap().into_domain();
+        let candidate_guard = candidate.external_guard.unwrap().into_domain();
+        assert!(!baseline_guard.enabled);
+        assert!(candidate_guard.enabled);
+        assert_eq!(candidate_guard.enter_bps, 6.0);
+        assert_eq!(candidate_guard.exit_bps, 3.0);
+        assert_eq!(candidate_guard.max_age_ms, 5000);
+
+        // Band red line holds for the frozen candidate: spread + cap <= band.
+        let spread = candidate.spread_bps.unwrap();
+        let band = candidate.band_bps.unwrap();
+        assert!(spread + candidate_nl.cap_bps <= band);
     }
 }

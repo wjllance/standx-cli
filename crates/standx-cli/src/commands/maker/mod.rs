@@ -19,6 +19,7 @@ use std::time::Duration;
 mod canary;
 mod config;
 mod cycle;
+mod external_feed;
 mod feed;
 mod ledger;
 mod market_data;
@@ -192,6 +193,21 @@ pub async fn handle_maker(
                 }
                 None => maker::SizeSkewConfig::default(),
             };
+            // Stage 3 v1 combined candidate: TOML-only switches (no CLI
+            // overrides) so frozen A/B configs stay the single source of truth.
+            let nonlinear_skew = file
+                .nonlinear_skew
+                .map(|config| config.into_domain())
+                .unwrap_or_default();
+            let external_guard_basis_half_life_secs = file
+                .external_guard
+                .as_ref()
+                .and_then(|config| config.basis_half_life_secs)
+                .unwrap_or(config::DEFAULT_GUARD_BASIS_HALF_LIFE_SECS);
+            let external_guard = file
+                .external_guard
+                .map(|config| config.into_domain())
+                .unwrap_or_default();
             // Keep accepting the removed rolling-circuit knobs for one
             // compatibility window so existing production commands/configs do
             // not fail to parse. They deliberately do not enter MakerRunArgs.
@@ -219,6 +235,9 @@ pub async fn handle_maker(
                     vol_window_secs: selected_vol_window_secs,
                     adaptive_spread,
                     size_skew,
+                    nonlinear_skew,
+                    external_guard,
+                    external_guard_basis_half_life_secs,
                     stop_loss: choose(stop_loss, file.stop_loss, 0.0),
                     alert_loss: choose(alert_loss, file.alert_loss, 0.0),
                     alert_inventory_pct: choose(alert_inventory_pct, file.alert_inventory_pct, 0.0),
@@ -306,6 +325,9 @@ struct MakerRunArgs {
     vol_window_secs: Option<u64>,
     adaptive_spread: maker::AdaptiveSpreadConfig,
     size_skew: maker::SizeSkewConfig,
+    nonlinear_skew: maker::NonlinearSkewConfig,
+    external_guard: maker::GuardConfig,
+    external_guard_basis_half_life_secs: u64,
     stop_loss: f64,
     alert_loss: f64,
     alert_inventory_pct: f64,
