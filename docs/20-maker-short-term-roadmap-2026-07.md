@@ -1,5 +1,10 @@
 # Maker 短期迭代路线图（2026-07-20 快照）
 
+> **已失效（2026-07-22）**：阶段 3 v0 A/B 判定完成（rejected，uptime 代价
+> 过大），触发文末失效条件第一条。判定报告见
+> [evidence/maker-stage3-ab-judgment-2026-07-22.md](evidence/maker-stage3-ab-judgment-2026-07-22.md)。
+> 后续按 18 号文档重排；本快照保留为历史记录。
+
 本文档是未来 2–4 周的执行层快照，回答"下一步做什么、按什么顺序、什么条件下改变计划"。
 长期阶段定义、验收口径和轨道原则见 [18-maker-strategy-roadmap.md](18-maker-strategy-roadmap.md)，
 本文不重复也不修改它们；两者冲突时以 18 号文档为准。

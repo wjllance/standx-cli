@@ -311,8 +311,12 @@ peak-to-trough `vol_bps`）和当前 touch spread。markout/toxicity 与滚动 l
 
 ## 阶段 3：非线性库存控制
 
-当前状态：`live_ab`（2026-07-20 实现落地；2026-07-21 gate 重验通过并启动 4 小时时间片 A/B，
-执行记录见 [maker-stage3-canary-2026-07-21.md](evidence/maker-stage3-canary-2026-07-21.md)）。
+当前状态：`rejected_uptime_cost`（2026-07-22 判定）。v0 的 6 臂实盘 A/B 完成：
+尾部治理达标（p95 |position| 降 40–62%、≥70% 仓时间清零、退出成本未恶化），但二值加仓侧
+压制使双边 uptime 降 43–80pp（判据 ≤3pp），按预注册判据不晋级；baseline 维持 HYPE 静态
+配置。判定报告见
+[maker-stage3-ab-judgment-2026-07-22.md](evidence/maker-stage3-ab-judgment-2026-07-22.md)。
+按 20 号文档分支，下一增量候选为 v1 非线性 price skew（"更陡但不停"），重走同一验收。
 立项依据是三项仲裁分析（610 笔 fill / 81 个库存事件 / 16 笔实测退出成本），记录见
 [maker-stage3-arbitration-2026-07-20.md](evidence/maker-stage3-arbitration-2026-07-20.md)，
 分析脚本 `scripts/maker_tail_arbitration.py`。
