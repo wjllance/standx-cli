@@ -27,7 +27,9 @@ docs/
 ├── 16-ws-iteration-goals.md  # Maker WebSocket 迭代目标
 ├── 17-ws-command-canary-quickstart.md # WS 生产 Canary 快速启动
 ├── 18-maker-strategy-roadmap.md # Maker 策略迭代路线与验收标准
-└── 19-maker-stage2-live-ab-runbook.md # Stage 2 canary/A-B 操作手册
+├── 19-maker-stage2-live-ab-runbook.md # Stage 2 canary/A-B 操作手册
+├── 20-maker-short-term-roadmap-2026-07.md # Maker 短期迭代路线图快照（2026-07）
+└── 21-maker-stage3-live-ab-runbook.md # Stage 3 canary/A-B 操作手册
 ```
 
 ---
@@ -55,6 +57,8 @@ docs/
 | [17-ws-command-canary-quickstart.md](17-ws-command-canary-quickstart.md) | WS 生产 Canary 配置、执行与成功判据 | 操作手册 |
 | [18-maker-strategy-roadmap.md](18-maker-strategy-roadmap.md) | Maker 策略分阶段目标、量化验收标准与晋级门槛 | 开发参考 |
 | [19-maker-stage2-live-ab-runbook.md](19-maker-stage2-live-ab-runbook.md) | Stage 2 小额 canary、应急处置与 2 小时 A/B | 操作手册 |
+| [20-maker-short-term-roadmap-2026-07.md](20-maker-short-term-roadmap-2026-07.md) | Maker 短期迭代路线图快照（主线阶段 3 A/B） | 开发参考 |
+| [21-maker-stage3-live-ab-runbook.md](21-maker-stage3-live-ab-runbook.md) | Stage 3 canary、应急处置与 4 小时 A/B | 操作手册 |
 
 ---
 
