@@ -78,3 +78,63 @@
 - 录制进程 uptime 44.5h，双源零重连；NDJSON 665,407 行末行校验通过。
 - 录制期间每 4 小时增量分析一次（共 11 次），跟随事件 n 从 8 增至 29，
   中位数收敛过程：838 → 865 → 945 → 985 → 1097 → 1240 → 1271 → 1209ms。
+- 更正：首次 SIGTERM 只终止了 shell 包装进程，录制子进程多运行了 ~1.7h；
+  真实停止于 2026-07-22T02:08Z（优雅 flush，末行校验通过）。最终文件
+  672,499 行（standx=514,583 / hyperliquid=157,916），重叠跨度 161,946s。
+  上文 44.5h 数字基于冻结前的 665,407 行快照，结论不受影响。
+
+## Update 2026-07-22: per-source fields + stratified coverage + own-feed response
+
+分析器补丁（`scripts/lag_analysis.py`，对同一份数据重跑，零新录制成本）：
+
+1. 每源独立字段：leader 改用 HL `midPx`（`--leader-field mid`，盘口中间价，
+   该 feed 上最快的公开价格），StandX 侧仍用 `mark`（maker 报价基准）。
+   原 `--field` 参数被 `--standx-field` / `--leader-field` 取代。
+2. 覆盖率按跳幅分层（[1x, 2x, 4x, 8x) × event-bps）。
+3. 新增 StandX mark 自身跳动响应速度统计（own-feed 快撤定价）。
+
+### Results with midPx leader（冻结后的完整文件）
+
+Cross-correlation：峰值 **+1500ms（StandX LAGS）**，r=0.071 仍弱，
+但 +750~+2250ms 呈宽平台（0.06–0.07），方向与"StandX 滞后"假设一致——
+此前 markPx-vs-markPx 的负向噪声峰值部分是把滞后聚合价当 leader 的伪影。
+
+Event response（≥8bps / 2s 窗口，131 次跳动）：
+
+- already ahead：**26（20%）**（markPx leader 时为 65%）
+- never follow：25（19%）
+- measurable follow：**80（61%）**，median=**2622ms**，p25=1834ms，
+  p75=3425ms，mean=2755ms
+
+按跳幅分层：
+
+| tier(bps) | jumps | already | never | follow | follow-median |
+| --- | --- | --- | --- | --- | --- |
+| 8–16 | 123 | 26 | 24 | 73 | 2570ms |
+| 16–32 | 8 | 0 | 1 | 7 | 2681ms |
+| ≥32 | 0 | – | – | – | – |
+
+StandX own-feed response（自身 mark ≥8bps / 6s 窗口，267 次）：
+
+- 覆盖自身 50% 变动：median=3001ms，p25=3000ms，p75=5999ms，mean=4119ms
+- 覆盖自身 90% 变动：median=5998ms，p25=3000ms，p75=6000ms，mean=4686ms
+- 数值量化到 ~3s 的 mark 更新节奏（p25/p75 恰为 3000/6000ms），应读作
+  "跳动需要 1–2 个 mark tick 完成"，而非连续速度。
+
+### Revised interpretation
+
+- **条件性 lag 上修至 ~2.6s**（此前 markPx leader 估计 1.2s）：HL markPx
+  本身是向 oracle 平滑的滞后聚合价；以盘口 midPx 为真正领先者，StandX
+  mark 的跟随中位数 2.6s，p75 3.4s，明确落在 1–3s 可防守窗口内。
+- **覆盖率大幅上修**：可测量跟随占 61%（此前 19%），"StandX 已在前侧"
+  仅 20%。且分层显示跳幅越大 StandX 越可靠地落后（16–32bps 档 0 次
+  already-ahead、跟随率 7/8），可利用性集中在真正造成 toxic fill 的
+  较大跳动上。≥32bps 档无样本，尾部仍未知。
+- **own-feed 快撤定价**：靠自身 mark 检测跳动，最快也要 ~3s（一个 tick）
+  才能看到 50% 的变动——own-feed 触发比外部 midPx 信号慢约一个量级，
+  但它是无条件可用的兜底（267 次自身跳动全部最终可被本地观测）。
+  快撤若按 own-feed 定价，预算为 1 个 mark tick（~3s）；外部信号预算
+  ~2.6s 的跟随中位数减去撤单 RTT（0.3–0.5s），仍有 ~2s 余量。
+- 对 Stage 4 的含义转正：外部价格引导报价路线从"弱支持"上调为"有实质
+  支持"——窗口存在、覆盖率过半、且在大跳幅档最可靠。仍须与
+  widen-spread A/B 结论及 SIP-5A $/Maker-Hour 联合决策。
