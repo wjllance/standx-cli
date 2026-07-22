@@ -218,7 +218,7 @@ class MakerRunManifestTests(unittest.TestCase):
                     [
                         '{"ts":1,"action":"cycle_summary","cycle":0}',
                         '{"ts":2,"action":"cycle_summary","cycle":1}',
-                        '{"ts":3,"action":"risk_notification","event":"frozen","kind":"position_reconciliation"}',
+                        '{"ts":3,"action":"risk_notification","event":"frozen","kind":"position_reconciliation","cycle":1}',
                         '{"ts":4,"action":"cycle_summary","cycle":1}',
                         '{"ts":5,"action":"cycle_summary","cycle":2}',
                     ]
@@ -286,6 +286,79 @@ class MakerRunManifestTests(unittest.TestCase):
             # not a freeze retry and must stay disqualifying.
             self.assertEqual(analyzed["duplicate_cycles"], [2])
             self.assertEqual(analyzed["freeze_retried_cycles"], [])
+
+    def test_freeze_lost_missing_cycle_keeps_cycle_sequence_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.ndjson"
+            log.write_text(
+                "\n".join(
+                    [
+                        '{"ts":1,"action":"cycle_summary","cycle":0}',
+                        '{"ts":2,"action":"risk_notification","event":"degraded_frozen","kind":"market_data","cycle":2}',
+                        '{"ts":3,"action":"cycle_summary","cycle":2}',
+                        '{"ts":4,"action":"lifecycle","event":"started"}',
+                        '{"ts":5,"action":"lifecycle","event":"stopped"}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            analyzed = manifest.analyze_log(log)
+            # Cycle 1 was lost to the market-data freeze recorded between its
+            # neighbours, so the gap must not disqualify the trace.
+            self.assertEqual(analyzed["missing_cycles"], [1])
+            self.assertEqual(analyzed["freeze_lost_cycles"], [1])
+
+            output = Path(directory) / "run.manifest.json"
+            output.write_text(
+                json.dumps(
+                    {
+                        "git_sha": "a" * 40,
+                        "git_dirty": False,
+                        "strategy_dirty_paths": [],
+                        "symbol": "BTC-USD",
+                        "program": {"sha256": "c" * 64},
+                        "collector": {
+                            "manifest_tool": {"sha256": "d" * 64},
+                            "wrapper": {"sha256": "e" * 64},
+                        },
+                        "config": {"sha256": "b" * 64},
+                        "symbol_metadata": {
+                            "price_tick_decimals": 1,
+                            "qty_tick_decimals": 1,
+                            "min_order_qty": "0.1",
+                        },
+                        "log": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest.finalize_manifest(
+                argparse.Namespace(manifest=output, log=log, exit_status=0)
+            )
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(payload["validation"]["checks"]["cycle_sequence_complete"])
+            self.assertTrue(payload["validation"]["baseline_eligible"])
+
+    def test_missing_cycle_without_freeze_breaks_cycle_sequence_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "run.ndjson"
+            log.write_text(
+                "\n".join(
+                    [
+                        '{"ts":1,"action":"cycle_summary","cycle":0}',
+                        '{"ts":2,"action":"risk_notification","event":"degraded_frozen","kind":"market_data","cycle":5}',
+                        '{"ts":3,"action":"cycle_summary","cycle":2}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            analyzed = manifest.analyze_log(log)
+            # Cycle 5's freeze sits above the gap at cycle 1, so the missing
+            # cycle is not freeze-caused and must stay disqualifying.
+            self.assertEqual(analyzed["missing_cycles"], [1])
+            self.assertEqual(analyzed["freeze_lost_cycles"], [])
 
     def test_regime_report_distinguishes_calm_trend_and_stress(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
