@@ -325,6 +325,13 @@ baseline 维持 HYPE 静态配置。判定报告见
 **uptime 判据修订为绝对值 ≥80%**（替代原 ≤3pp 相对判据，release owner 2026-07-22）。
 设计、红线（SIP-5A 带内 cap、无迟滞、guard fail-open）与预注册判据全文见
 [22-maker-stage3v1-guard-design.md](22-maker-stage3v1-guard-design.md)。
+
+**Round 1 → Round 2（2026-07-23 release owner 决定）**：Round 1（enter=6/exit=3）
+8 臂中期读数——非线性 skew 达标（p95 |pos| 降 50–67%、零 uptime 代价，判定为
+干净赢家）；防御门方向对但剂量超标（激活率 11.5–22.6%，是跳变预算的 5–10 倍，
+uptime 贴 80% 线、撤单率触边）。三症状同源=guard 开门过勤。处置：直接把
+`enter=10 / exit=5` 固定为新 base（不再单独验证阈值，纯配置变更不重锁），下一轮
+A/B 用此配置对；lag 分层证据支持——防御价值集中在 ≥16bps 大跳。skew 参数不动。
 立项依据是三项仲裁分析（610 笔 fill / 81 个库存事件 / 16 笔实测退出成本），记录见
 [maker-stage3-arbitration-2026-07-20.md](evidence/maker-stage3-arbitration-2026-07-20.md)，
 分析脚本 `scripts/maker_tail_arbitration.py`。

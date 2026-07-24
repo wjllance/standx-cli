@@ -73,9 +73,14 @@ cap_bps = 12.0
 # External-price defensive guard: suppress the endangered side while the
 # leader (Hyperliquid midPx) has moved and StandX mark has not yet followed.
 # Fail-open: missing/stale feed deactivates the guard, quoting continues.
+# Round 2 (2026-07-23, release owner): enter 6->10 / exit 3->5 fixed as the
+# new base. Round-1 activation ran 11.5-22.6% (5-10x the jump-only budget),
+# uptime tracked ~100%-activation; lag stratification shows the defensive
+# value concentrates in >=16bps jumps, so the raise sheds the noisy 6-10bps
+# band while keeping tail-killer coverage. Pure config change, no re-lock.
 [external_guard]
 enabled = true
-enter_bps = 6.0
-exit_bps = 3.0
+enter_bps = 10.0
+exit_bps = 5.0
 max_age_ms = 5000
 basis_half_life_secs = 300
