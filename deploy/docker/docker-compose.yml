@@ -48,15 +48,14 @@ services:
 
     # Root-owned 0600 file, same contents as the systemd deployment. Provides
     # STANDX_INSTALL_ROOT=/opt/standx, STANDX_BIN, lock paths, OpenObserve and
-    # supervisor webhook config, STANDX_ENABLE_LIVE_MAKER=1, and the three
-    # STANDX_BASELINE_* metadata values.
+    # supervisor webhook config, STANDX_ENABLE_LIVE_MAKER=1, the three
+    # STANDX_BASELINE_* metadata values, and — env-only auth, see entrypoint.sh —
+    # STANDX_JWT / STANDX_PRIVATE_KEY. Refresh the token by editing this file
+    # and recreating the container; there is no credentials.enc file to update.
     env_file:
       - /etc/standx/maker-stage2-ab.env
 
     volumes:
-      # Live credentials, read-only. Written on the host by `standx auth login`;
-      # refresh it there and the next arm's reconnect picks up the new token.
-      - ${STANDX_CREDENTIALS_FILE:-/opt/standx/state/standx/credentials.enc}:/opt/standx/state/standx/credentials.enc:ro
       # Run evidence (NDJSON + manifests) must outlive the container.
       - ${STANDX_LOG_DIR_HOST:-/opt/standx/var/standx}:/opt/standx/var/standx
 
@@ -81,5 +80,4 @@ services:
     env_file:
       - /etc/standx/maker-stage2-hype-ab.env
     volumes:
-      - ${STANDX_CREDENTIALS_FILE:-/opt/standx/state/standx/credentials.enc}:/opt/standx/state/standx/credentials.enc:ro
       - ${STANDX_LOG_DIR_HOST:-/opt/standx/var/standx}:/opt/standx/var/standx

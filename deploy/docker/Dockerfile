@@ -50,7 +50,9 @@ RUN set -eu; \
       || { echo 'ERROR: strategy source is dirty; build from a clean release commit:' >&2; \
            echo "$dirty" >&2; exit 1; }
 
-# Credentials come from a read-only mount at $XDG_DATA_HOME/standx/credentials.enc.
+# Env-only auth: credentials come from STANDX_JWT / STANDX_PRIVATE_KEY in the
+# env_file (see entrypoint.sh), never a credentials.enc file. XDG_DATA_HOME is
+# still set for other state the app may write under this writable layout.
 ENV XDG_DATA_HOME=/opt/standx/state
 # var/lock is where STANDX_MAKER_LOCK_PATH / STANDX_STAGE2_AB_LOCK_PATH should
 # point by default — container-local, not the host's /run/lock (see

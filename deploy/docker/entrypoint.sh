@@ -9,7 +9,6 @@
 set -euo pipefail
 
 root="${STANDX_INSTALL_ROOT:-/opt/standx}"
-cred_file="${XDG_DATA_HOME:-$root/state}/standx/credentials.enc"
 
 # Validate-only is a pure offline config/preflight check (symbol, config
 # byte-equality, hashes) — no credentials, no OpenObserve, no live orders. Skip
@@ -19,10 +18,13 @@ if [[ "${STANDX_STAGE2_VALIDATE_ONLY:-0}" == "1" ]]; then
   exec "$root/scripts/run_maker_stage2_ab.sh"
 fi
 
-# Credentials arrive either as env (STANDX_JWT) or the read-only mounted file.
-if [[ -z "${STANDX_JWT:-}" && ! -f "$cred_file" ]]; then
-  printf 'entrypoint: no credentials: set STANDX_JWT or mount %s (read-only)\n' \
-    "$cred_file" >&2
+# Env-only auth: this deployment authenticates strictly from the environment,
+# never a credentials.enc file (the file mount was removed). Both vars are
+# required — live trading signs orders, so STANDX_PRIVATE_KEY is not optional
+# here (the maker refuses live with an empty private key). Fail closed so a
+# missing/partial credential surfaces here rather than mid-run.
+if [[ -z "${STANDX_JWT:-}" || -z "${STANDX_PRIVATE_KEY:-}" ]]; then
+  printf 'entrypoint: env-only auth: set STANDX_JWT and STANDX_PRIVATE_KEY (see env_file)\n' >&2
   exit 64
 fi
 

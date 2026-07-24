@@ -18,14 +18,18 @@ recorded and the exact authorization text is in the release record.
 1. A **clean checkout at the release commit** (the image build fails if the
    committed strategy source — `crates/*`, `Cargo.*`, `examples/maker.toml` —
    is dirty, because the run manifest would reject every arm).
-2. Live credentials on the host via `standx auth login`
-   (`~/.local/share/standx/credentials.enc`), mounted read-only.
+2. **Env-only auth** — this container never reads `credentials.enc`. Set
+   `STANDX_JWT` and `STANDX_PRIVATE_KEY` directly in
+   `/etc/standx/maker-stage2-ab.env` (step 3 below); the entrypoint fails
+   closed (exit 64) if either is missing. Live trading requires a private key
+   for order signing, so both are mandatory, not just the JWT.
 3. A root-owned `0600` `/etc/standx/maker-stage2-ab.env` — copy
    [`deploy/systemd/maker-stage2-ab.env.example`](../systemd/maker-stage2-ab.env.example),
-   fill secrets and the three `STANDX_BASELINE_*` metadata values. The
-   `/opt/standx` paths it targets are correct as-is, but **override the two
-   lock paths** for docker (the example's `/run/lock/...` defaults are for the
-   systemd deployment, which shares them with the host):
+   fill secrets (including `STANDX_JWT` / `STANDX_PRIVATE_KEY`) and the three
+   `STANDX_BASELINE_*` metadata values. The `/opt/standx` paths it targets are
+   correct as-is, but **override the two lock paths** for docker (the
+   example's `/run/lock/...` defaults are for the systemd deployment, which
+   shares them with the host):
    ```
    STANDX_MAKER_LOCK_PATH=/opt/standx/var/lock/standx-maker-live.lock
    STANDX_STAGE2_AB_LOCK_PATH=/opt/standx/var/lock/standx-maker-stage2-ab.lock
@@ -38,11 +42,9 @@ recorded and the exact authorization text is in the release record.
 4. The frozen `examples/maker-stage2-xag-{baseline,candidate}.toml` (shipped in
    the image).
 
-Point compose at the host credential file and log dir with a sibling `.env`
-(or export the vars):
+Point compose at the log dir with a sibling `.env` (or export the var):
 
 ```
-STANDX_CREDENTIALS_FILE=/home/youruser/.local/share/standx/credentials.enc
 STANDX_LOG_DIR_HOST=/opt/standx/var/standx
 ```
 
@@ -79,6 +81,7 @@ only launches when you pass `--profile ab` explicitly.
 | `KillSignal=SIGTERM` / `TimeoutStopSec=90` | `stop_signal` + `stop_grace_period: 120s` | plus a new orchestrator SIGTERM trap |
 | `EnvironmentFile=/etc/standx/maker-stage2-ab.env` | `env_file` | same file |
 | `OnFailure=standx-notify@…` | `STANDX_SUPERVISOR_WEBHOOK` critical post | orchestrator already webhooks on critical stop |
+| `~/.local/share/standx/credentials.enc` (file auth) | `STANDX_JWT` + `STANDX_PRIVATE_KEY` in `env_file` (env-only auth) | **behavior change** — this container never mounts or reads `credentials.enc`; the systemd deployment is unaffected |
 
 ## Preserved vs. changed safety semantics
 
