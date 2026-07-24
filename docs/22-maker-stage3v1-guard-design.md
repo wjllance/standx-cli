@@ -62,8 +62,12 @@ HL midPx 已跳走、StandX mark 未跟上时，**临时压制危险侧**；mark
 - 控制器（core 纯逻辑，`GuardConfig { enabled, enter_bps, exit_bps, max_age_ms }`）：
   `|excess| ≥ enter_bps` 激活，回落 `< exit_bps` 解除（小迟滞防抖动）；激活
   期间反号越过 enter 立即换边。与 v0 闩锁的本质区别：解除条件是 excess 收敛
-  （StandX 追平即闭合，实测中位 2.6s），不依赖成交，无长闩锁风险。冻结候选
-  `enter=6 / exit=3`。
+  （StandX 追平即闭合，实测中位 2.6s），不依赖成交，无长闩锁风险。
+  **冻结候选 `enter=10 / exit=5`（Round 2，2026-07-23 release owner 固定为
+  base）**。Round 1 用 `enter=6 / exit=3` 实测激活率 11.5–22.6%（跳变预算
+  ~2.1% 的 5–10 倍），uptime ≈ 100%−激活率；lag 分层显示防御价值集中在
+  ≥16bps 大跳档（8–16bps 档信噪比差），故上调阈值剔除噪声段、保留尾部杀手
+  覆盖。纯配置变更，不重锁。
 - 压制语义复用现有 `SideSuppressed` 路径：激活时危险侧 desired 为空 →
   reconcile 撤该侧 resting、不摆新单；解除后自然恢复。事件时长秒级，
   按 lag 数据预算激活时间 ~0.7%/天，uptime 影响可忽略。

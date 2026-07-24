@@ -472,8 +472,10 @@ add_side_factor = 0.5
         let candidate_guard = candidate.external_guard.unwrap().into_domain();
         assert!(!baseline_guard.enabled);
         assert!(candidate_guard.enabled);
-        assert_eq!(candidate_guard.enter_bps, 6.0);
-        assert_eq!(candidate_guard.exit_bps, 3.0);
+        // Round-2 base (release owner 2026-07-23): thresholds raised to shed
+        // the noisy 6-10bps band; see docs/22.
+        assert_eq!(candidate_guard.enter_bps, 10.0);
+        assert_eq!(candidate_guard.exit_bps, 5.0);
         assert_eq!(candidate_guard.max_age_ms, 5000);
 
         // Band red line holds for the frozen candidate: spread + cap <= band.
